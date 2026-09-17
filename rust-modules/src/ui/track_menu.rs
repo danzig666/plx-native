@@ -88,16 +88,19 @@ pub(crate) fn sub_stream_id() -> i64 {
 fn n_audio() -> c_int {
     tracks().map(|t| t.audio.len()).unwrap_or(0) as c_int
 }
-/// Subtitle rows currently offered, as indices into the playing subs list. External/sidecar
-/// subs are NOT in the container, so the client renderer can't show them on direct-play —
-/// they're listed only while transcoding (the server can burn them).
+/// Subtitle rows currently offered, as indices into the playing subs list. An external/sidecar
+/// sub is NOT in the container: on direct play it is offered only when `player::sidecar` can
+/// fetch and draw it (a TEXT format — `Stream::sidecar_renderable`); while transcoding every
+/// sidecar is offered, because the server can burn any of them.
 fn visible_subs() -> Vec<usize> {
     tracks()
         .map(|t| {
             t.subs
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| !s.external || crate::route::is_transcoding())
+                .filter(|(_, s)| {
+                !s.external || s.sidecar_renderable() || crate::route::is_transcoding()
+            })
                 .map(|(i, _)| i)
                 .collect()
         })
@@ -152,7 +155,12 @@ fn sync_item() {
                 .flatten()
                 .or_else(|| t.audio.iter().position(|s| s.default))
                 .unwrap_or(0) as c_int;
-            let ssid = crate::route::cur_sub_sid();
+            // the route's id first; a sidecar RESTORED at start of play lives outside the
+            // route (see `route::apply_plan`), so its own selection is the fallback
+            let ssid = match crate::route::cur_sub_sid() {
+                0 => crate::player::sidecar::selected_stream_id(),
+                id => id,
+            };
             let sub = (ssid > 0)
                 .then(|| t.subs.iter().position(|s| s.id == ssid))
                 .flatten()
@@ -265,6 +273,17 @@ pub(crate) fn on_ok() {
             });
         }
         crate::route::commit_subtitle_selection(ridx, sub_stream_id());
+        // An EXTERNAL pick has no demuxer ordinal (`ridx` is -1, so the embedded renderer is
+        // off) — on direct play `player::sidecar` fetches and draws it instead. While
+        // transcoding the commit above already asked for a burn, and `sidecar::active` stays
+        // silent for as long as that is true, so selecting here is harmless and means the line
+        // survives the playback going BACK to direct play.
+        match tracks().and_then(|t| t.subs.get(new_sub.max(0) as usize)) {
+            Some(s) if new_sub >= 0 && s.sidecar_renderable() => {
+                crate::player::sidecar::select(crate::route::cur_sid(), s.id, s.key.clone())
+            }
+            _ => crate::player::sidecar::deselect(),
+        }
     }
 }
 
@@ -420,6 +439,9 @@ fn build_subs() -> Section {
             }
             if s.sdh {
                 row = row.badge(Badge::Sdh);
+            }
+            if s.external {
+                row = row.badge(Badge::Text("EXTERNAL".to_string()));
             }
             if is_image_sub_codec(&s.codec) {
                 row = row.badge(Badge::Text(s.codec.to_uppercase()));
