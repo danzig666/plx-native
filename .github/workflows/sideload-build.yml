@@ -14,7 +14,7 @@ name: Sideload build
 on:
   workflow_dispatch:
   push:
-    branches: [subtitle-tone]
+    branches: [subtitle-tone, subtitle-tone-v0.6.6]
 
 permissions:
   contents: read
@@ -32,6 +32,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # `make check` runs tooling self-tests that derive a chronology from `git log`, which a
+          # shallow clone cannot answer (ci.yml does the same, for the same reason).
+          fetch-depth: 0
       - name: Install the desktop SDL/GL libraries the hostsim suite links against
         run: |
           sudo apt-get update
@@ -53,8 +57,11 @@ jobs:
         include:
           - flavor: debug
             release: ""
-          - flavor: stable
-            release: "1"
+          # NO stable leg on this branch. It is cut from the unreleased trunk, whose ungated
+          # recorder bootstrap (`app/bootstrap.rs`, `app/boot.rs`) carries the literal
+          # `plxnative-noidle` — the byte witness ci/check-package.py refuses under the released
+          # id — and whose version is BEHIND the published line. The stable package comes from
+          # `subtitle-tone-v0.6.6`, the same change ported onto the release tag.
     # make reads both from the environment, so they ride EVERY invocation below (neither is
     # sticky between make runs) and the assertion scripts see the same configuration.
     env:
