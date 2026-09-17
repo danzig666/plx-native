@@ -7390,6 +7390,8 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
         crate::route::restore_quality(
             crate::dev::playback_quality_override().unwrap_or_else(|| session.playback_quality()),
         );
+        // The subtitle tone rides the same file and the same moment: a preference, restored once.
+        crate::player::restore_subtitle_tone(session.subtitle_tone());
         let force_login = crate::dev::flag("login");
         let dev_identity = !dev_token.is_empty();
         let boot_to = boot_destination(
@@ -10401,6 +10403,7 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                         crate::dev::playback_quality_override()
                             .unwrap_or_else(|| saved.playback_quality()),
                     );
+                    crate::player::restore_subtitle_tone(saved.subtitle_tone());
                     install_pms(&c.origin, &c.token, c.tier);
                     // the fourth store an identity change must not survive, beside the
                     // `browse`/`pms`/`person` resets `install_pms` performs: a new user must never

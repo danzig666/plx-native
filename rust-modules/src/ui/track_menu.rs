@@ -4,8 +4,15 @@
 //! D-pad/OK/BACK here while the menu is open; LEFT/RIGHT switch between the Audio and Subtitles
 //! panels. The selection commit (native audio switch / server transcode / burn) is unchanged
 //! from the previous procedural version — only the presentation moved onto the table.
+//!
+//! The Subtitles panel carries a second section under the tracks: **Color**, the tone the
+//! client-rendered caption is drawn in (`plex::session::SubtitleTone` — white, then a ladder of
+//! grays for a picture whose white is too bright, which is what HDR does to it). Same idiom as
+//! the tracks above it — [`Row::checked`], "the active one of several" — and the same flat
+//! `TableView::sel` over both sections, so [`TONE_BASE`] is where one ends.
 #![allow(dead_code)]
 use crate::metadata;
+use crate::plex::session::SubtitleTone;
 use crate::ui::consts::{SCR_H, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT, SDLK_UP};
 use crate::ui::popover::Popover;
 use crate::ui::table::{Badge, Row, Section, TableView};
@@ -19,6 +26,11 @@ static mut TAB: c_int = 0; // 0=Audio, 1=Subtitles
 static mut ACTIVE_AUDIO: c_int = 0; // index into the playing item's audio list
 static mut ACTIVE_SUB: c_int = -1; // -1 = Off, else index into the playing item's subs list
 static mut TABLE: TableView = TableView::new(); // main-thread only
+/// The flat row index of the FIRST tone row, captured when the Subtitles table was built — so
+/// [`on_ok`] splits tracks from tones by what was DRAWN, not by re-asking `visible_subs` (whose
+/// answer moves when a playback starts transcoding). `-1` on the Audio tab, which has no such
+/// section.
+static mut TONE_BASE: c_int = -1;
 
 fn table() -> &'static mut TableView {
     unsafe { &mut *addr_of_mut!(TABLE) }
@@ -91,13 +103,24 @@ fn visible_subs() -> Vec<usize> {
         })
         .unwrap_or_default()
 }
-/// selectable rows in a tab — Subtitles has a leading "Off" row
+/// selectable rows in a tab — Subtitles has a leading "Off" row and the tone ladder after its
+/// tracks
 fn n_rows(tab: c_int) -> c_int {
     if tab == 0 {
         n_audio()
     } else {
-        visible_subs().len() as c_int + 1
+        visible_subs().len() as c_int + 1 + SubtitleTone::LADDER.len() as c_int
     }
+}
+
+/// Which tone a flat Subtitles-panel row is, or `None` for a track row (and for anything past
+/// the ladder — `sel` survives a rebuild, so a stale index is no rung rather than a neighbour).
+fn tone_at(tone_base: c_int, sel: c_int) -> Option<SubtitleTone> {
+    if tone_base < 0 {
+        return None;
+    }
+    let i = usize::try_from(sel.checked_sub(tone_base)?).ok()?;
+    SubtitleTone::LADDER.get(i).copied()
 }
 /// the table row that should be focused when entering `tab` (its active selection)
 fn sel_for_tab(tab: c_int) -> c_int {
@@ -214,6 +237,10 @@ pub(crate) fn on_ok() {
                 crate::route::commit_audio_selection(ord, &s.codec, s.id);
             }
         }
+    } else if let Some(tone) = tone_at(unsafe { addr_of!(TONE_BASE).read() }, sel) {
+        // a row of the Color section: no track changes, so `commit_subtitle_selection` must NOT
+        // run — it always republishes, and re-committing the track would re-burn a transcode
+        crate::player::set_subtitle_tone(tone);
     } else {
         // row 0 = Off = -1; else map the visible row back to its subs-list index
         let vis = visible_subs();
@@ -403,13 +430,29 @@ fn build_subs() -> Section {
     sec
 }
 
+/// The Color section: one checked row per rung of the tone ladder, lightest first.
+fn build_tones() -> Section {
+    let active = crate::player::subtitle_tone();
+    let mut sec = Section::new("Color");
+    for tone in SubtitleTone::LADDER {
+        sec = sec.row(Row::new(tone.label()).checked(tone == active));
+    }
+    sec
+}
+
 fn rebuild(tab: c_int, slide: bool) {
-    let sec = if tab == 0 {
-        build_audio()
+    if tab == 0 {
+        unsafe { addr_of_mut!(TONE_BASE).write(-1) }
+        table().set_sections(vec![build_audio()], sel_for_tab(tab), slide);
     } else {
-        build_subs()
-    };
-    table().set_sections(vec![sec], sel_for_tab(tab), slide);
+        // TWO sections, and `TableView::sel` is one flat index over both (`more_menu`'s
+        // contract): the tones start where the track rows end.
+        let subs = build_subs();
+        let tones = build_tones();
+        table().set_sections(vec![subs, tones], sel_for_tab(tab), slide);
+        let base = table().n_rows() - SubtitleTone::LADDER.len() as c_int;
+        unsafe { addr_of_mut!(TONE_BASE).write(base) }
+    }
 }
 
 /// The panel at its WIDEST and TALLEST, for the overscan audit ([`crate::ui::consts::SAFE`]) — the
@@ -550,6 +593,27 @@ mod tests {
             "Full",
             "both sides are trimmed"
         );
+    }
+
+    /// **A Subtitles-panel row is a track or a tone, never both, and the split is where the table
+    /// was built** — with `Off` + two tracks the ladder starts at row 3. The failure this pins is
+    /// the quiet one: without the split every row past the tracks falls through to the
+    /// `vis.get(..)` miss, which means OFF — so picking a tone would switch the subtitles off.
+    #[test]
+    fn a_row_past_the_tracks_is_a_tone_and_a_track_row_never_is() {
+        for track_row in 0..3 {
+            assert_eq!(tone_at(3, track_row), None, "row {track_row} is a track");
+        }
+        for (i, tone) in SubtitleTone::LADDER.iter().enumerate() {
+            assert_eq!(tone_at(3, 3 + i as c_int), Some(*tone));
+        }
+        let past = 3 + SubtitleTone::LADDER.len() as c_int;
+        assert_eq!(tone_at(3, past), None, "past the ladder is no rung, not the last one");
+        assert_eq!(tone_at(3, -1), None);
+        // the Audio tab has no Color section (base -1), so nothing there is ever a tone
+        for sel in [-1, 0, 3, c_int::MAX] {
+            assert_eq!(tone_at(-1, sel), None);
+        }
     }
 
     /// **Position is the join, so an unnamed track must occupy a slot rather than be skipped.**

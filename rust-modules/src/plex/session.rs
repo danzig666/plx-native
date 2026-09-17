@@ -1476,6 +1476,13 @@ pub struct Session {
     /// instead of making the credentials file fail to parse.
     #[serde(default, deserialize_with = "de_soft_playback_quality")]
     pub(crate) playback_quality: Option<PlaybackQuality>,
+    /// **How bright the client-rendered subtitles are drawn** — white, or a rung of the grey
+    /// ladder under it. Install-wide like [`Session::playback_quality`], because it answers a fact
+    /// about the PANEL (an HDR picture maps graphics white to a searing level) rather than about
+    /// whoever is watching. Absence is white, which is what every build before the field drew.
+    /// Soft-parsed: an unknown spelling costs the preference, never the credentials.
+    #[serde(default, deserialize_with = "de_soft_subtitle_tone")]
+    pub(crate) subtitle_tone: SubtitleTone,
     /// **Device-wide ambient memory**: the last hero `UltraBlurColors` envelope Home actually
     /// rendered on this television, so a route in the Settings/first-run family that opens
     /// BEFORE Home has fetched anything this boot — first-run consent moved ahead of the
@@ -1519,6 +1526,8 @@ struct CanonicalSessionAuth {
 struct CanonicalSessionPreferences {
     #[serde(default, deserialize_with = "de_soft_playback_quality")]
     playback_quality: Option<PlaybackQuality>,
+    #[serde(default, deserialize_with = "de_soft_subtitle_tone")]
+    subtitle_tone: SubtitleTone,
     /// Parsed only so a future preference does not make the known fields disappear. The shipping
     /// adapter merges these opaque keys from the current DB8 public payload before every rewrite;
     /// they are not promoted into the Session domain object.
@@ -1536,6 +1545,7 @@ pub(crate) fn split_canonical(
 ) -> Result<(crate::storage::state::PublicPayload, String), ()> {
     let preferences = serde_json::to_value(CanonicalSessionPreferences {
         playback_quality: session.playback_quality,
+        subtitle_tone: session.subtitle_tone,
         extensions: BTreeMap::new(),
     })
     .map_err(|_| ())?;
@@ -1599,6 +1609,7 @@ pub(crate) fn join_canonical(
         home_pins,
         recent_searches,
         playback_quality: preferences.playback_quality,
+        subtitle_tone: preferences.subtitle_tone,
         // Visual atmosphere is a disposable cache and intentionally does not enter DB8.
         last_hero_blur: None,
         extensions: auth.extensions,
@@ -1671,6 +1682,64 @@ impl PlaybackQuality {
         } else {
             Self::Original
         }
+    }
+}
+
+/// The persisted subtitle tones, lightest first. Like [`PlaybackQuality`] the spelling on disk is
+/// explicit: these strings are a file-format contract and must survive a variant rename.
+///
+/// A ladder of GREYS rather than a colour wheel, because the job is brightness: over an HDR
+/// picture the panel maps graphics white far above where it sits in SDR, and the only thing that
+/// makes a caption comfortable there is less light. What each rung looks like is `ui::theme`'s
+/// (`SUBTITLE_INKS`); this type only names them.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubtitleTone {
+    #[default]
+    #[serde(rename = "white")]
+    White,
+    #[serde(rename = "grey_85")]
+    Silver,
+    #[serde(rename = "grey_70")]
+    LightGrey,
+    #[serde(rename = "grey_55")]
+    Grey,
+    #[serde(rename = "grey_40")]
+    DarkGrey,
+    #[serde(rename = "grey_28")]
+    Charcoal,
+}
+
+impl SubtitleTone {
+    /// Every rung, lightest first — the order the picker draws them in.
+    pub(crate) const LADDER: [SubtitleTone; 6] = [
+        SubtitleTone::White,
+        SubtitleTone::Silver,
+        SubtitleTone::LightGrey,
+        SubtitleTone::Grey,
+        SubtitleTone::DarkGrey,
+        SubtitleTone::Charcoal,
+    ];
+
+    /// The picker's row text — US spelling, like the rest of the product copy ("Favorite").
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SubtitleTone::White => "White",
+            SubtitleTone::Silver => "Silver",
+            SubtitleTone::LightGrey => "Light gray",
+            SubtitleTone::Grey => "Gray",
+            SubtitleTone::DarkGrey => "Dark gray",
+            SubtitleTone::Charcoal => "Charcoal",
+        }
+    }
+
+    /// An in-memory index back to a rung — out of range is `White`, never a neighbouring rung,
+    /// for the reason `Quality::from_index` gives: the ladder can grow or shrink.
+    pub(crate) fn from_index(i: u8) -> SubtitleTone {
+        Self::LADDER.get(i as usize).copied().unwrap_or(SubtitleTone::White)
+    }
+
+    pub(crate) fn index(self) -> u8 {
+        Self::LADDER.iter().position(|&t| t == self).unwrap_or(0) as u8
     }
 }
 
@@ -2028,6 +2097,28 @@ where
     Ok(serde_json::from_value::<Option<PlaybackQuality>>(v).unwrap_or(None))
 }
 
+/// The subtitle tone is a preference too: a spelling this build does not know degrades to white.
+fn de_soft_subtitle_tone<'de, D>(d: D) -> Result<SubtitleTone, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Ok(v) = serde_json::Value::deserialize(d) else {
+        return Ok(SubtitleTone::White);
+    };
+    Ok(serde_json::from_value::<SubtitleTone>(v).unwrap_or_default())
+}
+
+/// Persist the subtitle tone through the same ordinary read-modify-write door the playback
+/// quality uses (`route::persist_quality_choice`). Returns whether the write was admitted.
+pub(crate) fn set_subtitle_tone(tone: SubtitleTone) -> bool {
+    update_ordinary(|cur| {
+        if cur.subtitle_tone == tone {
+            return None;
+        }
+        Some(cur.with_subtitle_tone(tone))
+    })
+}
+
 impl Session {
     /// The effective persisted playback quality. Absence is the literal legacy migration rule:
     /// builds that predate the field played Original, so they continue to play Original.
@@ -2039,6 +2130,16 @@ impl Session {
     pub(crate) fn with_playback_quality(&self, quality: PlaybackQuality) -> Self {
         let mut next = self.clone();
         next.playback_quality = Some(quality);
+        next
+    }
+
+    pub(crate) fn subtitle_tone(&self) -> SubtitleTone {
+        self.subtitle_tone
+    }
+
+    pub(crate) fn with_subtitle_tone(&self, tone: SubtitleTone) -> Self {
+        let mut next = self.clone();
+        next.subtitle_tone = tone;
         next
     }
 
@@ -6130,6 +6231,53 @@ mod tests {
             encoded["tier"], "remote",
             "the file stays human-readable and stable"
         );
+    }
+
+    /// The subtitle tone's file contract, in both directions: absence is WHITE (every file
+    /// written before the field existed must keep drawing what it drew), a spelling this build
+    /// does not know is white rather than a parse failure that would cost the credentials, and
+    /// every rung survives the wire under its own explicit name.
+    #[test]
+    fn the_subtitle_tone_is_white_when_absent_or_unknown_and_round_trips_every_rung() {
+        let parsed: Session = serde_json::from_str(r#"{"client_id":"c"}"#).unwrap();
+        assert_eq!(parsed.subtitle_tone(), SubtitleTone::White);
+        for damaged in [r#""mauve""#, "7", "null", r#"{"a":1}"#] {
+            let text = format!(r#"{{"client_id":"c","subtitle_tone":{damaged}}}"#);
+            let parsed: Session = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed.client_id, "c", "a bad tone must not cost the session: {damaged}");
+            assert_eq!(parsed.subtitle_tone(), SubtitleTone::White, "{damaged}");
+        }
+        for (tone, wire) in [
+            (SubtitleTone::White, "white"),
+            (SubtitleTone::Silver, "grey_85"),
+            (SubtitleTone::LightGrey, "grey_70"),
+            (SubtitleTone::Grey, "grey_55"),
+            (SubtitleTone::DarkGrey, "grey_40"),
+            (SubtitleTone::Charcoal, "grey_28"),
+        ] {
+            let json = serde_json::to_value(Session::default().with_subtitle_tone(tone)).unwrap();
+            assert_eq!(json["subtitle_tone"], wire);
+            let again: Session = serde_json::from_value(json).unwrap();
+            assert_eq!(again.subtitle_tone(), tone);
+        }
+        assert_eq!(SubtitleTone::LADDER[0], SubtitleTone::White);
+        for (i, tone) in SubtitleTone::LADDER.iter().enumerate() {
+            assert_eq!(tone.index() as usize, i);
+            assert_eq!(SubtitleTone::from_index(i as u8), *tone);
+            assert!(!tone.label().is_empty());
+        }
+        assert_eq!(SubtitleTone::from_index(200), SubtitleTone::White, "out of range is white");
+    }
+
+    /// The tone lives in the PUBLIC preferences half of the canonical split, so it must come back
+    /// out of `split_canonical` → `join_canonical` unchanged.
+    #[test]
+    fn the_subtitle_tone_survives_the_canonical_split() {
+        let session = Session::default().with_subtitle_tone(SubtitleTone::DarkGrey);
+        let (public, protected) = split_canonical(&session).unwrap();
+        assert_eq!(public.preferences["subtitle_tone"], "grey_40");
+        let joined = join_canonical(&public, &protected).unwrap();
+        assert_eq!(joined.subtitle_tone(), SubtitleTone::DarkGrey);
     }
 
     /// A missing quality field is an OLD install, not an invitation to adopt a new default. The
