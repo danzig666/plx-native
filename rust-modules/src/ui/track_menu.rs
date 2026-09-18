@@ -224,6 +224,33 @@ pub(crate) fn move_focus(sym: c_int) {
     }
 }
 
+/// Pointer hover: park the highlight on the row under the cursor (a Magic Remote's hover is a
+/// D-pad move that has already happened). Nothing outside the rows moves it.
+pub(crate) fn pointer_focus(mx: f32, my: f32) {
+    if !is_open() {
+        return;
+    }
+    if let Some(gi) = table().hit_row(panel_rect(), mx, my) {
+        table().sel = gi;
+    }
+}
+
+/// Pointer click: a row under the cursor is committed exactly as OK would (and the panel
+/// closes with it); `false` says the click landed elsewhere, which the caller treats as BACK.
+pub(crate) fn click(mx: f32, my: f32) -> bool {
+    if !is_open() {
+        return false;
+    }
+    match table().hit_row(panel_rect(), mx, my) {
+        Some(gi) => {
+            table().sel = gi;
+            on_ok();
+            true
+        }
+        None => false,
+    }
+}
+
 /// commit the focused row as the active track for its tab, then close
 pub(crate) fn on_ok() {
     let tab = unsafe { addr_of!(TAB).read() };

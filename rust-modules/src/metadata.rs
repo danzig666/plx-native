@@ -1602,6 +1602,10 @@ pub(crate) struct PlayingItem {
     /// class — docs/plex-pass-audit.md, closing section).
     pub(crate) width: i64,
     pub(crate) height: i64,
+    /// The video stream is HDR (PQ/HLG transfer or Dolby Vision) — the HUD's media line.
+    pub(crate) hdr: bool,
+    /// The source video codec (`Media[0].videoCodec`) — the HUD's media line on direct play.
+    pub(crate) vcodec: String,
     /// Whole-file bitrate in kbps (`Media[0].bitrate`). Auto uses this—not merely the video
     /// stream's rate—when deciding whether a remote connection has enough headroom to carry the
     /// original file, because the transport also has to carry audio and container overhead.
@@ -1669,6 +1673,8 @@ pub(crate) fn cached_playing(sid: crate::plex::ServerId, rk: &str) -> Option<Pla
             video_fps: d.video_fps,
             width: d.width,
             height: d.height,
+            hdr: d.hdr,
+            vcodec: d.vcodec.clone(),
             bitrate: d.bitrate,
             dovi: d.dovi,
             markers: d.markers.clone(),
@@ -1700,7 +1706,11 @@ pub(crate) fn fetch_playing_item(sid: crate::plex::ServerId, rk: &str) -> Option
         .as_ref()
         .and_then(|it| it.first_part().map(|p| convert_streams(&p.stream)))
         .unwrap_or_default();
-    let (audio, subs, video_fps, dovi) = (st.audio, st.subs, st.fps, st.dovi);
+    let (audio, subs, video_fps, dovi, hdr) = (st.audio, st.subs, st.fps, st.dovi, st.hdr);
+    let vcodec = it
+        .as_ref()
+        .and_then(|it| it.primary_media().map(|m| m.video_codec.clone()))
+        .unwrap_or_default();
     // the frame size rides the same PRIMARY version the streams come from (route.rs's
     // direct-play gate tests it against the device bound — see the field doc)
     let (width, height, bitrate) = it
@@ -1715,6 +1725,8 @@ pub(crate) fn fetch_playing_item(sid: crate::plex::ServerId, rk: &str) -> Option
         video_fps,
         width,
         height,
+        hdr,
+        vcodec,
         bitrate,
         dovi,
         markers,

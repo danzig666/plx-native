@@ -8520,6 +8520,15 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                             crate::ui::more_menu::pointer_focus(mx, my);
                             continue;
                         }
+                        if matches!(
+                            route,
+                            Route::Player {
+                                overlay: Overlay::Menu
+                            }
+                        ) {
+                            crate::ui::track_menu::pointer_focus(mx, my);
+                            continue;
+                        }
                         hud.dismissed = false;
                         extend_hud(last_input, HUD_LINGER_MS);
                         if ptr.drag && dur() > 0 {
@@ -8720,8 +8729,12 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                         // partly hidden while a panel is up (draw_hud gets transport:false), so
                         // its rects must not be consulted — mirrors the modal key arms above.
                         match modal_of(route) {
+                            // A row under the cursor is the pick (it closes the panel itself, as
+                            // OK does); a click elsewhere is BACK.
                             Modal::Menu => {
-                                crate::ui::track_menu::close();
+                                if !crate::ui::track_menu::click(cx, cy) {
+                                    crate::ui::track_menu::close();
+                                }
                                 route = Route::Player {
                                     overlay: Overlay::None,
                                 };
@@ -8775,7 +8788,28 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                                 } else {
                                     None
                                 };
-                                if let Some(idx) = icon {
+                                // the bottom tab row — Info / Chapters — opens its panel at once,
+                                // as the key path's OK on row 2 does (`key_ok`'s player arm)
+                                let tab_click = if hud_vis {
+                                    crate::ui::player_hud::tab_hit(cx, cy)
+                                } else {
+                                    None
+                                };
+                                if let Some(t) = tab_click {
+                                    hud.nav.focus = 2;
+                                    hud.nav.tab = t;
+                                    if t == 0 {
+                                        crate::ui::info_panel::open();
+                                        route = Route::Player {
+                                            overlay: Overlay::Info,
+                                        };
+                                    } else {
+                                        crate::ui::chapters_panel::open();
+                                        route = Route::Player {
+                                            overlay: Overlay::Chapters,
+                                        };
+                                    }
+                                } else if let Some(idx) = icon {
                                     // Park the ring on the disc, then dip it — which panel opens is
                                     // `activate_player_row`'s to decide on the spring-back, off the
                                     // same `hud.nav.btn` the key path hands it. The panel used to
@@ -9128,7 +9162,29 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                             continue;
                         }
                         let delta = if dy < 0 { 1 } else { -1 };
-                        if crate::ui::consent::is_open() {
+                        // The player's popovers take the wheel as UP/DOWN (a Magic Remote's
+                        // wheel is how its owner scrolls a list); the bare player swallows it.
+                        if matches!(
+                            route,
+                            Route::Player {
+                                overlay: Overlay::Menu
+                            }
+                        ) {
+                            crate::ui::track_menu::move_focus(
+                                if dy < 0 { SDLK_DOWN } else { SDLK_UP } as c_int,
+                            );
+                        } else if matches!(
+                            route,
+                            Route::Player {
+                                overlay: Overlay::More
+                            }
+                        ) {
+                            crate::ui::more_menu::move_focus(
+                                if dy < 0 { SDLK_DOWN } else { SDLK_UP } as c_int,
+                            );
+                        } else if matches!(route, Route::Player { .. }) {
+                            // nothing vertical to scroll on the transport
+                        } else if crate::ui::consent::is_open() {
                             crate::ui::consent::on_updown(delta);
                         } else if crate::ui::legal::is_open() {
                             crate::ui::legal::on_updown(delta);
@@ -11045,6 +11101,14 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                 // deliberately issues no GL commands between its two boundaries.
                 crate::ui::profile::phase("profile.empty", || {});
                 crate::ui::profile::phase("frame.ui", || {
+                    // The player's chrome gives up light with the viewer's subtitle tone
+                    // (`player_hud::chrome_dim`); every other route draws at full ink. Set every
+                    // frame, before anything builds a `Painter::root()`.
+                    crate::ui::set_chrome_rgb(if player {
+                        crate::ui::player_hud::chrome_dim()
+                    } else {
+                        1.0
+                    });
                     crate::ui::guard(|| {
                         if player {
                             crate::system::clear_opaque_region();
@@ -11100,6 +11164,10 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                             // below, so an open Info card / Chapters strip still covers it.
                             crate::ui::player_hud::draw_readout(busy, now, jail_repair.state());
                             jail_repair.draw();
+                            // Over the centred "Buffering…" read-out whose block sits where this
+                            // panel wants to be, but UNDER the popovers below: the `…` menu carries
+                            // this panel's own off-switch, and a wide card drawn last covered it.
+                            crate::ui::stats::draw();
                             // Stale content panels are gated on the SAME failure as the transport.
                             // More is the ordinary-failure exception: its read-out opens that shared
                             // quality picker as recovery. Jail failures suppress even a stale More.
@@ -11145,12 +11213,6 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                             {
                                 crate::ui::more_menu::draw();
                             }
-                            // LAST, over everything including the centred "Buffering…" read-out whose
-                            // block sits where this panel wants to be. It is not chrome and not an
-                            // overlay route: it stays up until it is turned off. Nothing here occludes
-                            // its own off-switch: the panel is top-left and `more_menu`, which carries
-                            // the toggle, is a right-edge popover.
-                            crate::ui::stats::draw();
                         } else {
                             // Open the shared popover frame FIRST: it takes this frame's own-damage
                             // ledger, which every glass owner below then reads through

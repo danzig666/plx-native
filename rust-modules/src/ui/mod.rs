@@ -321,8 +321,41 @@ fn card_shadow_params(h: f32, f: f32) -> (f32, f32, f32) {
     )
 }
 
+/// **The chrome dim** — the RGB multiplier every [`Painter::root`] starts from. `1.0` (the rest
+/// value) draws every token at its authored code. The player route sets it to the viewer's
+/// subtitle tone for the frames it draws and puts it back after (`app.rs`'s frame block), so the
+/// transport, the popovers and the read-outs standing on an HDR picture give up light with the
+/// caption — and no other screen is touched, since nothing else runs between set and reset.
+/// A `static` rather than a parameter because the HUD's draw tree is a dozen modules deep and
+/// half of them build their own `Painter::root()`; threading a value through every one of them
+/// is the drift this cascade exists to avoid. Main-thread written and read.
+static CHROME_RGB: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000); // 1.0f32
+
+/// Set the chrome dim for everything drawn from now until it is set again. Clamped to 0..=1.
+pub(crate) fn set_chrome_rgb(m: f32) {
+    CHROME_RGB.store(
+        m.clamp(0.0, 1.0).to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn chrome_rgb() -> f32 {
+    f32::from_bits(CHROME_RGB.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl Painter {
-    pub const fn root() -> Self {
+    /// A root painter under the current chrome dim ([`set_chrome_rgb`]).
+    pub fn root() -> Self {
+        Self {
+            rgb: chrome_rgb(),
+            ..Self::untinted()
+        }
+    }
+    /// A root painter at full ink whatever the chrome dim — for the one thing that already
+    /// carries the viewer's tone in its own colour, the subtitle caption, which the dim would
+    /// otherwise darken twice.
+    pub const fn untinted() -> Self {
         Self {
             dx: 0.0,
             dy: 0.0,

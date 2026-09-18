@@ -90,7 +90,8 @@ pub(crate) fn draw_subtitles(hud_up: bool) {
     let block_top = baseline - n * lh;
     let ink = subtitle_ink(); // white unless the viewer picked a dimmer tone (track menu)
     let outline = theme::scrim_black(0.85);
-    let p = Painter::root();
+    // `untinted`: the ink IS the tone; the chrome dim would apply it a second time
+    let p = Painter::untinted();
     for (i, ln) in lines.iter().enumerate() {
         let top = block_top + i as f32 * lh;
         if let Ok(cs) = CString::new(ln.as_str()) {
@@ -115,6 +116,16 @@ fn subtitle_ink_for(tone: crate::plex::session::SubtitleTone) -> [f32; 4] {
         .get(tone.index() as usize)
         .copied()
         .unwrap_or(theme::SUBTITLE_INKS[0])
+}
+
+/// **How much light the player's CHROME gives up, from the same preference.** The viewer picked
+/// a subtitle tone because white over an HDR picture is too bright — and the transport, the
+/// panels and the read-outs standing on that same picture are the same white. So the whole HUD
+/// draws under [`crate::ui::set_chrome_rgb`] at the tone's own level: white is 1.0 (nothing
+/// changes), and each gray rung dims everything the route draws by exactly what it dims the
+/// caption. The caption itself is drawn `untinted`, or it would be dimmed twice.
+pub(crate) fn chrome_dim() -> f32 {
+    subtitle_ink()[0]
 }
 
 /// Subtitle baseline: where the caption block sits with the transport DOWN, and the ceiling it
@@ -231,7 +242,7 @@ pub(crate) fn draw_subtitle_bitmap(hud_up: bool) {
                 // the tone TINTS a bitmap: the image shader multiplies by it, so a PGS cue keeps
                 // its authored colours and outline and only gives up light (white = identity)
                 let tint = subtitle_ink();
-                let p = Painter::root();
+                let p = Painter::untinted(); // the tint IS the tone — see `draw_subtitles`
                 for (tex, r) in set.iter() {
                     let dy = if overhangs(*r) { lift } else { 0.0 };
                     p.tex(*tex, Rect::new(r.x, r.y - dy, r.w, r.h), 0.0, tint);
@@ -1039,6 +1050,38 @@ pub(crate) fn icon_hit(slot: ControlSlot, cx: f32, cy: f32) -> Option<i32> {
     })
 }
 
+/// Pointer hit-test for the bottom TAB row (`Info` / `Chapters`): which pill (cx,cy) is over, or
+/// None. Walks the same geometry `draw_hud` lays the pills out with — a measured width per label
+/// at `size::BODY`, `TAB_GAP` between — so a click lands on what was drawn. Needs a font, like
+/// the draw: never called from the host suite.
+pub(crate) fn tab_hit(cx: f32, cy: f32) -> Option<i32> {
+    let ph = BTN_S;
+    let py = (SB_Y + SCR_H) * 0.5 - ph * 0.5;
+    if cy < py || cy > py + ph {
+        return None;
+    }
+    let mut px = SB_X;
+    for (i, label) in hud_tabs().iter().enumerate() {
+        let pw = TabPill::width(label.chars().count(), theme::size::BODY);
+        if cx >= px && cx <= px + pw {
+            return Some(i as i32);
+        }
+        px += pw + TAB_GAP;
+    }
+    None
+}
+
+/// The bottom tab labels — Chapters only when the item actually has chapters. ONE list for the
+/// draw and the hit test.
+fn hud_tabs() -> &'static [&'static str] {
+    if crate::ui::chapters_panel::has_chapters() {
+        &["Info", "Chapters"]
+    } else {
+        &["Info"]
+    }
+}
+const TAB_GAP: f32 = 16.0;
+
 /// Pointer hit-test for the scrub-bar grab band (the scrubber's shared geometry, like `icon_hit`
 /// for the buttons): `Some(frac 0..1 along the bar)` when (cx,cy) lands in the band. The band is
 /// deliberately much taller than the bar itself — a pointer grab zone.
@@ -1175,6 +1218,8 @@ pub(crate) fn draw_hud(
                     0,
                     1,
                 );
+                let w = crate::text::text_width(cs.as_ptr(), theme::size::CAPTION, 1);
+                draw_media_after(p, SB_X + w, SCR_H - 312.0, dim);
             }
             if let Ok(cs) = CString::new(n.title.clone()) {
                 p.text(cs.as_ptr(), SB_X, SCR_H - 278.0, HUD_TITLE_SZ, white, 0, 1);
@@ -1189,6 +1234,8 @@ pub(crate) fn draw_hud(
                 0,
                 0,
             );
+            let w = crate::text::text_width(crate::route::ctxline_cptr(), theme::size::CAPTION, 0);
+            draw_media_after(p, SB_X + w, SCR_H - 312.0, dim);
             p.text(
                 crate::route::title_cptr(),
                 SB_X,
@@ -1409,11 +1456,7 @@ pub(crate) fn draw_hud(
     } // end `if transport`
 
     // bottom tabs as pills — Chapters only appears when the item actually has chapters
-    let tabs: &[&str] = if crate::ui::chapters_panel::has_chapters() {
-        &["Info", "Chapters"]
-    } else {
-        &["Info"]
-    };
+    let tabs = hud_tabs();
     // tabs match the transport control buttons' height (BTN_S), centred vertically between the
     // play bar (scrubber, at SB_Y) and the bottom edge of the screen
     let ph = BTN_S; // = 64, same as the Subtitles/Audio buttons
@@ -1430,7 +1473,170 @@ pub(crate) fn draw_hud(
                 .ground(ControlGround::Unkeyed)
                 .draw(&e, p);
         }
-        px += pw + 16.0;
+        px += pw + TAB_GAP;
+    }
+}
+
+// ---- the media line: what is playing, in the words a spec sheet uses ----------------------------
+
+/// `"4K · Dolby Vision · HEVC · TrueHD Atmos 7.1"` — the picture and the sound of THIS playback,
+/// drawn after the year · rating · runtime line. Source facts on direct play (and on a remux,
+/// which copies both streams); on a re-encode the codecs the server is actually sending, said
+/// as such, because then the source's spec sheet is not what reaches the panel.
+pub(crate) fn media_line() -> String {
+    let Some(item) = crate::metadata::playing() else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if crate::route::is_transcoding() && !crate::route::is_remux() {
+        parts.push("Converting".to_string());
+        let v = crate::ui::info_panel::video_codec_name(&crate::route::stream_vcodec());
+        if !v.is_empty() {
+            parts.push(v);
+        }
+        let a = audio_abbrev(&crate::route::stream_acodec(), "", "", 0);
+        if !a.is_empty() {
+            parts.push(a);
+        }
+        return parts.join(" \u{b7} ");
+    }
+    let res = resolution_class(item.width, item.height);
+    if !res.is_empty() {
+        parts.push(res.to_string());
+    }
+    if item.dovi.present {
+        parts.push("Dolby Vision".to_string());
+    } else if item.hdr {
+        parts.push("HDR".to_string());
+    }
+    let v = crate::ui::info_panel::video_codec_name(&item.vcodec);
+    if !v.is_empty() {
+        parts.push(v);
+    }
+    // the audio track on the wire: the one the viewer picked, else the server's selection, else
+    // the file's default, else the first — the same ladder the track menu's checkmark walks
+    let asid = crate::route::cur_audio_sid();
+    let audio = item
+        .audio
+        .iter()
+        .find(|s| asid > 0 && s.id == asid)
+        .or_else(|| item.audio.iter().find(|s| s.selected))
+        .or_else(|| item.audio.iter().find(|s| s.default))
+        .or_else(|| item.audio.first());
+    if let Some(s) = audio {
+        let a = audio_abbrev(&s.codec, &s.profile, &s.layout, s.channels);
+        if !a.is_empty() {
+            parts.push(a);
+        }
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// The stored frame's class in the words a shelf badge uses: `4K` / `1080p` / `720p` / `SD`;
+/// empty when the size is unknown. Judged on EITHER axis clearing the class, because a
+/// scope-cropped 3840×1602 file is 4K and a 1920×800 one is 1080p.
+pub(crate) fn resolution_class(w: i64, h: i64) -> &'static str {
+    if w <= 0 || h <= 0 {
+        ""
+    } else if w >= 3800 || h >= 2100 {
+        "4K"
+    } else if w >= 1900 || h >= 1060 {
+        "1080p"
+    } else if w >= 1260 || h >= 700 {
+        "720p"
+    } else {
+        "SD"
+    }
+}
+
+/// `"DTS-HD MA 7.1"`, `"DD+ Atmos 5.1"`, `"AAC 2.0"` — a codec in its spec-sheet abbreviation,
+/// then the layout. Deliberately NOT `metadata::friendly_codec`'s long names ("Dolby Digital
+/// Plus"): this run shares one line with the year and the runtime, so it uses the short forms
+/// every AV spec sheet and Plex's own badges use. The profile carries what the codec name
+/// alone cannot — MA / HRA / X for DTS, Atmos for the Dolby family.
+pub(crate) fn audio_abbrev(codec: &str, profile: &str, layout: &str, channels: i64) -> String {
+    let codec = codec.to_ascii_lowercase();
+    let profile = profile.to_ascii_lowercase();
+    let atmos = profile.contains("atmos");
+    let mut name = match codec.as_str() {
+        "truehd" => "TrueHD",
+        "eac3" | "ec-3" | "e-ac-3" => "DD+",
+        "ac3" | "ac-3" => "DD",
+        "dts" | "dca" => {
+            if profile.contains("ma") || profile.contains("master") {
+                "DTS-HD MA"
+            } else if profile.contains("hra") || profile.contains("high") {
+                "DTS-HD HRA"
+            } else if profile == "x" || profile.contains("dts:x") || profile.contains("dtsx") {
+                "DTS:X"
+            } else if profile.contains("es") {
+                "DTS-ES"
+            } else if profile.contains("96") {
+                "DTS 96/24"
+            } else {
+                "DTS"
+            }
+        }
+        "aac" => "AAC",
+        "flac" => "FLAC",
+        "opus" => "Opus",
+        "mp3" => "MP3",
+        "mp2" => "MP2",
+        "vorbis" => "Vorbis",
+        "alac" => "ALAC",
+        c if c.starts_with("pcm") => "PCM",
+        "" => "",
+        _ => "",
+    }
+    .to_string();
+    if name.is_empty() && !codec.is_empty() {
+        name = codec.to_uppercase();
+    }
+    if atmos && !name.is_empty() {
+        name.push_str(" Atmos");
+    }
+    let lay = layout_short(layout, channels);
+    match (name.is_empty(), lay.is_empty()) {
+        (false, false) => format!("{name} {lay}"),
+        (false, true) => name,
+        (true, false) => lay,
+        (true, true) => String::new(),
+    }
+}
+
+/// `"5.1"`, `"7.1"`, `"2.0"`, `"1.0"` — the numeric layout every spec sheet uses, from the
+/// server's ffmpeg-style layout (`5.1(side)`, `stereo`, `mono`), else from the channel count.
+fn layout_short(layout: &str, channels: i64) -> String {
+    let base = layout.split('(').next().unwrap_or("").trim().to_ascii_lowercase();
+    match base.as_str() {
+        "" => match channels {
+            0 => String::new(),
+            1 => "1.0".to_string(),
+            2 => "2.0".to_string(),
+            6 => "5.1".to_string(),
+            8 => "7.1".to_string(),
+            n => format!("{n} ch"),
+        },
+        "mono" => "1.0".to_string(),
+        "stereo" | "downmix" => "2.0".to_string(),
+        b if b.starts_with(|c: char| c.is_ascii_digit()) => b.to_string(),
+        _ => match channels {
+            0 => String::new(),
+            n => format!("{n} ch"),
+        },
+    }
+}
+
+/// The media line, continued after the run that ends at `x` on the same baseline — `" · "` and
+/// then [`media_line`], in the context line's own quiet ink. Nothing when there is nothing to
+/// say (no playing item yet), so the line the viewer already had is exactly as it was.
+fn draw_media_after(p: Painter, x: f32, y: f32, ink: [f32; 4]) {
+    let line = media_line();
+    if line.is_empty() {
+        return;
+    }
+    if let Ok(cs) = CString::new(format!(" \u{b7} {line}")) {
+        p.text(cs.as_ptr(), x, y, theme::size::CAPTION, ink, 0, 0);
     }
 }
 
@@ -1712,6 +1918,34 @@ mod tests {
         }
         // the darkest rung still has to be READ over the 0.85 black outline it is drawn on
         assert!(prev > 0.25, "the darkest tone has sunk into its own outline");
+    }
+
+    /// The media line's two vocabularies: the resolution CLASS a badge uses (either axis, so a
+    /// scope-cropped file keeps its class) and the spec-sheet audio abbreviation with its
+    /// layout, profile-aware for the DTS and Dolby families.
+    #[test]
+    fn the_media_line_speaks_spec_sheet() {
+        assert_eq!(resolution_class(3840, 1602), "4K");
+        assert_eq!(resolution_class(3840, 2160), "4K");
+        assert_eq!(resolution_class(1920, 800), "1080p");
+        assert_eq!(resolution_class(1440, 1080), "1080p");
+        assert_eq!(resolution_class(1280, 534), "720p");
+        assert_eq!(resolution_class(720, 576), "SD");
+        assert_eq!(resolution_class(0, 0), "");
+        assert_eq!(audio_abbrev("truehd", "", "7.1", 8), "TrueHD 7.1");
+        assert_eq!(audio_abbrev("truehd", "dolby truehd + dolby atmos", "7.1", 8), "TrueHD Atmos 7.1");
+        assert_eq!(audio_abbrev("eac3", "", "5.1(side)", 6), "DD+ 5.1");
+        assert_eq!(audio_abbrev("eac3", "dolby digital plus + dolby atmos", "5.1", 6), "DD+ Atmos 5.1");
+        assert_eq!(audio_abbrev("ac3", "", "5.1", 6), "DD 5.1");
+        assert_eq!(audio_abbrev("dca", "ma", "7.1", 8), "DTS-HD MA 7.1");
+        assert_eq!(audio_abbrev("dca", "hra", "5.1", 6), "DTS-HD HRA 5.1");
+        assert_eq!(audio_abbrev("dca", "dts", "5.1", 6), "DTS 5.1");
+        assert_eq!(audio_abbrev("dca", "", "", 6), "DTS 5.1", "no layout: the count says it");
+        assert_eq!(audio_abbrev("aac", "lc", "stereo", 2), "AAC 2.0");
+        assert_eq!(audio_abbrev("pcm_s16le", "", "mono", 1), "PCM 1.0");
+        assert_eq!(audio_abbrev("flac", "", "", 0), "FLAC");
+        assert_eq!(audio_abbrev("", "", "", 0), "");
+        assert_eq!(audio_abbrev("wma", "", "", 2), "WMA 2.0", "unknown codec: upper-cased as is");
     }
 
     /// A 1080p-authored PGS rect must land EXACTLY where it always did — the scale is identity,
