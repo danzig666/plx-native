@@ -75,6 +75,11 @@ const P_DECODED: c_int = 3;
 const P_UPLOADING: c_int = 4;
 const P_READY: c_int = 5;
 const P_FAILED: c_int = 6;
+/// A fetch that failed for a reason that can change — the address race's plaintext window, a
+/// refused or timed-out connect, a 5xx — parked until [`Pslot::retry_at`]. Settled for the LRU
+/// like `P_FAILED`, but a DRAW that finds it due puts it back to `P_WANT`. `P_FAILED` is kept for
+/// the answer that will not change: a 4xx, or bytes the decoder could not read.
+const P_RETRY: c_int = 7;
 
 /// How a store lookup treats the slot it lands on. The difference IS the prefetch's safety story.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,6 +126,10 @@ struct Pslot {
     use_: c_uint,  // LRU clock
     gen: c_uint,   // bumped on eviction; stale-decode guard
     frame: c_uint, // last frame poster_get touched it (evict-protect)
+    /// `P_RETRY` only: when the next attempt may go. `None` = due now.
+    retry_at: Option<std::time::Instant>,
+    /// Transient failures in a row for THIS key — the backoff's exponent; cleared on a claim.
+    attempts: u8,
 }
 impl Pslot {
     const ZERO: Pslot = Pslot {
@@ -134,7 +143,36 @@ impl Pslot {
         use_: 0,
         gen: 0,
         frame: 0,
+        retry_at: None,
+        attempts: 0,
     };
+}
+
+/// How long a slot waits after its `n`th transient failure: 1 s, 2 s, 4 s, 8 s, 16 s, then 30 s
+/// for good. The first step is short on purpose — the failure this exists for is the boot's
+/// plaintext window, which is over within a second — and the cap keeps a server that is really
+/// down from being asked more than twice a minute per tile.
+fn retry_backoff(attempts: u8) -> Duration {
+    let secs = 1u64 << attempts.saturating_sub(1).min(5);
+    Duration::from_secs(secs.min(30))
+}
+
+/// Is a `P_RETRY` slot's wait over?
+fn retry_due(s: &Pslot, now: std::time::Instant) -> bool {
+    s.state == P_RETRY && s.retry_at.map_or(true, |t| now >= t)
+}
+
+/// Does a failed fetch's outcome deserve another try? A status the server will keep giving —
+/// the item has no art (404), the request itself is malformed (400/410/415) — is final; every
+/// other way of coming back with nothing (no response, a 5xx, a 401/403 that a re-point or a
+/// token refresh will cure, a 429) is not. Bytes that arrived but did not decode are the
+/// decoder's verdict and final too, so they are not asked here.
+fn is_transient(outcome: &crate::plex::ArtFetch) -> bool {
+    match outcome {
+        crate::plex::ArtFetch::Bytes(_) => false,
+        crate::plex::ArtFetch::Status(s) => !matches!(s, 400 | 404 | 410 | 415),
+        crate::plex::ArtFetch::NoResponse => true,
+    }
 }
 
 /// Does this slot hold the art `srv` was asked for under `key`?
@@ -449,7 +487,10 @@ fn victim(slots: &[Pslot; PT_CAP], frame: c_uint) -> Option<usize> {
     let mut pick = None;
     for i in 0..PT_CAP {
         let s = &slots[i];
-        if (s.state == P_READY || s.state == P_FAILED) && s.frame != frame && s.use_ < oldest {
+        if (s.state == P_READY || s.state == P_FAILED || s.state == P_RETRY)
+            && s.frame != frame
+            && s.use_ < oldest
+        {
             oldest = s.use_;
             pick = Some(i);
         }
@@ -482,6 +523,15 @@ fn lookup(srv: ServerId, key_s: &str, touch: Touch) -> (Hit, Warm) {
                 let (c, f) = (g.clock, g.frame);
                 g.slots[i].use_ = c;
                 g.slots[i].frame = f;
+            }
+            // a parked transient failure whose wait is over goes back in the queue — on a DRAW
+            // only, so a tile nobody is looking at does not keep dialling a server that is down
+            if touch == Touch::Draw && retry_due(&g.slots[i], std::time::Instant::now()) {
+                g.slots[i].state = P_WANT;
+                g.slots[i].retry_at = None;
+                drop(g);
+                CV.notify_one();
+                return ((0, 0, 0), Warm::Known);
             }
             let s = &g.slots[i];
             let hit = if s.state == P_READY {
@@ -521,6 +571,8 @@ fn lookup(srv: ServerId, key_s: &str, touch: Touch) -> (Hit, Warm) {
         s.frame = frame;
         s.pw = 0;
         s.ph = 0;
+        s.retry_at = None;
+        s.attempts = 0;
     }
     drop(g);
     // free the evicted resources off-lock (this is the GL/main thread)
@@ -748,7 +800,7 @@ fn warn_fetch_failed(srv: ServerId, cause: ArtFail) {
     // the one that flipped the bit may write the line.
     if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
         crate::log(&format!(
-            "posters: art fetch FAILED on server {} - {} (tiles stay skeletons; further ones like this are silent)",
+            "posters: art fetch FAILED on server {} - {} (a 4xx is final; anything else is retried with backoff while the tile is on screen; further ones like this are silent)",
             srv.raw(),
             cause.why()
         ));
@@ -801,24 +853,32 @@ fn poster_worker() {
         // did, and the state transition below is untouched.
         let mut w = 0i32;
         let mut h = 0i32;
-        let px = match crate::plex::client_for(srv) {
-            Some(c) => match c.fetch_built(&key_s) {
+        // `transient` is what a null `px` means: park and retry (P_RETRY), or give up (P_FAILED).
+        let (px, transient) = match crate::plex::client_for(srv) {
+            Some(c) => match c.fetch_built_outcome(&key_s) {
                 // bytes arrived: from here on a failure is the decoder's, and `img.rs` logs it
-                Some(b) if !b.is_empty() => {
-                    img::img_decode_rgba(b.as_ptr(), b.len() as c_int, &mut w, &mut h)
-                }
-                Some(_) => {
+                crate::plex::ArtFetch::Bytes(b) if !b.is_empty() => (
+                    img::img_decode_rgba(b.as_ptr(), b.len() as c_int, &mut w, &mut h),
+                    false,
+                ),
+                crate::plex::ArtFetch::Bytes(_) => {
                     warn_fetch_failed(srv, ArtFail::Empty);
-                    std::ptr::null_mut()
+                    (std::ptr::null_mut(), true)
                 }
-                None => {
+                outcome @ crate::plex::ArtFetch::Status(_) => {
                     warn_fetch_failed(srv, ArtFail::NoResponse);
-                    std::ptr::null_mut()
+                    (std::ptr::null_mut(), is_transient(&outcome))
+                }
+                crate::plex::ArtFetch::NoResponse => {
+                    warn_fetch_failed(srv, ArtFail::NoResponse);
+                    (std::ptr::null_mut(), true)
                 }
             },
+            // no client for this id YET — a re-point in progress publishes the new one a moment
+            // later, which is the same window the plaintext refusal opens
             None => {
                 warn_fetch_failed(srv, ArtFail::NoServer);
-                std::ptr::null_mut()
+                (std::ptr::null_mut(), true)
             }
         };
 
@@ -830,6 +890,10 @@ fn poster_worker() {
                 s.pw = w;
                 s.ph = h;
                 s.state = P_DECODED;
+            } else if transient {
+                s.attempts = s.attempts.saturating_add(1);
+                s.retry_at = Some(std::time::Instant::now() + retry_backoff(s.attempts));
+                s.state = P_RETRY;
             } else {
                 s.state = P_FAILED;
             }
@@ -1177,6 +1241,53 @@ mod tests {
             ..Pslot::ZERO
         };
         assert_eq!(victim(&failed, 7), Some(8));
+        // …and so is a parked RETRY: a tile that scrolled away must not hold its slot
+        failed[8].state = P_RETRY;
+        assert_eq!(victim(&failed, 7), Some(8));
+    }
+
+    /// **A transient failure is parked, not burnt** (#107): the boot's plaintext window, a refused
+    /// connect or a 5xx used to mark a poster `P_FAILED`, and `lookup` then answered "no art"
+    /// for that key for as long as the slot lived — so a cover that missed once stayed a skeleton
+    /// for the session while the debug build (which allows plaintext tokens) showed it. Only a
+    /// status that will not change is final.
+    #[test]
+    fn only_a_final_status_is_final() {
+        use crate::plex::ArtFetch;
+        for s in [404, 400, 410, 415] {
+            assert!(!is_transient(&ArtFetch::Status(s)), "{s} will not change");
+        }
+        for s in [401, 403, 408, 429, 500, 502, 503, 504] {
+            assert!(is_transient(&ArtFetch::Status(s)), "{s} can change");
+        }
+        assert!(is_transient(&ArtFetch::NoResponse), "no response is the boot window's shape");
+        assert!(!is_transient(&ArtFetch::Bytes(vec![1])), "bytes are the decoder's to judge");
+    }
+
+    /// The wait doubles from one second and caps at thirty: quick enough that the plaintext
+    /// window costs one second, bounded enough that a dead server is not hammered.
+    #[test]
+    fn the_retry_backoff_doubles_from_one_second_and_caps() {
+        let secs: Vec<u64> = (1..=8).map(|n| retry_backoff(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(retry_backoff(0).as_secs(), 1);
+    }
+
+    /// Only a RETRY slot whose wait is over is due; `None` is due at once (a slot parked before
+    /// its clock was set, or by a test).
+    #[test]
+    fn a_retry_slot_is_due_when_its_wait_is_over() {
+        let now = std::time::Instant::now();
+        let mut s = Pslot {
+            state: P_RETRY,
+            ..Pslot::ZERO
+        };
+        assert!(retry_due(&s, now), "no clock = due");
+        s.retry_at = Some(now + Duration::from_secs(5));
+        assert!(!retry_due(&s, now));
+        assert!(retry_due(&s, now + Duration::from_secs(5)));
+        s.state = P_FAILED;
+        assert!(!retry_due(&s, now + Duration::from_secs(60)), "FAILED is never due");
     }
 
     /// **The test the whole prefetch rests on.** `Touch::Warm` writes `use_ = 0` and a frame stamp

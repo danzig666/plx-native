@@ -68,6 +68,7 @@ pub(crate) mod pins;
 pub(crate) mod discover;
 
 // The re-exports are the public surface the call sites import.
+pub(crate) use client::ArtFetch;
 pub(crate) use client::JsonDeadlineOutcome;
 #[allow(unused_imports)]
 pub use client::{Client, IpVersion, StreamUrl};

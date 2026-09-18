@@ -515,12 +515,27 @@ impl Client {
     /// The token is therefore in the CALLER's string. It must not be logged — the poster store
     /// logs no keys, and neither may anything else that holds one.
     pub(crate) fn fetch_built(&self, path_with_token: &str) -> Option<Vec<u8>> {
+        match self.fetch_built_outcome(path_with_token) {
+            ArtFetch::Bytes(b) => Some(b),
+            ArtFetch::Status(_) | ArtFetch::NoResponse => None,
+        }
+    }
+
+    /// [`Self::fetch_built`] keeping WHY there are no bytes, which is the difference between a
+    /// poster that will never exist (a 404) and one that could not be fetched right now (a refused
+    /// or timed-out connect — including this build refusing to put the token on a plaintext
+    /// origin, which is what the first ~100 ms of every boot look like while the address race
+    /// settles). The poster store retries the second kind and not the first.
+    pub(crate) fn fetch_built_outcome(&self, path_with_token: &str) -> ArtFetch {
         // NOT `body_2xx`, for the same reason this method exists at all: that helper appends the
         // token, and this path already ends in one.
         let owned = pms_headers(&[]);
         let headers: Vec<&str> = owned.iter().map(String::as_str).collect();
-        let r = http::request_bulk(&self.origin, path_with_token, Method::Get, &headers)?;
-        r.ok().then_some(r.body)
+        match http::request_bulk(&self.origin, path_with_token, Method::Get, &headers) {
+            Some(r) if r.ok() => ArtFetch::Bytes(r.body),
+            Some(r) => ArtFetch::Status(r.status),
+            None => ArtFetch::NoResponse,
+        }
     }
 
     /// GET whose body is discarded (transcode decision / stop registration side effects).
@@ -980,4 +995,14 @@ mod tests {
             8020
         );
     }
+}
+
+/// What [`Client::fetch_built_outcome`] found: bytes, an HTTP status outside 2xx, or no
+/// completed response at all (transport — refused, timed out, or refused by this build's own
+/// plaintext-credential rule).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArtFetch {
+    Bytes(Vec<u8>),
+    Status(i32),
+    NoResponse,
 }
