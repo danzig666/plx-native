@@ -1710,8 +1710,16 @@ fn teardown(mt: &MainThread, for_reload: bool) {
     // 5. reset shared + transport. On a real stop also stop the server transcode + clear the
     // URL; on a reload KEEP them so start_bufferfeed restarts the same item (a direct-play
     // reload has no transcode session anyway, so the skip only matters for the URL).
+    // The DURATION is a fact about the FILE, and a reload plays the same file: keep it across
+    // the reset so the playbar has a denominator while the demuxer reopens. Without this every
+    // reload-based seek — which on webOS 5+ is EVERY seek, in-place being disabled there — drew
+    // the playhead at position ÷ 0, i.e. the far left, for the few hundred ms until `ff.rs`
+    // re-published it, while the clock beside it (position alone) read correctly. Reported on an
+    // LG C3 (webOS 23), 2026-09-18. A real stop still zeroes it: the next item is a new file.
+    let duration_ns = SHARED.duration_ns.load(Ordering::Relaxed);
     SHARED.reset_session();
     if for_reload {
+        SHARED.duration_ns.store(duration_ns, Ordering::Relaxed);
         TX.reset_for_reload();
     } else {
         TX.reset();
