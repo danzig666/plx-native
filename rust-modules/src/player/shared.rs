@@ -499,9 +499,6 @@ pub(crate) struct Shared {
     // decoder (feeding further overfills the 4K HEVC DPB/CPB and stalls the sink).
     pub pres_fed: AtomicI64,
     pub frames: AtomicI32, // bf_frames
-    /// Position reports dropped since the last seek as not being about it (`sf_on_event_inner`);
-    /// zeroed with `frames`. A diagnostic and the once-per-seek log latch.
-    pub post_seek_dropped: AtomicI32,
     /// **Has this SESSION ever put a picture on the panel?** Set by the frame-presented callback
     /// beside `frames`, cleared ONLY by [`Shared::reset_session`] — so it survives a seek, which
     /// `frames` deliberately does not: `pump` zeroes `frames` as *part of applying* a seek, which
@@ -893,7 +890,6 @@ impl Shared {
             playpos_ns: AtomicI64::new(0),
             pres_fed: AtomicI64::new(0),
             frames: AtomicI32::new(0),
-            post_seek_dropped: AtomicI32::new(0),
             seen_frame: AtomicBool::new(false),
             load_completed: AtomicBool::new(false),
             media_id: Mutex::new(None),
@@ -1407,7 +1403,6 @@ impl Shared {
         self.playpos_ns.store(0, Ordering::Relaxed);
         self.pres_fed.store(0, Ordering::Relaxed);
         self.frames.store(0, Ordering::Relaxed);
-        self.post_seek_dropped.store(0, Ordering::Relaxed);
         // a fresh session has shown nothing yet — keep this adjacent to `frames` in all three
         // places (declaration, `new`, here): a reload that forgot the bit would silently suppress
         // the centred read-out for the rest of the app's life.
