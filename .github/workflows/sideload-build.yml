@@ -1,0 +1,108 @@
+name: Sideload build
+
+# A FORK's build: runs the host gate and cross-builds BOTH installable packages from this branch,
+# so a change can be put on a television without a local webOS NDK (there is none for Windows or
+# x86_64 Linux — see the Makefile's NDK bootstrap block). It is ci.yml's cross-build job plus the
+# one thing that job deliberately refuses to do: package the stable id.
+#
+#   debug   com.beb.plxnative.debug  — installs BESIDE the real app; dev features on
+#   stable  com.beb.plxnative        — RELEASE=1, installs OVER the real app
+#
+# Nothing here publishes, signs or uploads symbols; that is release.yml's job and it needs the
+# upstream repository's credentials. A stable package cut here carries no telemetry endpoint.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [subtitle-tone, subtitle-tone-v0.6.6, seek-hud-fixes-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_NIGHTLY: nightly-2026-07-02
+
+jobs:
+  host-checks:
+    name: host checks (lint + unit suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # `make check` runs tooling self-tests that derive a chronology from `git log`, which a
+          # shallow clone cannot answer (ci.yml does the same, for the same reason).
+          fetch-depth: 0
+      - name: Install the desktop SDL/GL libraries the hostsim suite links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev
+      - name: Install nightly Rust
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src --component clippy
+      - name: make check
+        run: make check
+      - name: Type-check the RELEASE feature set
+        run: cd rust-modules && CARGO_INCREMENTAL=0 cargo "+$RUST_NIGHTLY" check --lib --no-default-features
+
+  package:
+    name: package (${{ matrix.flavor }})
+    # MUST be arm64 Linux — the only Linux host the webOS NDK is published for.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: debug
+            release: ""
+          # NO stable leg on this branch. It is cut from the unreleased trunk, whose ungated
+          # recorder bootstrap (`app/bootstrap.rs`, `app/boot.rs`) carries the literal
+          # `plxnative-noidle` — the byte witness ci/check-package.py refuses under the released
+          # id — and whose version is BEHIND the published line. The stable package comes from
+          # `subtitle-tone-v0.6.6`, the same change ported onto the release tag.
+    # make reads both from the environment, so they ride EVERY invocation below (neither is
+    # sticky between make runs) and the assertion scripts see the same configuration.
+    env:
+      FLAVOR: ${{ matrix.flavor }}
+      RELEASE: ${{ matrix.release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install nightly Rust
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
+
+      - id: ndk
+        uses: ./.github/actions/webos-ndk
+
+      - name: Cache the bundled FFmpeg
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            vendor/ffmpeg-prefix
+            vendor/ffmpeg-build
+          key: ffmpeg-${{ runner.arch }}-${{ hashFiles('ci/build-ffmpeg.sh') }}
+
+      - name: Build
+        run: make WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' -j"$(nproc)"
+
+      - name: Package
+        run: make ipk WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
+
+      # Uploaded BEFORE the assertions so a red check below still leaves the package to inspect.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: plxnative-${{ matrix.flavor }}
+          path: pkg/*.ipk
+          if-no-files-found: error
+
+      - name: ELF assertions
+        run: ./ci/check-elf.sh
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+
+      - name: Packaging assertions
+        env:
+          REQUIRE_PACKAGE: "1"
+        run: python3 ci/check-package.py
