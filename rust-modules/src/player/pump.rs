@@ -1054,6 +1054,7 @@ pub(crate) fn pump(mt: &MainThread, now: u32) {
                                // presented position (which would wrongly break feeding on a forward in-place seek).
         SHARED.pres_fed.store(super::engine::PRES_NONE, Relaxed);
         SHARED.frames.store(0, Relaxed); // count only POST-seek frames (rebind + resume re-pause gate)
+        SHARED.post_seek_dropped.store(0, Relaxed);
                                          // …and forget the last presentation stamp with it. The plane goes dark across a seek by
                                          // design, so the first frame after one would otherwise post a gap the size of the seek and
                                          // read as a stutter (`Shared`'s `dg_vpres_*` block).

@@ -1295,6 +1295,13 @@ pub(crate) fn diag() -> Diag {
     }
 }
 
+/// How many position reports after a seek are eligible to be dropped as "not about the seek"
+/// (see the position arm of `sf_on_event_inner`), and how far from the target one has to land to
+/// be dropped. Three reports is 600 ms at the pipeline's 5 Hz; ten seconds is wider than any
+/// keyframe interval a real file has and narrower than any seek anyone notices.
+const POST_SEEK_SUSPECT_REPORTS: i32 = 3;
+const POST_SEEK_TOLERANCE_NS: i64 = 10_000_000_000;
+
 pub(crate) fn seek_display_ns() -> i64 {
     SHARED.seek_display_ns.load(Relaxed)
 }
@@ -1857,13 +1864,40 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
             let gap = t.saturating_sub(prev);
             SHARED.dg_vpres_gap.fetch_max(gap, Relaxed);
         }
+        let pos = num - SHARED.pts_shift.load(Relaxed) + SHARED.disp_base.load(Relaxed);
+        // **The first reports after a seek are not trusted to be about the seek.** A flushed
+        // pipeline re-anchored on a fresh segment reports a position or two before it reports the
+        // landed frame's — measured as the playbar snapping to the far LEFT for a beat on every
+        // seek (`pos` ≈ 0: the new segment's own zero, or a pre-seek stamp) and then back. Those
+        // reports used to be published as the playhead and counted as frames, so the HUD left
+        // its frozen target for one 200 ms tick and came back. A report that lands far from the
+        // target inside the first few after a seek is dropped whole: no position, no frame
+        // count, so the HUD keeps showing the target and the state stays busy until a report
+        // that IS about the seek arrives. Bounded by count (a keyframe genuinely far from the
+        // target is a real landing and must not be masked for long) and by distance (a landing
+        // near the target is never questioned).
+        let target = SHARED.seek_display_ns.load(Relaxed);
+        let reports_since_seek = SHARED.frames.load(Relaxed);
+        if target >= 0
+            && reports_since_seek < POST_SEEK_SUSPECT_REPORTS
+            && (pos - target).abs() > POST_SEEK_TOLERANCE_NS
+        {
+            if reports_since_seek == 0 || SHARED.post_seek_dropped.fetch_add(1, Relaxed) == 0 {
+                log(&format!(
+                    "position: dropping post-seek report pos={}ms target={}ms (report {} of {})",
+                    pos / 1_000_000,
+                    target / 1_000_000,
+                    reports_since_seek + 1,
+                    POST_SEEK_SUSPECT_REPORTS
+                ));
+            }
+            SHARED.post_seek_dropped.fetch_add(1, Relaxed);
+            return;
+        }
         SHARED.frames.fetch_add(1, Relaxed);
         SHARED.seen_frame.store(true, Relaxed); // session-scoped: unlike `frames`, a seek won't clear it
         SHARED.pres_fed.store(num, Relaxed); // raw fed pts, for the feed-ahead throttle
-        SHARED.playpos_ns.store(
-            num - SHARED.pts_shift.load(Relaxed) + SHARED.disp_base.load(Relaxed),
-            Relaxed,
-        );
+        SHARED.playpos_ns.store(pos, Relaxed);
     }
     if s.is_null() {
         return;
