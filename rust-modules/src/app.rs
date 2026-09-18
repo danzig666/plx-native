@@ -8475,6 +8475,28 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                         (route, crate::ui::consts::page_dir(sym, wcode))
                     {
                         key_library_page(dir);
+                    } else if matches!(key, Key::Back)
+                        && matches!(
+                            route,
+                            Route::Player {
+                                overlay: Overlay::None
+                            }
+                        )
+                        && hud.visible_at_press
+                        && !crate::ui::player_hud::transport_hidden()
+                    {
+                        // BACK with the transport UP hides it — the same hand-hide UP from the
+                        // control row performs — instead of leaving playback; the next BACK, on a
+                        // bare picture, leaves. `visible_at_press` is the pre-press sample, so a
+                        // press that only revealed the transport is not the one that hides it.
+                        // A FAILED read-out (`transport_hidden`) has no transport to hide, and
+                        // BACK there still leaves.
+                        if scrub() >= 0 {
+                            set_scrub(-1); // a scrub preview is abandoned with the bar
+                        }
+                        scrubber.disengage();
+                        hud.nav.focus = 0;
+                        hud.dismissed = true;
                     } else if matches!(key, Key::Back) {
                         key_back(
                             mt,

@@ -553,6 +553,15 @@ pub(crate) fn state() -> shared::PlaybackState {
     if JAIL_LOAD_BLOCKED.load(Relaxed) {
         return shared::PlaybackState::Error;
     }
+    // A seek in flight is derived HERE too, not only published by the pump's own ladder (which
+    // says the same thing in the same order — a seek outranks frames). The pump runs once an
+    // iteration and the key that requested the seek is handled AFTER it, so on the press frame
+    // `pb_state` still read Playing while `seeking` was already set: the HUD, which freezes the
+    // playhead at the target only while busy, drew one frame of the PRE-seek position between
+    // the scrub preview and the frozen target — a visible jump back and forth on every seek.
+    if SHARED.seeking.load(Relaxed) {
+        return shared::PlaybackState::Seeking;
+    }
     shared::PlaybackState::from_u8(SHARED.pb_state.load(Relaxed))
 }
 
