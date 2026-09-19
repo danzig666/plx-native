@@ -121,11 +121,17 @@ fn subtitle_ink_for(tone: crate::plex::session::SubtitleTone) -> [f32; 4] {
 /// **How much light the player's CHROME gives up, from the same preference.** The viewer picked
 /// a subtitle tone because white over an HDR picture is too bright — and the transport, the
 /// panels and the read-outs standing on that same picture are the same white. So the whole HUD
-/// draws under [`crate::ui::set_chrome_rgb`] at the tone's own level: white is 1.0 (nothing
-/// changes), and each gray rung dims everything the route draws by exactly what it dims the
-/// caption. The caption itself is drawn `untinted`, or it would be dimmed twice.
+/// draws under [`crate::ui::set_chrome_rgb`] ONE RUNG BRIGHTER than the caption's tone: the
+/// chrome is small text and thin marks on a dark scrim, and at the caption's own level the
+/// darkest rungs made it hard to read (owner report, 2026-09-19). White and Silver both leave
+/// the chrome at full ink. The caption itself is drawn `untinted`, or it would be dimmed twice.
 pub(crate) fn chrome_dim() -> f32 {
-    subtitle_ink()[0]
+    chrome_dim_for(crate::player::subtitle_tone())
+}
+
+fn chrome_dim_for(tone: crate::plex::session::SubtitleTone) -> f32 {
+    let one_up = crate::plex::session::SubtitleTone::from_index(tone.index().saturating_sub(1));
+    subtitle_ink_for(one_up)[0]
 }
 
 /// Subtitle baseline: where the caption block sits with the transport DOWN, and the ceiling it
@@ -1918,6 +1924,18 @@ mod tests {
         }
         // the darkest rung still has to be READ over the 0.85 black outline it is drawn on
         assert!(prev > 0.25, "the darkest tone has sunk into its own outline");
+    }
+
+    /// The chrome follows the caption ONE rung brighter, and never brighter than white.
+    #[test]
+    fn the_chrome_is_one_rung_brighter_than_the_caption() {
+        use crate::plex::session::SubtitleTone as T;
+        assert_eq!(chrome_dim_for(T::White), 1.0);
+        assert_eq!(chrome_dim_for(T::Silver), 1.0, "one up from Silver is White");
+        for w in T::LADDER.windows(2) {
+            assert_eq!(chrome_dim_for(w[1]), subtitle_ink_for(w[0])[0]);
+            assert!(chrome_dim_for(w[1]) > subtitle_ink_for(w[1])[0], "{:?}", w[1]);
+        }
     }
 
     /// The media line's two vocabularies: the resolution CLASS a badge uses (either axis, so a

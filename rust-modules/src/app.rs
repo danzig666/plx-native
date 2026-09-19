@@ -2192,6 +2192,49 @@ fn extend_hud(now: u32, ms: u32) {
         set_hud(want);
     }
 }
+/// **BACK hid the transport; the Magic Remote may not simply un-hide it.** The remote sends
+/// pointer motion for the jitter of a hand holding it — including the wiggle of pressing a
+/// button — and on the player EVERY motion raised the HUD. So BACK hid the bar, the jitter raised
+/// it again at once, and the next BACK found it visible and hid it instead of leaving: a loop the
+/// viewer could not get out of (reported on an LG C3, 2026-09-19).
+///
+/// The rule, in two parts. For [`BACK_HIDE_QUIET_MS`] after the press nothing the pointer does
+/// counts at all — that is the press itself. After that the first position seen is the ANCHOR,
+/// and the transport comes back only once the pointer is [`BACK_HIDE_TRAVEL_PX`] away from it. A
+/// DISTANCE, not a path length: the first version summed every motion like the other screens'
+/// D-pad gate ([`Pointer::mot_accum`]) does, and its own test showed ±2 px of jitter adding up to
+/// 120 px in half a second. A hand at rest stays within a few px of where it settled; a deliberate
+/// point at the screen leaves it in a fraction of a second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BackHide {
+    at: u32,
+    /// where the pointer settled once the quiet window was over (None = not seen yet)
+    anchor: Option<(f32, f32)>,
+}
+const BACK_HIDE_QUIET_MS: u32 = 700;
+const BACK_HIDE_TRAVEL_PX: f32 = 120.0;
+
+/// May this pointer motion raise the transport? `true` with nothing BACK-hidden; otherwise it
+/// feeds the gate and answers `true` — clearing it — only once the travel is past the threshold.
+/// Pure: the motion arm is its only caller, and a host test drives it.
+fn pointer_may_reveal(gate: &mut Option<BackHide>, now: u32, mx: f32, my: f32) -> bool {
+    let Some(g) = gate.as_mut() else {
+        return true;
+    };
+    if now.wrapping_sub(g.at) < BACK_HIDE_QUIET_MS {
+        return false; // the press itself
+    }
+    let Some((ax, ay)) = g.anchor else {
+        g.anchor = Some((mx, my));
+        return false;
+    };
+    if (mx - ax).abs() + (my - ay).abs() < BACK_HIDE_TRAVEL_PX {
+        return false;
+    }
+    *gate = None;
+    true
+}
+
 /// Is the transport HUD on screen? Its timer is live, OR playback is paused, OR the pipeline is
 /// BUSY — unless the user explicitly dismissed it (UP from the top row), which holds until the
 /// next key but cannot hide a stalled pipeline's read-out.
@@ -2296,6 +2339,33 @@ mod hud_visibility_tests {
     /// dismissal is what tells them apart, and it is cleared at the top of every fresh press — so
     /// an arm that re-derived visibility for itself got `true` and drove geometry the user could
     /// not see. Three points of one loop iteration, in their real order.
+    #[test]
+    fn back_hidden_transport_ignores_the_remotes_jitter_but_not_a_real_move() {
+        let at = 10_000;
+        let hide = || Some(BackHide { at, anchor: None });
+        // the press wiggle: large, but inside the quiet window — ignored entirely
+        let mut g = hide();
+        assert!(!pointer_may_reveal(&mut g, at + 50, 1000.0, 600.0));
+        assert!(!pointer_may_reveal(&mut g, at + 600, 900.0, 500.0));
+        assert_eq!(g.and_then(|g| g.anchor), None, "the quiet window does not even anchor");
+        // a resting hand afterwards: a few px of jitter for a long time never reaches the gate —
+        // the case a summed PATH length failed, at ~30 events
+        for i in 0..200u32 {
+            let d = if i % 2 == 0 { 2.0 } else { -2.0 };
+            assert!(!pointer_may_reveal(&mut g, at + 800 + i * 16, 900.0 + d, 500.0));
+        }
+        assert!(g.is_some(), "the bar stays down, so the next BACK leaves playback");
+        // a deliberate point at the screen: past the travel gate, the HUD may come back
+        let mut g = hide();
+        let mut revealed = false;
+        for i in 0..10 {
+            revealed |= pointer_may_reveal(&mut g, at + 800 + i * 16, 900.0 + i as f32 * 20.0, 500.0);
+        }
+        assert!(revealed && g.is_none(), "a real move clears the gate");
+        // and with nothing BACK-hidden, motion raises the HUD exactly as it always did
+        assert!(pointer_may_reveal(&mut None, at, 1.0, 1.0));
+    }
+
     #[test]
     fn a_hand_hidden_hud_still_takes_the_press_that_wakes_it() {
         with_state(PlaybackState::Playing, || {
@@ -3547,6 +3617,9 @@ struct HudState {
     /// click arm's `hud_vis`); this is the key path's version of that sample, taken once so the two
     /// arms that need it cannot answer the question differently.
     visible_at_press: bool,
+    /// Set while the transport is hidden BY BACK: the pointer may not bring it back until the
+    /// remote has really moved — see [`BackHide`]. Cleared by anything else that raises the HUD.
+    back_hidden: Option<BackHide>,
     /// The last SEGMENT the control row offered. Sticky: it is never cleared back to None,
     /// so each segment raises the HUD exactly once per playback however often the row
     /// flickers.
@@ -3562,6 +3635,7 @@ impl HudState {
         nav: HudNav::HOME,
         dismissed: false,
         visible_at_press: false,
+        back_hidden: None,
         last_offer: None,
         was_standin: false,
     };
@@ -3607,11 +3681,13 @@ impl HudState {
         // the whole of `note_global_press`, the ONLY caller: an unsupported press never reaches
         // here, so a colour button over a film no longer raises the transport.
         self.dismissed = false;
+        self.back_hidden = None;
     }
 
     fn raise_for_offer(&mut self, now: u32, primary: c_int) {
         extend_hud(now, HUD_LINGER_MS);
         self.dismissed = false;
+        self.back_hidden = None;
         if self.nav.focus == 0 {
             self.nav.focus = 1;
             self.nav.btn = primary;
@@ -8497,6 +8573,8 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                         scrubber.disengage();
                         hud.nav.focus = 0;
                         hud.dismissed = true;
+                        // …and keep the Magic Remote's jitter from raising it straight back
+                        hud.back_hidden = Some(BackHide { at: last_input, anchor: None });
                     } else if matches!(key, Key::Back) {
                         key_back(
                             mt,
@@ -8549,6 +8627,10 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                             }
                         ) {
                             crate::ui::track_menu::pointer_focus(mx, my);
+                            continue;
+                        }
+                        // a transport BACK hid stays hidden until the remote really moves
+                        if !pointer_may_reveal(&mut hud.back_hidden, last_input, mx, my) {
                             continue;
                         }
                         hud.dismissed = false;
@@ -8741,6 +8823,7 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                         // the invisible timed-out scrub band committed a blind seek.
                         let hud_vis = hud_visible(last_input, hud_until(), paused(), hud.dismissed);
                         hud.dismissed = false;
+                        hud.back_hidden = None;
                         let (cx, cy) = ptr_xy(&ev);
                         // Which control-row ITEM the click landed on, resolved ONCE: the arm below
                         // both guards on it and parks the ring with it, and re-asking would be two
