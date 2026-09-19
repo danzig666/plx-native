@@ -1592,6 +1592,9 @@ pub(crate) struct PlayingItem {
     /// would be the wrong file's, with nothing on screen to say so.
     pub(crate) sid: crate::plex::ServerId,
     pub(crate) rk: String,
+    /// The show's ratingKey when this is an episode (`grandparentRatingKey`), else empty — what
+    /// the resolve asks the show's own audio-language preference of.
+    pub(crate) show_rk: String,
     pub(crate) audio: Vec<Stream>,
     pub(crate) subs: Vec<Stream>,
     pub(crate) video_fps: f64, // the played leaf's video fps (0 = unknown) — feeds the Load esInfo
@@ -1668,6 +1671,7 @@ pub(crate) fn cached_playing(sid: crate::plex::ServerId, rk: &str) -> Option<Pla
         .map(|d| PlayingItem {
             sid,
             rk: rk.to_string(),
+            show_rk: d.show_rk.clone(),
             audio: d.audio.clone(),
             subs: d.subs.clone(),
             video_fps: d.video_fps,
@@ -1717,9 +1721,14 @@ pub(crate) fn fetch_playing_item(sid: crate::plex::ServerId, rk: &str) -> Option
         .as_ref()
         .and_then(|it| it.primary_media().map(|m| (m.width, m.height, m.bitrate)))
         .unwrap_or((0, 0, 0));
+    let show_rk = it
+        .as_ref()
+        .map(|it| it.grandparent_rating_key.clone())
+        .unwrap_or_default();
     Some(PlayingItem {
         sid,
         rk: rk.to_string(),
+        show_rk,
         audio,
         subs,
         video_fps,

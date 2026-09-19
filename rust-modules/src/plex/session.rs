@@ -1483,6 +1483,10 @@ pub struct Session {
     /// Soft-parsed: an unknown spelling costs the preference, never the credentials.
     #[serde(default, deserialize_with = "de_soft_subtitle_tone")]
     pub(crate) subtitle_tone: SubtitleTone,
+    /// **Skip intros automatically** — seek past a server intro marker the moment its segment
+    /// begins, instead of offering the Skip Intro button. Install-wide, off when absent.
+    #[serde(default, deserialize_with = "de_soft_flag")]
+    pub(crate) auto_skip_intro: bool,
     /// **Device-wide ambient memory**: the last hero `UltraBlurColors` envelope Home actually
     /// rendered on this television, so a route in the Settings/first-run family that opens
     /// BEFORE Home has fetched anything this boot — first-run consent moved ahead of the
@@ -1528,6 +1532,8 @@ struct CanonicalSessionPreferences {
     playback_quality: Option<PlaybackQuality>,
     #[serde(default, deserialize_with = "de_soft_subtitle_tone")]
     subtitle_tone: SubtitleTone,
+    #[serde(default, deserialize_with = "de_soft_flag")]
+    auto_skip_intro: bool,
     /// Parsed only so a future preference does not make the known fields disappear. The shipping
     /// adapter merges these opaque keys from the current DB8 public payload before every rewrite;
     /// they are not promoted into the Session domain object.
@@ -1546,6 +1552,7 @@ pub(crate) fn split_canonical(
     let preferences = serde_json::to_value(CanonicalSessionPreferences {
         playback_quality: session.playback_quality,
         subtitle_tone: session.subtitle_tone,
+        auto_skip_intro: session.auto_skip_intro,
         extensions: BTreeMap::new(),
     })
     .map_err(|_| ())?;
@@ -1610,6 +1617,7 @@ pub(crate) fn join_canonical(
         recent_searches,
         playback_quality: preferences.playback_quality,
         subtitle_tone: preferences.subtitle_tone,
+        auto_skip_intro: preferences.auto_skip_intro,
         // Visual atmosphere is a disposable cache and intentionally does not enter DB8.
         last_hero_blur: None,
         extensions: auth.extensions,
@@ -2097,6 +2105,15 @@ where
     Ok(serde_json::from_value::<Option<PlaybackQuality>>(v).unwrap_or(None))
 }
 
+/// A preference switch: anything but a JSON `true` (absent, garbage, a future shape) is off, and
+/// never a parse failure that would cost the credentials.
+fn de_soft_flag<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(matches!(serde_json::Value::deserialize(d), Ok(serde_json::Value::Bool(true))))
+}
+
 /// The subtitle tone is a preference too: a spelling this build does not know degrades to white.
 fn de_soft_subtitle_tone<'de, D>(d: D) -> Result<SubtitleTone, D::Error>
 where
@@ -2106,6 +2123,18 @@ where
         return Ok(SubtitleTone::White);
     };
     Ok(serde_json::from_value::<SubtitleTone>(v).unwrap_or_default())
+}
+
+/// Persist "Skip intros automatically", through the same door as the subtitle tone.
+pub(crate) fn set_auto_skip_intro(on: bool) -> bool {
+    update_ordinary(|cur| {
+        if cur.auto_skip_intro == on {
+            return None;
+        }
+        let mut next = cur.clone();
+        next.auto_skip_intro = on;
+        Some(next)
+    })
 }
 
 /// Persist the subtitle tone through the same ordinary read-modify-write door the playback
@@ -2135,6 +2164,10 @@ impl Session {
 
     pub(crate) fn subtitle_tone(&self) -> SubtitleTone {
         self.subtitle_tone
+    }
+
+    pub(crate) fn auto_skip_intro(&self) -> bool {
+        self.auto_skip_intro
     }
 
     pub(crate) fn with_subtitle_tone(&self, tone: SubtitleTone) -> Self {

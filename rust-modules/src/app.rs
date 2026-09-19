@@ -5742,6 +5742,11 @@ fn perform_settings_action(action: crate::ui::settings::Action, route: &mut Rout
         }
         crate::ui::settings::Action::Legal => crate::ui::legal::open(),
         crate::ui::settings::Action::About => crate::ui::legal::open_about(),
+        crate::ui::settings::Action::AutoSkipIntro => {
+            let on = crate::plex::session::peek().auto_skip_intro();
+            crate::plex::session::set_auto_skip_intro(!on);
+            crate::ui::settings::refresh();
+        }
         crate::ui::settings::Action::None => {}
     }
 }
@@ -10134,7 +10139,32 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
                     // the DISMISSAL and the ring in one act, because raising the timer alone left
                     // the tile behind a transport nobody drew. `HudState::raise_for_offer` is where
                     // that rule, its resting-position clause and the bug are written down.
-                    hud.raise_for_offer(now, ctrl.primary_btn());
+                    // "Skip intros automatically": an INTRO offer is taken at once — the same
+                    // two steps the button's own press performs (`activate_ctrl_row`), minus the
+                    // un-pause, since nobody pressed anything. Retired first, so the seek landing
+                    // on a keyframe still inside the segment does not offer it again.
+                    let auto = match ctrl {
+                        crate::ui::player_hud::ControlSlot::Skip(pr)
+                            if pr.kind == crate::metadata::MarkerKind::Intro =>
+                        {
+                            match pr.action {
+                                crate::ui::skip_pill::SkipAction::Seek(ns)
+                                    if crate::plex::session::peek().auto_skip_intro() =>
+                                {
+                                    Some((pr.marker, ns))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((marker, ns)) = auto {
+                        log("marker: intro skipped automatically");
+                        crate::metadata::mark_skipped(marker);
+                        request_seek(ns);
+                    } else {
+                        hud.raise_for_offer(now, ctrl.primary_btn());
+                    }
                 } else if crate::ui::player_hud::standin_left_the_ring(
                     hud.was_standin,
                     ctrl,

@@ -14,6 +14,8 @@ pub(crate) enum Action {
     Privacy,
     Legal,
     About,
+    /// flip "Skip intros automatically" — performed in place, the list stays open
+    AutoSkipIntro,
 }
 
 /// `caching_host` since 2026-09-03, for the two RAMPS and nothing else. At rest the opaque ground
@@ -101,6 +103,15 @@ fn rebuild(sel: i32) {
         );
         actions.push(Action::Home);
     }
+    let auto_skip = crate::plex::session::peek().auto_skip_intro();
+    sections.push(
+        Section::new("Playback").row(
+            Row::new("Skip intros automatically")
+                .detail("Jump past a show's intro as soon as it starts.")
+                .toggle(auto_skip),
+        ),
+    );
+    actions.push(Action::AutoSkipIntro);
     sections.push(
         Section::new("Privacy")
             .row(
@@ -389,13 +400,25 @@ mod tests {
 
     /// **Rules 8 and 9 on the root.** It answered neither LEFT nor RIGHT before, which is half of
     /// what issue 6 reports: Legal entered on RIGHT and left on LEFT while the screen one level
-    /// above it ignored both. Every row here is a destination, so RIGHT is OK's twin; the root has
-    /// no action band, so LEFT is BACK's.
+    /// above it ignored both. Every row but the Playback SWITCH is a destination, so on those RIGHT
+    /// is OK's twin; the switch opens nothing, so RIGHT leaves it alone (only OK flips it). The
+    /// root has no action band, so LEFT is BACK's.
     #[test]
     fn right_enters_the_focused_destination_and_left_leaves_the_modal() {
         let _g = crate::testlock::serial();
         open();
         assert!(is_open());
+        let rows = unsafe { (*addr_of!(ROWS)).clone() };
+        if let Some(i) = rows.iter().position(|a| *a == Action::AutoSkipIntro) {
+            table().sel = i as i32;
+            assert_eq!(on_left_right(1), Action::None, "RIGHT does not flip a switch");
+            assert_eq!(on_ok(), Action::AutoSkipIntro, "…OK does");
+        }
+        let dest = rows
+            .iter()
+            .position(|a| *a != Action::AutoSkipIntro)
+            .expect("the root has destinations");
+        table().sel = dest as i32;
         let by_ok = on_ok();
         assert_ne!(by_ok, Action::None, "the focused row is a real destination");
         assert_eq!(

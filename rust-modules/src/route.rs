@@ -5570,6 +5570,9 @@ pub(crate) struct Plan {
     pub sub_sid: i64,
     /// client-renderer ordinal for that subtitle (`metadata::sub_render_ordinal`). None = subs off.
     pub sub_render_ordinal: Option<i32>,
+    /// An EXTERNAL text subtitle to start with (stream id, delivery key) — the show's subtitle
+    /// settings chose it (`pick_dp_subtitle_pref`); `apply_plan` hands it to `player::sidecar`.
+    pub sidecar_sub: Option<(i64, String)>,
     /// the playing item's track store, fetched off-thread and installed by apply_plan
     pub playing: Option<crate::metadata::PlayingItem>,
     /// The server's PRE-FLIGHT refusal (see [`refusal`]), when `/decision` said it can neither
@@ -5742,11 +5745,46 @@ fn build_stream(rk: &str, part: &str, vcodec: &str, acodec: &str, env: &ResolveE
         .as_ref()
         .map(|p| p.audio.as_slice())
         .unwrap_or(&[]);
+    // The SHOW's own language settings (Advanced dialog), for an episode — one small read per
+    // play, cached for the show being binged. See `pick_dp_audio_pref` / `pick_dp_subtitle_pref`.
+    let show_prefs = plan
+        .playing
+        .as_ref()
+        .filter(|p| !p.show_rk.is_empty())
+        .and_then(|p| show_lang_prefs(client, env.sid, &p.show_rk))
+        .unwrap_or_default();
+    let pref_lang = show_prefs.audio.clone();
     let audio_sel = if rk.is_empty() {
         None
     } else {
-        pick_dp_audio(tracks, acodec)
+        pick_dp_audio_pref(tracks, acodec, pref_lang.as_deref())
     };
+    // the language of the audio that will play — what "shown with foreign audio" is judged by
+    let audio_lang: String = audio_sel
+        .as_ref()
+        .and_then(|(i, _, _)| usize::try_from(*i).ok())
+        .and_then(|i| tracks.get(i))
+        .or_else(|| tracks.iter().find(|s| s.default))
+        .or_else(|| tracks.first())
+        .map(|s| s.lang_code.clone())
+        .unwrap_or_default();
+    if let Some(lang) = pref_lang.as_deref() {
+        let hit = audio_sel
+            .as_ref()
+            .and_then(|(i, _, _)| usize::try_from(*i).ok())
+            .and_then(|i| tracks.get(i))
+            .is_some_and(|s| audio_lang_matches(lang, &s.lang_code));
+        crate::player::log(&format!(
+            "route: show prefers audio {lang} — {}",
+            if hit {
+                "playing that track"
+            } else if tracks.iter().any(|s| audio_lang_matches(lang, &s.lang_code)) {
+                "a track in it exists but is not direct-playable; using the usual order"
+            } else {
+                "no track in it; using the usual order"
+            }
+        ));
+    }
     // What the CONNECTION to this server allows, beside what the pipeline can decode: a Plex
     // relay is a ~2 Mbit/s tunnel, so neither of the two flavors that ship the file's own bytes
     // (direct play, and the uncapped container remux) can be asked for over one. Unrestricted on
@@ -5843,10 +5881,12 @@ fn build_stream(rk: &str, part: &str, vcodec: &str, acodec: &str, env: &ResolveE
         };
         let subtitle_ordinal = direct
             .then(|| {
-                plan.playing
-                    .as_ref()
-                    .and_then(|p| pick_dp_subtitle(&p.subs))
-                    .map(|(_, ord)| ord)
+                plan.playing.as_ref().and_then(|p| {
+                    match pick_dp_subtitle_pref(&p.subs, &show_prefs, &audio_lang) {
+                        SubStart::Embedded(_, ord) => Some(ord),
+                        SubStart::Sidecar(..) | SubStart::Off => None,
+                    }
+                })
             })
             .flatten();
         plan.auto_original = Some(AutoOriginalCandidate {
@@ -6017,13 +6057,29 @@ fn build_stream(rk: &str, part: &str, vcodec: &str, acodec: &str, env: &ResolveE
         // honour a subtitle the server already has selected for this part (chosen on another
         // client, or by this app in an earlier session) — free here, since the direct-play path
         // renders subtitles itself. apply_plan installs it on the main thread.
-        let sub_sel = plan
+        // …and, with no such selection, the SHOW's subtitle settings (`pick_dp_subtitle_pref`).
+        let sub_start = plan
             .playing
             .as_ref()
-            .and_then(|p| pick_dp_subtitle(&p.subs));
-        if let Some((ssid, ord)) = sub_sel {
-            plan.sub_sid = ssid;
-            plan.sub_render_ordinal = Some(ord);
+            .map(|p| pick_dp_subtitle_pref(&p.subs, &show_prefs, &audio_lang))
+            .unwrap_or(SubStart::Off);
+        let from_show = !matches!(sub_start, SubStart::Off)
+            && !plan.playing.as_ref().is_some_and(|p| p.subs.iter().any(|s| s.selected));
+        if from_show {
+            crate::player::log(&format!(
+                "route: show subtitles {} (mode {}) — turning on {}",
+                show_prefs.subtitle.as_deref().unwrap_or(""),
+                show_prefs.subtitle_mode,
+                if matches!(sub_start, SubStart::Sidecar(..)) { "an external track" } else { "an embedded track" }
+            ));
+        }
+        match sub_start {
+            SubStart::Embedded(ssid, ord) => {
+                plan.sub_sid = ssid;
+                plan.sub_render_ordinal = Some(ord);
+            }
+            SubStart::Sidecar(id, key) => plan.sidecar_sub = Some((id, key)),
+            SubStart::Off => {}
         }
         // direct-play: no transcode session (transcode_session() stays empty). Carry the
         // session id + identity on the file GET so PMS keys the /status/sessions entry by
@@ -6177,7 +6233,191 @@ const PREF_AUDIO_LANG: &str = "eng";
 /// playback — a worker replacing the store would drop those out from under the draw path, so the
 /// resolve must never touch it. (b) Being pure makes the selection ladder host-testable, which it
 /// has never been; see the tests at the foot of this file.
+#[cfg(test)]
 fn pick_dp_audio(
+    tracks: &[crate::metadata::Stream],
+    default_acodec: &str,
+) -> Option<(i32, String, i64)> {
+    pick_dp_audio_pref(tracks, default_acodec, None)
+}
+
+/// [`pick_dp_audio`] with the SHOW's preferred audio language (`audioLanguage`, e.g. `"hu-HU"`).
+/// A direct-playable track in that language is chosen right after rung 1 — before the built-in
+/// English preference, which exists only for items nobody configured, and before the file's
+/// default flag. Rung 1 still outranks it: a DIFFERENT track picked on another client for this
+/// very episode is a more specific choice than a show-wide default.
+///
+/// It is honoured here because the ladder did not see it at all: the preference lives on the
+/// SHOW, an episode's part carries nothing of it, and when the preferred track happened to be
+/// the file's default flag rung 1 could not tell it from no choice — so rung 2's English won
+/// (reported: a series set to Hungarian opening in English).
+fn pick_dp_audio_pref(
+    tracks: &[crate::metadata::Stream],
+    default_acodec: &str,
+    pref_lang: Option<&str>,
+) -> Option<(i32, String, i64)> {
+    let dp = crate::plex::is_dp_audio;
+    if let Some(lang) = pref_lang {
+        let real_pick = tracks
+            .iter()
+            .any(|s| s.selected && !s.default && dp(&s.codec.to_lowercase()));
+        if !real_pick {
+            if let Some(i) = tracks
+                .iter()
+                .position(|s| dp(&s.codec.to_lowercase()) && audio_lang_matches(lang, &s.lang_code))
+            {
+                return Some((i as i32, tracks[i].codec.to_lowercase(), tracks[i].id));
+            }
+        }
+    }
+    pick_dp_audio_ladder(tracks, default_acodec)
+}
+
+/// Does a stream's ISO-639-2 `languageCode` (`"hun"`, `"ger"`/`"deu"`) name the language of a
+/// Plex language preference (`"hu-HU"`, `"de-DE"`, `"pt-BR"`)? Only the primary subtag counts —
+/// a stream says "Portuguese", never "Brazilian". Both the bibliographic and the terminology
+/// three-letter spellings are accepted, because files carry either.
+fn audio_lang_matches(pref: &str, code: &str) -> bool {
+    let primary = pref.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    let code = code.to_ascii_lowercase();
+    if primary.is_empty() || code.is_empty() {
+        return false;
+    }
+    if code == primary {
+        return true;
+    }
+    let three: &[&str] = match primary.as_str() {
+        "ar" => &["ara"],
+        "bg" => &["bul"],
+        "ca" => &["cat"],
+        "zh" => &["chi", "zho"],
+        "hr" => &["hrv", "scr"],
+        "cs" => &["cze", "ces"],
+        "da" => &["dan"],
+        "nl" => &["dut", "nld"],
+        "en" => &["eng"],
+        "et" => &["est"],
+        "fi" => &["fin"],
+        "fr" => &["fre", "fra"],
+        "de" => &["ger", "deu"],
+        "el" => &["gre", "ell"],
+        "he" => &["heb"],
+        "hi" => &["hin"],
+        "hu" => &["hun"],
+        "id" => &["ind"],
+        "it" => &["ita"],
+        "ja" => &["jpn"],
+        "ko" => &["kor"],
+        "lv" => &["lav"],
+        "lt" => &["lit"],
+        "nb" | "no" => &["nob", "nor"],
+        "fa" => &["per", "fas"],
+        "pl" => &["pol"],
+        "pt" => &["por"],
+        "ro" => &["rum", "ron"],
+        "ru" => &["rus"],
+        "sk" => &["slo", "slk"],
+        "es" => &["spa"],
+        "sv" => &["swe"],
+        "th" => &["tha"],
+        "tr" => &["tur"],
+        "uk" => &["ukr"],
+        "vi" => &["vie"],
+        _ => &[],
+    };
+    three.contains(&code.as_str())
+}
+
+/// The show's language settings, cached for the last show asked about — a binge asks the same
+/// show again for every episode. RESOLVE WORKER; the client is the one the resolve already holds
+/// for this item's server. A failed read is not cached, so the next episode asks again.
+fn show_lang_prefs(
+    client: &crate::plex::Client,
+    sid: crate::plex::ServerId,
+    show_rk: &str,
+) -> Option<crate::plex::ShowLangPrefs> {
+    type Entry = (crate::plex::ServerId, String, crate::plex::ShowLangPrefs);
+    static LAST: std::sync::Mutex<Option<Entry>> = std::sync::Mutex::new(None);
+    if let Some((s, rk, v)) = LAST.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *s == sid && rk == show_rk {
+            return Some(v.clone());
+        }
+    }
+    let v = client.show_language_prefs(show_rk)?;
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((sid, show_rk.to_string(), v.clone()));
+    Some(v)
+}
+
+/// What subtitle a DIRECT PLAY starts with.
+#[derive(Clone, Debug, PartialEq)]
+enum SubStart {
+    Off,
+    /// (stream id, embedded-subtitle ordinal for the client renderer)
+    Embedded(i64, i32),
+    /// (stream id, delivery key) — an external text subtitle `player::sidecar` fetches
+    Sidecar(i64, String),
+}
+
+/// [`pick_dp_subtitle`] plus the SHOW's subtitle settings (`subtitleLanguage` + `subtitleMode`).
+///
+/// The server's own per-part selection still wins, and ANY selected subtitle — an external one
+/// included, which `apply_plan` restores itself — means someone chose, so the show's default
+/// stays out of it. Otherwise, with a preferred subtitle language set:
+///   - mode 2, **always enabled**: a subtitle in that language is turned on;
+///   - mode 1, **shown with foreign audio**: turned on only when the audio that will play is NOT
+///     in that language (`audio_lang`);
+///   - mode 0 (manual) and -1 (account default — on plex.tv, which this client does not read):
+///     nothing, as before.
+/// Among the tracks in the language: a full embedded track (not forced, not SDH) first, then any
+/// full embedded track, then a full external text track, then a forced one. Direct play only —
+/// a transcode keeps subtitles off, as it always has (turning one on there means a burn).
+fn pick_dp_subtitle_pref(
+    subs: &[crate::metadata::Stream],
+    prefs: &crate::plex::ShowLangPrefs,
+    audio_lang: &str,
+) -> SubStart {
+    if let Some((id, ord)) = pick_dp_subtitle(subs) {
+        return SubStart::Embedded(id, ord);
+    }
+    if subs.iter().any(|s| s.selected) {
+        return SubStart::Off;
+    }
+    let Some(lang) = prefs.subtitle.as_deref() else {
+        return SubStart::Off;
+    };
+    let want = match prefs.subtitle_mode {
+        2 => true,
+        1 => !audio_lang.is_empty() && !audio_lang_matches(lang, audio_lang),
+        _ => false,
+    };
+    if !want {
+        return SubStart::Off;
+    }
+    let in_lang = |s: &crate::metadata::Stream| audio_lang_matches(lang, &s.lang_code);
+    let embedded = |i: usize| {
+        let ord = crate::metadata::sub_render_ordinal(subs, i);
+        (ord >= 0 && subs[i].id > 0).then(|| SubStart::Embedded(subs[i].id, ord))
+    };
+    let sidecar = |i: usize| {
+        let s = &subs[i];
+        (s.sidecar_renderable() && s.id > 0).then(|| SubStart::Sidecar(s.id, s.key.clone()))
+    };
+    let tiers: [&dyn Fn(usize) -> Option<SubStart>; 5] = [
+        &|i| (!subs[i].forced && !subs[i].sdh).then(|| embedded(i)).flatten(),
+        &|i| (!subs[i].forced).then(|| embedded(i)).flatten(),
+        &|i| (!subs[i].forced).then(|| sidecar(i)).flatten(),
+        &|i| embedded(i),
+        &|i| sidecar(i),
+    ];
+    for tier in tiers {
+        if let Some(pick) = (0..subs.len()).filter(|&i| in_lang(&subs[i])).find_map(tier) {
+            return pick;
+        }
+    }
+    SubStart::Off
+}
+
+fn pick_dp_audio_ladder(
     tracks: &[crate::metadata::Stream],
     default_acodec: &str,
 ) -> Option<(i32, String, i64)> {
@@ -7098,6 +7338,9 @@ fn apply_plan(plan: Plan, rk: &str) -> Option<RouteStartTransaction> {
             plan.sub_sid
         ));
         crate::player::request_subtitle(ord);
+    } else if let (Some((id, key)), false) = (plan.sidecar_sub.clone(), is_transcoding()) {
+        // the show's subtitle settings chose an external track (`pick_dp_subtitle_pref`)
+        crate::player::sidecar::select(cur_sid(), id, key);
     } else if !is_transcoding() {
         // …and the EXTERNAL twin: `pick_dp_subtitle` leaves a server-selected sidecar alone
         // because the demuxer cannot render it, but `player::sidecar` can — on direct play only.
@@ -10033,6 +10276,104 @@ mod tests {
             server_selected(sub(12, 4, "eng", false)),
         ];
         assert_eq!(pick_dp_subtitle(&subs), Some((12, 1)));
+    }
+
+    /// **A show's preferred audio language beats the English default and the file's flag.**
+    /// The reported case: a series set to Hungarian whose episodes carry the Hungarian dub as the
+    /// FILE default beside an English track. Rung 1 cannot see a pick that lands on the default,
+    /// so rung 2's English won. Differential: `pick_dp_audio` (no preference) still picks English.
+    #[test]
+    fn a_shows_preferred_audio_language_is_honoured() {
+        let tracks = [trk(1, "ac3", "hun", true), trk(2, "ac3", "eng", false)];
+        assert_eq!(pick_dp_audio(&tracks, "ac3"), Some((1, "ac3".into(), 2)), "the old ladder");
+        assert_eq!(
+            pick_dp_audio_pref(&tracks, "ac3", Some("hu-HU")),
+            Some((0, "ac3".into(), 1))
+        );
+        // …and the other way round: Hungarian second, English default
+        let tracks = [trk(1, "ac3", "eng", true), trk(2, "eac3", "hun", false)];
+        assert_eq!(
+            pick_dp_audio_pref(&tracks, "ac3", Some("hu-HU")),
+            Some((1, "eac3".into(), 2))
+        );
+        // a preferred track that cannot direct-play does not force a transcode
+        let tracks = [trk(1, "ac3", "eng", true), trk(2, "dca", "hun", false)];
+        assert_eq!(pick_dp_audio_pref(&tracks, "ac3", Some("hu-HU")), Some((0, "ac3".into(), 1)));
+        // a DIFFERENT track chosen for this episode elsewhere still outranks the show's default
+        let tracks = [
+            trk(1, "ac3", "hun", true),
+            server_selected(trk(2, "ac3", "eng", false)),
+        ];
+        assert_eq!(pick_dp_audio_pref(&tracks, "ac3", Some("hu-HU")), Some((1, "ac3".into(), 2)));
+    }
+
+    fn sub_s(id: i64, lang: &str, forced: bool, external: bool) -> crate::metadata::Stream {
+        crate::metadata::Stream {
+            forced,
+            external,
+            key: if external { format!("/library/streams/{id}") } else { String::new() },
+            ..trk(id, "srt", lang, false)
+        }
+    }
+
+    /// **A show's subtitle settings turn a subtitle on at the start of a direct play.**
+    #[test]
+    fn a_shows_subtitle_settings_choose_the_starting_subtitle() {
+        let prefs = |mode: i32| crate::plex::ShowLangPrefs {
+            audio: None,
+            subtitle: Some("hu-HU".into()),
+            subtitle_mode: mode,
+        };
+        let subs = [sub_s(10, "eng", false, false), sub_s(11, "hun", true, false), sub_s(12, "hun", false, false)];
+        // always: the FULL Hungarian track, not the forced one before it
+        assert_eq!(pick_dp_subtitle_pref(&subs, &prefs(2), "hun"), SubStart::Embedded(12, 2));
+        // shown with foreign audio: on for English audio, off for Hungarian audio
+        assert_eq!(pick_dp_subtitle_pref(&subs, &prefs(1), "eng"), SubStart::Embedded(12, 2));
+        assert_eq!(pick_dp_subtitle_pref(&subs, &prefs(1), "hun"), SubStart::Off);
+        // manual and account default: nothing, as before
+        assert_eq!(pick_dp_subtitle_pref(&subs, &prefs(0), "eng"), SubStart::Off);
+        assert_eq!(pick_dp_subtitle_pref(&subs, &prefs(-1), "eng"), SubStart::Off);
+        // an external .srt is used when no embedded track has the language
+        let subs = [sub_s(10, "eng", false, false), sub_s(20, "hun", false, true)];
+        assert_eq!(
+            pick_dp_subtitle_pref(&subs, &prefs(2), "eng"),
+            SubStart::Sidecar(20, "/library/streams/20".into())
+        );
+        // a subtitle the server already has selected is a choice: the show's default stays out
+        let subs = [sub_s(10, "eng", false, false), sub_s(12, "hun", false, false)];
+        let mut chosen = subs.clone();
+        chosen[0].selected = true;
+        assert_eq!(pick_dp_subtitle_pref(&chosen, &prefs(2), "eng"), SubStart::Embedded(10, 0));
+    }
+
+    #[test]
+    fn show_settings_are_read_out_of_a_setting_list() {
+        use crate::plex::{Setting, ShowLangPrefs};
+        let s = |id: &str, v: &str| Setting { id: id.into(), value: v.into() };
+        assert_eq!(ShowLangPrefs::from_settings(&[s("episodeSort", "-1")]), None);
+        assert_eq!(
+            ShowLangPrefs::from_settings(&[
+                s("audioLanguage", "hu-HU"),
+                s("subtitleLanguage", ""),
+                s("subtitleMode", "1"),
+            ]),
+            Some(ShowLangPrefs { audio: Some("hu-HU".into()), subtitle: None, subtitle_mode: 1 })
+        );
+        assert_eq!(
+            ShowLangPrefs::from_settings(&[s("audioLanguage", "")]),
+            Some(ShowLangPrefs { audio: None, subtitle: None, subtitle_mode: -1 })
+        );
+    }
+
+    #[test]
+    fn preferred_language_tags_match_both_three_letter_spellings() {
+        assert!(audio_lang_matches("hu-HU", "hun"));
+        assert!(audio_lang_matches("de-DE", "ger") && audio_lang_matches("de-DE", "deu"));
+        assert!(audio_lang_matches("pt-BR", "por"));
+        assert!(audio_lang_matches("en-GB", "eng"));
+        assert!(!audio_lang_matches("hu-HU", "eng"));
+        assert!(!audio_lang_matches("", "hun"));
+        assert!(!audio_lang_matches("hu-HU", ""));
     }
 
     #[test]
