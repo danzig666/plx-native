@@ -541,10 +541,10 @@ distinction §6.1 draws.
 | **Rewind / Fast-forward** | the same as LEFT / RIGHT (§1.2) |
 | **UP / DOWN** | move between the HUD's three bands; a press on a hidden HUD is spent raising it |
 | **Stop** | leave the player |
-| **BACK** | leave the player |
+| **BACK** | with the transport on screen, hide it; on a bare picture (or while loading), leave the player |
 | **EXIT** | terminate the app (§2.3) |
 
-**Stop and BACK do the same thing here**: both run one teardown ritual — cancel any play still being
+**Stop, and BACK on a bare picture, do the same thing here**: both run one teardown ritual — cancel any play still being
 resolved, close every panel, stop the buffer feed — and return to **the page playback started
 from**. For an episode that is the **show page, scrolled to the episode that played**, not the
 generic show root. The final position is reported to the server on the way out, so the item resumes

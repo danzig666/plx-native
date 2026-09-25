@@ -129,6 +129,9 @@ pub(crate) struct PlayerScreen {
     pub(crate) lifted: bool,
     /// Where this playback returns to — see [`Origin`].
     pub(crate) origin: Option<Origin>,
+    /// When "Skip intros automatically" last took an intro (`app/run.rs`, on the offer's edge):
+    /// the "Intro skipped" notice fades out [`skip_pill::SKIP_TOAST_MS`] after it.
+    pub(crate) skip_toast_at: Option<u32>,
     render: PlayerRender,
     repair_alert: crate::ui::decision_alert::DecisionAlert,
     repair_frames: std::cell::Cell<Option<(Rect, Rect)>>,
@@ -147,6 +150,7 @@ impl PlayerScreen {
             transport: true,
             lifted: false,
             origin: None,
+            skip_toast_at: None,
             render: PlayerRender::default(),
             repair_alert: {
                 let mut alert = crate::ui::decision_alert::DecisionAlert::new();
@@ -191,6 +195,7 @@ impl PlayerScreen {
             self.hud.dismissed = false;
             self.hud.last_offer = None;
             self.up_next.reset();
+            self.skip_toast_at = None;
         }
         self.publish();
     }
@@ -330,6 +335,8 @@ impl PlayerScreen {
     ///   is not repeated here.)
     /// * `busy` — the read-out appearing and vanishing, including the `Playing -> Error` edge with
     ///   the HUD auto-hidden, where nothing else in the frame moves at all.
+    /// * the "Intro skipped" notice's opacity, in 1/32 steps — a DEADLINE-driven fade, so its
+    ///   frames are owed while it moves and not one after it reaches 0.
     pub(crate) fn clock_fingerprint(&self, ps: &crate::route::PlaybackSession, now: u32) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
         let pos = crate::player::playpos_ns();
@@ -373,7 +380,14 @@ impl PlayerScreen {
                 4 ^ ((k as u64) << 32) ^ (c.as_ptr() as u64)
             }
         });
+        mix((self.skip_toast_alpha(now) * 32.0).round() as u64);
         h
+    }
+
+    /// The "Intro skipped" notice's opacity at `now` — 0 when there is none.
+    fn skip_toast_alpha(&self, now: u32) -> f32 {
+        self.skip_toast_at
+            .map_or(0.0, |at| skip_pill::skip_toast_alpha(now.wrapping_sub(at)))
     }
 
     /// Is the transport on screen right now?
@@ -517,7 +531,13 @@ impl<H: PlayerLike + crate::screens::registry::MetadataLike> Machine<H> for Play
                     // dismissal, which is how a Magic Remote user finds the HUD over full-screen
                     // video. `app/run.rs`'s own motion arm did this and then RETURNED, so the page
                     // never saw a pointer event at all.
-                    InputKind::Pointer { .. } => {
+                    //
+                    // A transport BACK hid stays hidden until the remote really moves — the
+                    // jitter of a hand holding it is motion too (`input::BackHide`).
+                    InputKind::Pointer { x, y, .. } => {
+                        if !input::pointer_may_reveal(&mut self.hud.back_hidden, input.at.ms, *x, *y) {
+                            return Handled::Yes;
+                        }
                         self.hud.dismissed = false;
                         self.hud.extend(input.at.ms, input::HUD_LINGER_MS);
                         self.publish();
@@ -588,6 +608,8 @@ impl PlayerScreen {
     ) -> Handled {
         use player_hud::{ELEM_FAILURE_OK, ELEM_ROW_BASE, ELEM_SCRUB, ELEM_TAB_BASE};
         let failed = crate::ui::player_hud::transport_hidden(ps);
+        // A click is a deliberate act, never jitter: it ends a BACK-hide's pointer gate.
+        self.hud.back_hidden = None;
         let Some(elem) = hit else {
             // **A click that lands on no control at all toggles play/pause** — the `else` arm of
             // the old pointer block, and the reason clicking the PICTURE works: over full-screen
@@ -746,6 +768,25 @@ impl PlayerScreen {
             // by `PlayerOverlayScreen::key` before this screen ever sees the press, since the
             // overlay is a SURFACE and owns input while it is up) both perform the same ritual
             // `key_back`/the Stop arm did.
+            //
+            // …except a BACK that finds the transport ON SCREEN, which takes it down instead —
+            // the same hand-hide UP from the control row performs, abandoning a scrub preview with
+            // it — so the next BACK, on a bare picture, is the one that leaves
+            // (`input::back_hides`). The Magic Remote's jitter is kept from raising it straight
+            // back by `input::BackHide`.
+            Key::Back
+                if input::back_hides(self.hud.visible_at_press, crate::player::loading(ps)) =>
+            {
+                if edge == Edge::Down {
+                    self.scrub.ns = -1;
+                    self.scrub.disengage();
+                    self.hud.nav.focus = 0;
+                    self.hud.dismissed = true;
+                    self.hud.back_hidden = Some(input::BackHide { at: now, anchor: None });
+                    self.publish();
+                }
+                Handled::Yes
+            }
             Key::Stop | Key::Back => {
                 if edge == Edge::Down {
                     Self::ask(fx, PlayerReq::Exit);
@@ -1238,6 +1279,9 @@ impl<H: PlayerLike + crate::screens::registry::MetadataLike> Screen<H> for Playe
         // instead of vanishing with the 4.5 s linger. AFTER the transport, so it is never dimmed by
         // the scrim; BEFORE the overlay panels, which the container draws above this page.
         crate::ui::player_hud::draw_readout(ps, self.busy, now, f.measure);
+        // Not chrome either: it outlives a hidden HUD, which is the whole of its use — an
+        // automatic skip happens with nobody touching the remote.
+        skip_pill::draw_skip_toast(self.skip_toast_alpha(now), f.measure);
         if self.repair_alert.visible() {
             self.repair_alert.draw_scrim();
             self.repair_alert.draw(c"Cancel", c"Repair");
@@ -1404,6 +1448,31 @@ mod clock_animator_tests {
             "the Play mark stopped being drawn on this frame: it must report",
         );
         assert!(presents(after), "…and a report is a frame");
+    }
+
+    /// **The NOTICE class** — the "Intro skipped" pill an automatic skip leaves. It appears with
+    /// the transport hidden and nobody touching the remote, so its fade and its disappearance are
+    /// frames nothing else in the page would owe.
+    #[test]
+    fn the_intro_skipped_notice_presents_its_fade_and_its_end() {
+        let _g = crate::testlock::serial();
+        let ps = PlaybackSession::IDLE;
+        let mut pl = Player::new();
+        let mut screen = PlayerScreen::new(crate::ui::machine::EntryId(1));
+        assert!(!screen.hud_up(&ps, 10_000), "the fixture: the transport is hidden");
+
+        settled(&mut pl, &screen, &ps, 9_000);
+        screen.skip_toast_at = Some(10_000);
+        assert!(
+            reported(&mut pl, &screen, &ps, 10_100),
+            "the notice is fading in: it must report",
+        );
+        assert!(presents(10_100), "…and a report is a frame");
+        settled(&mut pl, &screen, &ps, 11_000);
+        assert!(
+            reported(&mut pl, &screen, &ps, 10_000 + skip_pill::SKIP_TOAST_MS),
+            "the notice left the screen on this frame: it must report",
+        );
     }
 
     /// **The READ-OUT class** — `busy`, i.e. the centred status surface appearing and vanishing.
@@ -1696,6 +1765,35 @@ mod step_ladder_tests {
             assert_eq!(handled, Handled::Yes);
             assert_eq!(reqs, vec![PlayerReq::Exit], "wcode {wcode}");
         }
+    }
+
+    /// BACK with the transport ON SCREEN hides it (and starts the pointer gate) rather than
+    /// leaving; the next BACK, on a bare picture, leaves. STOP leaves at once either way.
+    #[test]
+    fn back_hides_a_visible_transport_and_the_next_back_leaves() {
+        let _g = crate::testlock::serial();
+        let prev = crate::player::swap_state_for_test(crate::player::PlaybackState::Playing);
+        let mut page = PlayerScreen::new(ENTRY);
+        fresh(&mut page);
+        page.hud.nav.focus = 1;
+        page.scrub.ns = 5_000_000_000;
+        let (handled, reqs) = press(&mut page, 0, WCODE_BACK, Edge::Down);
+        assert_eq!(handled, Handled::Yes);
+        assert!(reqs.is_empty(), "the first BACK hides, it does not leave: {reqs:?}");
+        assert!(page.hud.dismissed, "the transport is taken down");
+        assert_eq!(page.hud.nav.focus, 0, "…with the ring re-parked on the scrubber");
+        assert_eq!(page.scrub.ns, -1, "…and the scrub preview abandoned with it");
+        assert!(page.hud.back_hidden.is_some(), "…and the jitter gate armed");
+
+        page.hud.visible_at_press = false; // what `note_fresh_press` samples for the next press
+        let (_, reqs) = press(&mut page, 0, WCODE_BACK, Edge::Down);
+        assert_eq!(reqs, vec![PlayerReq::Exit], "BACK on a bare picture leaves");
+
+        let mut page = PlayerScreen::new(ENTRY);
+        fresh(&mut page);
+        let (_, reqs) = press(&mut page, 0, WCODE_STOP, Edge::Down);
+        assert_eq!(reqs, vec![PlayerReq::Exit], "STOP always leaves");
+        crate::player::restore_state_for_test(prev);
     }
 
     /// Port of `key_player_updown`: from the scrubber, UP walks to the control row and DOWN to the

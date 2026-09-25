@@ -156,9 +156,11 @@ pub(super) fn multi_user_session(tag: &str) -> crate::plex::session::TempSession
     t
 }
 
-/// Signed-in with a Plex Home roster, row 3 is Automatically Sign In (after Favorite libraries,
-/// Privacy & data, Legal notices).
-pub(super) const AUTO_SIGN_IN_ROW: u32 = 3;
+/// Signed-in with a Plex Home roster, row 4 is Automatically Sign In (after Favorite libraries,
+/// Privacy & data, Legal notices and the Playback section's Skip intros automatically).
+pub(super) const AUTO_SIGN_IN_ROW: u32 = 4;
+/// …and row 3 is Skip intros automatically, the Playback section's one switch.
+pub(super) const AUTO_SKIP_INTRO_ROW: u32 = 3;
 
 /// Run the push spring to rest on 16 ms frames — bounded, so a spring that never settles
 /// fails the test rather than hanging the suite.

@@ -559,6 +559,12 @@ pub struct Session {
     /// Soft-parsed: an unknown spelling costs the preference, never the credentials.
     #[serde(default, deserialize_with = "de_soft_subtitle_tone")]
     pub(crate) subtitle_tone: SubtitleTone,
+    /// **Skip intros automatically** — seek past a server intro marker the moment its segment
+    /// begins, instead of offering the Skip Intro button. Install-wide like the subtitle tone.
+    /// Absence is **off**, which is the Skip Intro button every build before the field offered.
+    /// Soft-parsed: a malformed value costs the preference, never the credentials.
+    #[serde(default, deserialize_with = "de_soft_bool")]
+    pub(crate) auto_skip_intro: bool,
     /// **Device-wide ambient memory**: the last hero `UltraBlurColors` envelope Home actually
     /// rendered on this television, so a route in the Settings/first-run family that opens
     /// BEFORE Home has fetched anything this boot — first-run consent moved ahead of the
@@ -608,6 +614,8 @@ struct CanonicalSessionPreferences {
     trailer_autoplay: bool,
     #[serde(default, deserialize_with = "de_soft_subtitle_tone")]
     subtitle_tone: SubtitleTone,
+    #[serde(default, deserialize_with = "de_soft_bool")]
+    auto_skip_intro: bool,
     /// Parsed only so a future preference does not make the known fields disappear. The shipping
     /// adapter merges these opaque keys from the current DB8 public payload before every rewrite;
     /// they are not promoted into the Session domain object.
@@ -631,6 +639,7 @@ impl Default for CanonicalSessionPreferences {
             last_hero_blur: None,
             trailer_autoplay: true,
             subtitle_tone: SubtitleTone::White,
+            auto_skip_intro: false,
             extensions: BTreeMap::new(),
         }
     }
@@ -671,6 +680,7 @@ fn split_public(session: &Session) -> Result<crate::storage::state::PublicPayloa
         last_hero_blur: session.last_hero_blur,
         trailer_autoplay: session.trailer_autoplay,
         subtitle_tone: session.subtitle_tone,
+        auto_skip_intro: session.auto_skip_intro,
         extensions: BTreeMap::new(),
     })
     .map_err(|_| ())?;
@@ -733,6 +743,7 @@ pub(crate) fn join_canonical(
         last_hero_blur: preferences.last_hero_blur,
         trailer_autoplay: preferences.trailer_autoplay,
         subtitle_tone: preferences.subtitle_tone,
+        auto_skip_intro: preferences.auto_skip_intro,
         profiles,
         extensions: auth.extensions,
     })
@@ -754,6 +765,7 @@ fn public_session(public: &crate::storage::state::PublicPayload) -> Session {
         last_hero_blur: preferences.last_hero_blur,
         trailer_autoplay: preferences.trailer_autoplay,
         subtitle_tone: preferences.subtitle_tone,
+        auto_skip_intro: preferences.auto_skip_intro,
         home_pins, recent_searches,
         ..Default::default()
     }
@@ -1681,6 +1693,16 @@ impl Session {
 
     pub(crate) fn subtitle_tone(&self) -> SubtitleTone {
         self.subtitle_tone
+    }
+
+    pub(crate) fn auto_skip_intro(&self) -> bool {
+        self.auto_skip_intro
+    }
+
+    pub(crate) fn with_auto_skip_intro(&self, on: bool) -> Self {
+        let mut next = self.clone();
+        next.auto_skip_intro = on;
+        next
     }
 
     pub(crate) fn with_subtitle_tone(&self, tone: SubtitleTone) -> Self {

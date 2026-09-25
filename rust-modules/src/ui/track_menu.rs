@@ -801,6 +801,8 @@ mod tests {
                 video_fps: 0.0,
                 width: 0,
                 height: 0,
+                hdr: false,
+                vcodec: String::new(),
                 bitrate: 0,
                 dovi: Default::default(),
                 markers: Vec::new(),

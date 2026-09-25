@@ -211,6 +211,10 @@ pub(crate) struct HudState {
     /// click arm's `hud_vis`); this is the key path's version of that sample, taken once so the two
     /// arms that need it cannot answer the question differently.
     pub(crate) visible_at_press: bool,
+    /// Set while the transport is hidden BY BACK: the pointer may not bring it back until the
+    /// remote has really moved — see [`BackHide`]. Cleared by anything else that raises the HUD:
+    /// a bound key ([`Self::note_fresh_press`]), a click, a segment offer.
+    pub(crate) back_hidden: Option<BackHide>,
     /// The last SEGMENT the control row offered. Sticky: it is never cleared back to None,
     /// so each segment raises the HUD exactly once per playback however often the row
     /// flickers.
@@ -227,6 +231,7 @@ impl HudState {
         until: 0,
         dismissed: false,
         visible_at_press: false,
+        back_hidden: None,
         last_offer: None,
         was_standin: false,
     };
@@ -269,6 +274,7 @@ impl HudState {
         // the whole of `note_global_press`, the ONLY caller: an unsupported press never reaches
         // here, so a colour button over a film no longer raises the transport.
         self.dismissed = false;
+        self.back_hidden = None;
     }
 
     /// A FRESH segment offer takes the control row: put the HUD ON SCREEN and, from rest, park the
@@ -298,12 +304,65 @@ impl HudState {
     pub(crate) fn raise_for_offer(&mut self, now: u32, primary: c_int) {
         self.extend(now, HUD_LINGER_MS);
         self.dismissed = false;
+        self.back_hidden = None;
         if self.nav.focus == 0 {
             self.nav.focus = 1;
             self.nav.btn = primary;
         }
     }
 }
+/// **Does this BACK hide the transport rather than leave playback?** With the transport on screen
+/// when the press arrived ([`HudState::visible_at_press`]) BACK takes it down — the same hand-hide
+/// UP from the control row performs — and the next BACK, on a bare picture, leaves. Except while
+/// the pipeline is LOADING: [`hud_visible`] keeps the transport up then whatever the dismissal
+/// says, so a hide would change nothing on screen and BACK could never leave a stalled load.
+/// The STOP key is not asked: it always leaves. A FAILED read-out never reaches this question
+/// (`PlayerScreen::handle_key` answers every key on it first).
+pub(crate) fn back_hides(visible_at_press: bool, loading: bool) -> bool {
+    visible_at_press && !loading
+}
+
+/// **BACK hid the transport; the Magic Remote may not simply un-hide it.** The remote sends
+/// pointer motion for the jitter of a hand holding it — including the wiggle of pressing a
+/// button — and on the player EVERY motion raises the HUD. So BACK hid the bar, the jitter raised
+/// it again at once, and the next BACK found it visible and hid it instead of leaving: a loop the
+/// viewer could not get out of (reported on an LG C3, 2026-09-19).
+///
+/// The rule, in two parts. For [`BACK_HIDE_QUIET_MS`] after the press nothing the pointer does
+/// counts at all — that is the press itself. After that the first position seen is the ANCHOR,
+/// and the transport comes back only once the pointer is [`BACK_HIDE_TRAVEL_PX`] away from it. A
+/// DISTANCE, not a path length: summing every motion lets ±2 px of jitter add up to 120 px in
+/// half a second. A hand at rest stays within a few px of where it settled; a deliberate point at
+/// the screen leaves it in a fraction of a second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BackHide {
+    pub(crate) at: u32,
+    /// where the pointer settled once the quiet window was over (None = not seen yet)
+    pub(crate) anchor: Option<(f32, f32)>,
+}
+pub(crate) const BACK_HIDE_QUIET_MS: u32 = 700;
+pub(crate) const BACK_HIDE_TRAVEL_PX: f32 = 120.0;
+
+/// May this pointer motion raise the transport? `true` with nothing BACK-hidden; otherwise it
+/// feeds the gate and answers `true` — clearing it — only once the travel is past the threshold.
+pub(crate) fn pointer_may_reveal(gate: &mut Option<BackHide>, now: u32, mx: f32, my: f32) -> bool {
+    let Some(g) = gate.as_mut() else {
+        return true;
+    };
+    if now.wrapping_sub(g.at) < BACK_HIDE_QUIET_MS {
+        return false; // the press itself
+    }
+    let Some((ax, ay)) = g.anchor else {
+        g.anchor = Some((mx, my));
+        return false;
+    };
+    if (mx - ax).abs() + (my - ay).abs() < BACK_HIDE_TRAVEL_PX {
+        return false;
+    }
+    *gate = None;
+    true
+}
+
 // scrub tuning: a press jumps SCRUB_STEP_NS; holding engages a continuous scrub ramping
 // SCRUB_BASE→SCRUB_MAX (playback-seconds per real-second). Defined in `ui::player_hud` and
 // re-exported here — the trailer transport's own hold-to-scrub (`screens::detail::trailer`) wants
@@ -480,6 +539,59 @@ mod hud_visibility_tests {
             hud.note_fresh_press(&ps, 10_000, false);
             assert!(!hud.visible_at_press, "the press found a hand-hidden HUD");
             assert!(!hud.dismissed, "the same bound press wakes it for the next decision");
+        });
+    }
+
+    /// BACK hides a transport that is on screen and leaves a bare picture — except while the
+    /// pipeline is LOADING, where the transport cannot be hidden and BACK must still leave.
+    #[test]
+    fn back_hides_a_visible_transport_but_never_traps_a_load() {
+        assert!(back_hides(true, false), "on screen: the first BACK hides it");
+        assert!(!back_hides(false, false), "a bare picture: BACK leaves");
+        assert!(!back_hides(true, true), "loading pins the transport up: BACK leaves");
+        assert!(!back_hides(false, true));
+    }
+
+    /// The jitter gate after a BACK-hide: the press wiggle is ignored outright, a resting hand
+    /// never reaches the threshold however long it jitters, a deliberate move does, and with
+    /// nothing BACK-hidden motion raises the HUD exactly as it always did.
+    #[test]
+    fn back_hidden_transport_ignores_the_remotes_jitter_but_not_a_real_move() {
+        let at = 10_000;
+        let hide = || Some(BackHide { at, anchor: None });
+        let mut g = hide();
+        assert!(!pointer_may_reveal(&mut g, at + 50, 1000.0, 600.0));
+        assert!(!pointer_may_reveal(&mut g, at + 600, 900.0, 500.0));
+        assert_eq!(g.and_then(|g| g.anchor), None, "the quiet window does not even anchor");
+        // a resting hand: ±2 px for three seconds — the case a summed PATH length failed
+        for i in 0..200u32 {
+            let d = if i % 2 == 0 { 2.0 } else { -2.0 };
+            assert!(!pointer_may_reveal(&mut g, at + 800 + i * 16, 900.0 + d, 500.0));
+        }
+        assert!(g.is_some(), "the bar stays down, so the next BACK leaves playback");
+        let mut g = hide();
+        let mut revealed = false;
+        for i in 0..10 {
+            revealed |=
+                pointer_may_reveal(&mut g, at + 800 + i * 16, 900.0 + i as f32 * 20.0, 500.0);
+        }
+        assert!(revealed && g.is_none(), "a real move clears the gate");
+        assert!(pointer_may_reveal(&mut None, at, 1.0, 1.0));
+    }
+
+    /// Any bound key and any segment offer clear the gate: they raise the transport on their own
+    /// authority, and a stale gate would then swallow the pointer on a transport that is up.
+    #[test]
+    fn a_key_or_an_offer_clears_the_back_hide_gate() {
+        let ps = crate::route::PlaybackSession::IDLE;
+        with_state(PlaybackState::Playing, || {
+            let gate = Some(BackHide { at: 1, anchor: None });
+            let mut hud = HudState { back_hidden: gate, ..HudState::IDLE };
+            hud.note_fresh_press(&ps, 10_000, false);
+            assert_eq!(hud.back_hidden, None, "a key");
+            let mut hud = HudState { back_hidden: gate, ..HudState::IDLE };
+            hud.raise_for_offer(10_000, 0);
+            assert_eq!(hud.back_hidden, None, "an offer");
         });
     }
 

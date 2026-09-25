@@ -1514,7 +1514,26 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
                 // the DISMISSAL and the ring in one act, because raising the timer alone left
                 // the tile behind a transport nobody drew. `HudState::raise_for_offer` is where
                 // that rule, its resting-position clause and the bug are written down.
-                player.hud.raise_for_offer(fr.now, fr.ctrl.primary_btn());
+                //
+                // "Skip intros automatically" takes an INTRO offer instead of raising it — the
+                // same two steps the button's own press performs (`activate_ctrl_row`), minus
+                // the un-pause, since nobody pressed anything. Retired first, so the seek landing
+                // on a keyframe still inside the segment does not offer it again. The session is
+                // read on this EDGE only, never per frame.
+                let auto = crate::screens::player::skip_pill::auto_skip(
+                    fr.ctrl,
+                    crate::plex::session::peek().auto_skip_intro(),
+                );
+                if let Some((marker, ns)) = auto {
+                    log("marker: intro skipped automatically");
+                    app.bridge
+                        .metadata_mut()
+                        .run(crate::stores::metadata::MetadataCmd::MarkSkipped(marker));
+                    request_seek(ns);
+                    player.skip_toast_at = Some(fr.now);
+                } else {
+                    player.hud.raise_for_offer(fr.now, fr.ctrl.primary_btn());
+                }
             } else if crate::ui::player_hud::standin_left_the_ring(
                 player.hud.was_standin,
                 fr.ctrl,
@@ -2200,6 +2219,11 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
             // An empty selected phase provides the profiler floor for this build; it
             // deliberately issues no GL commands between its two boundaries.
             crate::ui::profile::phase("profile.empty", || {});
+            // The player's chrome gives up light with the viewer's subtitle tone
+            // (`player_hud::chrome_dim`); every other route draws at full ink. Set before anything
+            // builds a `Painter::root()` and put back after the frame, so nothing drawn outside
+            // this phase inherits it.
+            crate::ui::set_chrome_rgb(if fr.player { crate::ui::player_hud::chrome_dim() } else { 1.0 });
             crate::ui::profile::phase("frame.ui", || {
                 crate::ui::guard(|| {
                     if fr.player {
@@ -2373,6 +2397,7 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                     crate::ui::runtime_warning::draw(app.boot_initial.is_some());
                 });
             });
+            crate::ui::set_chrome_rgb(1.0);
     (vx, vy, vw, vh)
 }
 

@@ -393,6 +393,26 @@ fn the_subtitle_tone_survives_the_canonical_split() {
     assert_eq!(public_session(&empty).subtitle_tone(), SubtitleTone::White);
 }
 
+/// "Skip intros automatically" is off when absent or malformed, and survives the canonical split
+/// (`split_public` → `join_canonical`, and the locked-bundle `public_session` snapshot) like the
+/// tone beside it.
+#[test]
+fn skip_intros_automatically_is_off_when_absent_and_survives_the_canonical_split() {
+    let parsed: Session = serde_json::from_str(r#"{"client_id":"c"}"#).unwrap();
+    assert!(!parsed.auto_skip_intro());
+    let garbage: Session =
+        serde_json::from_str(r#"{"client_id":"c","auto_skip_intro":"yes please"}"#).unwrap();
+    assert!(!garbage.auto_skip_intro(), "a malformed switch is off, never a parse failure");
+
+    let session = Session::default().with_auto_skip_intro(true);
+    let public = split_public(&session).unwrap();
+    assert_eq!(public.preferences["auto_skip_intro"], true);
+    assert!(join_canonical(&public, MINIMAL_PROTECTED_AUTH).unwrap().auto_skip_intro());
+    assert!(public_session(&public).auto_skip_intro());
+    let empty = crate::storage::state::PublicPayload::default();
+    assert!(!join_canonical(&empty, MINIMAL_PROTECTED_AUTH).unwrap().auto_skip_intro());
+}
+
 /// **A session written before household evidence existed reads as TODAY's behaviour, not worse.**
 ///
 /// `SourceRef::home`/`owner_id` are absent from every file on every television right now, and the

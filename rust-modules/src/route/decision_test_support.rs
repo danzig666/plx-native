@@ -362,6 +362,8 @@ pub(super) fn fourk_item_with_subs(
         video_fps: 23.976,
         width: 3840,
         height: 2160,
+        hdr: false,
+        vcodec: "hevc".into(),
         bitrate: 48_000,
         dovi: crate::metadata::Dovi::NONE,
         markers: Vec::new(),

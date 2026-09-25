@@ -454,6 +454,28 @@ fn card_shadow_params(h: f32, f: f32) -> (f32, f32, f32) {
     )
 }
 
+thread_local! {
+    /// **The chrome dim** — the RGB multiplier every [`Painter::root`] starts from. `1.0` (the
+    /// rest value) draws every token at its authored code. The player frame sets it from the
+    /// viewer's subtitle tone for the pass it draws and puts it back after (`app/run.rs`'s
+    /// `draw`), so the transport, the panels and the read-outs standing on an HDR picture give
+    /// up light with the caption — and no other screen is touched, since nothing else draws
+    /// between set and reset. Ambient rather than a parameter because the player's draw tree is a
+    /// dozen modules deep and half of them build their own `Painter::root()`; threading a value
+    /// through every one of them is the drift this cascade exists to avoid. Thread-local because
+    /// only the draw thread paints, and so a host test that sets it cannot leak into another.
+    static CHROME_RGB: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Set the chrome dim for everything drawn on this thread until it is set again. Clamped to 0..=1.
+pub(crate) fn set_chrome_rgb(m: f32) {
+    CHROME_RGB.with(|c| c.set(m.clamp(0.0, 1.0)));
+}
+
+pub(crate) fn chrome_rgb() -> f32 {
+    CHROME_RGB.with(|c| c.get())
+}
+
 impl Painter {
     fn declare(self, r: Rect, tag: u64, values: impl FnOnce(&mut Vec<u64>)) -> bool {
         if self.text_recorder { return true; }
@@ -484,7 +506,17 @@ impl Painter {
         true
     }
 
-    pub const fn root() -> Self {
+    /// A root painter under the current chrome dim ([`set_chrome_rgb`]).
+    pub fn root() -> Self {
+        Self {
+            rgb: chrome_rgb(),
+            ..Self::untinted()
+        }
+    }
+    /// A root painter at full ink whatever the chrome dim — for the one thing that already
+    /// carries the viewer's tone in its own colour, the subtitle caption, which the dim would
+    /// otherwise darken twice.
+    pub const fn untinted() -> Self {
         Self {
             dx: 0.0,
             dy: 0.0,
@@ -496,7 +528,7 @@ impl Painter {
         }
     }
     pub(crate) const fn recording() -> Self {
-        Self { text_recorder: true, ..Self::root() }
+        Self { text_recorder: true, ..Self::untinted() }
     }
     pub(crate) const fn is_recording(self) -> bool {
         self.text_recorder
