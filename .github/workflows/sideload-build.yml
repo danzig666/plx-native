@@ -39,31 +39,51 @@ env:
   RUST_NIGHTLY: nightly-2026-07-02
 
 jobs:
+  # A release run (a `v*-fork.*` tag, or a dispatch with `release_tag`) of a commit this workflow
+  # has already run green does not run the host checks a second time: the packages are rebuilt
+  # (they are what gets published), the checks' verdict on the same tree is reused. Anything else
+  # — every branch push, a release of a commit never checked — runs them.
+  prior:
+    name: already checked?
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      checked: ${{ steps.look.outputs.checked }}
+    steps:
+      - id: look
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '' }}
+        run: |
+          checked=false
+          if [ "$RELEASE" = true ]; then
+            n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sideload-build.yml/runs?head_sha=$GITHUB_SHA&status=success&per_page=1" --jq '.total_count')
+            [ "${n:-0}" -gt 0 ] && checked=true
+          fi
+          echo "checked=$checked" >> "$GITHUB_OUTPUT"
+          echo "host checks already green for $GITHUB_SHA: $checked" >> "$GITHUB_STEP_SUMMARY"
+
   host-checks:
-    # `make check`'s four stages (see the Makefile's `check` rule) plus the RELEASE feature set,
-    # each on its own runner at once rather than one after another on a single one: the wall clock
-    # is the slowest stage (~a unit-suite build and run), not the sum of five crate builds. Each
-    # stage keeps its own rust-cache, so a warm run rebuilds only this crate, never its deps.
     name: host checks (${{ matrix.stage }})
+    needs: prior
+    if: needs.prior.outputs.checked != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - stage: lint
-            run: make RUST_NIGHTLY="$RUST_NIGHTLY" lint
-          - stage: unit
-            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check-unit
-          - stage: hostsim
-            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check-hostsim
-          - stage: tools
-            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check-tools
-          - stage: release-features
+          - stage: make check
+            id: check
+            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check
+          # beside it rather than after it: a separate crate build that needs nothing check builds
+          - stage: release features
+            id: release-features
             run: cd rust-modules && cargo "+$RUST_NIGHTLY" check --lib --no-default-features
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # `check-tools` runs tooling self-tests that derive a chronology from `git log`, which a
+          # `make check` runs tooling self-tests that derive a chronology from `git log`, which a
           # shallow clone cannot answer (ci.yml does the same, for the same reason).
           fetch-depth: 0
       - name: Install the desktop SDL/GL libraries the hostsim suite links against
@@ -72,10 +92,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev
       - name: Install nightly Rust
         run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src --component clippy
+      # The crate's dependencies, compiled once and restored after: a warm run rebuilds only this
+      # crate.
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: rust-modules
-          key: host-${{ matrix.stage }}
+          key: host-${{ matrix.id }}
       - name: ${{ matrix.stage }}
         env:
           CARGO_INCREMENTAL: "0"
@@ -147,8 +169,15 @@ jobs:
 
   publish:
     name: publish the fork release
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
-    needs: [host-checks, package]
+    # `always()` so a host-checks job SKIPPED by `prior` does not skip this one with it; the
+    # condition then states the gate itself: packages built, and the checks green now or before.
+    if: >-
+      always()
+      && (startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '')
+      && needs.package.result == 'success'
+      && (needs.host-checks.result == 'success'
+          || (needs.host-checks.result == 'skipped' && needs.prior.outputs.checked == 'true'))
+    needs: [prior, host-checks, package]
     runs-on: ubuntu-latest
     # The only job with a write token, and only on a tag.
     permissions:
