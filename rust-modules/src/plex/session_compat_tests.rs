@@ -411,6 +411,17 @@ fn skip_intros_automatically_is_off_when_absent_and_survives_the_canonical_split
     assert!(public_session(&public).auto_skip_intro());
     let empty = crate::storage::state::PublicPayload::default();
     assert!(!join_canonical(&empty, MINIMAL_PROTECTED_AUTH).unwrap().auto_skip_intro());
+
+    // …and its credits twin, independently
+    let parsed: Session = serde_json::from_str(r#"{"client_id":"c"}"#).unwrap();
+    assert!(!parsed.auto_skip_credits());
+    let session = Session::default().with_auto_skip_credits(true);
+    let public = split_public(&session).unwrap();
+    assert_eq!(public.preferences["auto_skip_credits"], true);
+    assert_eq!(public.preferences["auto_skip_intro"], false);
+    let joined = join_canonical(&public, MINIMAL_PROTECTED_AUTH).unwrap();
+    assert!(joined.auto_skip_credits() && !joined.auto_skip_intro());
+    assert!(public_session(&public).auto_skip_credits());
 }
 
 /// **A session written before household evidence existed reads as TODAY's behaviour, not worse.**

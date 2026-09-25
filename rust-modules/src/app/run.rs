@@ -1492,6 +1492,7 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         // Focus follows the control row's OCCUPANT, on both edges. Driven by slot identity
         // rather than a "was something shown" bool, because the two edges have different jobs
         // and the previous bool implemented neither of the ones its comment promised.
+        let mut advance = false;
         if let Some(player) = super::bridge::player_mut(&mut app.pages) {
             // Keyed on the SEGMENT, not the slot, and `last_offer` is only ever advanced to
             // a real offer — never cleared back to None. `active_marker` is gated on `is_playing`,
@@ -1515,24 +1516,32 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
                 // the tile behind a transport nobody drew. `HudState::raise_for_offer` is where
                 // that rule, its resting-position clause and the bug are written down.
                 //
-                // "Skip intros automatically" takes an INTRO offer instead of raising it — the
-                // same two steps the button's own press performs (`activate_ctrl_row`), minus
-                // the un-pause, since nobody pressed anything. Retired first, so the seek landing
-                // on a keyframe still inside the segment does not offer it again. The session is
-                // read on this EDGE only, never per frame.
-                let auto = crate::screens::player::skip_pill::auto_skip(
+                // "Skip intros/credits automatically" takes the offer instead of raising it
+                // (`skip_pill::auto_skip`). A SEEK is the same two steps the button's own press
+                // performs (`activate_ctrl_row`), minus the un-pause, since nobody pressed
+                // anything: retired first, so the seek landing on a keyframe still inside the
+                // segment does not offer it again. The session is read on this EDGE only, never
+                // per frame.
+                let sess = crate::plex::session::peek();
+                match crate::screens::player::skip_pill::auto_skip(
                     fr.ctrl,
-                    crate::plex::session::peek().auto_skip_intro(),
-                );
-                if let Some((marker, ns)) = auto {
-                    log("marker: intro skipped automatically");
-                    app.bridge
-                        .metadata_mut()
-                        .run(crate::stores::metadata::MetadataCmd::MarkSkipped(marker));
-                    request_seek(ns);
-                    player.skip_toast_at = Some(fr.now);
-                } else {
-                    player.hud.raise_for_offer(fr.now, fr.ctrl.primary_btn());
+                    sess.auto_skip_intro(),
+                    sess.auto_skip_credits(),
+                ) {
+                    Some(crate::screens::player::skip_pill::AutoSkip::Seek { marker, ns }) => {
+                        log(&format!("marker: {:?} skipped automatically", marker.kind));
+                        app.bridge
+                            .metadata_mut()
+                            .run(crate::stores::metadata::MetadataCmd::MarkSkipped(marker));
+                        request_seek(ns);
+                        player.skip_toast = Some((fr.now, marker.kind));
+                    }
+                    // Closing credits: performed below, once this borrow of the page is over —
+                    // it starts the next item or leaves the player.
+                    Some(crate::screens::player::skip_pill::AutoSkip::Advance) => {
+                        advance = true;
+                    }
+                    None => player.hud.raise_for_offer(fr.now, fr.ctrl.primary_btn()),
                 }
             } else if crate::ui::player_hud::standin_left_the_ring(
                 player.hud.was_standin,
@@ -1549,6 +1558,21 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
             }
             player.hud.was_standin = !fr.ctrl.is_discs();
             player.publish();
+        }
+        // "Skip credits automatically" at the CLOSING credits: exactly what the row's primary
+        // does when pressed — *Next Episode* on Up Next, Skip Credits (finish the item) on a
+        // `final` segment with nothing queued.
+        if advance {
+            log("marker: Credits skipped automatically");
+            super::playback::activate_ctrl_row(
+                &mut app.player.session,
+                &mut app.adapters.player,
+                fr.ctrl,
+                &mut app.refresh_hubs_at,
+                crate::ui::up_next::BTN_NEXT,
+                &mut app.pages,
+                &mut app.bridge,
+            );
         }
         // While the countdown runs, hold the HUD up — a timer nobody can see is a cut to the
         // next episode out of nowhere. `hud.dismissed` has to clear with it, not just the

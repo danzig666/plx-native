@@ -129,9 +129,10 @@ pub(crate) struct PlayerScreen {
     pub(crate) lifted: bool,
     /// Where this playback returns to — see [`Origin`].
     pub(crate) origin: Option<Origin>,
-    /// When "Skip intros automatically" last took an intro (`app/run.rs`, on the offer's edge):
-    /// the "Intro skipped" notice fades out [`skip_pill::SKIP_TOAST_MS`] after it.
-    pub(crate) skip_toast_at: Option<u32>,
+    /// When an automatic skip last took a segment, and which kind (`app/run.rs`, on the offer's
+    /// edge): the "Intro skipped" / "Credits skipped" notice fades out
+    /// [`skip_pill::SKIP_TOAST_MS`] after it.
+    pub(crate) skip_toast: Option<(u32, crate::metadata::MarkerKind)>,
     render: PlayerRender,
     repair_alert: crate::ui::decision_alert::DecisionAlert,
     repair_frames: std::cell::Cell<Option<(Rect, Rect)>>,
@@ -150,7 +151,7 @@ impl PlayerScreen {
             transport: true,
             lifted: false,
             origin: None,
-            skip_toast_at: None,
+            skip_toast: None,
             render: PlayerRender::default(),
             repair_alert: {
                 let mut alert = crate::ui::decision_alert::DecisionAlert::new();
@@ -195,7 +196,7 @@ impl PlayerScreen {
             self.hud.dismissed = false;
             self.hud.last_offer = None;
             self.up_next.reset();
-            self.skip_toast_at = None;
+            self.skip_toast = None;
         }
         self.publish();
     }
@@ -335,7 +336,7 @@ impl PlayerScreen {
     ///   is not repeated here.)
     /// * `busy` — the read-out appearing and vanishing, including the `Playing -> Error` edge with
     ///   the HUD auto-hidden, where nothing else in the frame moves at all.
-    /// * the "Intro skipped" notice's opacity, in 1/32 steps — a DEADLINE-driven fade, so its
+    /// * the "… skipped" notice's opacity, in 1/32 steps — a DEADLINE-driven fade, so its
     ///   frames are owed while it moves and not one after it reaches 0.
     pub(crate) fn clock_fingerprint(&self, ps: &crate::route::PlaybackSession, now: u32) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
@@ -384,10 +385,10 @@ impl PlayerScreen {
         h
     }
 
-    /// The "Intro skipped" notice's opacity at `now` — 0 when there is none.
+    /// The "… skipped" notice's opacity at `now` — 0 when there is none.
     fn skip_toast_alpha(&self, now: u32) -> f32 {
-        self.skip_toast_at
-            .map_or(0.0, |at| skip_pill::skip_toast_alpha(now.wrapping_sub(at)))
+        self.skip_toast
+            .map_or(0.0, |(at, _)| skip_pill::skip_toast_alpha(now.wrapping_sub(at)))
     }
 
     /// Is the transport on screen right now?
@@ -1281,7 +1282,9 @@ impl<H: PlayerLike + crate::screens::registry::MetadataLike> Screen<H> for Playe
         crate::ui::player_hud::draw_readout(ps, self.busy, now, f.measure);
         // Not chrome either: it outlives a hidden HUD, which is the whole of its use — an
         // automatic skip happens with nobody touching the remote.
-        skip_pill::draw_skip_toast(self.skip_toast_alpha(now), f.measure);
+        if let Some((_, kind)) = self.skip_toast {
+            skip_pill::draw_skip_toast(kind, self.skip_toast_alpha(now), f.measure);
+        }
         if self.repair_alert.visible() {
             self.repair_alert.draw_scrim();
             self.repair_alert.draw(c"Cancel", c"Repair");
@@ -1462,7 +1465,7 @@ mod clock_animator_tests {
         assert!(!screen.hud_up(&ps, 10_000), "the fixture: the transport is hidden");
 
         settled(&mut pl, &screen, &ps, 9_000);
-        screen.skip_toast_at = Some(10_000);
+        screen.skip_toast = Some((10_000, crate::metadata::MarkerKind::Intro));
         assert!(
             reported(&mut pl, &screen, &ps, 10_100),
             "the notice is fading in: it must report",

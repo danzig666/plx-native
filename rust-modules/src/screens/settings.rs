@@ -950,6 +950,7 @@ enum Action {
     AutoSignIn,
     TrailerAutoplay,
     AutoSkipIntro,
+    AutoSkipCredits,
     About,
 }
 
@@ -964,6 +965,7 @@ pub(crate) struct RootPage {
     pending_auto: Option<(bool, crate::storage_worker::TypedTicket<bool>)>,
     pending_trailer: Option<(bool, crate::storage_worker::TypedTicket<bool>)>,
     pending_skip: Option<(bool, crate::storage_worker::TypedTicket<bool>)>,
+    pending_credits: Option<(bool, crate::storage_worker::TypedTicket<bool>)>,
 }
 
 struct RootState {
@@ -971,6 +973,7 @@ struct RootState {
     auto_sign_in: bool,
     trailer_autoplay: bool,
     auto_skip_intro: bool,
+    auto_skip_credits: bool,
 }
 
 impl LogicalState for RootState {
@@ -978,12 +981,17 @@ impl LogicalState for RootState {
         w.u32(self.sel as u32)
             .bool(self.auto_sign_in)
             .bool(self.trailer_autoplay)
-            .bool(self.auto_skip_intro);
+            .bool(self.auto_skip_intro)
+            .bool(self.auto_skip_credits);
     }
     fn probe(&self, out: &mut String) {
         out.push_str(&format!(
-            "root sel={} auto_sign_in={} trailer_autoplay={} auto_skip_intro={}",
-            self.sel, self.auto_sign_in, self.trailer_autoplay, self.auto_skip_intro
+            "root sel={} auto_sign_in={} trailer_autoplay={} auto_skip_intro={} auto_skip_credits={}",
+            self.sel,
+            self.auto_sign_in,
+            self.trailer_autoplay,
+            self.auto_skip_intro,
+            self.auto_skip_credits
         ));
     }
 }
@@ -996,12 +1004,13 @@ impl RootPage {
             rows: Vec::new(),
             session_watch: Default::default(),
             session_snapshot: Default::default(),
-            pending_auto: None, pending_trailer: None, pending_skip: None,
+            pending_auto: None, pending_trailer: None, pending_skip: None, pending_credits: None,
             state: RootState {
                 sel: 0,
                 auto_sign_in: false,
                 trailer_autoplay: true,
                 auto_skip_intro: false,
+                auto_skip_credits: false,
             },
         };
         s.rebuild(0, directory);
@@ -1017,10 +1026,12 @@ impl RootPage {
         let auto_sign_in = self.pending_auto.as_ref().map_or_else(|| sess.auto_sign_in(), |(value, _)| *value);
         let trailer_autoplay = self.pending_trailer.as_ref().map_or_else(|| sess.trailer_autoplay(), |(value, _)| *value);
         let auto_skip_intro = self.pending_skip.as_ref().map_or_else(|| sess.auto_skip_intro(), |(value, _)| *value);
+        let auto_skip_credits = self.pending_credits.as_ref().map_or_else(|| sess.auto_skip_credits(), |(value, _)| *value);
         let multi_user = sess.home_users.len() > 1;
         self.state.auto_sign_in = auto_sign_in;
         self.state.trailer_autoplay = trailer_autoplay;
         self.state.auto_skip_intro = auto_skip_intro;
+        self.state.auto_skip_credits = auto_skip_credits;
 
         let mut actions = Vec::new();
         let mut sections = Vec::new();
@@ -1057,13 +1068,19 @@ impl RootPage {
         actions.extend([Action::Privacy, Action::Legal]);
         if signed_in {
             sections.push(
-                Section::new("Playback").row(
-                    Row::new("Skip intros automatically")
-                        .detail("Jump past a show's intro as soon as it starts.")
-                        .toggle(auto_skip_intro),
-                ),
+                Section::new("Playback")
+                    .row(
+                        Row::new("Skip intros automatically")
+                            .detail("Jump past a show's intro as soon as it starts.")
+                            .toggle(auto_skip_intro),
+                    )
+                    .row(
+                        Row::new("Skip credits automatically")
+                            .detail("Skip the credits, or go straight to the next episode.")
+                            .toggle(auto_skip_credits),
+                    ),
             );
-            actions.push(Action::AutoSkipIntro);
+            actions.extend([Action::AutoSkipIntro, Action::AutoSkipCredits]);
         }
         let mut system = Section::new("System");
         // A one-person account already skips the picker; the switch only changes a multi-user boot.
@@ -1141,6 +1158,14 @@ impl RootPage {
                 }
                 self.rebuild(self.table.sel, directory);
             }
+            Action::AutoSkipCredits => {
+                let on = !self.state.auto_skip_credits;
+                if let Ok(ticket) = crate::plex::session::queue_update_ticket(move |current|
+                    (current.auto_skip_credits() != on).then(|| current.with_auto_skip_credits(on))) {
+                    self.pending_credits = Some((on, ticket));
+                }
+                self.rebuild(self.table.sel, directory);
+            }
             Action::Favourites => fx.push(Fx::Nav(NavOp::Push(SettingsPage::Favourites))),
             Action::Privacy => fx.push(Fx::Nav(NavOp::Push(SettingsPage::Privacy))),
             Action::Legal => fx.push(Fx::Nav(NavOp::Push(SettingsPage::Legal))),
@@ -1166,7 +1191,7 @@ impl Machine<InnerHost> for RootPage {
             }
             ScreenEvent::Tick(t) => {
                 let mut landed = self.session_watch.changed();
-                for pending in [&mut self.pending_auto, &mut self.pending_trailer, &mut self.pending_skip] {
+                for pending in [&mut self.pending_auto, &mut self.pending_trailer, &mut self.pending_skip, &mut self.pending_credits] {
                     if pending.as_ref().is_some_and(|(_, ticket)| !matches!(ticket.try_recv(),
                         Err(std::sync::mpsc::TryRecvError::Empty))) {
                         // Read AFTER the receipt: the worker may have installed Locked/Blocked

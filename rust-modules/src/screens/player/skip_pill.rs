@@ -72,21 +72,38 @@ pub(crate) fn prompt_for(m: metadata::Marker) -> Prompt {
     }
 }
 
-/// **"Skip intros automatically"** (Settings → Playback): the seek an INTRO offer is taken with at
-/// once, instead of raising the Skip Intro button, and the segment to retire before it. `None` —
-/// the ordinary button — for the switch off, for a credits offer (Up Next and "let it run" are
-/// choices the viewer makes), and for anything that is not a seek. PURE, so the rule is
+/// What an automatic skip does with a fresh control-row offer — see [`auto_skip`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AutoSkip {
+    /// Retire `marker` and seek to `ns` — an intro, or credits that are not the item's last
+    /// segment. The "… skipped" notice names `marker.kind`.
+    Seek { marker: metadata::Marker, ns: i64 },
+    /// The item's closing credits: perform what the row's own primary would — start the queued
+    /// episode (Up Next's *Next Episode*), or finish the item when nothing is queued (a `final`
+    /// segment's Skip Credits). `activate_ctrl_row` does either from the slot.
+    Advance,
+}
+
+/// **"Skip intros automatically" / "Skip credits automatically"** (Settings → Playback): what a
+/// fresh offer is taken as at once, instead of raising the button. `None` — the ordinary
+/// button — for a kind whose switch is off, and for the discs. PURE, so the rule is
 /// host-testable; the frame loop performs it on the offer's fresh edge (`app/run.rs`).
 pub(crate) fn auto_skip(
     slot: crate::ui::player_hud::ControlSlot,
-    enabled: bool,
-) -> Option<(metadata::Marker, i64)> {
+    intro: bool,
+    credits: bool,
+) -> Option<AutoSkip> {
+    use crate::ui::player_hud::ControlSlot;
+    let on = |kind| match kind {
+        MarkerKind::Intro => intro,
+        MarkerKind::Credits => credits,
+    };
     match slot {
-        crate::ui::player_hud::ControlSlot::Skip(Prompt {
-            marker,
-            kind: MarkerKind::Intro,
-            action: SkipAction::Seek(ns),
-        }) if enabled => Some((marker, ns)),
+        ControlSlot::Skip(pr) if on(pr.kind) => Some(match pr.action {
+            SkipAction::Seek(ns) => AutoSkip::Seek { marker: pr.marker, ns },
+            SkipAction::Finish => AutoSkip::Advance,
+        }),
+        ControlSlot::UpNext(m) if on(m.kind) => Some(AutoSkip::Advance),
         _ => None,
     }
 }
@@ -127,7 +144,13 @@ pub(crate) fn draw(row: &mut crate::ui::player_hud::TransportRow, p: Painter, pr
 pub(crate) const SKIP_TOAST_MS: u32 = 2_500;
 /// Each fade's share of [`SKIP_TOAST_MS`] — in at the start, out at the end.
 const SKIP_TOAST_FADE_MS: u32 = 200;
-const SKIP_TOAST_TEXT: &CStr = c"Intro skipped";
+/// The notice's words, per skipped kind.
+fn skip_toast_text(kind: MarkerKind) -> &'static CStr {
+    match kind {
+        MarkerKind::Intro => c"Intro skipped",
+        MarkerKind::Credits => c"Credits skipped",
+    }
+}
 const SKIP_TOAST_H: f32 = 64.0;
 const SKIP_TOAST_PAD: f32 = 32.0;
 
@@ -151,18 +174,19 @@ fn skip_toast_rect(text_w: f32) -> Rect {
     Rect::new((SCR_W - w) * 0.5, SAFE.y, w, SKIP_TOAST_H)
 }
 
-/// Draw "Intro skipped" at `alpha` ([`skip_toast_alpha`]); nothing at 0. Not a control: it takes
+/// Draw "Intro skipped" / "Credits skipped" at `alpha` ([`skip_toast_alpha`]); nothing at 0. Not a control: it takes
 /// no focus and no keys, and every key keeps doing what it did while it is up. Its own opaque
 /// ground, like the read-outs', because on this route the UI plane is cleared transparent and
 /// the pill stands on whatever frame of video is under it.
-pub(crate) fn draw_skip_toast(alpha: f32, measure: &dyn crate::ui::machine::Measure) {
+pub(crate) fn draw_skip_toast(kind: MarkerKind, alpha: f32, measure: &dyn crate::ui::machine::Measure) {
     if alpha <= 0.0 {
         return;
     }
-    let r = skip_toast_rect(measure.width(SKIP_TOAST_TEXT, theme::size::BODY, true));
+    let text = skip_toast_text(kind);
+    let r = skip_toast_rect(measure.width(text, theme::size::BODY, true));
     let p = Painter::root().alpha(alpha);
     p.rect(r, r.h * 0.5, theme::PANEL_TOP, theme::PANEL_BOT, 0.0);
-    Label::new(SKIP_TOAST_TEXT.as_ptr(), theme::size::BODY, theme::TEXT_PRIMARY)
+    Label::new(text.as_ptr(), theme::size::BODY, theme::TEXT_PRIMARY)
         .bold()
         .h(HAlign::Center)
         .v(VAlign::Middle)
@@ -178,19 +202,24 @@ mod auto_skip_tests {
         metadata::Marker { kind, start_ms: 10_000, end_ms: 70_000, final_seg }
     }
 
-    /// Only an intro is taken automatically, only with the switch on, and at the segment's end.
+    /// Each kind is taken only with its own switch on; an intro or mid-item credits seek to the
+    /// segment's end, closing credits advance (the next episode, or the item's end).
     #[test]
-    fn only_an_intro_is_skipped_automatically_and_only_when_asked() {
+    fn each_kind_is_skipped_automatically_only_under_its_own_switch() {
         let intro = seg(MarkerKind::Intro, false);
-        assert_eq!(
-            auto_skip(ControlSlot::Skip(prompt_for(intro)), true),
-            Some((intro, 70_000 * 1_000_000))
-        );
-        assert_eq!(auto_skip(ControlSlot::Skip(prompt_for(intro)), false), None, "switch off");
-        for credits in [seg(MarkerKind::Credits, false), seg(MarkerKind::Credits, true)] {
-            assert_eq!(auto_skip(ControlSlot::Skip(prompt_for(credits)), true), None);
-        }
-        assert_eq!(auto_skip(ControlSlot::Discs, true), None);
+        let credits = seg(MarkerKind::Credits, false);
+        let closing = seg(MarkerKind::Credits, true);
+        let seek = |m: metadata::Marker| Some(AutoSkip::Seek { marker: m, ns: 70_000 * 1_000_000 });
+        let skip = |m| ControlSlot::Skip(prompt_for(m));
+
+        assert_eq!(auto_skip(skip(intro), true, false), seek(intro));
+        assert_eq!(auto_skip(skip(intro), false, true), None, "the credits switch is not the intro's");
+        assert_eq!(auto_skip(skip(credits), false, true), seek(credits), "mid-item credits seek past");
+        assert_eq!(auto_skip(skip(credits), true, false), None, "the intro switch is not the credits'");
+        assert_eq!(auto_skip(skip(closing), false, true), Some(AutoSkip::Advance), "closing credits finish");
+        assert_eq!(auto_skip(ControlSlot::UpNext(closing), false, true), Some(AutoSkip::Advance), "…or play the next one");
+        assert_eq!(auto_skip(ControlSlot::UpNext(closing), true, false), None);
+        assert_eq!(auto_skip(ControlSlot::Discs, true, true), None);
     }
 
     /// The notice fades in, holds, fades out and is GONE at its deadline — the deadline is also

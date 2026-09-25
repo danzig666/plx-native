@@ -106,12 +106,20 @@ fn a_multi_user_root_toggles_automatically_sign_in_in_place() {
     assert_eq!(s.inner.depth(), 1);
 }
 
-/// Skip intros automatically is a switch like Automatically Sign In: OK flips it in place, no
-/// page is pushed, and the queued write is durable once the worker completes.
+/// The two Playback switches behave like Automatically Sign In: OK flips each in place, no page
+/// is pushed, the queued write is durable once the worker completes, and neither flips the other.
 #[test]
-fn the_root_toggles_skip_intros_automatically_in_place() {
+fn the_root_toggles_both_skip_switches_in_place() {
+    for (row_elem, credits) in [(AUTO_SKIP_INTRO_ROW, false), (AUTO_SKIP_CREDITS_ROW, true)] {
+        toggles_a_skip_switch(row_elem, credits);
+    }
+}
+
+fn toggles_a_skip_switch(row_elem: u32, credits: bool) {
+    let get = |s: &crate::plex::session::Session| if credits { s.auto_skip_credits() } else { s.auto_skip_intro() };
+    let other = |s: &crate::plex::session::Session| if credits { s.auto_skip_intro() } else { s.auto_skip_credits() };
     let _g = crate::testlock::serial();
-    let _sess = multi_user_session("root-auto-skip-toggle");
+    let _sess = multi_user_session(if credits { "root-auto-credits-toggle" } else { "root-auto-skip-toggle" });
     let mut s = RouteSurface::new(
         EntryId(0),
         InstanceId(0),
@@ -122,7 +130,7 @@ fn the_root_toggles_skip_intros_automatically_in_place() {
     step(&mut s, ScreenEvent::Mount, None);
     let row = FocusKey {
         entry: EntryId(0),
-        elem: AUTO_SKIP_INTRO_ROW,
+        elem: row_elem,
     };
     step(
         &mut s,
@@ -133,22 +141,22 @@ fn the_root_toggles_skip_intros_automatically_in_place() {
         },
         Some(row),
     );
-    assert!(!crate::plex::session::peek().auto_skip_intro(), "off by default");
+    assert!(!get(&crate::plex::session::peek()), "off by default");
     step(&mut s, ScreenEvent::Activate(row.elem), Some(row));
     crate::storage_worker::drain_for_test();
     assert_eq!(name(&s), word::SETTINGS, "OK on the switch must not push a page");
     assert_eq!(s.inner.depth(), 1);
     assert!(
-        crate::plex::session::peek().auto_skip_intro(),
+        get(&crate::plex::session::peek()),
         "the queued switch is durable after the worker completes"
     );
     assert!(
-        !crate::plex::session::peek().auto_sign_in(),
+        !crate::plex::session::peek().auto_sign_in() && !other(&crate::plex::session::peek()),
         "…and it is its own switch, not a neighbour's"
     );
     step(&mut s, ScreenEvent::Activate(row.elem), Some(row));
     crate::storage_worker::drain_for_test();
-    assert!(!crate::plex::session::peek().auto_skip_intro());
+    assert!(!get(&crate::plex::session::peek()));
 }
 
 #[test]

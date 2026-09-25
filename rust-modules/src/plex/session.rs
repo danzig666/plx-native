@@ -565,6 +565,11 @@ pub struct Session {
     /// Soft-parsed: a malformed value costs the preference, never the credentials.
     #[serde(default, deserialize_with = "de_soft_bool")]
     pub(crate) auto_skip_intro: bool,
+    /// **Skip credits automatically** — the credits twin of [`Session::auto_skip_intro`]: seek
+    /// past a mid-item credits marker, and at the closing credits play the queued episode (or
+    /// finish the item) instead of offering Skip Credits / Up Next. Absence is off.
+    #[serde(default, deserialize_with = "de_soft_bool")]
+    pub(crate) auto_skip_credits: bool,
     /// **Device-wide ambient memory**: the last hero `UltraBlurColors` envelope Home actually
     /// rendered on this television, so a route in the Settings/first-run family that opens
     /// BEFORE Home has fetched anything this boot — first-run consent moved ahead of the
@@ -616,6 +621,8 @@ struct CanonicalSessionPreferences {
     subtitle_tone: SubtitleTone,
     #[serde(default, deserialize_with = "de_soft_bool")]
     auto_skip_intro: bool,
+    #[serde(default, deserialize_with = "de_soft_bool")]
+    auto_skip_credits: bool,
     /// Parsed only so a future preference does not make the known fields disappear. The shipping
     /// adapter merges these opaque keys from the current DB8 public payload before every rewrite;
     /// they are not promoted into the Session domain object.
@@ -640,6 +647,7 @@ impl Default for CanonicalSessionPreferences {
             trailer_autoplay: true,
             subtitle_tone: SubtitleTone::White,
             auto_skip_intro: false,
+            auto_skip_credits: false,
             extensions: BTreeMap::new(),
         }
     }
@@ -681,6 +689,7 @@ fn split_public(session: &Session) -> Result<crate::storage::state::PublicPayloa
         trailer_autoplay: session.trailer_autoplay,
         subtitle_tone: session.subtitle_tone,
         auto_skip_intro: session.auto_skip_intro,
+        auto_skip_credits: session.auto_skip_credits,
         extensions: BTreeMap::new(),
     })
     .map_err(|_| ())?;
@@ -744,6 +753,7 @@ pub(crate) fn join_canonical(
         trailer_autoplay: preferences.trailer_autoplay,
         subtitle_tone: preferences.subtitle_tone,
         auto_skip_intro: preferences.auto_skip_intro,
+        auto_skip_credits: preferences.auto_skip_credits,
         profiles,
         extensions: auth.extensions,
     })
@@ -766,6 +776,7 @@ fn public_session(public: &crate::storage::state::PublicPayload) -> Session {
         trailer_autoplay: preferences.trailer_autoplay,
         subtitle_tone: preferences.subtitle_tone,
         auto_skip_intro: preferences.auto_skip_intro,
+        auto_skip_credits: preferences.auto_skip_credits,
         home_pins, recent_searches,
         ..Default::default()
     }
@@ -1702,6 +1713,16 @@ impl Session {
     pub(crate) fn with_auto_skip_intro(&self, on: bool) -> Self {
         let mut next = self.clone();
         next.auto_skip_intro = on;
+        next
+    }
+
+    pub(crate) fn auto_skip_credits(&self) -> bool {
+        self.auto_skip_credits
+    }
+
+    pub(crate) fn with_auto_skip_credits(&self, on: bool) -> Self {
+        let mut next = self.clone();
+        next.auto_skip_credits = on;
         next
     }
 
