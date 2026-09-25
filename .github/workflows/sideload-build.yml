@@ -40,24 +40,46 @@ env:
 
 jobs:
   host-checks:
-    name: host checks (lint + unit suite)
+    # `make check`'s four stages (see the Makefile's `check` rule) plus the RELEASE feature set,
+    # each on its own runner at once rather than one after another on a single one: the wall clock
+    # is the slowest stage (~a unit-suite build and run), not the sum of five crate builds. Each
+    # stage keeps its own rust-cache, so a warm run rebuilds only this crate, never its deps.
+    name: host checks (${{ matrix.stage }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - stage: lint
+            run: make RUST_NIGHTLY="$RUST_NIGHTLY" lint
+          - stage: unit
+            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check-unit
+          - stage: hostsim
+            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check-hostsim
+          - stage: tools
+            run: make RUST_NIGHTLY="$RUST_NIGHTLY" check-tools
+          - stage: release-features
+            run: cd rust-modules && cargo "+$RUST_NIGHTLY" check --lib --no-default-features
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # `make check` runs tooling self-tests that derive a chronology from `git log`, which a
+          # `check-tools` runs tooling self-tests that derive a chronology from `git log`, which a
           # shallow clone cannot answer (ci.yml does the same, for the same reason).
           fetch-depth: 0
       - name: Install the desktop SDL/GL libraries the hostsim suite links against
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev
+          sudo apt-get install -y --no-install-recommends libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev
       - name: Install nightly Rust
         run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src --component clippy
-      - name: make check
-        run: make RUST_NIGHTLY="$RUST_NIGHTLY" check
-      - name: Type-check the RELEASE feature set
-        run: cd rust-modules && CARGO_INCREMENTAL=0 cargo "+$RUST_NIGHTLY" check --lib --no-default-features
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: rust-modules
+          key: host-${{ matrix.stage }}
+      - name: ${{ matrix.stage }}
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: ${{ matrix.run }}
 
   package:
     name: package (${{ matrix.flavor }})
@@ -81,6 +103,13 @@ jobs:
 
       - name: Install nightly Rust
         run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
+
+      # The crate's dependencies cache; `-Z build-std` recompiles std every run regardless, since
+      # rust-cache cannot see those crates (see ci.yml's cross-build job, Swatinem/rust-cache#161).
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: rust-modules
+          key: armv7-${{ matrix.flavor }}
 
       - id: ndk
         uses: ./.github/actions/webos-ndk
