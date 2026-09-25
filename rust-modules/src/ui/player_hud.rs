@@ -1717,7 +1717,7 @@ pub(crate) fn draw_hud(
             if let Ok(title) = CString::new(n.title.clone()) {
                 draw_title(p, Kicker::Episode(kicker.as_ptr()), title.as_ptr());
             }
-            let w = crate::text::text_width(kicker.as_ptr(), theme::size::CAPTION, 1);
+            let w = measure.width(&kicker, theme::size::CAPTION, true);
             draw_media_after(p, SB_X + w, ps, meta);
         } else {
             draw_title(
@@ -1725,7 +1725,10 @@ pub(crate) fn draw_hud(
                 Kicker::Context(crate::route::ctxline_cptr(ps)),
                 crate::route::title_cptr(ps),
             );
-            let w = crate::text::text_width(crate::route::ctxline_cptr(ps), theme::size::CAPTION, 0);
+            // SAFETY: the session's NUL-terminated ctxline buffer, the same pointer `draw_title`
+            // just drew as a C string; it lives for the whole frame.
+            let ctx = unsafe { std::ffi::CStr::from_ptr(crate::route::ctxline_cptr(ps)) };
+            let w = measure.width(ctx, theme::size::CAPTION, false);
             draw_media_after(p, SB_X + w, ps, meta);
         }
 
