@@ -1,0 +1,143 @@
+name: Sideload build
+
+# A FORK's build: runs the host gate and cross-builds BOTH installable packages from this branch,
+# so a change can be put on a television without a local webOS NDK (there is none for Windows or
+# x86_64 Linux — see the Makefile's NDK bootstrap block). It is ci.yml's cross-build job plus the
+# one thing that job deliberately refuses to do: package the stable id.
+#
+#   debug   com.beb.plxnative.debug  — installs BESIDE the real app; dev features on
+#   stable  com.beb.plxnative        — RELEASE=1, installs OVER the real app
+#
+# A tag `v<upstream version>-fork.<n>` also PUBLISHES: the two packages and their checksums as a
+# GitHub Release of this fork, with `docs/fork-releases/<tag>.md` as its body. Nothing here
+# signs, uploads symbols or touches the Homebrew Channel manifest; that is release.yml's job and it
+# needs the upstream repository's credentials. A stable package cut here carries no telemetry
+# endpoint. (release.yml also wakes on the `v*` tag and stops at its tag/version guard, because
+# `-fork.<n>` is not the version in pkg/appinfo.json — that red run is expected and harmless.)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/plx-native-version-diff-9faa0w]
+    tags: ['v*-fork.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_NIGHTLY: nightly-2026-07-02
+
+jobs:
+  host-checks:
+    name: host checks (lint + unit suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # `make check` runs tooling self-tests that derive a chronology from `git log`, which a
+          # shallow clone cannot answer (ci.yml does the same, for the same reason).
+          fetch-depth: 0
+      - name: Install the desktop SDL/GL libraries the hostsim suite links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev
+      - name: Install nightly Rust
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src --component clippy
+      - name: make check
+        run: make RUST_NIGHTLY="$RUST_NIGHTLY" check
+      - name: Type-check the RELEASE feature set
+        run: cd rust-modules && CARGO_INCREMENTAL=0 cargo "+$RUST_NIGHTLY" check --lib --no-default-features
+
+  package:
+    name: package (${{ matrix.flavor }})
+    # MUST be arm64 Linux — the only Linux host the webOS NDK is published for.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: debug
+            release: ""
+          - flavor: stable
+            release: "1"
+    # make reads both from the environment, so they ride EVERY invocation below (neither is
+    # sticky between make runs) and the assertion scripts see the same configuration.
+    env:
+      FLAVOR: ${{ matrix.flavor }}
+      RELEASE: ${{ matrix.release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install nightly Rust
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
+
+      - id: ndk
+        uses: ./.github/actions/webos-ndk
+
+      - name: Cache the bundled FFmpeg
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            vendor/ffmpeg-prefix
+            vendor/ffmpeg-build
+          key: ffmpeg-${{ runner.arch }}-${{ hashFiles('ci/build-ffmpeg.sh') }}
+
+      - name: Build
+        run: make RUST_NIGHTLY="$RUST_NIGHTLY" WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' -j"$(nproc)"
+
+      - name: Package
+        run: make RUST_NIGHTLY="$RUST_NIGHTLY" ipk WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
+
+      # Uploaded BEFORE the assertions so a red check below still leaves the package to inspect.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: plxnative-${{ matrix.flavor }}
+          path: pkg/*.ipk
+          if-no-files-found: error
+
+      - name: ELF assertions
+        run: ./ci/check-elf.sh
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+
+      - name: Packaging assertions
+        env:
+          REQUIRE_PACKAGE: "1"
+        run: python3 ci/check-package.py
+
+  publish:
+    name: publish the fork release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-checks, package]
+    runs-on: ubuntu-latest
+    # The only job with a write token, and only on a tag.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          ls -l
+          sha256sum *.ipk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          note="docs/fork-releases/$TAG.md"
+          [ -f "$note" ] || { echo "::error::$note is missing — the release would publish with no notes"; exit 1; }
+          title=$(head -n1 "$note" | sed 's/^# *//')
+          tail -n +2 "$note" > "$RUNNER_TEMP/body.md"
+          gh release create "$TAG" dist/*.ipk dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$title" --notes-file "$RUNNER_TEMP/body.md"
