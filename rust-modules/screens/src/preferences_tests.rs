@@ -229,3 +229,17 @@ fn the_continue_watching_row_defaults_to_open_details_and_its_picker_saves_the_p
     });
     assert_eq!(saved, Some(DeckPress::Play));
 }
+
+/// Every option a Playback picker offers is saved on the set. Skip intros / Skip credits once
+/// fell through the picker's commit to the account path, which ignores them: the option showed
+/// and a press did nothing.
+#[test]
+fn every_playback_option_is_saved_locally() {
+    let inputs = FieldListInputs { kind: Kind::Playback, quality: Quality::Original, direct_play: DirectPlayMode::Auto,
+        prefs: None, busy: false, show_retry: false };
+    for &field in fields_of(&inputs) {
+        for (label, value) in field_options(field, inputs.quality, inputs.direct_play, None) {
+            assert!(value.is_local(), "{field:?}'s option {label:?} is not routed to the local save");
+        }
+    }
+}

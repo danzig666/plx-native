@@ -86,6 +86,14 @@ impl Kind {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Value { Quality(Quality), DirectPlay(DirectPlayMode), SubtitleSize(SubtitleSize), SubtitlePosition(SubtitlePosition), NextEpisode(NextEpisodeMode), SkipIntro(MarkerSkip), SkipCredits(MarkerSkip), DeckPress(DeckPress), SkipInterval(SkipInterval), Language(String), Mode(i64), Forced(i64) }
+impl Value {
+    /// Saved on this television ([`Txn::save_local`]) rather than to the account. The picker
+    /// routes on this, so a new local setting is saved by adding it here and to `save_local`.
+    fn is_local(&self) -> bool {
+        matches!(self, Value::Quality(_) | Value::DirectPlay(_) | Value::SubtitleSize(_) | Value::SubtitlePosition(_)
+            | Value::NextEpisode(_) | Value::SkipIntro(_) | Value::SkipCredits(_) | Value::DeckPress(_) | Value::SkipInterval(_))
+    }
+}
 
 /// The hashed half of a transaction: what the page shows while a load or save is in flight.
 struct Io { busy: bool, status: String }
