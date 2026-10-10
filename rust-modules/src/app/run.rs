@@ -2340,6 +2340,11 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
             // An empty selected phase provides the profiler floor for this build; it
             // deliberately issues no GL commands between its two boundaries.
             plx_ui::profile::phase("profile.empty", || {});
+            // The player's chrome gives up light with the viewer's subtitle tone
+            // (`player_hud::chrome_dim`); every other route draws at full ink. Set before anything
+            // builds a `Painter::root()` and put back after the frame, so nothing drawn outside
+            // this phase inherits it.
+            plx_ui::set_chrome_rgb(if fr.player { plx_appkit::player_hud::chrome_dim() } else { 1.0 });
             plx_ui::profile::phase("frame.ui", || {
                 plx_ui::guard(|| {
                     if fr.player {
@@ -2524,6 +2529,7 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                     plx_ui::runtime_warning::draw(app.boot_initial.is_some());
                 });
             });
+            plx_ui::set_chrome_rgb(1.0);
     (vx, vy, vw, vh)
 }
 

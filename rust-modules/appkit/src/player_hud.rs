@@ -187,7 +187,7 @@ pub fn draw_subtitle_message(text: &str, hud_up: bool) {
     let block_top = baseline - n * lh;
     let ink = subtitle_ink(); // white unless the viewer picked a dimmer tone (track menu)
     let outline = theme::scrim_black(0.85);
-    let p = Painter::root();
+    let p = Painter::untinted(); // the ink IS the tone: the chrome dim would apply it twice
     for (i, ln) in lines.iter().enumerate() {
         let top = block_top + i as f32 * lh;
         if let Ok(cs) = CString::new(ln.as_str()) {
@@ -212,6 +212,22 @@ fn subtitle_ink_for(tone: plx_plex::plex::session::SubtitleTone) -> [f32; 4] {
         .get(tone.index() as usize)
         .copied()
         .unwrap_or(theme::SUBTITLE_INKS[0])
+}
+
+/// **How much light the player's CHROME gives up, from the same preference.** The viewer picked
+/// a subtitle tone because white over an HDR picture is too bright — and the transport, the
+/// panels and the read-outs standing on that same picture are the same white. So the whole player
+/// frame draws under [`plx_ui::set_chrome_rgb`] ONE RUNG BRIGHTER than the caption's tone: the
+/// chrome is small text and thin marks on a dark scrim, and at the caption's own level the
+/// darkest rungs made it hard to read. White and Silver both leave the chrome at full ink. The
+/// caption itself is drawn `untinted`, or it would be dimmed twice.
+pub fn chrome_dim() -> f32 {
+    chrome_dim_for(plx_media::player::subtitle_tone())
+}
+
+fn chrome_dim_for(tone: plx_plex::plex::session::SubtitleTone) -> f32 {
+    let one_up = plx_plex::plex::session::SubtitleTone::from_index(tone.index().saturating_sub(1));
+    subtitle_ink_for(one_up)[0]
 }
 
 /// The face-size multiplier for the viewer's Settings > Playback pick, applied to the plain-text
@@ -368,7 +384,7 @@ pub fn draw_subtitle_bitmap(cache: &mut SubtitleBitmaps, hud_up: bool) {
             // the tone TINTS a bitmap: the image shader multiplies by it, so a PGS cue keeps its
             // authored colours and outline and only gives up light (white is the identity)
             let tint = subtitle_ink();
-            let p = Painter::root();
+            let p = Painter::untinted(); // the tint IS the tone — see `draw_subtitles`
             for (tex, r) in set.iter() {
                 let dy = if overhangs(*r) { lift } else { 0.0 };
                 p.tex(*tex, Rect::new(r.x, r.y - dy, r.w, r.h), 0.0, tint);
@@ -2155,6 +2171,18 @@ mod tests {
     }
 
     use super::*;
+
+    /// The chrome follows the caption ONE rung brighter, and never brighter than white.
+    #[test]
+    fn the_chrome_is_one_rung_brighter_than_the_caption() {
+        use plx_plex::plex::session::SubtitleTone as T;
+        assert_eq!(chrome_dim_for(T::White), 1.0);
+        assert_eq!(chrome_dim_for(T::Silver), 1.0, "one up from Silver is White");
+        for w in T::LADDER.windows(2) {
+            assert_eq!(chrome_dim_for(w[1]), subtitle_ink_for(w[0])[0]);
+            assert!(chrome_dim_for(w[1]) > subtitle_ink_for(w[1])[0], "{:?}", w[1]);
+        }
+    }
 
     /// The media line's two vocabularies: the resolution CLASS a badge uses (either axis, so a
     /// scope-cropped file keeps its class) and the spec-sheet audio abbreviation with its

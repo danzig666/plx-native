@@ -107,7 +107,8 @@ impl AssSubtitles {
         }
         let ink = plx_appkit::player_hud::subtitle_ink();
         for (texture, rect) in self.textures.iter().zip(&frame.rects) {
-            Painter::root().tex(
+            // `untinted`: the ink IS the tone; the chrome dim would apply it a second time
+            Painter::untinted().tex(
                 texture.id,
                 Rect::new(
                     (self.viewport.x + rect.x) as f32,
