@@ -7952,6 +7952,10 @@ pub fn demux(
                     ),
                     None => String::new(),
                 };
+                // PQ (16) or HLG (18): the HUD's media line names the stream HDR from this.
+                SHARED
+                    .video_hdr
+                    .store(matches!((*vcp).color_trc, 16 | 18), Ordering::Relaxed);
                 crate::player::log(&format!(
                     "ff: v=#{vi} codec={cname} codec_id={} {}x{} trc={} pri={} spc={}{dv} a=#{ai} dur_ns={}",
                     (*vcp).codec_id,

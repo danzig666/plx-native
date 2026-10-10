@@ -538,6 +538,10 @@ pub fn seen_frame() -> bool {
 pub fn duration_ns() -> i64 {
     SHARED.duration_ns.load(Relaxed)
 }
+/// Is the playing video stream HDR (PQ or HLG)? See [`shared::Shared::video_hdr`].
+pub fn video_hdr() -> bool {
+    SHARED.video_hdr.load(Relaxed)
+}
 pub fn seek_pending() -> i64 {
     TX.seek_to_ns.load(Relaxed)
 }

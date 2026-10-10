@@ -529,6 +529,11 @@ pub struct Shared {
     /// see `appkit::player_hud::busy_surface`. Monotone within a session (false→true only), which is
     /// what lets two readers in one frame sample it independently without disagreeing.
     pub seen_frame: AtomicBool,
+    /// **Is the playing VIDEO stream HDR?** Its colour transfer as the demuxer opened it — PQ
+    /// (`AVCOL_TRC_SMPTE2084`, 16) or HLG (`AVCOL_TRC_ARIB_STD_B67`, 18). What the HUD's media line
+    /// says beside the resolution when the stream is not Dolby Vision. Written by `ff::demux` per
+    /// open, cleared with the session.
+    pub video_hdr: AtomicBool,
     /// **Why the NEXT rebuild is happening, when the viewer's audio-track pick is the cause**: the
     /// read-out beside the load spinner says "Switching audio…" instead of "Buffering…". A
     /// [`AudioSwitch`] value. `Picked` (set by `route::commit_audio_selection` once its rebuild is
@@ -940,6 +945,7 @@ impl Shared {
             pres_fed: AtomicI64::new(0),
             frames: AtomicI32::new(0),
             seen_frame: AtomicBool::new(false),
+            video_hdr: AtomicBool::new(false),
             audio_switch: AtomicU8::new(AudioSwitch::None as u8),
             audio_pick_ms: AtomicI64::new(0),
             load_completed: AtomicBool::new(false),
@@ -1528,6 +1534,7 @@ impl Shared {
         // places (declaration, `new`, here): a reload that forgot the bit would silently suppress
         // the centred read-out for the rest of the app's life.
         self.seen_frame.store(false, Ordering::Relaxed);
+        self.video_hdr.store(false, Ordering::Relaxed);
         // an audio pick's rebuild has begun (a reload keeps the pick's meaning for this session);
         // any other reset ends it
         let next = match AudioSwitch::from_u8(self.audio_switch.load(Ordering::Relaxed)) {
