@@ -167,6 +167,14 @@
     "value": "Skip Credits",
     "description": "Player action that skips the currently offered introduction or credits marker."
   },
+  "widgets.skip.intro_skipped": {
+    "value": "Intro skipped",
+    "description": "A short notice at the top of the player after the intro was skipped automatically (Settings, Skip intros)."
+  },
+  "widgets.skip.credits_skipped": {
+    "value": "Credits skipped",
+    "description": "A short notice at the top of the player after the credits were skipped automatically (Settings, Skip credits)."
+  },
   "widgets.next.episode": {
     "value": "Next Episode",
     "description": "Up-next episode card over the player; keep the supplied episode title intact."

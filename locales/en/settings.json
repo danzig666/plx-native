@@ -703,6 +703,30 @@
     "value": "Play",
     "description": "Continue Watching picker option: OK on a card starts or resumes the video at once."
   },
+  "settings.playback.skip_intro": {
+    "value": "Skip intros",
+    "description": "Settings row title and picker title: whether a show's intro is skipped automatically or offered as a Skip Intro button."
+  },
+  "settings.playback.skip_credits": {
+    "value": "Skip credits",
+    "description": "Settings row title and picker title: whether credits are skipped automatically or offered as a Skip Credits / Next Episode button."
+  },
+  "settings.playback.marker_skip.button": {
+    "value": "Show button",
+    "description": "Skip intros / Skip credits picker option (the default): the player offers a button and skips only when it is pressed."
+  },
+  "settings.playback.marker_skip.auto": {
+    "value": "Skip automatically",
+    "description": "Skip intros / Skip credits picker option: the player skips the segment as soon as it starts, without a press."
+  },
+  "settings.playback.skip_intro.copy": {
+    "value": "Skip automatically jumps past a show's intro as soon as it starts, and says so on screen. Show button offers Skip Intro instead.",
+    "description": "Explanation under the title of the Skip intros picker. It names the two options by their picker labels; keep those words identical to settings.playback.marker_skip.auto and .button."
+  },
+  "settings.playback.skip_credits.copy": {
+    "value": "Skip automatically jumps past credits as soon as they start; at the end of an episode the next one starts at once. Show button offers Skip Credits or Next Episode instead.",
+    "description": "Explanation under the title of the Skip credits picker. It names the two options by their picker labels; keep those words identical to settings.playback.marker_skip.auto and .button."
+  },
   "settings.playback.skip_interval": {
     "value": "Skip interval",
     "description": "Settings, consent or sign-in UI: how far one Left or Right press jumps while watching."

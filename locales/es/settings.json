@@ -172,6 +172,12 @@
   "settings.playback.deck_press": "Continuar viendo",
   "settings.playback.deck_press.details": "Abrir detalles",
   "settings.playback.deck_press.play": "Reproducir",
+  "settings.playback.skip_intro": "Saltar introducciones",
+  "settings.playback.skip_credits": "Saltar créditos",
+  "settings.playback.marker_skip.button": "Mostrar botón",
+  "settings.playback.marker_skip.auto": "Saltar automáticamente",
+  "settings.playback.skip_intro.copy": "Saltar automáticamente omite la introducción de una serie en cuanto empieza y lo indica en pantalla. Mostrar botón ofrece Saltar introducción en su lugar.",
+  "settings.playback.skip_credits.copy": "Saltar automáticamente omite los créditos en cuanto empiezan; al final de un episodio, el siguiente empieza al instante. Mostrar botón ofrece Saltar créditos o Siguiente episodio en su lugar.",
   "settings.playback.skip_interval": "Intervalo de salto",
   "settings.playback.skip_interval.seconds": {
     "one": "{count} segundo",

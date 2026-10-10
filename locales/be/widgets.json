@@ -38,6 +38,8 @@
   "widgets.chapters.number": "Раздзел {number}",
   "widgets.skip.intro": "Прапусціць застаўку",
   "widgets.skip.credits": "Прапусціць цітры",
+  "widgets.skip.intro_skipped": "Застаўка прапушчана",
+  "widgets.skip.credits_skipped": "Цітры прапушчаны",
   "widgets.next.episode": "Наступная серыя",
   "widgets.next.credits": "Глядзець цітры",
   "widgets.next.caption": "Далей · {episode}",

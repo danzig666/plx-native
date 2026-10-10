@@ -142,6 +142,10 @@ pub struct PlayerScreen {
     hud_policy: HudPolicy,
     /// Where this playback returns to — see [`Origin`].
     pub origin: Option<Origin>,
+    /// When an automatic skip last took a segment, and which kind (`app/run.rs`, on the offer's
+    /// edge): the "Intro skipped" / "Credits skipped" notice fades out
+    /// [`plx_appkit::skip_pill::SKIP_TOAST_MS`] after it.
+    pub skip_toast: Option<(u32, plx_data::metadata::MarkerKind)>,
     render: PlayerRender,
     /// The page's one decision card: the sandbox repair's confirmation.
     repair_alert: plx_ui::decision_alert::DecisionAlert,
@@ -169,6 +173,7 @@ impl PlayerScreen {
             transport: true,
             hud_policy: HudPolicy::Normal,
             origin: None,
+            skip_toast: None,
             render: PlayerRender::default(),
             repair_alert: {
                 let mut alert = plx_ui::decision_alert::DecisionAlert::new();
@@ -216,6 +221,7 @@ impl PlayerScreen {
             self.hud.dismissed = false;
             self.hud.last_offer = None;
             self.up_next.reset();
+            self.skip_toast = None;
         }
         self.publish();
     }
@@ -355,6 +361,8 @@ impl PlayerScreen {
     ///   is not repeated here.)
     /// * `busy` — the read-out appearing and vanishing, including the `Playing -> Error` edge with
     ///   the HUD auto-hidden, where nothing else in the frame moves at all.
+    /// * the "… skipped" notice's opacity, in 1/32 steps — a DEADLINE-driven fade, so its frames
+    ///   are owed while it moves and not one after it reaches 0.
     pub fn clock_fingerprint(&self, ps: &plx_media::route::PlaybackSession, now: u32) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
         let pos = plx_media::player::playpos_ns();
@@ -399,7 +407,14 @@ impl PlayerScreen {
                 4 ^ ((k as u64) << 32) ^ (c.as_ptr() as u64)
             }
         });
+        mix((self.skip_toast_alpha(now) * 32.0).round() as u64);
         h
+    }
+
+    /// The "… skipped" notice's opacity at `now` — 0 when there is none.
+    fn skip_toast_alpha(&self, now: u32) -> f32 {
+        self.skip_toast
+            .map_or(0.0, |(at, _)| plx_appkit::skip_pill::skip_toast_alpha(now.wrapping_sub(at)))
     }
 
     /// Is the transport on screen right now? `false` whenever a surface HIDES it
@@ -1384,6 +1399,11 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Screen<H> for PlayerScreen {
         // instead of vanishing with the 4.5 s linger. AFTER the transport, so it is never dimmed by
         // the scrim; BEFORE the overlay panels, which the container draws above this page.
         plx_appkit::player_hud::draw_readout(ps, self.busy, now, self.failure_sel, f.measure);
+        // Not chrome either: it outlives a hidden HUD, which is the whole of its use — an
+        // automatic skip happens with nobody touching the remote.
+        if let Some((_, kind)) = self.skip_toast {
+            plx_appkit::skip_pill::draw_skip_toast(kind, self.skip_toast_alpha(now), f.measure);
+        }
         if self.repair_alert.visible() {
             self.repair_alert.draw_scrim();
             self.repair_alert.draw(plx_platform::i18n::msg::settings_cancel_c(), plx_platform::i18n::msg::widgets_repair_action_c(), f.measure);
@@ -1550,6 +1570,31 @@ mod clock_animator_tests {
             "the Play mark stopped being drawn on this frame: it must report",
         );
         assert!(presents(after), "…and a report is a frame");
+    }
+
+    /// **The NOTICE class** — the "… skipped" pill an automatic skip leaves. It appears with the
+    /// transport hidden and nobody touching the remote, so its fade and its disappearance are
+    /// frames nothing else in the page would owe.
+    #[test]
+    fn the_skipped_notice_presents_its_fade_and_its_end() {
+        let _g = plx_base::testlock::serial();
+        let ps = PlaybackSession::IDLE;
+        let mut pl = Player::new();
+        let mut screen = PlayerScreen::new(plx_machine::machine::EntryId(1));
+        assert!(!screen.hud_up(&ps, 10_000), "the fixture: the transport is hidden");
+
+        settled(&mut pl, &screen, &ps, 9_000);
+        screen.skip_toast = Some((10_000, plx_data::metadata::MarkerKind::Intro));
+        assert!(
+            reported(&mut pl, &screen, &ps, 10_100),
+            "the notice is fading in: it must report",
+        );
+        assert!(presents(10_100), "…and a report is a frame");
+        settled(&mut pl, &screen, &ps, 11_000);
+        assert!(
+            reported(&mut pl, &screen, &ps, 10_000 + plx_appkit::skip_pill::SKIP_TOAST_MS),
+            "the notice left the screen on this frame: it must report",
+        );
     }
 
     /// **The READ-OUT class** — `busy`, i.e. the centred status surface appearing and vanishing.

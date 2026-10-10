@@ -6419,6 +6419,51 @@ pub fn set_deck_press(mode: DeckPress) -> bool {
     saved
 }
 
+/// **Skip intros / Skip credits** — install-wide, like [`DECK_PRESS`]. Read once per segment offer
+/// by the frame loop (`skip_pill::auto_skip`), never per frame.
+static SKIP_INTRO: AtomicU8 = AtomicU8::new(0); // MarkerSkip::Button's index
+static SKIP_CREDITS: AtomicU8 = AtomicU8::new(0);
+
+pub fn skip_intro() -> MarkerSkip {
+    MarkerSkip::from_index(SKIP_INTRO.load(Ordering::Relaxed))
+}
+
+pub fn skip_credits() -> MarkerSkip {
+    MarkerSkip::from_index(SKIP_CREDITS.load(Ordering::Relaxed))
+}
+
+pub fn restore_marker_skip(intro: MarkerSkip, credits: MarkerSkip) {
+    #[cfg(any(test, feature = "test-support"))]
+    plx_base::testlock::assert_held("marker skip preferences");
+    SKIP_INTRO.store(intro.index(), Ordering::Relaxed);
+    SKIP_CREDITS.store(credits.index(), Ordering::Relaxed);
+}
+
+/// Blocking persistence seam for Skip intros; Settings dispatches it on the storage worker. The
+/// live value changes only once the write is durable, so a failed save claims nothing.
+pub fn set_skip_intro(mode: MarkerSkip) -> bool {
+    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_skip_intro(mode)))
+        .is_some_and(|write| matches!(write.classify(),
+            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
+    if saved {
+        SKIP_INTRO.store(mode.index(), Ordering::Relaxed);
+        plx_machine::idle::invalidate();
+    }
+    saved
+}
+
+/// [`set_skip_intro`]'s credits twin.
+pub fn set_skip_credits(mode: MarkerSkip) -> bool {
+    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_skip_credits(mode)))
+        .is_some_and(|write| matches!(write.classify(),
+            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
+    if saved {
+        SKIP_CREDITS.store(mode.index(), Ordering::Relaxed);
+        plx_machine::idle::invalidate();
+    }
+    saved
+}
+
 pub fn set_default_quality(q: Quality) -> bool {
     let q = supported_quality(q);
     let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_playback_quality(q)))
