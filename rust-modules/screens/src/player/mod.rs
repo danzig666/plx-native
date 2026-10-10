@@ -585,7 +585,13 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                     // dismissal, which is how a Magic Remote user finds the HUD over full-screen
                     // video. `app/run.rs`'s own motion arm did this and then RETURNED, so the page
                     // never saw a pointer event at all.
-                    InputKind::Pointer { .. } => {
+                    //
+                    // A transport BACK hid stays hidden until the remote really moves — the
+                    // jitter of a hand holding it is motion too (`input::BackHide`).
+                    InputKind::Pointer { x, y, .. } => {
+                        if !input::pointer_may_reveal(&mut self.hud.back_hidden, input.at.ms, *x, *y) {
+                            return Handled::Yes;
+                        }
                         self.hud.dismissed = false;
                         self.hud.extend(input.at.ms, input::HUD_LINGER_MS);
                         self.publish();
@@ -669,6 +675,8 @@ impl PlayerScreen {
     ) -> Handled {
         use player_hud::{ELEM_FAILURE_BASE, ELEM_FAILURE_END, ELEM_ROW_BASE, ELEM_SCRUB, ELEM_TAB_BASE};
         let failed = plx_appkit::player_hud::transport_hidden(ps);
+        // A click is a deliberate act, never jitter: it ends a BACK-hide's pointer gate.
+        self.hud.back_hidden = None;
         let Some(elem) = hit else {
             // **A click that lands on no control at all toggles play/pause** — the `else` arm of
             // the old pointer block, and the reason clicking the PICTURE works: over full-screen
@@ -841,6 +849,25 @@ impl PlayerScreen {
             // by `PlayerOverlayScreen::key` before this screen ever sees the press, since the
             // overlay is a SURFACE and owns input while it is up) both perform the same ritual
             // `key_back`/the Stop arm did.
+            //
+            // …except a BACK that finds the transport ON SCREEN, which takes it down instead —
+            // the same hand-hide UP from the control row performs, abandoning a scrub preview with
+            // it — so the next BACK, on a bare picture, is the one that leaves
+            // (`input::back_hides`). The Magic Remote's jitter is kept from raising it straight
+            // back by `input::BackHide`.
+            Key::Back
+                if input::back_hides(self.hud.visible_at_press, plx_media::player::loading(ps)) =>
+            {
+                if edge == Edge::Down {
+                    self.scrub.ns = -1;
+                    self.scrub.disengage();
+                    self.hud.nav.focus = 0;
+                    self.hud.dismissed = true;
+                    self.hud.back_hidden = Some(input::BackHide { at: now, anchor: None });
+                    self.publish();
+                }
+                Handled::Yes
+            }
             Key::Stop | Key::Back => {
                 if edge == Edge::Down {
                     Self::ask(fx, PlayerReq::Exit);
@@ -1917,6 +1944,35 @@ mod step_ladder_tests {
             assert_eq!(handled, Handled::Yes);
             assert_eq!(reqs, vec![PlayerReq::Exit], "wcode {wcode}");
         }
+    }
+
+    /// BACK with the transport ON SCREEN hides it (and starts the pointer gate) rather than
+    /// leaving; the next BACK, on a bare picture, leaves. STOP leaves at once either way.
+    #[test]
+    fn back_hides_a_visible_transport_and_the_next_back_leaves() {
+        let _g = plx_base::testlock::serial();
+        let prev = plx_media::player::swap_state_for_test(plx_media::player::PlaybackState::Playing);
+        let mut page = PlayerScreen::new(ENTRY);
+        fresh(&mut page);
+        page.hud.nav.focus = 1;
+        page.scrub.ns = 5_000_000_000;
+        let (handled, reqs) = press(&mut page, 0, WCODE_BACK, Edge::Down);
+        assert_eq!(handled, Handled::Yes);
+        assert!(reqs.is_empty(), "the first BACK hides, it does not leave: {reqs:?}");
+        assert!(page.hud.dismissed, "the transport is taken down");
+        assert_eq!(page.hud.nav.focus, 0, "…with the ring re-parked on the scrubber");
+        assert_eq!(page.scrub.ns, -1, "…and the scrub preview abandoned with it");
+        assert!(page.hud.back_hidden.is_some(), "…and the jitter gate armed");
+
+        page.hud.visible_at_press = false; // what `note_fresh_press` samples for the next press
+        let (_, reqs) = press(&mut page, 0, WCODE_BACK, Edge::Down);
+        assert_eq!(reqs, vec![PlayerReq::Exit], "BACK on a bare picture leaves");
+
+        let mut page = PlayerScreen::new(ENTRY);
+        fresh(&mut page);
+        let (_, reqs) = press(&mut page, 0, WCODE_STOP, Edge::Down);
+        assert_eq!(reqs, vec![PlayerReq::Exit], "STOP always leaves");
+        plx_media::player::restore_state_for_test(prev);
     }
 
     /// Port of `key_player_updown`: from the scrubber, UP walks to the control row and DOWN to the
