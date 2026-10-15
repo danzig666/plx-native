@@ -16,11 +16,15 @@ import urllib.request
 from mock_pms import (
     ENHANCEMENT_AAC_51_RK, ENHANCEMENT_AC3_2CH_RK, ENHANCEMENT_DEFAULT_SRT_RK,
     ENHANCEMENT_DV_P8_RK, ENHANCEMENT_EXTERNAL_SRT_RK, EXTRA_MEDIA_RK_BASE, PLEX_DIRECT_HASH,
-    Library, MockPms, plaintext_only_lan_resources, serve,
+    RESUME_ON_DECK_SHOW_RK, RESUME_PLAIN_SHOW_RK,
+    CatalogLibrary, Library, MockPms, demo_cache_dir, plaintext_only_lan_resources, serve,
 )
 
 
 HAS_FFMPEG_AND_FFPROBE = shutil.which("ffmpeg") and shutil.which("ffprobe")
+HAS_DEMO_CACHE = bool(HAS_FFMPEG_AND_FFPROBE) and (demo_cache_dir() / "derived").is_dir()
+CATALOG = pathlib.Path(__file__).resolve().parent / "demo_library" / "catalog.json"
+FIXTURES = pathlib.Path(__file__).resolve().parent / "demo_library" / "fixtures"
 
 
 def get(pms, path):
@@ -30,6 +34,17 @@ def get(pms, path):
 
 
 class LibraryRail(unittest.TestCase):
+    def test_catalog_recent_hub_pages_through_its_provider_key(self):
+        lib = object.__new__(CatalogLibrary)
+        lib.__dict__.update(Library(movies=60).__dict__)
+        lib.catalog = {"hubs": [{"hubIdentifier": "home.movies.recent", "recent": "movie"}]}
+        pms = MockPms(lib)
+        response = get(pms, "/hubs/demo/home.movies.recent"
+                           "?X-Plex-Container-Start=36&X-Plex-Container-Size=24")
+        self.assertEqual(response["offset"], 36)
+        self.assertEqual(response["Metadata"], lib.recent("movie", 1000)[36:60])
+        self.assertEqual(response["totalSize"], len(lib.recent("movie", 1000)))
+
     def test_collection_ids_and_collection_routes_match_pms(self):
         pms = MockPms(Library())
         collections = get(pms, "/library/sections/1/collections")["Metadata"]
@@ -207,6 +222,43 @@ class LibraryRail(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class ResumeFixture(unittest.TestCase):
+    """`--resume-fixture`: a show that has been watched up to S12E14, and one that has not."""
+
+    def test_the_on_deck_show_carries_its_episode_only_when_asked(self):
+        pms = MockPms(Library(resume_fixture=True))
+        show = get(pms, f"/library/metadata/{RESUME_ON_DECK_SHOW_RK}?includeOnDeck=1")["Metadata"][0]
+        deck = show["OnDeck"]["Metadata"]
+        self.assertEqual((deck["parentIndex"], deck["index"], deck["type"]), (12, 14, "episode"))
+        self.assertGreater(deck["viewOffset"], 0)
+        self.assertEqual(show["childCount"], 12)
+        self.assertNotIn("OnDeck", get(pms, f"/library/metadata/{RESUME_ON_DECK_SHOW_RK}")["Metadata"][0])
+
+    def test_the_other_show_has_no_on_deck_and_is_unwatched(self):
+        pms = MockPms(Library(resume_fixture=True))
+        show = get(pms, f"/library/metadata/{RESUME_PLAIN_SHOW_RK}?includeOnDeck=1")["Metadata"][0]
+        self.assertNotIn("OnDeck", show)
+        self.assertEqual(show["viewedLeafCount"], 0)
+
+    def test_the_resume_episode_heads_continue_watching_and_a_season_pages_over_one_screen(self):
+        pms = MockPms(Library(resume_fixture=True))
+        deck = get(pms, "/hubs/continueWatching?count=12")["Hub"][0]["Metadata"]
+        self.assertEqual(deck[0]["grandparentRatingKey"], str(RESUME_ON_DECK_SHOW_RK))
+        seasons = get(pms, f"/library/metadata/{RESUME_ON_DECK_SHOW_RK}/children")["Metadata"]
+        self.assertEqual([s["index"] for s in seasons], list(range(1, 13)))
+        self.assertEqual(len(get(pms, f"/library/metadata/{seasons[11]['ratingKey']}/children")["Metadata"]), 30)
+
+    def test_off_by_default_and_the_generated_library_does_not_move(self):
+        plain, fixture = Library(), Library(resume_fixture=True)
+        self.assertEqual(plain.on_deck, {})
+        self.assertNotIn(RESUME_ON_DECK_SHOW_RK, plain.items)
+        for rk, item in plain.items.items():
+            if item["type"] in ("movie", "show", "season", "episode") and rk < 970000:
+                self.assertEqual(item, {**fixture.items[rk],
+                                        **{k: item[k] for k in ("leafCount", "viewedLeafCount", "childCount")
+                                           if k in item}}, rk)
 
 
 class HomeHubsFlag(unittest.TestCase):
@@ -563,7 +615,9 @@ class Enhancement266(unittest.TestCase):
         self.assertEqual(ext_sub["codec"], "srt")
         self.assertTrue(ext_sub["key"])
         # invisible to the ordinary section listings/rails/counts
-        self.assertEqual(get(MockPms(lib), "/library/sections/1/all")["totalSize"], 48)
+        # A real server answers a total only to a paged request: the size-0 window is the read.
+        self.assertEqual(get(MockPms(lib), "/library/sections/1/all"
+                             "?X-Plex-Container-Start=0&X-Plex-Container-Size=0")["totalSize"], 48)
 
     def test_decision_enhancement_shapes(self):
         pms = MockPms(Library())
@@ -687,6 +741,360 @@ class Enhancement266(unittest.TestCase):
     def test_missing_transcode_fixture_file_is_rejected(self):
         with self.assertRaises(ValueError):
             serve(0, movies=0, transcode_fixture=pathlib.Path("/no/such/fixture.mkv"))
+
+
+# The fields the detail page draws that the demo catalog can supply (docs: the S1a stage of the
+# demo-library plan). Every one is asserted against what the MOCK serves, because a field the mock
+# omits is a field the screenshots and the site video silently never show.
+@unittest.skipUnless(HAS_DEMO_CACHE, "no derived demo cache (make demo-library) or no ffmpeg/ffprobe")
+class CatalogDetailFields(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.lib = CatalogLibrary(CATALOG)
+        cls.pms = MockPms(cls.lib)
+        cls.catalog = json.loads(CATALOG.read_text())
+
+    def detail(self, rk, pms=None):
+        return get(pms or self.pms, f"/library/metadata/{rk}")["Metadata"][0]
+
+    def rk_of(self, film):
+        return int(self.lib.by_slug[film])
+
+    def test_a_complete_title_serves_the_fields_the_detail_page_draws(self):
+        for film in ("sintel", "tears-of-steel"):
+            with self.subTest(film=film):
+                rec = next(m for m in self.catalog["movies"] if m["id"] == film)
+                d = self.detail(self.rk_of(film))
+                self.assertEqual(d["tagline"], rec["tagline"])
+                self.assertEqual([c["tag"] for c in d["Country"]], rec["countries"])
+                self.assertEqual([w["tag"] for w in d["Writer"]], rec["writers"])
+                self.assertEqual([r["tag"] for r in d["Role"]], [c["name"] for c in rec["cast"]])
+                self.assertEqual([r.get("role", "") for r in d["Role"]],
+                                 [c.get("role", "") for c in rec["cast"]])
+                self.assertEqual([x["tag"] for x in d["Director"]], rec["directors"])
+
+    def test_an_uncited_rating_is_never_served(self):
+        # Wikidata holds no review score and no certification for these two, so the mock serves
+        # none: the app then shows "Unrated" and no ratings row, not an invented number.
+        for film in ("sintel", "tears-of-steel"):
+            with self.subTest(film=film):
+                d = self.detail(self.rk_of(film))
+                self.assertNotIn("contentRating", d)
+                self.assertEqual(d.get("Rating", []), [])
+                for flat in ("rating", "audienceRating", "ratingImage", "audienceRatingImage"):
+                    self.assertNotIn(flat, d)
+
+    def test_the_related_hub_is_the_whole_list_so_no_row_waits_for_a_page(self):
+        hubs = get(self.pms, f"/library/metadata/{self.rk_of('tears-of-steel')}/related")["Hub"]
+        related = next(h for h in hubs if h["hubIdentifier"] == "related")
+        self.assertFalse(related["more"])
+        self.assertEqual(related["size"], related["totalSize"])
+        self.assertEqual(len(related["Metadata"]), len(self.catalog["movies"]) - 1)
+        self.assertTrue(all(m.get("thumb") for m in related["Metadata"]), "every card has a poster")
+
+    def test_a_person_without_a_catalog_photo_is_served_without_one(self):
+        # Only the catalog's `people` have a portrait; for everyone else the app draws its glyph.
+        for film, jobs in (("sintel", ("Role", "Director", "Writer")), ("tears-of-steel", ("Director", "Writer"))):
+            d = self.detail(self.rk_of(film))
+            for job in jobs:
+                for person in d[job]:
+                    self.assertNotIn("thumb", person, (film, job, person))
+
+    def test_a_person_with_a_catalog_photo_is_served_it_through_the_transcoder(self):
+        d = self.detail(self.rk_of("tears-of-steel"))
+        people = {p["tag"]: p for p in d["Role"]}
+        self.assertEqual({name for name, p in people.items() if "thumb" in p}, set(self.catalog["people"]))
+        self.assertEqual(len(people), 7, "the whole cast")
+        seen = set()
+        for name in self.catalog["people"]:
+            ctype, body = self.lib.image(people[name]["thumb"], 300, 300)
+            self.assertEqual(ctype, "image/jpeg")
+            self.assertEqual(body[:2], b"\xff\xd8", name)
+            seen.add(body)
+        self.assertEqual(len(seen), len(self.catalog["people"]), "each person has their own picture")
+
+    def _temp_library(self, edit):
+        """A CatalogLibrary over a copy of the catalog that `edit` has changed."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        cat = json.loads(CATALOG.read_text())
+        edit(cat)
+        (root / "catalog.json").write_text(json.dumps(cat))
+        shutil.copy(CATALOG.parent / "assets.json", root / "assets.json")
+        lib = CatalogLibrary(root / "catalog.json")
+        return lib, MockPms(lib)
+
+    def test_a_cited_content_rating_and_ratings_are_served_as_a_server_sends_them(self):
+        cited = {"source": "https://example.invalid/cite", "retrieved": "2026-10-07"}
+
+        def edit(cat):
+            m = next(m for m in cat["movies"] if m["id"] == "sintel")
+            m["contentRating"] = dict(cited, value="PG")
+            m["ratings"] = [dict(cited, image="rottentomatoes://image.rating.ripe", value=9.1, type="critic"),
+                            dict(cited, image="imdb://image.rating", value=7.5, type="audience")]
+
+        lib, pms = self._temp_library(edit)
+        d = self.detail(int(lib.by_slug["sintel"]), pms)
+        self.assertEqual(d["contentRating"], "PG")
+        self.assertEqual(d["Rating"], [
+            {"image": "rottentomatoes://image.rating.ripe", "value": 9.1, "type": "critic"},
+            {"image": "imdb://image.rating", "value": 7.5, "type": "audience"}])
+        self.assertEqual((d["rating"], d["ratingImage"]), (9.1, "rottentomatoes://image.rating.ripe"))
+        self.assertEqual((d["audienceRating"], d["audienceRatingImage"]), (7.5, "imdb://image.rating"))
+
+    def test_show_creators_are_writers_and_episodes_inherit_the_shows_credits(self):
+        def edit(cat):
+            show = next(s for s in cat["shows"] if s["id"] == "caminandes")
+            show["creators"] = ["Pablo Vazquez"]
+            show["cast"] = [{"name": "A Voice", "role": "Koro"}]
+            show["countries"] = ["Netherlands"]
+
+        lib, pms = self._temp_library(edit)
+        show = self.detail(int(lib.by_slug["caminandes"]), pms)
+        self.assertEqual([w["tag"] for w in show["Writer"]], ["Pablo Vazquez"])
+        self.assertEqual([c["tag"] for c in show["Country"]], ["Netherlands"])
+        ep = self.detail(int(lib.by_slug["caminandes/1/1"]), pms)
+        for job in ("Director", "Writer", "Role"):
+            self.assertEqual(ep[job], show[job], job)
+        self.assertEqual([c["tag"] for c in ep["Role"]], ["A Voice"])
+
+
+class DetailFixtures(unittest.TestCase):
+    """`tests/demo_library/fixtures/detail-<rk>.json` is the mock's `/library/metadata/<rk>`
+    answer for each fixture title, committed so the data crate can parse it
+    (`rust-modules/data/src/metadata_demo_fixture_tests.rs`) without a derived-art cache."""
+    TITLES = {"sintel": 102, "tears-of-steel": 105}
+
+    def test_each_fixture_carries_every_field_the_catalog_supplies(self):
+        cat = json.loads(CATALOG.read_text())
+        for film, rk in self.TITLES.items():
+            with self.subTest(film=film):
+                rec = next(m for m in cat["movies"] if m["id"] == film)
+                d = json.loads((FIXTURES / f"detail-{rk}.json").read_text())["MediaContainer"]["Metadata"][0]
+                self.assertEqual(d["title"], rec["title"])
+                self.assertEqual(d["tagline"], rec["tagline"])
+                self.assertEqual([c["tag"] for c in d["Country"]], rec["countries"])
+                self.assertEqual([w["tag"] for w in d["Writer"]], rec["writers"])
+                self.assertEqual([x["tag"] for x in d["Director"]], rec["directors"])
+                self.assertEqual([r["tag"] for r in d["Role"]], [c["name"] for c in rec["cast"]])
+
+    @unittest.skipUnless(HAS_DEMO_CACHE, "no derived demo cache (make demo-library) or no ffmpeg/ffprobe")
+    def test_each_fixture_is_what_the_mock_serves_now(self):
+        pms = MockPms(CatalogLibrary(CATALOG))
+        for film, rk in self.TITLES.items():
+            with self.subTest(film=film):
+                status, _, body = pms.handle("GET", f"/library/metadata/{rk}")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), json.loads((FIXTURES / f"detail-{rk}.json").read_text()),
+                                 "regenerate with `python3 tools/demo_library.py fixtures`")
+
+
+def first_of(lib, kind):
+    return next(it for it in lib.items.values() if it["type"] == kind)
+
+
+def window(path, start, size, headers=False):
+    """`path` paged by the container window, as a query parameter or, with `headers`, as headers."""
+    if headers:
+        return path, {"X-Plex-Container-Start": str(start), "X-Plex-Container-Size": str(size)}
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}X-Plex-Container-Start={start}&X-Plex-Container-Size={size}", None
+
+
+def fetch(pms, path, headers=None):
+    status, ctype, data = pms.handle("GET", path, headers=headers)
+    assert (status, ctype) == (200, "application/json"), (status, ctype, path)
+    return json.loads(data)["MediaContainer"]
+
+
+class ContainerPaging(unittest.TestCase):
+    """The PMS paging contract (docs/pms-api.md, "Paging, observed"): a request pages only when it
+    carries the container window, as a query parameter or as a header; a paged answer echoes
+    `offset` and carries the listing's `totalSize`; an unpaged answer carries neither."""
+
+    def assertPaged(self, container, start, rows, total):
+        self.assertEqual(container["totalSize"], total)
+        self.assertEqual(container["offset"], start)
+        self.assertEqual(container["size"], len(rows))
+
+    def test_unpaged_answers_carry_no_total_and_no_offset(self):
+        lib = Library()
+        pms = MockPms(lib)
+        show = first_of(lib, "show")
+        season = next(it for it in lib.items.values() if it["type"] == "season")
+        title = first_of(lib, "movie")["title"]
+        for path in ("/library/sections/1/all", f"/library/metadata/{show['ratingKey']}/children",
+                     f"/library/metadata/{season['ratingKey']}/children",
+                     f"/library/metadata/{first_of(lib, 'movie')['ratingKey']}/similar",
+                     "/hubs/continueWatching/items", "/hubs", "/hubs/sections/1",
+                     f"/library/search?query={title}&searchTypes=movies"):
+            with self.subTest(path=path):
+                container = fetch(pms, path)
+                self.assertNotIn("totalSize", container)
+                self.assertNotIn("offset", container)
+
+    def test_a_size_without_a_start_is_ignored(self):
+        """docs/pms-api.md, "Paging gotcha": a query-param Size without Start changes nothing."""
+        pms = MockPms(Library())
+        ignored = fetch(pms, "/library/sections/1/all?X-Plex-Container-Size=5")
+        self.assertEqual(len(ignored["Metadata"]), 48)
+        self.assertNotIn("totalSize", ignored)
+        self.assertNotIn("offset", ignored)
+
+    def test_window_as_query_and_as_header_answer_alike(self):
+        pms = MockPms(Library())
+        by_query = fetch(pms, window("/library/sections/1/all", 10, 5)[0])
+        by_header = fetch(pms, *window("/library/sections/1/all", 10, 5, headers=True))
+        self.assertEqual(by_header, by_query)
+        self.assertPaged(by_query, 10, by_query["Metadata"], 48)
+        self.assertEqual(len(by_query["Metadata"]), 5)
+
+    def test_size_zero_is_a_paged_request_that_reads_the_total(self):
+        pms = MockPms(Library())
+        page = fetch(pms, window("/library/sections/1/all", 0, 0)[0])
+        self.assertEqual(page["Metadata"], [])
+        self.assertPaged(page, 0, [], 48)
+
+    def test_start_past_the_end_is_empty_and_still_echoes_the_offset(self):
+        pms = MockPms(Library())
+        page = fetch(pms, window("/library/sections/1/all", 500, 10)[0])
+        self.assertEqual(page["Metadata"], [])
+        self.assertPaged(page, 500, [], 48)
+
+    def test_children_of_a_show_and_of_a_season_page(self):
+        lib = Library()
+        pms = MockPms(lib)
+        show = first_of(lib, "show")["ratingKey"]
+        season = next(it["ratingKey"] for it in lib.items.values() if it["type"] == "season")
+        for parent in (show, season):
+            with self.subTest(parent=parent):
+                full = fetch(pms, f"/library/metadata/{parent}/children")["Metadata"]
+                self.assertGreaterEqual(len(full), 2)
+                page = fetch(pms, window(f"/library/metadata/{parent}/children", 1, 1)[0])
+                self.assertEqual(page["Metadata"], full[1:2])
+                self.assertPaged(page, 1, full[1:2], len(full))
+
+    def test_extras_page_and_default_library_has_none(self):
+        lib = Library(extras=3)
+        pms = MockPms(lib)
+        movie = first_of(lib, "movie")["ratingKey"]
+        full = fetch(pms, f"/library/metadata/{movie}/extras")["Metadata"]
+        self.assertEqual(len(full), 3)
+        self.assertEqual({row["type"] for row in full}, {"clip"})
+        self.assertEqual(len({row["ratingKey"] for row in full}), 3)
+        self.assertNotIn("totalSize", fetch(pms, f"/library/metadata/{movie}/extras"))
+        page = fetch(pms, window(f"/library/metadata/{movie}/extras", 1, 2)[0])
+        self.assertEqual(page["Metadata"], full[1:3])
+        self.assertPaged(page, 1, full[1:3], 3)
+        default = MockPms(Library())
+        self.assertEqual(fetch(default, f"/library/metadata/{movie}/extras")["Metadata"], [])
+
+    def test_person_media_pages(self):
+        lib = Library()
+        pms = MockPms(lib)
+        pid = max(lib.people, key=lambda p: len(lib.person_media(p)))
+        self.assertGreaterEqual(len(lib.person_media(pid)), 2, "the fixture gives a person two credits")
+        full = fetch(pms, f"/library/people/{pid}/media")["Metadata"]
+        self.assertEqual(full, lib.person_media(pid))
+        page = fetch(pms, window(f"/library/people/{pid}/media", 1, 1)[0])
+        self.assertEqual(page["Metadata"], full[1:2])
+        self.assertPaged(page, 1, full[1:2], len(full))
+
+    def test_similar_pages_over_the_same_type_without_the_item_itself(self):
+        lib = Library()
+        pms = MockPms(lib)
+        movie = first_of(lib, "movie")
+        full = fetch(pms, f"/library/metadata/{movie['ratingKey']}/similar")["Metadata"]
+        self.assertEqual(len(full), sum(1 for it in lib.items.values() if it["type"] == "movie") - 1)
+        self.assertNotIn(movie["ratingKey"], {row["ratingKey"] for row in full})
+        self.assertEqual({row["type"] for row in full}, {"movie"})
+        page = fetch(pms, window(f"/library/metadata/{movie['ratingKey']}/similar", 2, 3)[0])
+        self.assertEqual(page["Metadata"], full[2:5])
+        self.assertPaged(page, 2, full[2:5], len(full))
+
+    def test_continue_watching_items_page_contiguously(self):
+        lib = Library()
+        pms = MockPms(lib)
+        # The default library already has in-progress items; the test sets its own five.
+        for it in lib.items.values():
+            it["viewOffset"] = 0
+        for n, movie in enumerate([it for it in lib.items.values() if it["type"] == "movie"][:5]):
+            movie["viewOffset"] = 1000
+            movie["lastViewedAt"] = 1_700_000_000 + n
+        full = lib.continue_watching()
+        self.assertEqual(len(full), 5)
+        first = fetch(pms, window("/hubs/continueWatching/items", 0, 3)[0])
+        second = fetch(pms, window("/hubs/continueWatching/items", 3, 3)[0])
+        self.assertPaged(first, 0, first["Metadata"], 5)
+        self.assertPaged(second, 3, second["Metadata"], 5)
+        self.assertEqual(first["Metadata"] + second["Metadata"], full)
+
+    def test_hubs_page_by_hub_on_both_hub_listings(self):
+        lib = Library()
+        pms = MockPms(lib)
+        pms.home_hubs = 6
+        full = fetch(pms, "/hubs")["Hub"]
+        self.assertEqual(len(full), 6)
+        page = fetch(pms, window("/hubs", 2, 3)[0])
+        self.assertEqual(page["Hub"], full[2:5])
+        self.assertPaged(page, 2, full[2:5], 6)
+        header_page = fetch(pms, *window("/hubs", 2, 3, headers=True))
+        self.assertEqual(header_page, page)
+        section = fetch(pms, "/hubs/sections/1")["Hub"]
+        self.assertEqual(len(section), 2)
+        section_page = fetch(pms, window("/hubs/sections/1", 1, 1)[0])
+        self.assertEqual(section_page["Hub"], section[1:2])
+        self.assertPaged(section_page, 1, section[1:2], 2)
+
+    def test_library_search_rows_page_by_offset_and_limit_caps_the_total(self):
+        lib = Library()
+        pms = MockPms(lib)
+        prefix = first_of(lib, "movie")["title"][:2]
+        hits = [it for it in lib.items.values() if it["type"] == "movie" and it["title"].startswith(prefix)]
+        self.assertGreaterEqual(len(hits), 2, "the prefix matches at least two movies")
+        path = f"/library/search?query={prefix}&searchTypes=movies"
+        full = fetch(pms, path)["SearchResult"]
+        self.assertEqual(len(full), len(hits))
+        for row in full:
+            self.assertEqual(set(row), {"Metadata", "score"})
+            self.assertTrue(row["Metadata"]["title"].startswith(prefix))
+        page = fetch(pms, window(path, 1, 1)[0])
+        self.assertEqual(page["SearchResult"], full[1:2])
+        self.assertPaged(page, 1, full[1:2], len(full))
+        capped = fetch(pms, window(f"{path}&limit=1", 0, 5)[0])
+        self.assertEqual(len(capped["SearchResult"]), 1)
+        self.assertPaged(capped, 0, capped["SearchResult"], 1)
+
+    def test_library_search_types_order_and_unknown_kinds(self):
+        lib = Library()
+        pms = MockPms(lib)
+        # Known titles under one prefix, so the order each type lists in is what is asserted.
+        movie = first_of(lib, "movie")
+        show = first_of(lib, "show")
+        episode = next(it for it in lib.items.values() if it["type"] == "episode")
+        movie["title"], show["title"], episode["title"] = "s0000abc0", "s0000abc1", "s0000abc2"
+        person = lib.people[1]
+        person["tag"] = "s0000abc9"
+        query = "s0000abc"
+
+        def titles(kinds):
+            rows = fetch(pms, f"/library/search?query={query}&searchTypes={kinds}")["SearchResult"]
+            return [row["Metadata"]["title"] for row in rows]
+
+        self.assertEqual(titles("tv"), ["s0000abc1", "s0000abc2"], "shows first, then episodes")
+        self.assertEqual(titles("movies,tv"), ["s0000abc0", "s0000abc1", "s0000abc2"],
+                         "one mixed list in movies, shows, episodes order")
+        people = fetch(pms, f"/library/search?query={query}&searchTypes=people")["SearchResult"]
+        self.assertEqual(len(people), 1)
+        self.assertEqual(people[0]["Directory"]["tagKey"], person["tagKey"])
+        self.assertEqual(people[0]["Directory"]["count"], len(lib.person_media(person["id"])))
+        self.assertIn("score", people[0])
+        for kinds in ("shows", "bogus", "music"):
+            with self.subTest(searchTypes=kinds):
+                empty = fetch(pms, window(f"/library/search?query={query}&searchTypes={kinds}", 0, 10)[0])
+                self.assertEqual(empty["SearchResult"], [])
+                self.assertPaged(empty, 0, [], 0)
 
 
 if __name__ == "__main__":

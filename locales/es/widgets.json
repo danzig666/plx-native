@@ -13,6 +13,7 @@
   "widgets.tracks.subtitles": "Subtítulos",
   "widgets.tracks.unknown": "Desconocido",
   "widgets.tracks.off": "Desactivados",
+  "widgets.tracks.forced_only": "Solo forzados",
   "widgets.tracks.mono": "Mono",
   "widgets.tracks.stereo": "Estéreo",
   "widgets.tracks.original": "Original: {language}",
@@ -114,7 +115,7 @@
     "many": "{heading} · {count} PISTAS",
     "other": "{heading} · {count} PISTAS"
   },
-  "widgets.reason.jail_help": "La reparación requiere un televisor con root y acceso a Homebrew Channel. Consulta github.com/GLinnik21/plx-native/issues/74 para obtener ayuda.",
+  "widgets.reason.jail_help": "La reparación requiere un televisor con root y acceso a Homebrew Channel. Ayuda: plxnative.com/troubleshooting/#playback-reports-jail_missing_rtkmem.",
   "widgets.tracks.empty": "No hay pistas",
   "widgets.tracks.bytes": {
     "one": "{count} byte",
@@ -168,6 +169,7 @@
   "widgets.tracks.enh_reason_refused": "Tu servidor Plex no pudo activar esto para este vídeo.",
   "widgets.tracks.sub_burn_audio": "Lo dibuja tu servidor mientras convierte el audio.",
   "widgets.tracks.sub_burn_quality": "Lo dibuja tu servidor con esta calidad.",
+  "widgets.tracks.sub_remembered_note": "Los subtítulos que elegiste para esta serie no se pueden mostrar con este vídeo.",
   "widgets.tracks.style": "Estilo",
   "widgets.tracks.style_size": "Tamaño",
   "widgets.tracks.style_position": "Posición",
@@ -196,8 +198,6 @@
   "widgets.ass.invalid_track": "Esta pista de subtítulos con estilo no es válida o es demasiado grande",
   "widgets.ass.invalid_events": "Esta pista de subtítulos con estilo contiene eventos no válidos",
   "widgets.ass.track_too_large": "Esta pista de subtítulos con estilo es demasiado grande",
-  "widgets.ass.too_many_fonts": "Esta pista de subtítulos con estilo contiene demasiadas fuentes",
-  "widgets.ass.invalid_fonts": "Esta pista de subtítulos con estilo contiene fuentes no válidas",
   "widgets.ass.render_failed": "No se pudo mostrar este subtítulo con estilo",
   "widgets.ass.unavailable": "Los subtítulos con estilo no están disponibles en esta instalación",
   "widgets.ass.fonts_unavailable": "No se pudieron cargar las fuentes de los subtítulos",

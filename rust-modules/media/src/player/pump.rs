@@ -677,13 +677,21 @@ fn land_recovery_flight(
 /// Settle a synchronous native reload effect.  A failed `start_bufferfeed` used to be only a log:
 /// callers had already advanced the route reducer and then returned, leaving no Engine to publish
 /// the failure and (for Original) an `OriginalTrial` which could never receive its first frame.
-fn settle_reload(outcome: super::engine::ReloadOutcome, operation: &str) -> bool {
+pub(super) fn settle_reload(outcome:super::engine::ReloadOutcome, operation: &str) -> bool {
     if outcome == super::engine::ReloadOutcome::Started {
         return true;
     }
     super::log(&format!(
         "route transition: {operation} failed synchronously ({outcome:?})",
     ));
+    // The reload's teardown parked a Load that had already passed its budget and cleared the
+    // session flags with the rest of that session's state, then the start was refused for the
+    // outstanding object. Without the cause the report says `unspecified`; the cause is the
+    // timeout, so publish it again beside the Error.
+    if outcome == super::engine::ReloadOutcome::StartFailed && SHARED.native_load_abandoned() {
+        SHARED.load_failed.store(true, Release);
+        SHARED.load_timed_out.store(true, Release);
+    }
     set_state(super::shared::PlaybackState::Error);
     false
 }
@@ -1120,7 +1128,14 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         crate::route::confirm_original_recovery(ps);
     }
     if SHARED.frames.load(Relaxed) > 0 {
-        crate::route::confirm_resume_presented(ps);
+        // **The first decoded frame** (`route::on_decoded_frame`, one call per frame, each step once
+        // per landing), in the one order its doc fixes: the container-name re-match of a remembered
+        // subtitle (FO: the demuxer's track names exist now), the resume confirmation, and
+        // **the write of a remembered choice back to the server** (W6): the landing parked it,
+        // and a decoded frame is the evidence the television took the direct play with those
+        // tracks. A refused direct play never gets here with it parked (its rescue installs a fresh
+        // session), and the send only queues, so this frame never waits.
+        crate::route::on_decoded_frame(ps);
     }
 
     // The producer died before publishing a duration: the EOS path is gated on `duration_ns > 0`
@@ -1763,11 +1778,24 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         }
     }
 
-    // ---------- send the WHOLE sourceInfo envelope VERBATIM, once frames flow, then
+    // ---------- send the WHOLE sourceInfo envelope once frames flow (verbatim, except a
+    // container-PQ VP9 stream, see below), then
     // window + PLAYING (setMediaVideoData -> setDisplayWindow -> setState PLAYING) ----------
     if eng.stage == Stage::Bound && !eng.video_info_sent && SHARED.frames.load(Relaxed) >= 2 {
         let bytes = SHARED.source_info.lock().unwrap().clone();
-        if let Some(bytes) = bytes {
+        if let Some(mut bytes) = bytes {
+            // A VP9 stream's PQ lives in the container, which the pipeline never sees, so its own
+            // envelope says "hdrType":"none". Say HDR10 here when the demuxer found PQ (see
+            // `vp9_hdr`). `/tmp/plxnative-novp9hdr` sends the envelope as the pipeline made it.
+            let container_hdr = *SHARED.container_hdr.lock().unwrap();
+            if let Some(h) = container_hdr {
+                if !plx_base::devtrig::flag("novp9hdr") {
+                    if let Some(rewritten) = super::vp9_hdr::rewrite_source_info(&bytes, &h) {
+                        super::log(&super::vp9_hdr::log_line(&h));
+                        bytes = rewritten;
+                    }
+                }
+            }
             let rv = unsafe { super::sink().plane_send_video_data(mt, bytes.as_ptr() as *const c_char) };
             super::log(&format!(
                 "setMediaVideoData rv={rv} frames={}",
@@ -2183,8 +2211,8 @@ mod flight_tests {
     /// A seek tap on a transcode hands the PMS half to a worker: the frame returns without waiting
     /// for the server, a flight is outstanding, and the seek lands on a later frame.
     ///
-    /// "Without waiting" is graded CAUSALLY: the rig is told to hold every `/decision` answer, so
-    /// when the frame returns no answer has been delivered, and a frame that had made the round trip
+    /// "Without waiting" is graded CAUSALLY: the rig is told to hold every answer, so
+    /// when the frame returns no answer has been written, and a frame that had made the round trip
     /// itself could not have returned at all until the server's safety release. Nothing here depends
     /// on how long the frame took. The request LOG is not graded: the rig logs a `/decision` the
     /// moment it arrives and the worker may legitimately have sent it by then (the earlier
@@ -2196,11 +2224,11 @@ mod flight_tests {
         assert_eq!(rig.flight.decisions(), 0, "sanity: an idle frame asks PMS nothing");
         let before = crate::route::transcode_session(&rig.ps);
 
-        rig.flight.hold_decisions();
+        rig.flight.hold_answers();
         crate::player::request_seek(SEEK_TARGET_NS);
         rig.frame();
         assert_eq!(
-            rig.flight.answered_decisions(),
+            rig.flight.answered(),
             0,
             "the seek frame returned only after the server answered: a PMS round trip on the frame \
              thread: {:?}",
@@ -2215,12 +2243,29 @@ mod flight_tests {
         assert!(super::super::claim_hold::active(), "the old picture is held under the spinner");
         assert!(TX.paused.load(Acquire), "the hold paused the stream, as a direct-play seek does");
 
-        rig.flight.release_decisions();
+        rig.flight.release_answers();
         rig.frames_until("the seek's landing", |_| !crate::route::flight_outstanding());
         assert_eq!(rig.flight.decisions(), 1, "exactly one /decision for the seek");
         assert_ne!(crate::route::transcode_session(&rig.ps), before, "the landing installed the replacement encoder");
         assert_eq!(TX.seek_to_ns.load(Relaxed), -1, "the seek was consumed, not re-armed");
         rig.flight.wait_for("the replaced encoder's stop", |f| f.stopped().iter().any(|s| s == "rig-1"));
+    }
+
+    /// The track-memory write-back is sent from the pump's decoded-frame branch and from nowhere
+    /// else (W6): a frame before the first decoded picture leaves it parked, the first frame
+    /// with `frames > 0` takes it. The session is the rig's transcode, so the send drops the value
+    /// rather than queueing a PUT; what is graded here is only WHEN the pump takes it.
+    #[test]
+    fn the_first_decoded_frame_takes_the_parked_write_back_and_an_earlier_frame_does_not() {
+        let mut rig = Rig::new(150);
+        crate::route::park_write_back_for_test(&mut rig.ps);
+        assert_eq!(SHARED.frames.load(Relaxed), 0, "sanity: nothing decoded yet");
+        rig.frame();
+        assert!(crate::route::write_back_parked(&rig.ps), "no decoded frame yet: the write stays parked");
+
+        SHARED.frames.store(1, Relaxed);
+        rig.frame();
+        assert!(!crate::route::write_back_parked(&rig.ps), "the first decoded frame took the parked write");
     }
 
     /// A Home press while a seek flight is out saves the SEEK TARGET (what `app::intended_pos`
@@ -2290,20 +2335,22 @@ mod flight_tests {
         let mut rig = Rig::new(150);
         FlightRig::offer_original(&mut rig.ps, false);
         rig.frame();
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
         let epoch = engine_epoch(&mut rig);
 
+        rig.flight.hold_answers();
         FlightRig::queue_manual_original(&rig.ps, false);
         rig.frame();
         assert_eq!(
-            rig.flight.asked(),
-            asked,
-            "the claiming frame made a PMS round trip on the frame thread: {:?}",
+            rig.flight.answered(),
+            answered,
+            "the claiming frame waited for a PMS answer on the frame thread: {:?}",
             rig.flight.requests()
         );
         assert!(crate::route::flight_outstanding(), "the recovery's PMS half must be a flight");
         assert!(super::super::claim_hold::active(), "a user's claim holds the picture at its offset");
         assert_eq!(engine_epoch(&mut rig), epoch, "nothing reloads before the landing");
+        rig.flight.release_answers();
 
         rig.frames_until("the recovery's landing", |_| !crate::route::flight_outstanding());
         assert_eq!(rig.flight.decisions(), 1, "exactly one replacement /decision");
@@ -2325,12 +2372,14 @@ mod flight_tests {
         FlightRig::offer_original(&mut rig.ps, false);
         rig.flight.refuse_decisions(1);
         rig.frame();
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
 
+        rig.flight.hold_answers();
         FlightRig::queue_manual_original(&rig.ps, true);
         rig.frame();
-        assert_eq!(rig.flight.asked(), asked, "{:?}", rig.flight.requests());
+        assert_eq!(rig.flight.answered(), answered, "{:?}", rig.flight.requests());
         assert!(crate::route::flight_outstanding());
+        rig.flight.release_answers();
 
         rig.frames_until("the owed reload's landing", |r| {
             !crate::route::flight_outstanding() && r.flight.decisions() == 2
@@ -2371,19 +2420,21 @@ mod flight_tests {
         let mut rig = hls_rig(150);
         FlightRig::offer_original(&mut rig.ps, false);
         rig.frame();
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
         let epoch = engine_epoch(&mut rig);
 
+        rig.flight.hold_answers();
         FlightRig::publish_hls_to_original(60_000_000_000);
         rig.frame();
         assert_eq!(
-            rig.flight.asked(),
-            asked,
-            "the claiming frame made a PMS round trip on the frame thread: {:?}",
+            rig.flight.answered(),
+            answered,
+            "the claiming frame waited for a PMS answer on the frame thread: {:?}",
             rig.flight.requests()
         );
         assert!(crate::route::flight_outstanding());
         assert_eq!(engine_epoch(&mut rig), epoch);
+        rig.flight.release_answers();
 
         rig.frames_until("the recovery's landing", |_| !crate::route::flight_outstanding());
         assert_eq!(rig.flight.decisions(), 1);
@@ -2463,15 +2514,16 @@ mod flight_tests {
     fn an_automatic_hls_fallback_frame_makes_no_pms_call_and_the_worker_lands_it_later() {
         let mut rig = auto_original_rig(150);
         rig.frame();
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
         let epoch = engine_epoch(&mut rig);
 
+        rig.flight.hold_answers();
         FlightRig::publish_original_to_hls(6_000, 60_000_000_000);
         rig.frame();
         assert_eq!(
-            rig.flight.asked(),
-            asked,
-            "the claiming frame made a PMS round trip on the frame thread: {:?}",
+            rig.flight.answered(),
+            answered,
+            "the claiming frame waited for a PMS answer on the frame thread: {:?}",
             rig.flight.requests()
         );
         assert!(crate::route::flight_outstanding(), "the fallback's PMS half must be a flight");
@@ -2479,6 +2531,7 @@ mod flight_tests {
         assert!(!TX.paused.load(Acquire), "the stream was not paused for the flight");
         assert_eq!(engine_epoch(&mut rig), epoch, "nothing reloads before the landing");
         assert_eq!(crate::route::transcode_session(&rig.ps), "rig-1", "the Original is still the route");
+        rig.flight.release_answers();
 
         rig.frames_until("the fallback's landing", |_| !crate::route::flight_outstanding());
         assert_eq!(rig.flight.decisions(), 1, "exactly one replacement /decision");
@@ -2707,21 +2760,23 @@ mod flight_tests {
     #[test]
     fn a_failed_original_trial_frame_makes_no_pms_call_and_the_worker_lands_the_rollback_later() {
         let mut rig = failed_original_trial_rig(150);
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
         let decisions = rig.flight.decisions();
         let epoch = engine_epoch(&mut rig);
 
+        rig.flight.hold_answers();
         SHARED.load_failed.store(true, Release);
         rig.frame();
         assert_eq!(
-            rig.flight.asked(),
-            asked,
-            "the failure frame made a PMS round trip on the frame thread: {:?}",
+            rig.flight.answered(),
+            answered,
+            "the failure frame waited for a PMS answer on the frame thread: {:?}",
             rig.flight.requests()
         );
         assert!(crate::route::flight_outstanding(), "the rollback's rebase must be a flight");
         assert_ne!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "the viewer sees a spinner, not the failure");
         assert_eq!(engine_epoch(&mut rig), epoch, "nothing reloads before the landing");
+        rig.flight.release_answers();
 
         rig.frames_until("the rollback's landing", |_| !crate::route::flight_outstanding());
         assert_eq!(rig.flight.decisions(), decisions + 1, "exactly one rebuild /decision for the rollback");
@@ -2739,12 +2794,14 @@ mod flight_tests {
         let mut rig = failed_original_trial_rig(40);
         let epoch = engine_epoch(&mut rig);
         rig.flight.refuse_decisions(1);
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
 
+        rig.flight.hold_answers();
         SHARED.load_failed.store(true, Release);
         rig.frame();
-        assert_eq!(rig.flight.asked(), asked, "{:?}", rig.flight.requests());
+        assert_eq!(rig.flight.answered(), answered, "{:?}", rig.flight.requests());
         assert!(crate::route::flight_outstanding());
+        rig.flight.release_answers();
 
         rig.frames_until("the refusal's landing", |r| {
             crate::player::state(&r.ps) == crate::player::PlaybackState::Error
@@ -2804,25 +2861,27 @@ mod flight_tests {
     #[test]
     fn a_synchronous_trial_load_failure_makes_no_pms_call_and_the_worker_lands_the_rollback_later() {
         let mut rig = failed_original_trial_rig(150);
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
         let decisions = rig.flight.decisions();
         let epoch = engine_epoch(&mut rig);
         // The candidate route is gone, so the trial's own reload cannot start.
         crate::route::clear_url(&mut rig.ps);
 
+        rig.flight.hold_answers();
         {
             let _frame = plx_base::task::FrameScope::enter();
             start_original_trial_reload(&mut rig.ps, &mut rig.pa, crate::route::AutoOriginalReload::Remux, 60_000_000_000);
         }
         assert_eq!(
-            rig.flight.asked(),
-            asked,
-            "the failure frame made a PMS round trip on the frame thread: {:?}",
+            rig.flight.answered(),
+            answered,
+            "the failure frame waited for a PMS answer on the frame thread: {:?}",
             rig.flight.requests()
         );
         assert!(crate::route::engineless_flight_outstanding(), "the rollback's rebase must be an Engine-less flight");
         assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Resolving, "a spinner, not the failure");
         assert_eq!(engine_epoch(&mut rig), epoch, "nothing reloads before the landing");
+        rig.flight.release_answers();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while crate::route::engineless_flight_outstanding() {
@@ -2864,13 +2923,15 @@ mod flight_tests {
     #[test]
     fn a_foreground_rollback_is_pending_without_a_pms_call_and_lands_a_tracked_reload() {
         let mut rig = failed_original_trial_rig(120);
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
+        rig.flight.hold_answers();
         let recovery = {
             let _frame = plx_base::task::FrameScope::enter();
             recover_failed_foreground_original(&mut rig.ps)
         };
         assert!(matches!(recovery, ForegroundOriginalRecovery::Pending));
-        assert_eq!(rig.flight.asked(), asked, "{:?}", rig.flight.requests());
+        assert_eq!(rig.flight.answered(), answered, "{:?}", rig.flight.requests());
+        rig.flight.release_answers();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let landed = loop {
             assert!(std::time::Instant::now() < deadline, "timed out waiting for the rollback's landing");
@@ -2906,20 +2967,22 @@ mod flight_tests {
     fn an_unopened_source_frame_makes_no_pms_call_and_the_worker_lands_the_hls_later() {
         let mut rig = unopened_auto_original_rig(150);
         rig.frame();
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
         let epoch = engine_epoch(&mut rig);
 
+        rig.flight.hold_answers();
         SHARED.load_failed.store(true, Release);
         rig.frame();
         assert_eq!(
-            rig.flight.asked(),
-            asked,
-            "the failure frame made a PMS round trip on the frame thread: {:?}",
+            rig.flight.answered(),
+            answered,
+            "the failure frame waited for a PMS answer on the frame thread: {:?}",
             rig.flight.requests()
         );
         assert!(crate::route::flight_outstanding(), "the unopened fallback's PMS half must be a flight");
         assert_ne!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "a spinner, not the failure");
         assert_eq!(engine_epoch(&mut rig), epoch, "nothing reloads before the landing");
+        rig.flight.release_answers();
 
         rig.frames_until("the fallback's landing", |_| !crate::route::flight_outstanding());
         assert_eq!(rig.flight.decisions(), 1, "exactly one replacement /decision");
@@ -2938,12 +3001,14 @@ mod flight_tests {
         rig.flight.refuse_decisions(1);
         rig.frame();
         let epoch = engine_epoch(&mut rig);
-        let asked = rig.flight.asked();
+        let answered = rig.flight.answered();
 
+        rig.flight.hold_answers();
         SHARED.load_failed.store(true, Release);
         rig.frame();
-        assert_eq!(rig.flight.asked(), asked, "{:?}", rig.flight.requests());
+        assert_eq!(rig.flight.answered(), answered, "{:?}", rig.flight.requests());
         assert!(crate::route::flight_outstanding());
+        rig.flight.release_answers();
 
         rig.frames_until("the refusal's landing", |r| {
             crate::player::state(&r.ps) == crate::player::PlaybackState::Error

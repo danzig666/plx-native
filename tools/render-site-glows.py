@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Render the landing page's glows: tiny, already blurred pictures that the browser scales up.
 
-    python3 tools/render-site-glows.py
+    python3 tools/render-site-glows.py [--only feel-glow.png ...]
 
-A soft, coloured copy of the TV screen and of each close-up glows behind it. The page used to
+`--only` renders just the named glows (`site_video.py adopt --derive` asks for the film's two).
+
+A soft, coloured copy of the TV screen glows behind it on the page (the close-ups' glows are no longer used there, since the Landing Page v9 redesign). The page used to
 make it live with `filter: blur(70px)` over the full-size image, which the browser re-renders
 whenever the layer changes; a blur that heavy leaves nothing a 48-pixel picture cannot hold, so
 each glow is now that picture (site/media/*-glow*.png), scaled up by the browser at no cost.
@@ -19,6 +21,7 @@ Needs ffmpeg.
 import math
 import pathlib
 import subprocess
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MEDIA = ROOT / "site" / "media"
@@ -76,9 +79,19 @@ def render(name, source, box, blur, sat):
           f" --mx: {m / w:.4f}; --my: {m / h:.4f};")
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    only = None
+    if argv[:1] == ["--only"]:
+        only = argv[1:]
+        unknown = sorted(set(only) - {g[0] for g in GLOWS})
+        if not only or unknown:
+            sys.exit(f"render-site-glows: --only wants names from {[g[0] for g in GLOWS]}, got {only}")
+    elif argv:
+        sys.exit("usage: render-site-glows.py [--only NAME ...]")
     for glow in GLOWS:
-        render(*glow)
+        if only is None or glow[0] in only:
+            render(*glow)
 
 
 if __name__ == "__main__":

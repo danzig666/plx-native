@@ -25,7 +25,7 @@ is not one any `shutdown(2)` of ours can reach. Exactly one of the two ever has 
 and pinned to majors 63/63/61, and is built `--disable-network` with `file` as its only protocol —
 so the AVIO is not merely how bytes reach it today, it is the only way they *can*. See the root
 `docs/agent-reference.md` linking section for why. It
-emits Annex-B video AUs (param sets prepended at each keyframe) and AC3/EAC3, ADTS-framed AAC, or DTS core audio frames,
+emits Annex-B video AUs (param sets prepended at each keyframe) and, for AV1, Section-5 temporal units (TD OBU first, the av1C sequence header and metadata OBUs in-band on keyframes; `/tmp/plxnative-av1obu` = notd,noseq,raw tokens varies it on a debug build), for VP9 the demuxed packet unchanged (a frame carries its own headers and libpf's `video/x-vp9` caps have no `codec_data`), and AC3/EAC3, ADTS-framed AAC, or DTS core audio frames,
 and seeks by time via `av_seek_frame` (libavformat's own Cues index).
 
 ## Threading model (this is the whole ballgame)
@@ -99,8 +99,9 @@ something.
   measured the picture: **13.0 fps presented under the 60 declaration, 24.1 under 24**. So H.264
   declares the stream's rate class
   (`fps_class`), HEVC keeps 60 (4K HEVC under 60 holds 24), and a transcode with no known rate
-  keeps 60. `/tmp/plxnative-sinkmax=WxH@F` overrides the envelope for the legs still unrun on
-  10.3.1.
+  keeps 60. AV1 (only on a set whose codec table lists an AV1 decoder) keeps HEVC's 4K60 rule,
+  clamped by `Caps::av1_row`; the clamp is unmeasured (one owner reports AV1 playing on a webOS 10.3.1 set, with no log). `/tmp/plxnative-sinkmax=WxH@F`
+  overrides the envelope for the legs still unrun on 10.3.1.
 - **There IS a presented-frame instrument now, and it is not a GStreamer trace.** The payload's
   `streamQualityInfo` / `streamQualityInfoNonFlushable` keys make libpf read the video sink's
   `dropped-frames` / `non-flushable-displayed-frames` properties on the same 200 ms timer as the
@@ -122,7 +123,10 @@ something.
   thread still inside `sf_load` (that froze the SDL thread on BACK): the thread, payload and
   epoch are parked as `engine::AbandonedLoad` (Rust phase `Abandoned`), native starts are
   refused, and `reap_abandoned_load` runs the ordinary Unload → gate → retire → D1 release on the
-  main thread once Load returns; a Load that never returns leaks its object. A Load that has not
+  main thread once Load returns; a Load that never returns leaks its object. A refusal says why:
+  a reload refused for the parked Load (`pump::settle_reload`) republishes `load_timed_out`, and a
+  refused FRESH start sets `ps.native_start_refused`, which `player::state` derives `Error` from
+  (cause `load_timeout`, Try Again offered) because no Engine exists to publish it; the first start that is not refused (`start_bufferfeed_for`, which every reload shares) clears it. A Load that has not
   timed out is still joined. The host concurrent tests model this boundary, not
   the firmware's native initialization. ACB dispatch is additionally constrained by stage/bind
   ordering; the C Starfish gate does not wrap ACB calls.
@@ -203,9 +207,9 @@ something.
   collides with the pipeline's uMS connection (CONN_FIND_ERR). See the comment in `load_thread`.
 - **ACB bind order matters** (mirrors Kodi/ss4s): `setSinkType(MAIN)` → `setMediaId` →
   `setState(LOADED)` → *wait for decoded frames* → `setMediaVideoData(<sourceInfo envelope
-  VERBATIM>)` → `setDisplayWindow` → `setState(PLAYING)`. The payload passed to
+  as captured; a PQ VP9 gets its HDR keys written in first, see below>)` → `setDisplayWindow` → `setState(PLAYING)`. The payload passed to
   `setMediaVideoData` is the **whole `sourceInfo` envelope** captured verbatim from the pipeline's
-  callback (`sourceInfoRaw`), not a reconstructed one. Audio is owned by the pipeline — **never feed
+  callback (`sourceInfoRaw`), not a reconstructed one — with ONE exception: a VP9 stream whose container says PQ gets `hdrType` / `mediaVui` / `mediaSei` written in first (`player/vp9_hdr.rs`), because a VP9 bitstream cannot carry the transfer function, so the pipeline's own envelope says `"hdrType":"none"` and the panel stays SDR (device-measured on the dev set, whose ACB path is the only one that sends the envelope: the TV's `picture.dynamicRange` flips to HDR with the rewrite and stays SDR with `/tmp/plxnative-novp9hdr`; webOS 5+ has no ACB, so nothing is sent there and its VP9 HDR behaviour is unknown). The envelope is otherwise untouched, and an envelope that already names an HDR type is never overridden. Audio is owned by the pipeline — **never feed
   ACB an audio SINK or elementary stream**. That half is real and unchanged. Its long-stated
   consequence is not: `SOUND_ERROR_019` is a literal that exists in **no library on this
   television** (swept across ~70 harvested libraries including 92 MB of Chromium), and the clause
@@ -237,7 +241,10 @@ something.
   store — not `SHARED.sub_cues`, which is a window the demuxer refills and a backward seek would
   empty. It is silent where the server burns the selection (a re-encode, or a remux whose embedded
   track the app may not read itself); over a plain remux the app draws it, and draws an embedded
-  track too (`subside.rs`) when the link is local and the Part is 1..=30000 kbps.
+  track too (`subside.rs`) when the link is local and the Part is 1..=30000 kbps. Which sidecar
+  starts is `sidecar::restore_selection`'s one answer: the server's selected one, else the one the
+  track memory chose for this episode (`Plan::memory_sidecar`, its key and codec read from the
+  playing item).
 - **A seek NEVER interrupts the demuxer.** The pump publishes the target in `seek_to_ns` and the
   demux thread — the only thread that touches the `AVFormatContext` — `av_seek_frame`s on it
   between two reads. Do not reintroduce an interrupt: the pump used to `shutdown(2)` the socket to
@@ -281,6 +288,37 @@ something.
   `frames` in the presented callback, cleared **only** in `reset_session`. The HUD divides its two
   busy indicators on it (`appkit::player_hud::busy_surface`); anything else asking "has this session put
   a picture on the panel" wants `player::seen_frame()`, not `frames() > 0`.
+- **A remembered track choice is written back to PMS on the first decoded frame, never at the
+  landing.** `route::apply_plan` only PARKS it (`PlaybackSession.write_back`: installing a URL is not
+  evidence the television accepted it, and a refused direct play's rescue PUTs its own selection);
+  `pump`'s `frames > 0` branch calls `route::on_decoded_frame`, whose last step is
+  `route::send_parked_write_back`: it `take`s the value (one write per play), drops it when
+  `parked_write_stale` says so (the route changed: another URL, any transcode; or the selection on
+  screen moved), and otherwise only QUEUES one `PUT /library/parts` on the serial selection worker,
+  so the frame never waits on the server. The queue stamps each request with the slot client's
+  `(instance_gen, grant_epoch)` and the worker drops it when either moved: a profile switch re-tokens
+  the SAME slot, so without the stamp a request queued under one profile would go out under the next
+  (manual picks share the queue). A failed PUT is logged and never retried. "The selection on screen"
+  is read from the SESSION once the landing has restored the server's sidecar, not from the plan.
+  A subtitle change before the send that is not the viewer's pick (the first-frame container-name
+  re-match, FO) re-points the parked write with `route::repoint_parked_subtitle` and queues no PUT
+  of its own: a PUT of its own would move the selection under the parked write, which would then be
+  dropped, and would reach PMS without W5 and W7. That re-match is
+  `route::rematch_subtitle_with_names`, and the order of the `frames > 0` steps is load-bearing:
+  re-match FIRST (the demuxer's track names exist only once the file is open), `send_parked_write_back`
+  second, so one PUT names the remembered audio and the re-matched subtitle together. The order lives
+  in ONE function, `route::on_decoded_frame`, which the pump and the write-back tests both call, so
+  a swap there is graded (the two-step tests go red); do not re-inline the steps in `pump`.
+  `repoint_parked_subtitle` runs BEFORE the commit, because the commit changes `cur_sub_sid` under the
+  parked pair, and it asks the SAME staleness predicate the send asks (`parked_write_stale`) before it
+  touches the write: a write the send would drop (route replaced in place, an audio pick before the
+  first frame) is dropped there and logged, `repoint_parked_subtitle` returns `false`, and the re-match
+  commits with its own PUT, so the server always hears the subtitle on screen. That PUT, parked or not,
+  is W5-gated: over a Part that carries an external stream the re-match commit PUTs nothing (the
+  selection moving off a download makes PMS discard it). With nothing parked it otherwise commits with
+  its own PUT as before. It holds itself to the
+  subtitle the landing put on screen (`owed.landed_sub`, settled from the session by
+  `settle_landing_selection`), so it never replaces a remembered sidecar the restore drew.
 - **App-switch lifecycle** (handled in `app/run.rs`, the frame loop; the machine and the
   transport-pause contract are `player/lifecycle.rs`, which `app::lifecycle` re-exports; details in
   the `docs/agent-reference.md` gotchas): OS

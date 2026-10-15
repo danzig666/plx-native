@@ -22,11 +22,14 @@ use std::os::raw::{c_char, c_int};
 
 pub mod qr;
 pub mod anim;
-pub mod card_row;
+pub(crate) mod card_row;
+pub mod cards; // shared card sections (plan: shared-card-sections): Shelf, Grid, CardSource, and the card conformance suite
 pub mod marquee; // the focused run's looping glide: a tile's title and caption (card_row), cast name and role, menu rows (table)
 pub mod card_motion;
 #[cfg(feature = "devtriggers")]
 pub mod card_motion_metrics;
+#[cfg(feature = "devtriggers")]
+pub mod card_probe; // `plxnative-focusx`: the focused card's drawn rect/index/art of every Shelf and Grid
 pub mod value_chip; // shared label/value/owner capsule used by menu-opening controls
 pub mod containers; // RESTRUCTURE (spec §6.2): Navigation = TabContainer → NavStack → ModalStack, the transitions, the host fold
 pub mod collection_tile; // the neutral tile a thumb-less collection draws on every surface
@@ -39,6 +42,7 @@ pub mod adapters; // RESTRUCTURE (spec §2.2): the one door out of the machine w
 pub mod geom; // RESTRUCTURE (spec §7.1): `Focusable` for the widgets — geometry IS `place`
 pub mod tile; // RESTRUCTURE (spec §10): the library's item abstraction for a shelf tile
 pub mod document_reader;
+pub mod prose_scroll; // the paged prose viewport `person_bio` and `about_panel` share
 pub mod fit; // one declared-priority primitive for a line with two competing runs (`two_runs`)
 pub mod fixture; // RESTRUCTURE spike: `FixtureHost` — the bundle the generic library is tested against
 pub mod focus; // RESTRUCTURE (spec §7.3): the focus ENGINE — one owner of focus, the golden tables
@@ -48,6 +52,7 @@ pub mod frame; // RESTRUCTURE spike (spec §8.1): `Budget`, admission control fo
 pub mod glassload; // dev-only backdrop-glass LOAD DIAL + the blurred-route-transition prototype
 pub mod hold_hint; // the standing "Hold [OK] for options" capsule: dwell/life schedule, hold-progress cap, fade + rise
 pub mod hit; // RESTRUCTURE (spec §7.6): the double-buffered hit map and the pointer gates
+pub mod placeholder; // placeholder accounting: a per-frame count at every placeholder DRAW + the #FF00FE pixel sentinel (feature `placeholder-sentinel`)
 pub mod hero_logo; // the ONE clearLogo sizing rule + its fallback-to-title band (both heroes, the compact title)
 pub mod landing_hero; // shared landing hero geometry and scrim curve, also read by route/legibility checks
 pub mod icons;
@@ -71,7 +76,7 @@ pub mod page_stack; // the drill-in page stack Tracks and More share
 pub mod panel_motion; // the resize/page-slide spring of the in-player table popovers (Tracks, More)
 pub mod nav; // the page transition's PRESENTATION, published once a frame from the container
 pub mod pill; // THE CAPSULE OUTLINE — three blended arcs per corner, solved; not a stadium
-pub mod poster_grid; // uniform six-column portrait geometry for collection-like pages
+pub(crate) mod poster_grid; // uniform six-column portrait geometry for collection-like pages
 pub mod popover; // shared modal open/appear choreography (track menu / info / chapters / account)
 pub mod press; // tvOS-style click: OK-down dips the focused card, OK-up springs it back + activates
 pub use plx_gfx::gfx::profile; // the draw-phase profiler lives in `gfx` now (module-layers step L5)
@@ -452,7 +457,14 @@ impl Painter {
         use frame::backdrop::Value;
         let mut data=vec![tag];
         [self.a,self.rgb].record(&mut data);
-        let m = self.place(r);
+        let mut m = self.place(r);
+        if matches!(tag, 100..=102) && self.zoom.is_none() {
+            // Unzoomed text is drawn at a whole pixel (`text::Placed::origin` snaps it), so the
+            // pixel it lands on is what it can change under a glass, not the float it came from: a
+            // heading easing the last fraction of a pixel into place changes nothing on screen.
+            m.x = plx_gfx::gfx::snap(m.x);
+            m.y = plx_gfx::gfx::snap(m.y);
+        }
         [m.x,m.y,m.w,m.h].record(&mut data);
         values(&mut data);
         // The primitive AA/rim can paint just outside its nominal rectangle.
@@ -1003,10 +1015,11 @@ impl Painter {
         rim: plx_gfx::gfx::GlassRim,
         face: plx_gfx::gfx::GlassFace,
         deep: f32,
+        rises: bool,
     ) -> bool {
         if self.records() { return false; }
         if frame::backdrop::discovering() {
-            frame::backdrop::surface(self.place(r));
+            frame::backdrop::surface_with(self.place(r), rises);
             self.declare(r,frame::backdrop::GLASS_COMMAND,|data| {
                 use frame::backdrop::Value;
                 (rim as u32).record(data);
@@ -1030,6 +1043,7 @@ impl Painter {
             rim,
             face,
             deep,
+            rises,
         )
     }
     /// [`tex`](Self::tex) with the focus edge-sheen (the 1px inset perimeter rim) baked into the SAME

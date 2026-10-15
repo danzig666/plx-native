@@ -64,8 +64,9 @@ pub(crate) fn desktop_window_size() -> (c_int, c_int) {
 /// generated. `crashtrace.c` says so itself. Two deliberate SIGSEGVs produced the signal status and
 /// an empty `/var/log/reports/librdx/`.
 ///
-/// The line this hook writes is also the crash channel's PANIC input: `telemetry::crashreport`
-/// reads the log on the next launch, hashes the message and sends the location only.
+/// The record this hook writes (the panic line and its `time:` line) is also the crash channel's
+/// PANIC input: `telemetry::crashreport` reads the log on the next launch, hashes the message and
+/// sends the location and the bounded crash time, never the message.
 pub(crate) fn install_panic_logger() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -86,6 +87,7 @@ pub(crate) fn install_panic_logger() {
         let _ = record_panic_in_crash_log(
             &plx_base::paths::in_runtime_dir(plx_base::paths::runtime_file::CRASH),
             &line,
+            plx_telemetry::telemetry::crashreport::now_secs(),
         );
         default(info); // preserve default behaviour (stderr -> plxnative-stderr.log)
     }));
@@ -102,8 +104,19 @@ pub(crate) fn install_panic_logger() {
 /// link, 0640, never truncated) rather than a bare `OpenOptions` at the umask's mode, so a name
 /// planted in the shared `/tmp` is refused instead of written through. `Err` is for the hook to
 /// ignore: a panic hook has nowhere to report a failure to.
-fn record_panic_in_crash_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
-    plx_base::eventlog::append_record(path, &plx_base::eventlog::scrub::scrub_local(line))
+///
+/// **The record is two lines in ONE write:** the panic line and the `time: <unix seconds>` line the
+/// C tracer also writes under a signal record ([`plx_telemetry::telemetry::crashreport::crash_time_record`]
+/// is the one spelling). The crash importer sends it as the event's `timestamp`, so the report says
+/// when the panic happened rather than when the next launch found it. `0` (a clock that reads
+/// nothing) writes no time line.
+fn record_panic_in_crash_log(path: &std::path::Path, line: &str, unix_secs: u64) -> std::io::Result<()> {
+    let mut record = plx_base::eventlog::scrub::scrub_local(line);
+    if unix_secs > 0 {
+        record.push('\n');
+        record.push_str(&plx_telemetry::telemetry::crashreport::crash_time_record(unix_secs));
+    }
+    plx_base::eventlog::append_record(path, &record)
 }
 
 #[cfg(test)]
@@ -127,15 +140,22 @@ mod panic_log_tests {
     fn the_panic_text_is_scrubbed_like_every_event_log_line() {
         let dir = scratch("scrub");
         let path = dir.join("crash.log");
-        record_panic_in_crash_log(&path, LINE).unwrap();
+        record_panic_in_crash_log(&path, LINE, 1_750_000_000).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("SECRETTOKEN"), "{written}");
         assert!(!written.contains("192-168-1-50") && !written.contains("plex.direct"), "{written}");
         assert!(written.starts_with("*** RUST PANIC [demux] at src/ff.rs:1204: "), "the record's shape survives: {written}");
-        assert!(written.ends_with('\n') && written.matches('\n').count() == 1, "one newline-terminated record");
-        // And the crash report parser still reads the scrubbed record.
+        assert!(
+            written.ends_with("\ntime: 1750000000\n") && written.matches('\n').count() == 2,
+            "the panic line, then its time line, newline-terminated: {written}"
+        );
+        // And the crash report parser still reads the scrubbed record, with the time it was given.
         let reports = plx_telemetry::telemetry::crashreport::parse(&written);
         assert_eq!(reports.len(), 1, "{written}");
+        assert!(
+            matches!(&reports[0], plx_telemetry::telemetry::crashreport::Report::Panic(p) if p.crash_time == Some(1_750_000_000)),
+            "{reports:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -147,14 +167,14 @@ mod panic_log_tests {
         let path = dir.join("crash.log");
         std::fs::write(&path, b"*** SIGNAL 11 earlier\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        record_panic_in_crash_log(&path, "*** RUST PANIC [t] at src/a.rs:1: boom").unwrap();
+        record_panic_in_crash_log(&path, "*** RUST PANIC [t] at src/a.rs:1: boom", 1_750_000_000).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "*** SIGNAL 11 earlier\n*** RUST PANIC [t] at src/a.rs:1: boom\n"
+            "*** SIGNAL 11 earlier\n*** RUST PANIC [t] at src/a.rs:1: boom\ntime: 1750000000\n"
         );
         let fresh = dir.join("fresh.log");
-        record_panic_in_crash_log(&fresh, "*** RUST PANIC [t] at src/a.rs:1: boom").unwrap();
+        record_panic_in_crash_log(&fresh, "*** RUST PANIC [t] at src/a.rs:1: boom", 1_750_000_000).unwrap();
         assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o7777, 0o640);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -170,11 +190,11 @@ mod panic_log_tests {
 
         let linked = dir.join("symlinked.log");
         symlink(&victim, &linked).unwrap();
-        assert!(record_panic_in_crash_log(&linked, LINE).is_err());
+        assert!(record_panic_in_crash_log(&linked, LINE, 1_750_000_000).is_err());
 
         let hard = dir.join("hardlinked.log");
         std::fs::hard_link(&victim, &hard).unwrap();
-        assert!(record_panic_in_crash_log(&hard, LINE).is_err());
+        assert!(record_panic_in_crash_log(&hard, LINE, 1_750_000_000).is_err());
 
         let meta = std::fs::metadata(&victim).unwrap();
         assert_eq!(meta.mode() & 0o7777, 0o600, "never widened");
@@ -359,20 +379,307 @@ mod seam_order_tests {
         let init = body.find(concat!("plx_net::net::", "global_init()")).expect("construct's libcurl init");
         assert!(user_agent < init, "set_user_agent must come before net::global_init");
     }
+
+    /// SDL reads `SDL_WEBOS_CURSOR_SLEEP_TIME` in `SDL_Init`, so the hint set after it does nothing.
+    #[test]
+    fn the_cursor_sleep_hint_is_set_before_sdl_init() {
+        // Split with `concat!` for the reason the test above gives.
+        let source = include_str!("boot.rs");
+        let body = source
+            .split_once(concat!("pub(crate) unsafe fn ", "construct("))
+            .expect("construct")
+            .1;
+        let hint = body
+            .find(concat!("webos3_cursor_", "sleep_hint()"))
+            .expect("construct must set the cursor sleep hint");
+        let init = body.find(concat!("SDL_Init(", "SDL_INIT_VIDEO)")).expect("construct's SDL_Init");
+        assert!(hint < init, "the cursor sleep hint must come before SDL_Init");
+    }
 }
 
 /// Hide the Magic Remote's on-screen pointer. A webOS-only concept: there is no such cursor to
 /// hide on a desktop, and `SDL_webOSCursorVisibility` exists in no SDL but LG's fork.
 ///
-/// One door rather than a branch at each of the five call sites, so the platform question is
-/// asked once and the call sites read the same on both.
+/// One door rather than a branch at each caller, so the platform question is asked once
+/// and the callers read the same on LG's extension and on the transparent-cursor path.
+///
+/// Resolved at runtime rather than linked: webOS 3.4 ships SDL 2.0.3, which has none of LG's
+/// `SDL_webOS*` extensions, and a strong reference there is a lazily-bound PLT slot that kills
+/// the process on the first D-pad press (`tools/fwcompat.py --release 3.4.0`).
+///
+/// **Without LG's extension the pointer is SDL's own cursor, and it is swapped for a transparent
+/// one rather than switched off.** webOS 3.9.3 ships SDL 2.0.4 with no `SDL_webOS*` export at all,
+/// and that SDL draws the pointer itself (its `.rodata` carries `/usr/share/im/cursorType*.png`
+/// and `wl_starfish_pointer`). With nothing to call, every hide was a no-op and the pointer stayed
+/// up until LG's ~5-minute idle timeout, issue #642. `SDL_ShowCursor(SDL_DISABLE)` does hide it
+/// there, but measured on that set it also stops pointer motion reaching the app until the pointer
+/// re-enters the window (opening and closing the Settings overlay), so no motion could bring it
+/// back. With a transparent cursor the motion keeps arriving, and [`show_cursor_after_motion`] puts
+/// the previous cursor back on the next one. Every SDL call is dlsym'd, so the binary gains no
+/// import.
 #[inline]
 pub(crate) unsafe fn hide_cursor() {
     #[cfg(not(feature = "hostsim"))]
     {
-        SDL_webOSCursorVisibility(0);
+        hide_through(cursor_door(), &SHOWN_CURSOR);
     }
 }
+
+/// Bring the pointer back after [`hide_cursor`] swapped in the transparent cursor. Call on pointer
+/// motion while the cursor is hidden. A no-op wherever LG's extension exists: there the
+/// compositor shows its own pointer on motion, as it always has.
+#[inline]
+pub(crate) unsafe fn show_cursor_after_motion() {
+    #[cfg(not(feature = "hostsim"))]
+    {
+        show_through(cursor_door(), &SHOWN_CURSOR);
+    }
+}
+
+/// [`hide_cursor`] on a given door, the cursor it replaced kept in `shown`. Split out so the
+/// bookkeeping is gradeable on the host with a door of fake functions.
+#[cfg(not(feature = "hostsim"))]
+unsafe fn hide_through(door: CursorDoor, shown: &std::sync::atomic::AtomicUsize) {
+    match door {
+        CursorDoor::Lg(f) => {
+            f(0);
+        }
+        CursorDoor::Sdl { set, get, def, blank } => {
+            let cur = get() as usize;
+            if cur != blank {
+                let keep = if cur != 0 { cur } else { def() as usize };
+                if keep == 0 {
+                    return; // nothing to put back, so the pointer would never return: leave it
+                }
+                shown.store(keep, std::sync::atomic::Ordering::Relaxed);
+            }
+            set(blank as *mut std::ffi::c_void);
+        }
+        CursorDoor::None => {}
+    }
+}
+
+/// [`show_cursor_after_motion`] on a given door.
+#[cfg(not(feature = "hostsim"))]
+unsafe fn show_through(door: CursorDoor, shown: &std::sync::atomic::AtomicUsize) {
+    if let CursorDoor::Sdl { set, .. } = door {
+        let shown = shown.load(std::sync::atomic::Ordering::Relaxed);
+        if shown != 0 {
+            set(shown as *mut std::ffi::c_void);
+        }
+    }
+}
+
+/// **webOS 3.x: shorten LG's own idle hide from about five minutes to five seconds.** Without
+/// LG's extension, LG's SDL hides its pointer by itself after `SDL_WEBOS_CURSOR_SLEEP_TIME` of
+/// stillness, and its default is about five minutes (timed on a 3.9.3 set, issue #642), where
+/// every other app on that television hides it within seconds. Measured on the same set: the value
+/// is milliseconds, `5000` hides a still pointer after about five seconds, and a deliberate
+/// movement brings it back. Set only where `SDL_webOSCursorVisibility` is absent, so webOS 4+
+/// keeps its SDL's own behaviour. Must run before `SDL_Init`, which reads the hint.
+#[cfg(not(feature = "hostsim"))]
+unsafe fn webos3_cursor_sleep_hint() {
+    if let Some(ms) = cursor_sleep_hint(self_sym("SDL_webOSCursorVisibility").is_some()) {
+        SDL_SetHint(c"SDL_WEBOS_CURSOR_SLEEP_TIME".as_ptr(), ms.as_ptr());
+        log("cursor: SDL_WEBOS_CURSOR_SLEEP_TIME=5000 (no SDL_webOS* in this SDL)");
+    }
+}
+#[cfg(feature = "hostsim")]
+unsafe fn webos3_cursor_sleep_hint() {}
+
+/// The idle-hide time to ask SDL for, in milliseconds as a string; `None` where LG's extension is
+/// present and its SDL keeps its own behaviour.
+#[cfg(not(feature = "hostsim"))]
+fn cursor_sleep_hint(has_lg_extension: bool) -> Option<&'static std::ffi::CStr> {
+    (!has_lg_extension).then_some(c"5000")
+}
+
+/// A symbol of the running process (the system SDL), resolved at runtime; `None` if absent or NULL.
+#[cfg(not(feature = "hostsim"))]
+fn self_sym(name: &str) -> Option<*mut std::ffi::c_void> {
+    plx_base::dynlib::Handle::self_handle().sym(name).filter(|p| !p.is_null())
+}
+
+/// The cursor [`hide_cursor`] replaced with the transparent one, for the motion that restores it.
+#[cfg(not(feature = "hostsim"))]
+static SHOWN_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(feature = "hostsim"))]
+type CursorVisibilityFn = unsafe extern "C" fn(c_int) -> c_int;
+#[cfg(not(feature = "hostsim"))]
+type SetCursorFn = unsafe extern "C" fn(*mut std::ffi::c_void);
+#[cfg(not(feature = "hostsim"))]
+type GetCursorFn = unsafe extern "C" fn() -> *mut std::ffi::c_void;
+#[cfg(not(feature = "hostsim"))]
+type CreateCursorFn =
+    unsafe extern "C" fn(*const u8, *const u8, c_int, c_int, c_int, c_int) -> *mut std::ffi::c_void;
+
+/// Which call hides the pointer on this firmware, resolved once: LG's extension when the system
+/// SDL has it (webOS 4+), else a transparent SDL cursor (webOS 3.x).
+#[cfg(not(feature = "hostsim"))]
+#[derive(Clone, Copy)]
+enum CursorDoor {
+    Lg(CursorVisibilityFn),
+    /// `SDL_SetCursor` / `SDL_GetCursor` / `SDL_GetDefaultCursor`, and the transparent cursor.
+    Sdl { set: SetCursorFn, get: GetCursorFn, def: GetCursorFn, blank: usize },
+    None,
+}
+
+/// Resolved on the first hide, after `SDL_Init`, because `SDL_CreateCursor` needs the video
+/// subsystem.
+#[cfg(not(feature = "hostsim"))]
+fn cursor_door() -> CursorDoor {
+    static DOOR: std::sync::OnceLock<CursorDoor> = std::sync::OnceLock::new();
+    *DOOR.get_or_init(|| {
+        use std::ffi::c_void;
+        use std::mem::transmute;
+        // SAFETY: each symbol is transmuted to the signature SDL2's public API (or, for
+        // `SDL_webOSCursorVisibility`, LG's fork) gives it, and is called on the main thread.
+        let door = unsafe {
+            if let Some(f) = self_sym("SDL_webOSCursorVisibility") {
+                CursorDoor::Lg(transmute::<*mut c_void, CursorVisibilityFn>(f))
+            } else if let (Some(set), Some(get), Some(def), Some(create)) = (
+                self_sym("SDL_SetCursor"),
+                self_sym("SDL_GetCursor"),
+                self_sym("SDL_GetDefaultCursor"),
+                self_sym("SDL_CreateCursor"),
+            ) {
+                // 8x1 with every data and mask bit clear: SDL's transparent pixel throughout.
+                let bits = [0u8; 1];
+                let create = transmute::<*mut c_void, CreateCursorFn>(create);
+                let blank = create(bits.as_ptr(), bits.as_ptr(), 8, 1, 0, 0);
+                if blank.is_null() {
+                    CursorDoor::None
+                } else {
+                    CursorDoor::Sdl {
+                        set: transmute::<*mut c_void, SetCursorFn>(set),
+                        get: transmute::<*mut c_void, GetCursorFn>(get),
+                        def: transmute::<*mut c_void, GetCursorFn>(def),
+                        blank: blank as usize,
+                    }
+                }
+            } else {
+                CursorDoor::None
+            }
+        };
+        log(match door {
+            CursorDoor::Lg(_) => "cursor: SDL_webOSCursorVisibility",
+            CursorDoor::Sdl { .. } => "cursor: transparent SDL cursor (no SDL_webOS* in this SDL)",
+            CursorDoor::None => "cursor: no way to hide the pointer",
+        });
+        door
+    })
+}
+#[cfg(all(test, not(feature = "hostsim")))]
+mod cursor_door_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    const BLANK: usize = 0x99;
+
+    thread_local! {
+        static CURRENT: Cell<usize> = const { Cell::new(0) };
+        static DEFAULT: Cell<usize> = const { Cell::new(0) };
+        static SET: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static LG: RefCell<Vec<c_int>> = const { RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn set(c: *mut c_void) {
+        SET.with(|s| s.borrow_mut().push(c as usize));
+        CURRENT.with(|cur| cur.set(c as usize));
+    }
+    unsafe extern "C" fn get() -> *mut c_void {
+        CURRENT.with(Cell::get) as *mut c_void
+    }
+    unsafe extern "C" fn def() -> *mut c_void {
+        DEFAULT.with(Cell::get) as *mut c_void
+    }
+    unsafe extern "C" fn lg(visible: c_int) -> c_int {
+        LG.with(|l| l.borrow_mut().push(visible));
+        0
+    }
+
+    /// A fresh door with SDL's current cursor and default cursor as given (0 = NULL).
+    fn sdl(current: usize, default: usize) -> CursorDoor {
+        CURRENT.with(|c| c.set(current));
+        DEFAULT.with(|d| d.set(default));
+        SET.with(|s| s.borrow_mut().clear());
+        CursorDoor::Sdl { set, get, def, blank: BLANK }
+    }
+    fn installed() -> Vec<usize> {
+        SET.with(|s| s.borrow().clone())
+    }
+
+    #[test]
+    fn hiding_swaps_in_the_blank_cursor_and_motion_puts_the_previous_one_back() {
+        let shown = AtomicUsize::new(0);
+        let door = sdl(0x10, 0x20);
+        unsafe {
+            hide_through(door, &shown);
+            assert_eq!(installed(), [BLANK]);
+            show_through(door, &shown);
+        }
+        assert_eq!(installed(), [BLANK, 0x10]);
+    }
+
+    #[test]
+    fn with_no_current_cursor_the_default_one_is_what_comes_back() {
+        let shown = AtomicUsize::new(0);
+        let door = sdl(0, 0x20);
+        unsafe {
+            hide_through(door, &shown);
+            show_through(door, &shown);
+        }
+        assert_eq!(installed(), [BLANK, 0x20]);
+    }
+
+    #[test]
+    fn hiding_again_while_hidden_keeps_the_cursor_to_restore() {
+        let shown = AtomicUsize::new(0);
+        let door = sdl(0x10, 0x20);
+        unsafe {
+            hide_through(door, &shown);
+            hide_through(door, &shown); // `get` now answers the blank cursor
+            show_through(door, &shown);
+        }
+        assert_eq!(installed(), [BLANK, BLANK, 0x10]);
+    }
+
+    /// With no current and no default cursor there is nothing to put back, so the pointer must not
+    /// be hidden: it would never come back.
+    #[test]
+    fn with_nothing_to_restore_the_cursor_is_left_alone() {
+        let shown = AtomicUsize::new(0);
+        let door = sdl(0, 0);
+        unsafe {
+            hide_through(door, &shown);
+            show_through(door, &shown);
+        }
+        assert_eq!(installed(), Vec::<usize>::new());
+        assert_eq!(shown.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn lgs_extension_is_asked_to_hide_and_motion_leaves_it_to_the_compositor() {
+        let shown = AtomicUsize::new(0);
+        LG.with(|l| l.borrow_mut().clear());
+        unsafe {
+            hide_through(CursorDoor::Lg(lg), &shown);
+            show_through(CursorDoor::Lg(lg), &shown);
+        }
+        assert_eq!(LG.with(|l| l.borrow().clone()), [0]);
+    }
+
+    #[test]
+    fn the_idle_hide_hint_is_asked_for_only_where_lgs_extension_is_absent() {
+        assert_eq!(cursor_sleep_hint(false), Some(c"5000"));
+        assert_eq!(cursor_sleep_hint(true), None);
+    }
+}
+
+
 /// Advance the once-per-second LOOP-RATE window: bump `iters_ct` and, when a full second has
 /// elapsed, recompute `loop_shown`, reset the window, and return `true` so the caller logs the
 /// heartbeat with its own route/overlay tag. Shared by the player and home/detail draw paths.
@@ -594,6 +901,11 @@ pub(crate) unsafe fn boot(
     // The Up Next still prefetch `route::pump_play` asks for is `ui`'s, which `route` may not name,
     // so it is handed over here, before any playback can land. Replay boots take it too.
     plx_media::route::install_up_next_still_warm(super::playback::warm_up_next_still);
+    // The dev frame probe's clock is `platform`'s, which `gfx` does not depend on.
+    plx_gfx::gfx::install_clear_probe(
+        plx_platform::tv::window::frame_probe_waiting,
+        plx_platform::tv::window::frame_probe_acquired,
+    );
     let initial = match &preflight {
         super::bootstrap::Preflight::Live => None,
         super::bootstrap::Preflight::Record => {
@@ -621,6 +933,37 @@ pub(super) fn apply_deferred_capture(rec: &mut super::recorder::Recplay,
     Ok(())
 }
 
+/// **Boot's restore**: the mirrors from the record, then the ten live per-profile cells for the seat
+/// the process starts with, `Unseated` (no profile is published yet), through the one
+/// `route::restore_profile_rows` the seat trigger (`bridge::SeatWatch`) calls at every seat change.
+/// Every cell then holds the fallback (the frozen install-wide key, then the default), which is the
+/// value boot always set. Split out of [`construct`] so the cells it sets can be graded without an
+/// SDL window (`run.rs`' `lifecycle_regression_tests`).
+///
+/// Restored before any route can resolve a stream. A legacy file with no quality resolves to
+/// Original; a new file can choose Auto only through route's explicit readiness gate
+/// (session::load records that decision once). The dev quality override is honoured unless the
+/// harness is `controlled`.
+pub(super) fn restore_player_preferences(session: &plx_plex::plex::session::Session, controlled: bool) {
+    plx_media::route::restore_install_rows(session);
+    plx_media::route::restore_profile_rows(session, &plx_plex::plex::session::Seat::Unseated,
+        plx_media::route::Overrides {
+            quality: if controlled { None } else { crate::dev::playback_quality_override() },
+        });
+}
+
+/// **The stored session resumed, as boot does it**: `ResumeStored` makes the owner seat the stored
+/// profile (`release_held_handoff` publishes it, which is what the seat trigger sees) and emit
+/// `Ready`; the handoff is returned for the caller to install. The same function the stored boot
+/// runs, so a host test grades the boot and not a copy of it.
+pub(super) fn resume_stored(pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+    bridge: &mut super::bridge::Bridge, tap: &mut dyn plx_ui::dispatch::Tap<super::bridge::AppHost>)
+    -> Option<plx_session::auth::ReadyCreds> {
+    super::bridge::execute_session_command(pages, plx_session::auth::SessionCmd::ResumeStored);
+    pages.frame_with(bridge, plx_machine::machine::Tick::default(), Vec::new(), Vec::new(), tap, false);
+    bridge.take_session_ready()
+}
+
 pub(crate) unsafe fn construct(
     pms_host: *const c_char, pms_port: c_int, mt: plx_base::task::MainThread,
     preflight: super::bootstrap::Preflight, initial: Option<super::bootstrap::Initial>,
@@ -646,6 +989,7 @@ pub(crate) unsafe fn construct(
     // app, and nothing reachable from SDL changes that. The line stays because it costs
     // nothing and states the intent; it is not what keeps the screensaver away.
     SDL_SetHint(c"SDL_VIDEO_ALLOW_SCREENSAVER".as_ptr(), c"0".as_ptr());
+    webos3_cursor_sleep_hint();
     if SDL_Init(SDL_INIT_VIDEO) != 0 {
         log("SDL_Init failed");
         return Err(1);
@@ -710,7 +1054,14 @@ pub(crate) unsafe fn construct(
     let title = c"PlxNative";
     #[cfg(not(feature = "hostsim"))]
     let title = c"plxnative";
-    let win = SDL_CreateWindow(title.as_ptr(), wx, wy, ww_req, wh_req, SDL_WINDOW_FLAGS);
+    // A frame dump's drawable is exactly the window's size in points: ALLOW_HIGHDPI (0x2000) would
+    // make a Retina display's drawable 3840x2160 for a 1920x1080 window, which the master cannot
+    // be, and which differs from the canonical Linux host. (Absent from every shipping build.)
+    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    let window_flags = if crate::dev::framedump::requested() { SDL_WINDOW_FLAGS & !0x2000 } else { SDL_WINDOW_FLAGS };
+    #[cfg(not(all(feature = "hostsim", feature = "devtriggers")))]
+    let window_flags = SDL_WINDOW_FLAGS;
+    let win = SDL_CreateWindow(title.as_ptr(), wx, wy, ww_req, wh_req, window_flags);
     if win.is_null() {
         log("CreateWindow failed");
         return Err(1);
@@ -724,7 +1075,13 @@ pub(crate) unsafe fn construct(
     // vsync on → the frame rate locks to the panel refresh. `/tmp/plxnative-novsync` uncaps it so
     // `fps=` reports the true GPU render rate. WSLg's X11/GLX swap accepts interval 1 without
     // blocking, so the software budget in `run` follows the same switch.
-    let vsync_enabled = controlled || !crate::dev::scenarios::novsync_armed();
+    // A frame dump never waits on the display: every iteration is a render, at swap interval 0 and
+    // with the Linux software pacer off (`vsync_enabled` also gates `wslg_frame_pacing`).
+    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    let dumping = crate::dev::framedump::requested();
+    #[cfg(not(all(feature = "hostsim", feature = "devtriggers")))]
+    let dumping = false;
+    let vsync_enabled = !dumping && (controlled || !crate::dev::scenarios::novsync_armed());
     SDL_GL_SetSwapInterval(if vsync_enabled { 1 } else { 0 });
     #[cfg(all(feature = "hostsim", target_os = "linux"))]
     let wslg_frame_pacing = vsync_enabled
@@ -784,7 +1141,9 @@ pub(crate) unsafe fn construct(
     plx_gfx::gfx::init_blur();
     // The transport takes the client's `User-Agent` as a value (it names no Plex layer): hand it
     // over before any request can be made, so the first one already carries it.
-    plx_net::net::set_user_agent(plx_plex::plex::identity::user_agent());
+    if plx_net::net::set_user_agent(plx_plex::plex::identity::user_agent()).is_err() {
+        plx_base::eventlog::log("net: the client's User-Agent holds a control character; none is sent");
+    }
     // One-time libcurl bind + init (main thread) before any threaded HTTPS call. A false here
     // means this device has no libcurl we can bind, so plex.tv sign-in will not work — the app
     // still runs, and `net::global_init` has already said so in the event log.
@@ -930,6 +1289,13 @@ pub(crate) unsafe fn construct(
     // television. Armed after the projection above, whose sign-out arm only clears bound hosts.
     #[cfg(feature = "devtriggers")]
     crate::dev::scenarios::clock_fact::arm_at_boot();
+    // dev: /tmp/plxnative-hintoff — the hold hint taught for this run, on every screen kind, read
+    // once here on the frame thread (the hint's latches are thread-local). The site demo film is
+    // shot with it: the capsule is a one-time teaching overlay, and a film has no viewer to teach.
+    #[cfg(feature = "devtriggers")]
+    if plx_base::devtrig::flag("hintoff") {
+        plx_ui::hold_hint::teach_all_for_dev();
+    }
     #[cfg(not(test))]
     plx_platform::i18n::initialize(session.language, controlled);
     let forced_login = !controlled && crate::dev::scenarios::login_forced();
@@ -958,28 +1324,12 @@ pub(crate) unsafe fn construct(
     let mut pages = plx_ui::dispatch::Dispatcher::with_transition(Box::new(
         plx_ui::containers::transition::PageDip::new(),
     ));
-    // Install-wide playback preference, restored before any route can resolve a stream.
-    // A legacy file with no value resolves to Original; a new file can choose Auto only
-    // through route's explicit readiness gate (session::load records that decision once).
-    plx_media::route::restore_quality(
-        if controlled { session.playback_quality() }
-        else { crate::dev::playback_quality_override().unwrap_or_else(|| session.playback_quality()) },
-    );
-    plx_media::route::restore_direct_play_mode(session.direct_play_mode());
-    plx_media::route::restore_subtitle_size(session.subtitle_size());
-    plx_media::route::restore_subtitle_position(session.subtitle_position());
-    plx_media::route::restore_next_episode_mode(session.next_episode_mode());
-    plx_media::route::restore_skip_interval(session.skip_interval());
-    plx_media::route::restore_deck_press(session.deck_press());
-    plx_media::route::restore_marker_skip(session.skip_intro(), session.skip_credits());
-    // The subtitle tone rides the same file and the same moment: a preference, restored once.
-    plx_media::player::restore_subtitle_tone(session.subtitle_tone());
-    plx_media::player::restore_audio_enhancements(session.audio_enhancements());
-    // dev: /tmp/plxnative-audioenh=off|boost|loudness — force the PERSISTED enhancement
-    // preference right after it was restored from whatever the install actually has saved, so a
-    // harness case's starting preference never depends on what an earlier run's pick left behind.
-    // Unlike every other boot override on this page, this one calls the real persisting setter —
-    // see `dev::scenarios::arm_audio_enhancements`'s own doc for why.
+    restore_player_preferences(&session, controlled);
+    // dev: /tmp/plxnative-audioenh=off|boost|loudness — force the enhancement preference right after
+    // the restore. Nobody is seated yet, so this sets the live cell alone (the door refuses to save
+    // for nobody), which is all a dev-token boot, which never seats, gets. A boot that seats a
+    // profile runs the arm again, writing THAT profile's record, at the seat change
+    // (`bridge::SeatWatch`). See `dev::scenarios::arm_audio_enhancements`'s own doc.
     if !controlled { crate::dev::scenarios::arm_audio_enhancements(); }
     let primary_binding = initial.as_ref().map(|initial| initial.primary_client);
     let activate_session = |bridge: &mut super::bridge::Bridge,
@@ -1048,10 +1398,7 @@ pub(crate) unsafe fn construct(
             // install_pms can read any per-profile stores. Stored boot does not re-save its
             // credentials. This is the normal bounded dispatcher drain over the same owner
             // and queue later moved into App, not a recursive bootstrap reducer.
-            super::bridge::execute_session_command(pages, plx_session::auth::SessionCmd::ResumeStored);
-            pages.frame_with(bridge, plx_machine::machine::Tick::default(), Vec::new(), Vec::new(),
-                rec, false);
-            if let Some(ready) = bridge.take_session_ready() {
+            if let Some(ready) = resume_stored(pages, bridge, rec) {
                 let endpoints = install_pms_owned(bridge, &ready.origin, &ready.address,
                     &ready.token, ready.tier, ready.pin.as_ref(), &ready.install);
                 super::bridge::execute_endpoint_outcomes(pages, endpoints);
@@ -1300,6 +1647,12 @@ pub(crate) unsafe fn construct(
         .then(crate::dev::scenarios::herobench_value)
         .flatten()
         .map(|(n, period, target)| crate::dev::scenarios::bench::HeroBench::new(n, period, target));
+    // dev: /tmp/plxnative-holdbench[=<n>[,<period_ms>[,tap]]] — a REAL press-and-hold (or press-and-
+    // cancel) on the focused card, cycle after cycle (`bench::PressBench`).
+    let hold_bench = (!controlled)
+        .then(crate::dev::scenarios::holdbench_value)
+        .flatten()
+        .map(|(n, period, kind)| crate::dev::scenarios::bench::PressBench::new(n, period, kind));
 
     // dev: /tmp/plxnative-framedrop — the FRAME-DROP DETECTOR. When present, each frame is timed with
     // the high-res perf counter (pump / draw / swap, NO glFinish so it doesn't perturb the pipeline),
@@ -1527,6 +1880,7 @@ pub(crate) unsafe fn construct(
         menu_play_await: None,
         prev,
         refresh_hubs_at,
+        refresh_detail: None,
         plaintext_upgrade: Default::default(),
         ev,
         remote,
@@ -1578,6 +1932,7 @@ pub(crate) unsafe fn construct(
             modal_bench,
             deep_bench,
             hero_bench,
+            hold_bench,
             marker_tried,
             press_tried,
             press_release_at,

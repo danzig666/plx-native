@@ -25,7 +25,7 @@
 //! and only once, in case a future server starts advertising the key itself (issue #146).
 //!
 //! Everything a viewer chose in a library's view is remembered across restarts, per profile, by
-//! (machine id, section key), as ONE record (`plex::session::Session::library_views`, issues #278
+//! (machine id, section key), as ONE record (`plex::session::Preferences::library_views`, issues #278
 //! and #441; [`saved_view`] holds the merge rules): the sort and its direction, the Unwatched
 //! switch, the genre and the listing type. A sort is recorded by its KEY, never its menu
 //! position, and applied on the section's first page only after that page's menu has offered the
@@ -59,15 +59,17 @@
 use plx_plex::plex::{SectionQuery, ServerId};
 use saved_view::ViewField;
 use crate::pms::{parse_item, PmsMovie};
+use crate::stores::page_cache::{kept_when_over_budget, Keep, PAGE};
 use std::panic::catch_unwind;
 #[cfg(test)]
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Page size for section listings. Two grid screens' worth (10 rows × 6) — big enough that a
-/// full-screen scroll rarely waits, small enough that a page parse stays invisible on-frame.
-const PAGE: usize = 60;
+/// The sections left most recently that keep the pages of the window they last showed. Every
+/// other section keeps its total and no pages, so a library a viewer has moved on from costs
+/// nothing but its count.
+const RECENT_SECTIONS: usize = 3;
 
 /// Frames between attempts to reach a source whose discovery failed. Far longer than the page
 /// retry (`RETRY_CD`, ~2 s): a page retry is racing a user looking at a spinner, while an
@@ -512,6 +514,15 @@ pub enum CursorAt {
     SlotIndex(usize),
 }
 
+impl Cursor {
+    /// The item index the bookmark points at.
+    fn slot(&self) -> usize {
+        match &self.at {
+            CursorAt::ItemKey { slot, .. } | CursorAt::SlotIndex(slot) => *slot,
+        }
+    }
+}
+
 /// Per-section browse state: the current query, the server-driven menus, the sparse item
 /// store, the library's own published shelves, and the remembered view (focus/scroll survive
 /// leaving the screen — state amnesia is the official app's loudest complaint).
@@ -562,6 +573,9 @@ struct SecState {
 /// as the flat vector did; `page_missing` is the fetch scan, over pages.
 /// Cloning retains the page table in O(1). Writes copy only the table of page handles and
 /// changed pages, never the whole loaded catalog. This is the Library read-view backing.
+/// Pages are also dropped again: a landing applies the keep rule ([`SecItems::evict`]) and a
+/// section the grid has left keeps no pages ([`BrowseState::apply_section_rule`]). A dropped page
+/// is a hole, the same as one never fetched, and `len` never changes with it.
 #[derive(Clone, Default)]
 struct SecItems {
     pages: Arc<Vec<Option<Arc<Vec<Option<PmsMovie>>>>>>,
@@ -615,6 +629,47 @@ impl SecItems {
         page.resize_with(n, || None);
         if let Some(cell) = page.get_mut(i % PAGE) {
             *cell = Some(m);
+        }
+    }
+    /// Lands a fetched page at `start`, then applies the keep rule. The only place eviction runs.
+    fn land(&mut self, start: usize, items: Vec<PmsMovie>, keep: &Keep) {
+        for (offset, item) in items.into_iter().enumerate() {
+            self.set(start + offset, item);
+        }
+        self.evict(keep);
+    }
+    /// Drops the pages `keep` does not hold, once more than `MAX_LOADED` are loaded. A dropped page
+    /// is a hole, as if it had never landed: `len` stays, so every index keeps its meaning, and
+    /// the next want for the page fetches it again. Readers that already cloned the table keep
+    /// their rows, the copy-on-write sharing `set` relies on.
+    fn evict(&mut self, keep: &Keep) {
+        let (len, pages) = (self.len, self.pages.len());
+        let loaded = self.pages.iter().filter(|page| page.is_some()).count();
+        let Some(kept) = kept_when_over_budget(loaded, pages, keep, |i| if i < len { i / PAGE } else { pages }) else {
+            return;
+        };
+        self.retain_pages(|p| kept[p]);
+    }
+    /// Keeps only the pages covering `window` (an empty window keeps none). Used for a section the
+    /// grid has left: its total stays, so its indices still mean what they meant.
+    fn retain_window(&mut self, window: std::ops::Range<usize>) {
+        let (lo, hi) = if window.is_empty() {
+            (0, 0)
+        } else {
+            (window.start / PAGE, window.end.div_ceil(PAGE))
+        };
+        self.retain_pages(|p| (lo..hi).contains(&p));
+    }
+    /// Drops the rows of every loaded page `keep` rejects. Copies the page table only when there
+    /// is something to drop, so a read view holding the table is not disturbed for nothing.
+    fn retain_pages(&mut self, keep: impl Fn(usize) -> bool) {
+        if !self.pages.iter().enumerate().any(|(p, page)| page.is_some() && !keep(p)) {
+            return;
+        }
+        for (p, slot) in Arc::make_mut(&mut self.pages).iter_mut().enumerate() {
+            if !keep(p) {
+                *slot = None;
+            }
         }
     }
     /// Does page `p` (items `p*PAGE ..`) have a slot not yet filled?
@@ -722,6 +777,11 @@ pub struct BrowseState {
     /// Wanted item-index range (inclusive lo, exclusive hi) — set by the grid each frame from its
     /// visible rows + lookahead; [`pump`] fetches the first missing page inside it.
     want: (usize, usize),
+    /// The grid's focused slot, sent with [`Self::want`]; the landing keeps its page.
+    focus: Option<usize>,
+    /// The sections left most recently, newest first, each with the window it last showed (see
+    /// [`RECENT_SECTIONS`]).
+    left: Vec<(usize, (usize, usize))>,
     gen: u32,
     sections_gen: u32,
     epoch: u32,
@@ -730,7 +790,7 @@ pub struct BrowseState {
     tab_shape: u32,
     retry_cd: u32,
     remembered: Vec<(SecKind, String, i64)>,
-    /// This profile's remembered library views ([`plx_plex::plex::session::Session::library_views`]):
+    /// This profile's remembered library views ([`plx_plex::plex::session::Preferences::library_views`]):
     /// sort, Unwatched, genre and listing type. Loaded beside [`remembered`](Self::remembered) and
     /// cleared with it on a reset, so a profile switch can never open one person's library in
     /// another's view.
@@ -815,6 +875,8 @@ impl Default for BrowseState {
             states: Vec::new(),
             cur: 0,
             want: (0, 0),
+            focus: None,
+            left: Vec::new(),
             gen: 0,
             sections_gen: 0,
             epoch: 0,
@@ -972,12 +1034,32 @@ impl BrowseState {
         if i >= self.sections.len() || i == self.cur() {
             return;
         }
+        let left = self.cur();
+        // The section coming back to the screen is no longer "left", and must not use a slot.
+        self.left.retain(|&(section, _)| section != left && section != i);
+        self.left.insert(0, (left, self.want));
+        self.left.truncate(RECENT_SECTIONS);
         self.cur = i;
         self.bump_gen();
+        self.apply_section_rule();
         activate_source_of(i);
     }
-    fn want(&mut self, lo: usize, hi: usize) {
+    /// The grid's memory of the sections it is not showing: the recent few keep their last
+    /// window, the rest keep no pages. Runs on a switch, never per frame.
+    fn apply_section_rule(&mut self) {
+        for (section, state) in self.states.iter_mut().enumerate() {
+            if section == self.cur {
+                continue;
+            }
+            match self.left.iter().find(|&&(left, _)| left == section) {
+                Some(&(_, (lo, hi))) => state.items.retain_window(lo..hi),
+                None => state.items.retain_window(0..0),
+            }
+        }
+    }
+    fn want(&mut self, lo: usize, hi: usize, focus: Option<usize>) {
         self.want = (lo, hi);
+        self.focus = focus;
     }
     pub fn resolve_section(&self, epoch: u32, sid: ServerId, key: i64) -> Option<usize> {
         if epoch != self.table_epoch() {
@@ -1131,18 +1213,19 @@ impl BrowseState {
         plx_plex::plex::session::queue_update(move |current| {
             let mut next = current.clone();
             let slot = match next
+                .prefs
                 .last_library
                 .iter_mut()
                 .find(|library| library.user == user)
             {
                 Some(library) => library,
                 None => {
-                    next.last_library.push(plx_plex::plex::session::LastLibrary {
+                    next.prefs.last_library.push(plx_plex::plex::session::LastLibrary {
                         user: user.clone(),
                         libs: Vec::new(),
                         extensions: Default::default(),
                     });
-                    next.last_library.last_mut()?
+                    next.prefs.last_library.last_mut()?
                 }
             };
             slot.set(wire, &machine, key);
@@ -1465,17 +1548,23 @@ impl BrowseState {
                 self.hubs_kick(index, adapter);
                 self.hubs_commit_staged(index, may_publish)
             }
+            LibraryWork::HubPage { id, key, before, seen } => self.hubs_page(index, seen, &id, &key, before, adapter),
+            LibraryWork::HubPageCancel { id, key } => self.hubs_cancel_page(index, &id, &key, adapter),
+            LibraryWork::HubHold { lo, hi } => self.hubs_hold(index, lo, hi, adapter),
             work => {
                 if self.cur() != index {
                     return false;
                 }
                 match work {
-                    LibraryWork::Want { lo, hi } => self.want(lo, hi),
+                    LibraryWork::Want { lo, hi, focus } => self.want(lo, hi, focus),
                     LibraryWork::Letters => self.kick_letters(adapter),
                     LibraryWork::Genres => self.kick_genres(adapter),
                     LibraryWork::Retry => self.retry_cur_source(),
                     LibraryWork::Commit { .. }
                     | LibraryWork::Hubs { .. }
+                    | LibraryWork::HubPage { .. }
+                    | LibraryWork::HubPageCancel { .. }
+                    | LibraryWork::HubHold { .. }
                     | LibraryWork::SaveCursor { .. } => unreachable!(),
                 }
                 true
@@ -1680,7 +1769,7 @@ impl BrowseState {
         }
     }
     fn load_remembered(&mut self, session: &plx_plex::plex::session::Session, user: &str) {
-        self.remembered = session.last_library.iter().find(|library| library.user == user)
+        self.remembered = session.prefs.last_library.iter().find(|library| library.user == user)
             .map(|library| library.libs.iter().filter_map(|target| {
                 SecKind::from_wire(&target.kind)
                     .map(|kind| (kind, target.machine_id.clone(), target.key))
@@ -2041,6 +2130,7 @@ impl BrowseState {
         self.view_memory = Default::default();
         self.tab_shape = u32::MAX;
         self.cur = 0;
+        self.left = Vec::new();
         self.retry_cd = 0;
         self.refresh_tab_shape();
     }
@@ -2289,7 +2379,10 @@ impl BrowseState {
         adapter: &Arc<BrowseAdapter>,
         gate: &plx_machine::landgate::Gate,
     ) -> crate::stores::StoreOutcome {
-        let taken = crate::stores::take_landing(gate, crate::stores::StoreId::Browse, || {
+        // DUMP MODE: owed while the discovery claim (`src_fetching`, set at the spawn and cleared
+        // in `apply_discovery`, after its epoch check) is held. Per MAILBOX: the claim of the one mailbox taken here.
+        let taken = crate::stores::take_landing_owed(gate, crate::stores::StoreId::Browse,
+            || adapter.src_fetching.load(Ordering::SeqCst), || {
             adapter.src_result.lock().unwrap_or_else(|e| e.into_inner()).take()
         });
         let Some((epoch, source, landing)) = taken else { return Default::default() };
@@ -2302,7 +2395,10 @@ impl BrowseState {
         mail: &Mutex<Option<DirectoryResult<T>>>,
         apply: impl FnOnce(&mut SecState, Vec<T>),
     ) -> bool {
-        let taken = crate::stores::take_landing(gate, crate::stores::StoreId::Browse, || {
+        // DUMP MODE: owed while this directory's own claim `flag` is held (genre and letters each
+        // have one), per mailbox.
+        let taken = crate::stores::take_landing_owed(gate, crate::stores::StoreId::Browse,
+            || flag.load(Ordering::SeqCst), || {
             mail.lock().unwrap_or_else(|e| e.into_inner()).take()
         });
         let Some(result) = taken else { return false };
@@ -2444,7 +2540,13 @@ impl BrowseState {
                     state.letters = Arc::new(list);
                 }
             });
-        let page = crate::stores::take_landing(gate, crate::stores::StoreId::Browse, || {
+        // DUMP MODE: owed while the listing page's claim (`fetching`) is held.
+        // The wanted window, read before the landing borrows the section table: the grid's
+        // visible rows, the focused slot's page and the page a restore lands on.
+        let wanted = self.want;
+        let focus = self.focus;
+        let page = crate::stores::take_landing_owed(gate, crate::stores::StoreId::Browse,
+            || adapter.fetching.load(Ordering::SeqCst), || {
             adapter.page_result.lock().unwrap_or_else(|e| e.into_inner()).take()
         });
         if let Some(result) = page {
@@ -2512,9 +2614,14 @@ impl BrowseState {
                                     state.total = result.total;
                                     state.items.resize(state.total as usize);
                                 }
-                                for (offset, item) in result.items.into_iter().enumerate() {
-                                    state.items.set(result.start + offset, item);
-                                }
+                                // A pending restore lands on the bookmark's slot: its page stays
+                                // loaded until the restore seats (see `Keep::restore`).
+                                let keep = Keep {
+                                    wanted: wanted.0..wanted.1,
+                                    focus,
+                                    restore: state.cursor.as_deref().map(Cursor::slot),
+                                };
+                                state.items.land(result.start, result.items, &keep);
                                 changed = true;
                             }
                         }
@@ -2536,7 +2643,7 @@ impl BrowseState {
 
 /// A remembered sort and genre to put the first page in, once the server proves it still offers
 /// them — see [`fetch_listing_page`]. Built by [`BrowseState::restore_for`] from
-/// [`plx_plex::plex::session::Session::library_views`].
+/// [`plx_plex::plex::session::Preferences::library_views`].
 struct Restore {
     kind: SecKind,
     /// The listing the first page is for, which scopes the genre list the check reads.
@@ -3586,6 +3693,13 @@ pub fn adapter_fetching_for_test(adapter: &BrowseAdapter) -> bool {
     adapter.fetching.load(Ordering::SeqCst)
 }
 
+/// Is a discovery request this adapter spawned still unanswered or unapplied? `src_fetching` is
+/// raised when the request is handed to its launcher and cleared when the answer is APPLIED, so a
+/// take that finds the mailbox empty while it reads true is waiting for a worker that is out.
+pub fn discovery_owed(adapter: &BrowseAdapter) -> bool {
+    adapter.src_fetching.load(Ordering::SeqCst)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_adapter_src_fetching_for_test(adapter: &BrowseAdapter, fetching: bool) {
     adapter.src_fetching.store(fetching, Ordering::SeqCst);
@@ -3657,6 +3771,10 @@ mod test_support;
 mod table_tests;
 
 #[cfg(test)]
+#[path = "browse_dump_tests.rs"]
+mod dump_tests;
+
+#[cfg(test)]
 #[path = "browse_discovery_lifecycle_tests.rs"]
 mod discovery_lifecycle_tests;
 
@@ -3667,6 +3785,10 @@ mod fetch_state_tests;
 #[cfg(test)]
 #[path = "browse_home_and_tabs_tests.rs"]
 mod home_and_tabs_tests;
+
+#[cfg(test)]
+#[path = "browse_eviction_tests.rs"]
+mod eviction_tests;
 
 #[cfg(test)]
 #[path = "browse_reachability_tests.rs"]
@@ -3690,6 +3812,7 @@ mod localized_type_tests {
             (Preference::En, ["Movies", "Collections", "TV Shows", "Seasons", "Episodes", "Collections"]),
             (Preference::Es, ["Películas", "Colecciones", "Series", "Temporadas", "Episodios", "Colecciones"]),
             (Preference::Be, ["Фільмы", "Калекцыі", "Серыялы", "Сезоны", "Серыі", "Калекцыі"]),
+            (Preference::Fr, ["Films", "Collections", "Séries", "Saisons", "Épisodes", "Collections"]),
         ] {
             let locale = LocaleContext::resolve(preference, None, None, None, None);
             let rows = LibraryType::offered(SecKind::Movie).iter().map(|&t| (t, SecKind::Movie))

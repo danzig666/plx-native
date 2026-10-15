@@ -26,11 +26,42 @@ replayed against the other needs.
 files with ffprobe at startup, never from a household library or account. Without `--media`, the
 library and the old deliberately undecodable part response are unchanged.
 
+`--media-next-episode` (needs `--media`, default off) adds a THIRD item to that surface: a second
+episode of the verification show (index 2, its own ratingKey and its own part id, backed by the
+same `mockverify-v1.mkv`, so it has the same tracks as the first), and lets a `continuous=1`
+PlayQueue on either episode follow the show, so the app has a next episode to offer. It is how a
+sim run walks "pick on episode 1, play on to episode 2". The part id is separate on purpose: the
+selection PUT flips `selected` on the part it names, so a shared part would carry episode 1's pick
+to episode 2 on the server and the run would prove nothing about the app's own memory. Without
+the flag the surface, the show's counts and the queue of one are unchanged.
+
+`--media-next-episode-remux` (needs `--media-next-episode`, default off) makes that second episode
+a file the server has to remux: `/video/:/transcode/universal/decision` answers it `transcode` with
+the video and every other stream `copy` (a copy remux, no video encode) for either request shape,
+and its `Media.bitrate` reads 32000 kbps, over the 30000 kbps ceiling the app's embedded-subtitle
+side reader admits. The first episode stays a direct play. It is how a sim run reaches the Subtitles
+tab's note line: a subtitle remembered on episode 1 that episode 2's remux route cannot show. Pair it
+with `--no-plex-pass` or `--no-loudness-analysis`; with both on, the app burns the subtitle into a
+re-encode instead of remuxing, and there is no note.
+
+`--media-forced-subtitle` (needs `--media`, default off) marks the English embedded subtitle of
+`mockverify-v1.mkv` FORCED on the wire (`"forced": true` on its Stream, nothing else about the stream
+changes, the file is untouched), for the first episode and, under `--media-next-episode`, the second
+(which is the same file). The surface has no forced track otherwise. It is how a sim run reaches
+the Subtitles tab's "Forced only" row with a forced track to draw: Forced only then shows that
+track, and the run proves the mode, not a full track. Without the flag every stream is unchanged.
+
 `--extra-media FILE` (repeatable) adds one movie per arbitrary file outside that fixture set —
 e.g. a hand-generated Dolby Vision asset — with its DOVI*/colorTrc/bitDepth/container fields read
 from ffprobe exactly like `--media`, at a fixed ratingKey block (990001+) that cannot collide with
 the generated library or the `--media` verification ids. The ratingKey-to-file mapping is printed
 at startup.
+
+`--resume-fixture` (seeded library only, default off) adds two shows to the shows section for the
+resume-point pages: 970001 has 12 seasons (every third one 30 episodes) and an `OnDeck` of S12E14,
+part-way through, which is also the newest Continue Watching entry; 970002 has 3 seasons and no
+`OnDeck`. `OnDeck` rides `/library/metadata/<show>?includeOnDeck=1`, as one object, like PMS's.
+Boot with `plxnative-detail=970001` (or `970002`), or onto Home for the Continue Watching card.
 
     python3 tests/mock_pms.py --port 32499              # serve until Ctrl-C
     python3 tests/mock_pms.py --port 32499 --selftest   # prove the shapes without an app
@@ -47,8 +78,10 @@ which is the home hero's first slot. An episode marked `stand_in` plays: its med
 silent file of the episode's catalog length that `derive` made (never the work itself), which is
 enough for the simulator's clock sink to run the player over it. And a `continuous=1` PlayQueue
 of an episode carries the rest of its show after it, as PMS's does, so Up Next has a successor.
-Nothing recorded against it may be committed as a fixture — the harness's alphabet check would
-refuse it, correctly.
+A focus-fingerprint or replay recording made against it must not be committed under
+`tests/fixtures/replay/`: the harness's alphabet check would refuse it, correctly. The one
+sanctioned capture is `tools/demo_library.py fixtures`, which writes the demo library's own
+detail answers to `tests/demo_library/fixtures/` for the data crate's parse tests.
 
 Every mode also answers the four plex.tv calls of the QR sign-in (`/api/v2/pins`, the poll, the
 QR image, and `/api/v2/user`) with a fixed demo code, for an app booted with
@@ -183,12 +216,17 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # demo_library.qr
+import link_conditioner  # noqa: E402
 
 VERIFY_SHOW_RK = 900001
 VERIFY_SEASON_RK = 900002
 V1_RATING_KEY = 900003
 V2_RATING_KEY = 900004
-VERIFY_PARTS = {V1_RATING_KEY: 900101, V2_RATING_KEY: 900102}
+V3_RATING_KEY = 900005  # `--media-next-episode`: the verification show's second episode
+# `--media-next-episode-remux`: the second episode's whole-stream bitrate, just over the 30000 kbps
+# `SIDE_MAX_PART_KBPS` ceiling of the app's embedded-subtitle side reader (`route/decision.rs`).
+V3_REMUX_KBPS = 32000
+VERIFY_PARTS = {V1_RATING_KEY: 900101, V2_RATING_KEY: 900102, V3_RATING_KEY: 900103}
 VERIFY_SIDECAR_ID = 901009
 # Subtitle search (`MockPms.subtitle_search`): candidate and installed stream ids live in their own
 # bands so neither can collide with a generated or verification stream.
@@ -202,6 +240,12 @@ SUB_SEARCH_LANGS = {"en": ("eng", "English"), "nl": ("nld", "Nederlands"), "es":
 # so a deliberately huge --shows run remains this module's problem to notice, not to silently hit.
 EXTRA_MEDIA_RK_BASE = 990001
 EXTRA_MEDIA_PART_ID_BASE = 991001
+# `Library(extras=N)` clips: ten ids per movie from 800001, clear of the movie ids (to 2000), the
+# episode ids (rk*10+n from 2001) and the fixture blocks above.
+EXTRA_CLIP_RK_BASE = 800001
+# Episode ids of a library built with more than nine episodes a season (`--episodes`): srk*10+e
+# would run into the next season's ids. 3_000_000 clears every block above; a season takes 1000.
+LONG_SEASON_RK_BASE = 3_000_000
 # #266 enhancement fixtures (module doc): own librarySectionID (3, never registered in
 # `Library.sections`), so they never appear in a section/rail listing or count, but are always
 # present and reachable directly by ratingKey. 960001..960005 sits clear of the generated range
@@ -213,6 +257,15 @@ ENHANCEMENT_AAC_51_RK = 960002
 ENHANCEMENT_DV_P8_RK = 960003
 ENHANCEMENT_DEFAULT_SRT_RK = 960004
 ENHANCEMENT_EXTERNAL_SRT_RK = 960005
+# `--resume-fixture` (module doc): two shows in the ordinary shows section whose watch state puts a
+# resume point deep in a long show, and one with none. 970001.. sits clear of the verification ids
+# (to 901009), the enhancement movies (960001..960005) and --extra-media (990001+); a show k takes
+# seasons 971000+100k+n and episodes 975000+1000k+40n+e (n <= 12, e <= 30), parts from 972001.
+RESUME_ON_DECK_SHOW_RK = 970001
+RESUME_PLAIN_SHOW_RK = 970002
+RESUME_ON_DECK_SEASON = 12
+RESUME_ON_DECK_EPISODE = 14
+RESUME_PART_ID_BASE = 972001
 VERIFY_PREFS = [
     {"id": "audioLanguage", "value": "de"},
     {"id": "subtitleLanguage", "value": "en"},
@@ -269,14 +322,43 @@ class Library:
     seasons, episodes, media parts, chapters, markers, watch state and blur colours. Generated
     ids are dense from 1; the opt-in verification ids are fixed and deliberately conspicuous."""
 
+    # Clips per movie for `/library/metadata/{id}/extras`. A class default, not an instance
+    # attribute, so a default library's `__dict__` (pinned by test_default_generated_data_is_stable)
+    # is unchanged: the detail pages the recorded fixtures came from have no clips, and keep none.
+    extras_per_movie = 0
+    # show ratingKey -> its on-deck episode (the item itself). Empty on a library without
+    # `resume_fixture`, and served as `OnDeck` only when a show is asked for with includeOnDeck=1.
+    on_deck = {}
+    # `--media-next-episode` (module doc): the verification show's second episode and a continuous
+    # queue over the show. A class default, so the default library's `__dict__` is unchanged.
+    media_next_episode = False
+    # `--media-next-episode-remux` (module doc): the second episode answers a copy remux and reads a
+    # high bitrate. Also a class default, for the same reason.
+    next_episode_remux = False
+    # `--media-forced-subtitle` (module doc): the verification episodes' English subtitle is flagged
+    # forced on the wire. A class default, for the same reason.
+    media_forced_subtitle = False
+
     def __init__(self, seed=1, movies=48, shows=6, seasons=2, episodes=6, rail_fixture=False,
-                 media=None, extra_media=None, loudness_analysis=True):
+                 media=None, extra_media=None, loudness_analysis=True, extras=0,
+                 resume_fixture=False, media_next_episode=False, next_episode_remux=False,
+                 media_forced_subtitle=False):
+        if media_next_episode and media is None:
+            raise ValueError("--media-next-episode needs --media")
+        if media_forced_subtitle and media is None:
+            raise ValueError("--media-forced-subtitle needs --media")
+        if next_episode_remux and not media_next_episode:
+            raise ValueError("--media-next-episode-remux needs --media-next-episode")
         # Movie keys start at 1001; shows start at 2001. Refuse a fixture that would silently
         # overwrite a film with a show instead of exercising the requested listing size.
         if not 0 <= movies <= 1000:
             raise ValueError("movies must be between 0 and 1000")
+        if not 0 <= extras <= 9:
+            raise ValueError("extras must be between 0 and 9 clips per movie")
         # #266: whether a generated/verification audio stream carries canNormalizeLoudness.
         self.loudness_analysis = loudness_analysis
+        if extras:
+            self.extras_per_movie = extras
         rng = random.Random(seed)
         self.seed = seed
         self.machine = "s%08x" % rng.getrandbits(32) + "s%08x" % rng.getrandbits(32)
@@ -312,7 +394,10 @@ class Library:
                 season = self._season(rng, srk, show, s)
                 self.items[srk] = season
                 for e in range(1, episodes + 1):
-                    erk = srk * 10 + e
+                    # srk*10+e is unique only for e <= 9; a long season (--episodes) takes its own
+                    # id block, clear of every other (the default keeps its historical ids).
+                    erk = srk * 10 + e if episodes <= 9 else \
+                        LONG_SEASON_RK_BASE + (srk - 20010) * 1000 + e
                     part += 1
                     self.items[erk] = self._episode(rng, erk, season, show, e, part)
         self._add_empty_collection(sname(rng))
@@ -326,6 +411,8 @@ class Library:
             elif i % 6 == 1:
                 it["viewOffset"] = it["duration"] // 3
                 it["lastViewedAt"] = 1_700_100_000 + i
+        if resume_fixture:
+            self._add_resume_fixture()
         self._roll_up()
         self._add_enhancement_fixtures()
         if media is not None or extra_media:
@@ -333,8 +420,15 @@ class Library:
             self.sidecars = {}
             self.verification_streams = {}
             self.media_content_type = {}
+        if media_next_episode:
+            # Only set when on: `test_default_generated_data_is_stable` hashes `Library.__dict__`.
+            self.media_next_episode = True
+        if next_episode_remux:
+            self.next_episode_remux = True
+        if media_forced_subtitle:
+            self.media_forced_subtitle = True
         if media is not None:
-            self._add_verification_media(pathlib.Path(media))
+            self._add_verification_media(pathlib.Path(media), next_episode=media_next_episode)
         if extra_media:
             self._add_extra_media([pathlib.Path(p) for p in extra_media])
         if rail_fixture:
@@ -347,6 +441,45 @@ class Library:
                                and it["type"] in ("movie", "show")), key=lambda it: it["ratingKey"])
                 for index, it in enumerate(rows):
                     it["titleSort"] = "ACFMZ"[index % 5] + " " + it["titleSort"]
+
+    def _add_resume_fixture(self):
+        """`--resume-fixture`: the data behind a show page that opens at the resume point.
+
+        Show `RESUME_ON_DECK_SHOW_RK` has 12 seasons (every third one 30 episodes, the rest 20, so
+        a season's filmstrip needs scrolling) and has been watched up to S12E14, which is
+        part-way through, is the show's `OnDeck` and is the newest entry in Continue Watching.
+        Show `RESUME_PLAIN_SHOW_RK` has 3 seasons of 10 and nothing watched: no OnDeck, no deck
+        entry, so it opens on season 1. Both live in the shows section; their episodes are added
+        long ago, so the Recently Added hub keeps its generated rows. Drawn from their own
+        `random.Random`, so no generated byte moves."""
+        part = RESUME_PART_ID_BASE
+        self.on_deck = {}
+        for k, (show_rk, season_count) in enumerate(
+                ((RESUME_ON_DECK_SHOW_RK, 12), (RESUME_PLAIN_SHOW_RK, 3)), start=1):
+            rng = random.Random(show_rk)
+            show = self._show(rng, show_rk)
+            self.items[show_rk] = show
+            for n in range(1, season_count + 1):
+                srk = 971000 + 100 * k + n
+                season = self._season(rng, srk, show, n)
+                self.items[srk] = season
+                count = (30 if n % 3 == 0 else 20) if k == 1 else 10
+                for e in range(1, count + 1):
+                    erk = 975000 + 1000 * k + 40 * n + e
+                    part += 1
+                    ep = self._episode(rng, erk, season, show, e, part)
+                    ep["addedAt"] = ep["updatedAt"] = 1_680_000_000 + erk
+                    self.items[erk] = ep
+                    if k != 1:
+                        continue
+                    here = (n, e)
+                    if here < (RESUME_ON_DECK_SEASON, RESUME_ON_DECK_EPISODE):
+                        ep["viewCount"] = 1
+                        ep["lastViewedAt"] = 1_700_800_000 + n * 100 + e
+                    elif here == (RESUME_ON_DECK_SEASON, RESUME_ON_DECK_EPISODE):
+                        ep["viewOffset"] = ep["duration"] // 3
+                        ep["lastViewedAt"] = 1_700_900_000
+                        self.on_deck[show_rk] = ep
 
     def _probe(self, path):
         if not path.is_file():
@@ -486,12 +619,26 @@ class Library:
         self.verification_streams[part_id] = streams
         return media, duration
 
-    def _add_verification_media(self, media_dir):
-        """Add the two opt-in items without perturbing the seeded library's random sequence."""
+    def _flag_forced_subtitle(self, media):
+        """`--media-forced-subtitle`: the English embedded subtitle of `media`'s Part is forced on
+        the wire. The stream dicts are shared with `verification_streams`, so a selection PUT sees
+        the same flag; nothing else about the stream changes."""
+        if not self.media_forced_subtitle:
+            return
+        for stream in media["Part"][0]["Stream"]:
+            if stream["streamType"] == 3 and stream.get("languageCode") == "eng":
+                stream["forced"] = True
+                return
+        raise ValueError("--media-forced-subtitle: the verification file has no English subtitle")
+
+    def _add_verification_media(self, media_dir, next_episode=False):
+        """Add the two opt-in items without perturbing the seeded library's random sequence.
+        `next_episode` adds the third (module doc, `--media-next-episode`)."""
         v1_media, v1_duration = self._verified_media(
             media_dir / "mockverify-v1.mkv", V1_RATING_KEY, VERIFY_PARTS[V1_RATING_KEY])
         v2_media, v2_duration = self._verified_media(
             media_dir / "mockverify-v2.mkv", V2_RATING_KEY, VERIFY_PARTS[V2_RATING_KEY])
+        self._flag_forced_subtitle(v1_media)
         sidecar = media_dir / "mockverify-v2.eng.srt"
         side_info = self._probe(sidecar)
         side_stream = next((s for s in side_info.get("streams", [])
@@ -507,12 +654,13 @@ class Library:
         self.sidecars[VERIFY_SIDECAR_ID] = sidecar
 
         show = self._base(random.Random(149), VERIFY_SHOW_RK, "show", self.sections[1])
-        show.update(contentRating="TV-14", duration=v1_duration, childCount=1, leafCount=1,
+        episodes = 2 if next_episode else 1
+        show.update(contentRating="TV-14", duration=v1_duration, childCount=1, leafCount=episodes,
                     viewedLeafCount=0, Genre=[], Role=[])
         season = self._base(random.Random(150), VERIFY_SEASON_RK, "season", self.sections[1])
         season.update(index=1, parentRatingKey=str(VERIFY_SHOW_RK), parentKey=show["key"],
-                      parentTitle=show["title"], parentThumb=show["thumb"], childCount=1,
-                      leafCount=1, viewedLeafCount=0)
+                      parentTitle=show["title"], parentThumb=show["thumb"], childCount=episodes,
+                      leafCount=episodes, viewedLeafCount=0)
         episode = self._base(random.Random(151), V1_RATING_KEY, "episode", self.sections[1])
         episode.update(index=1, parentIndex=1, parentRatingKey=str(VERIFY_SEASON_RK),
                        parentKey=season["key"], parentTitle=season["title"],
@@ -526,6 +674,22 @@ class Library:
                      Role=[], Country=[], Chapter=[], Marker=[], Rating=[])
         self.items.update({VERIFY_SHOW_RK: show, VERIFY_SEASON_RK: season,
                            V1_RATING_KEY: episode, V2_RATING_KEY: movie})
+        if next_episode:
+            # The same file under its own rating key and part id: the same tracks, but a selection
+            # PUT on episode 1's part never touches this one (module doc).
+            v3_media, v3_duration = self._verified_media(
+                media_dir / "mockverify-v1.mkv", V3_RATING_KEY, VERIFY_PARTS[V3_RATING_KEY])
+            self._flag_forced_subtitle(v3_media)
+            if self.next_episode_remux:
+                v3_media["bitrate"] = V3_REMUX_KBPS
+            second = self._base(random.Random(152), V3_RATING_KEY, "episode", self.sections[1])
+            second.update(index=2, parentIndex=1, parentRatingKey=str(VERIFY_SEASON_RK),
+                          parentKey=season["key"], parentTitle=season["title"],
+                          grandparentRatingKey=str(VERIFY_SHOW_RK), grandparentKey=show["key"],
+                          grandparentTitle=show["title"], grandparentThumb=show["thumb"],
+                          grandparentArt=show["art"], duration=v3_duration, contentRating="TV-14",
+                          Media=[v3_media], Director=[], Writer=[], Role=[], Chapter=[], Marker=[])
+            self.items[V3_RATING_KEY] = second
 
     def _add_extra_media(self, paths):
         """--extra-media: one movie per arbitrary file, at a fixed id block (EXTRA_MEDIA_RK_BASE+)
@@ -560,6 +724,16 @@ class Library:
                          Role=[], Country=[], Chapter=[], Marker=[], Rating=[])
             self.items[rk] = movie
             self.extra_media_files[rk] = path
+
+    def continuous_queue(self, it):
+        """The rows of a `continuous=1` PlayQueue started on `it`: an episode and every episode of
+        its show after it, in (season, episode) order, as PMS answers; anything else, itself."""
+        if it["type"] != "episode":
+            return [it]
+        show = [x for x in self.items.values()
+                if x["type"] == "episode" and x["grandparentRatingKey"] == it["grandparentRatingKey"]]
+        show.sort(key=lambda x: (x["parentIndex"], x["index"]))
+        return show[show.index(it):]
 
     # --- item builders -------------------------------------------------------------------
 
@@ -788,7 +962,9 @@ class Library:
         if a:
             rows = [it for it in rows if any(str(t["id"]) == a for t in
                     it.get("Role", []) + it.get("Director", []) + it.get("Writer", []))]
-        c = q.get("collection")
+        # `tagId` is the key of a `collection.related` hub, the only tag id these listings are
+        # asked for with; it filters the same way `collection` does.
+        c = q.get("collection") or q.get("tagId")
         if c:
             rows = [it for it in rows if any(str(t["id"]) == c for t in it.get("Collection", []))]
         sort = q.get("sort", "titleSort")
@@ -855,6 +1031,52 @@ class Library:
     def person_media(self, pid):
         return [it for it in self.items.values() if it["type"] in ("movie", "show") and any(
             t["id"] == pid for t in it.get("Role", []) + it.get("Director", []) + it.get("Writer", []))]
+
+    def similar(self, rk):
+        """What `/library/metadata/{id}/similar` lists: the other items of the same type, in library
+        order, the item itself left out. The `related` hub is the head of this list."""
+        it = self.items.get(rk)
+        return [x for x in self.items.values() if it and x["type"] == it["type"] and x is not it]
+
+    def extras(self, rk):
+        """Clips for a movie, as `/library/metadata/{id}/extras` lists them. Generated only when the
+        library was built with `extras=N` (see `__init__`); titles come from the closed alphabet."""
+        it = self.items.get(rk)
+        if not it or it["type"] != "movie" or not self.extras_per_movie:
+            return []
+        rows = []
+        for i in range(self.extras_per_movie):
+            key = EXTRA_CLIP_RK_BASE + (rk - 1001) * 10 + i
+            rows.append({"ratingKey": str(key), "key": f"/library/metadata/{key}", "type": "clip",
+                         "subtype": "trailer" if i == 0 else "behindTheScenes",
+                         "title": "s" + hashlib.md5(f"clip{key}".encode()).hexdigest()[:8],
+                         "duration": 90000, "thumb": f"/library/metadata/{key}/thumb/1"})
+        return rows
+
+    def search_results(self, query, kinds, limit=None):
+        """`/library/search` rows for the requested `kinds`, in PMS' listing order: movies, then the
+        shows and the episodes (`tv`), then the people (`people`), each as a `SearchResult`.
+
+        `music` is not modelled (the mock has no artists, albums or tracks), so it answers nothing,
+        as does an unknown kind: PMS answers an unsupported `searchTypes` with an empty result rather
+        than an error, which a client cannot tell from "no hits". `limit` caps the list before a
+        window is applied, which is why PMS' `totalSize` is capped by it."""
+        hits = search_matcher(query)
+        rows = []
+        if "movies" in kinds:
+            rows += [{"Metadata": it, "score": "0.90000"} for it in self.items.values()
+                     if it["type"] == "movie" and hits(it["title"])]
+        if "tv" in kinds:
+            for kind in ("show", "episode"):
+                rows += [{"Metadata": it, "score": "0.90000"} for it in self.items.values()
+                         if it["type"] == kind and hits(it["title"])]
+        if "people" in kinds:
+            for person in self.people.values():
+                if hits(person["tag"]):
+                    count = len(self.person_media(person["id"]))
+                    rows.append({"Directory": dict(person, type="actor", count=count),
+                                 "score": "0.90000"})
+        return rows if limit is None else rows[:limit]
 
     def composite(self, rk, width, height):
         """The server's automatic collection poster (`/library/collections/<rk>/composite/<stamp>`):
@@ -996,6 +1218,30 @@ def demo_cache_dir():
     return pathlib.Path(env) if env else pathlib.Path.home() / ".cache" / "plxnative-demo"
 
 
+_DEMO_TOOL = []
+
+
+# Where a person's photograph lives in `CatalogLibrary.images`: above every item and collection key.
+PERSON_IMAGE_BASE = 9_000_000
+
+
+def demo_tool():
+    """`tools/demo_library.py`, loaded once by path."""
+    if not _DEMO_TOOL:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "demo_library_tool", pathlib.Path(__file__).resolve().parent.parent / "tools" / "demo_library.py")
+        _DEMO_TOOL.append(importlib.util.module_from_spec(spec))
+        spec.loader.exec_module(_DEMO_TOOL[0])
+    return _DEMO_TOOL[0]
+
+
+def demo_derived_file(assets, cache, key, rec, role):
+    """Where `tools/demo_library.py derive` put one derived file (`derived_file` there decides: the
+    name carries a hash of the recipe, so checkouts sharing a cache never overwrite each other)."""
+    return demo_tool().derived_file(assets, cache, key, rec, role)
+
+
 class CatalogLibrary(Library):
     """The demo library (`--catalog`): the same wire shapes and the same queries as the generated
     library, built from `tests/demo_library/catalog.json` instead of a seed. Keys are dense and
@@ -1035,6 +1281,16 @@ class CatalogLibrary(Library):
                     return p
             pid = len(self.people) + 1
             self.people[pid] = {"id": pid, "tag": name, "tagKey": f"demo-person-{pid}"}
+            photo = cat.get("people", {}).get(name)
+            if photo:
+                # The catalog's `people`: a portrait cut from an openly licensed frame, served
+                # through the photo transcoder like every other picture (`image`), under a key of its own.
+                path = demo_derived_file(assets, self.cache, demo_tool().person_key(name), photo, "photo")
+                if not path.is_file():
+                    raise ValueError(f"{name}: derived photo is missing ({path}); rerun "
+                                     "`python3 tools/demo_library.py derive`")
+                self.images[PERSON_IMAGE_BASE + pid] = {"thumb": path}
+                self.people[pid]["thumb"] = f"/library/metadata/{PERSON_IMAGE_BASE + pid}/thumb/{self.now}"
             return self.people[pid]
 
         def genre(name):
@@ -1046,12 +1302,36 @@ class CatalogLibrary(Library):
             return self.genres[gid]
 
         def credits(rec):
+            # A show's creators are its `Writer` rows — what the detail hero reads "Created by"
+            # from. A person is served with a `thumb` only when the catalog's `people` gives them a
+            # portrait (`person`); for everyone else the app draws its glyph.
+            writers = list(dict.fromkeys(rec.get("writers", []) + rec.get("creators", [])))
             return {
                 "Genre": [dict(genre(g)) for g in rec.get("genres", [])],
                 "Director": [dict(person(n)) for n in rec.get("directors", [])],
-                "Writer": [dict(person(n)) for n in rec.get("writers", [])],
-                "Role": [dict(person(c["name"]), role=c["role"]) for c in rec.get("cast", [])],
+                "Writer": [dict(person(n)) for n in writers],
+                "Role": [dict(person(c["name"]), **({"role": c["role"]} if c.get("role") else {}))
+                         for c in rec.get("cast", [])],
             }
+
+        def described(rec):
+            """What a title's page draws beyond its credits, from the catalog's optional keys:
+            `tagline` (our own text, marked DEMO there), `Country`, and the CITED `contentRating`
+            and `Rating[]` — a title without a cited value serves none, so the app shows
+            "Unrated" and no ratings row. The flat `rating`/`audienceRating` pair is the one a
+            section listing sends; it is the first critic and the first audience row."""
+            out = {"Country": [{"tag": c} for c in rec.get("countries", [])],
+                   "Rating": [{"image": r["image"], "value": r["value"], "type": r["type"]}
+                              for r in rec.get("ratings", [])]}
+            if rec.get("tagline"):
+                out["tagline"] = rec["tagline"]
+            if "contentRating" in rec:
+                out["contentRating"] = rec["contentRating"]["value"]
+            for kind, flat in (("critic", "rating"), ("audience", "audienceRating")):
+                row = next((r for r in out["Rating"] if r["type"] == kind), None)
+                if row:
+                    out[flat], out[flat + "Image"] = row["value"], row["image"]
+            return out
 
         def base(rk, kind, section, rec, slug):
             key = slug.replace("/", "_")
@@ -1066,17 +1346,19 @@ class CatalogLibrary(Library):
                 it["year"] = rec["year"]
             images = {}
             for role, name in (("thumb", "poster"), ("art", "art"), ("thumb", "thumb")):
-                path = self.derived / key / f"{name}.jpg"
-                if name in rec and path.is_file():
+                if name not in rec:
+                    continue
+                path = demo_derived_file(assets, self.cache, slug, rec, name)
+                if path.is_file():
                     images[role] = path
                     it[role] = f"/library/metadata/{rk}/{role}/{self.now}"
-                elif name in rec:
+                else:
                     raise ValueError(f"{slug}: derived {name} is missing ({path}); rerun "
                                      "`python3 tools/demo_library.py derive`")
             if "logo" in rec:
                 # The item's clearLogo, which the app asks for by path
                 # (`/library/metadata/<rk>/clearLogo`), as it does of a real server.
-                path = self.derived / key / "logo.png"
+                path = demo_derived_file(assets, self.cache, slug, rec, "logo")
                 if not path.is_file():
                     raise ValueError(f"{slug}: derived logo is missing ({path}); rerun "
                                      "`python3 tools/demo_library.py derive`")
@@ -1095,7 +1377,7 @@ class CatalogLibrary(Library):
             it = base(rk, "movie", movies, m, m["id"])
             dur = m["minutes"] * 60_000
             it.update(studio=m.get("studio", ""), originallyAvailableAt=m["originallyAvailableAt"],
-                      duration=dur, Chapter=[], Marker=[], **credits(m))
+                      duration=dur, Chapter=[], Marker=[], **credits(m), **described(m))
             if m.get("collections"):
                 it["Collection"] = [{"tag": c, "id": coll_id[c]} for c in m["collections"]]
             if "media" in m:
@@ -1111,7 +1393,7 @@ class CatalogLibrary(Library):
             rk = 201 + n
             show = base(rk, "show", shows, s, s["id"])
             show.update(studio=s.get("studio", ""), originallyAvailableAt=f"{s['year']}-01-01",
-                        duration=0, childCount=0, leafCount=0, viewedLeafCount=0, **credits(s))
+                        duration=0, childCount=0, leafCount=0, viewedLeafCount=0, **credits(s), **described(s))
             self.items[rk] = show
             for season in s["seasons"]:
                 srk = rk * 10 + season["index"]
@@ -1132,10 +1414,16 @@ class CatalogLibrary(Library):
                               grandparentThumb=show.get("thumb", ""), grandparentArt=show.get("art", ""),
                               year=int(e["date"][:4]), originallyAvailableAt=e["date"], duration=dur,
                               Media=self._demo_media(erk, part, dur, f"/media/TV/{s['title']}/S{season['index']:02d}E{e['index']:02d}"),
-                              Director=[], Writer=[], Role=[], Chapter=[], Marker=[])
+                              Chapter=[], Marker=[])
+                    # An episode carries its show's credits and rating, as a server's episodes do
+                    # when the agent has no per-episode crew.
+                    for field in ("Director", "Writer", "Role"):
+                        ep[field] = [dict(t) for t in show[field]]
+                    if "contentRating" in show:
+                        ep["contentRating"] = show["contentRating"]
                     if e.get("stand_in"):
                         slug = f"{s['id']}/{season['index']}/{e['index']}"
-                        path = self.derived / slug.replace("/", "_") / "stand-in.mp4"
+                        path = demo_derived_file(assets, self.cache, slug, e, "stand-in")
                         if not path.is_file():
                             raise ValueError(f"{slug}: derived stand-in is missing ({path}); rerun "
                                              "`python3 tools/demo_library.py derive`")
@@ -1154,16 +1442,6 @@ class CatalogLibrary(Library):
                                       if x["type"] == "episode" and x["grandparentRatingKey"] == it["ratingKey"]),
                                      default=0)
 
-    def continuous_queue(self, it):
-        """The rows of a `continuous=1` PlayQueue started on `it`: an episode and every episode of
-        its show after it, in (season, episode) order, as PMS answers; anything else, itself."""
-        if it["type"] != "episode":
-            return [it]
-        show = [x for x in self.items.values()
-                if x["type"] == "episode" and x["grandparentRatingKey"] == it["grandparentRatingKey"]]
-        show.sort(key=lambda x: (x["parentIndex"], x["index"]))
-        return show[show.index(it):]
-
     def _pin_clock(self, hero):
         """addedAt, lastViewedAt, viewOffset and viewCount from the catalog and its pinned `now` —
         never from the wall clock. `hero` goes to the head of Continue Watching: the home hero pool
@@ -1171,6 +1449,9 @@ class CatalogLibrary(Library):
         cat = self.catalog
         if hero not in self.by_slug:
             raise ValueError(f"--hero {hero!r} is not in the catalog")
+        if any(t["id"] == hero.split("/")[0] and t.get("not_hero") for t in cat["movies"] + cat["shows"]):
+            # The head of Continue Watching is the home hero; the catalog declares this title never one.
+            raise ValueError(f"--hero {hero!r} is marked `not_hero` in the catalog")
         for i, slug in enumerate(cat["added_order"]):
             it = self.items[self.by_slug[slug]]
             added = self.now - 86_400 * (2 + 3 * i)
@@ -1468,7 +1749,7 @@ class MockPms:
                 hubs.append({"title": f"Mock Shelf {i}", "type": kind, "size": len(recent),
                              "hubIdentifier": f"mock.section.{key}.shelf.{i}",
                              "key": f"/hubs/mock/section/{key}/shelf/{i}",
-                             "more": False, "Metadata": recent})
+                             "more": True, "totalSize": len(lib.recent(kind, 1000)), "Metadata": recent})
         return hubs
 
     def __init__(self, lib):
@@ -1480,6 +1761,8 @@ class MockPms:
         self.section_hubs = 0
         self.section_hubs_linked = 0
         self.lock = threading.Lock()
+        self.link = link_conditioner.Conditioner()  # `--link`; a no-op until a profile is set
+        self.wire_log = []  # `GET /_mock/wire`: per-request arrival/finish times under the link
         self.requests = []  # (path, status) in arrival order, for the harness
         self.unknown = []
         self.writes = []
@@ -1614,7 +1897,7 @@ class MockPms:
         mc = {"size": 0, "allowSync": False, "identifier": "com.plexapp.plugins.library",
               "mediaTagPrefix": "/system/bundle/media/flags/", "mediaTagVersion": 1}
         mc.update(kw)
-        for k in ("Metadata", "Directory", "Hub"):
+        for k in ("Metadata", "Directory", "Hub", "SearchResult"):
             if k in mc:
                 mc["size"] = len(mc[k])
         return {"MediaContainer": mc}
@@ -1682,10 +1965,15 @@ class MockPms:
             return j(current)
 
         def paged(rows):
-            start = int(q.get("X-Plex-Container-Start",
-                              headers.get("X-Plex-Container-Start", 0)))
-            size = int(q.get("X-Plex-Container-Size",
-                             headers.get("X-Plex-Container-Size", len(rows))))
+            """PMS pages a listing only when the request carries the window's start, as a query
+            parameter or as a header, and then echoes its `offset` beside the listing's `totalSize`.
+            An unpaged answer carries neither: a client reads the whole list from it. A Size
+            without a Start is ignored, as PMS ignores it (docs/pms-api.md, "Paging gotcha")."""
+            start_key, size_key = "X-Plex-Container-Start", "X-Plex-Container-Size"
+            if start_key not in q and start_key not in headers:
+                return rows, {}
+            start = max(0, int(q.get(start_key, headers.get(start_key, 0))))
+            size = max(0, int(q.get(size_key, headers.get(size_key, len(rows) - start))))
             return rows[start:start + size], {"totalSize": len(rows), "offset": start}
 
         write_path = (p in ("/:/timeline", "/:/scrobble", "/:/unscrobble", "/:/progress",
@@ -1787,6 +2075,10 @@ class MockPms:
             if q.get("includeMeta") == "1":
                 extra["Meta"] = self.sort_meta(q.get("type"))
             return j(self.container(Metadata=page, **extra))
+        if len(segs) == 4 and segs[:2] == ["library", "sections"] and segs[3] == "recentlyAdded":
+            kind = {"1": "movie", "2": "episode"}.get(segs[2], "movie")
+            page, extra = paged(lib.recent(kind, 1000))
+            return j(self.container(Metadata=page, **extra))
         if len(segs) == 4 and segs[:2] == ["library", "sections"]:
             d = segs[3]
             if d == "collections":
@@ -1809,6 +2101,10 @@ class MockPms:
                             if coll and int(row["ratingKey"]) == coll["ratingKey"]]
                 if not rows:
                     return j(self.container(Metadata=[]), 404)
+                if q.get("includeOnDeck") == "1" and len(rows) == 1 \
+                        and int(ids) in lib.on_deck:
+                    # PMS sends `OnDeck.Metadata` as one OBJECT (a whole episode record).
+                    rows = [dict(rows[0], OnDeck={"Metadata": lib.on_deck[int(ids)]})]
                 if q.get("includePreferences") == "1" and len(rows) == 1 \
                         and int(ids) == VERIFY_SHOW_RK and getattr(lib, "media_files", None):
                     rows = [dict(rows[0], Preferences={"Setting": list(VERIFY_PREFS)})]
@@ -1818,16 +2114,34 @@ class MockPms:
             if sub == "tree" and rk == VERIFY_SHOW_RK and getattr(lib, "media_files", None):
                 return j(self.container(Setting=list(VERIFY_PREFS)))
             if sub == "children":
-                return j(self.container(Metadata=lib.children(rk)))
+                page, extra = paged(lib.children(rk))
+                return j(self.container(Metadata=page, **extra))
+            if sub == "extras":
+                page, extra = paged(lib.extras(rk))
+                return j(self.container(Metadata=page, **extra))
+            if sub == "similar":
+                page, extra = paged(lib.similar(rk))
+                return j(self.container(Metadata=page, **extra))
             if sub == "allLeaves":
                 return j(self.container(Metadata=lib.leaves(rk)))
             if sub == "subtitles":
                 return self.subtitle_search(lib, rk, method, q, j)
             if sub == "related":
                 it = lib.items.get(rk)
-                pool = [x for x in lib.items.values() if it and x["type"] == it["type"] and x is not it]
+                pool = lib.similar(rk)
+                # The demo catalog's hub is the whole list, not a preview: the app takes a member
+                # movie's collection out of Related, which can leave one card of an eight-card
+                # preview, and a row with `more` behind it paints unloaded cells until focus
+                # reaches it and it pages. The site film scrolls past that row without stopping
+                # on it, and the frame dump refuses a card that can never resolve.
+                head = pool if catalog else pool[:8]
                 hubs = [{"title": "related", "type": it["type"] if it else "movie",
-                         "hubIdentifier": "related", "size": min(8, len(pool)), "Metadata": pool[:8]}]
+                         "hubIdentifier": "related", "size": len(head), "Metadata": head,
+                         # A server says there is more behind a preview (`more`, `totalSize`).
+                         "more": len(pool) > len(head), "totalSize": len(pool),
+                         # What a server names so the rest of the list can be read: the app pages
+                         # it (hubs.rs::is_pageable_hub_key admits `/library/metadata/{id}/similar`), so the related row has a tail.
+                         "key": f"/library/metadata/{rk}/similar"}]
                 # A member movie also gets one `collection.related.{section}.{n}` hub per
                 # collection (a live probe): titled with the collection, keyed by the section's
                 # TAG-id filter, listing EVERY member — the movie itself included.
@@ -1858,7 +2172,13 @@ class MockPms:
             return j(self.container(Metadata=page, **extra), 200 if coll else 404)
         if segs[:2] == ["library", "people"] and len(segs) == 4 and segs[3] == "media":
             pid = int(segs[2]) if segs[2].isdigit() else -1
-            return j(self.container(Metadata=lib.person_media(pid)))
+            page, extra = paged(lib.person_media(pid))
+            return j(self.container(Metadata=page, **extra))
+        if catalog and segs[:2] == ["hubs", "demo"] and len(segs) == 3:
+            hub = next((hub for hub in lib.catalog["hubs"] if hub.get("hubIdentifier") == segs[2] and "recent" in hub), None)
+            if hub:
+                page, extra = paged(lib.recent(hub["recent"], 1000))
+                return j(self.container(Metadata=page, **extra))
         if p == "/hubs" or p == "/hubs/promoted":
             hubs = [{"title": "home.continue", "type": "mixed", "hubIdentifier": "home.continue",
                      "key": "/hubs/continueWatching", "size": 0, "Metadata": []},
@@ -1881,7 +2201,9 @@ class MockPms:
                                  "more": False, "Metadata": rows})
             for h in hubs:
                 h["size"] = len(h["Metadata"])
-            return j(self.container(Hub=hubs))
+            # A window on `/hubs` pages the hub list itself, one hub per row.
+            page, extra = paged(hubs)
+            return j(self.container(Hub=page, **extra))
         if len(segs) == 4 and segs[:3] == ["hubs", "mock", "shelf"] and self.home_hubs:
             page, extra = paged(lib.recent("movie", 1000))
             return j(self.container(Metadata=page, **extra))
@@ -1890,6 +2212,9 @@ class MockPms:
             return j(self.container(Hub=[{"title": "Continue Watching", "type": "mixed",
                                           "hubIdentifier": "home.continue", "key": "/hubs/continueWatching",
                                           "size": len(rows), "Metadata": rows}]))
+        if p == "/hubs/continueWatching/items":
+            page, extra = paged(lib.continue_watching())
+            return j(self.container(Metadata=page, **extra))
         if p == "/hubs/continueWatching":
             rows = lib.continue_watching()[:int(q.get("count", 12))]
             return j(self.container(Hub=[{"title": "home.continue", "type": "mixed",
@@ -1916,12 +2241,20 @@ class MockPms:
                 # #412: pad the section's shelves up to exactly `--section-hubs` hubs.
                 hubs = hubs[:self.section_hubs]
                 hubs += self.section_pad_hubs(key, kind, self.section_hubs - len(hubs))
-            return j(self.container(Hub=hubs))
+            # As on `/hubs`: a window pages the section's shelves, not the rows inside them.
+            page, extra = paged(hubs)
+            return j(self.container(Hub=page, **extra))
         if len(segs) == 6 and segs[:3] == ["hubs", "mock", "section"] and segs[4] == "shelf" \
                 and self.section_hubs:
             kind = {"1": "movie", "2": "show"}.get(segs[3], "movie")
             page, extra = paged(lib.recent(kind, 1000))
             return j(self.container(Metadata=page, **extra))
+        if p == "/library/search":
+            lim = q.get("limit", "")
+            kinds = q.get("searchTypes", "").split(",")
+            page, extra = paged(lib.search_results(q.get("query", ""), kinds,
+                                                   int(lim) if lim.isdigit() else None))
+            return j(self.container(SearchResult=page, **extra))
         if p == "/hubs/search":
             lim = q.get("limit", "")
             return j(self.container(Hub=lib.search(q.get("query", ""), int(lim) if lim.isdigit() else 3,
@@ -1962,11 +2295,15 @@ class MockPms:
             uri = q.get("uri", "")
             rk = uri.rsplit("/", 1)[-1]
             it = lib.items.get(int(rk)) if rk.isdigit() else None
-            # Only the demo library follows `continuous=1` past the item: the seeded library's
-            # queue of one is what the harness's recorded cases were taken against.
+            # Only the demo library follows `continuous=1` past the item, and the verification show
+            # under `--media-next-episode`: the seeded library's queue of one is what the
+            # harness's recorded cases were taken against.
             if it is None:
                 queue = []
-            elif q.get("continuous") == "1" and isinstance(lib, CatalogLibrary):
+            elif q.get("continuous") == "1" and (
+                    isinstance(lib, CatalogLibrary)
+                    or (getattr(lib, "media_next_episode", False)
+                        and it.get("grandparentRatingKey") == str(VERIFY_SHOW_RK))):
                 queue = lib.continuous_queue(it)
             else:
                 queue = [it]
@@ -2057,6 +2394,17 @@ class MockPms:
                     else:
                         stream["decision"] = "transcode"
                         stream["codec"] = "ac3"
+                return j(self.container(generalDecisionCode=1000, generalDecisionText="Transcode OK",
+                                        mdeDecisionCode=1000, transcodeDecisionCode=1000,
+                                        Metadata=[row]))
+            # `--media-next-episode-remux`: the second episode is a file the server converts rather
+            # than serves, whichever request shape asked (the MDE probe or the remux). A copy
+            # remux: the Part is "transcode" and nothing in it is encoded.
+            if item is not None and rk == V3_RATING_KEY and getattr(lib, "next_episode_remux", False):
+                row = json.loads(json.dumps(item))
+                row["Media"][0]["Part"][0]["decision"] = "transcode"
+                for stream in row["Media"][0]["Part"][0]["Stream"]:
+                    stream["decision"] = "copy"
                 return j(self.container(generalDecisionCode=1000, generalDecisionText="Transcode OK",
                                         mdeDecisionCode=1000, transcodeDecisionCode=1000,
                                         Metadata=[row]))
@@ -2179,6 +2527,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
+        split = urllib.parse.urlsplit(self.path)
+        if split.path in ("/_mock/link", "/_mock/wire"):
+            return self._link_control(method, split.path, body)
+        t_recv = time.monotonic()
+        plan = self.server.pms.link.plan(split.path, split.query, self.headers.get("X-Plex-Container-Start"))
+        if plan is not None and plan.delay_s:
+            time.sleep(plan.delay_s)
+        if plan is not None and plan.fail:
+            self._wire(plan, split, t_recv, 0, 503 if plan.fail == "503" else 0, True)
+            if plan.fail == "reset":
+                # SO_LINGER 0 turns close() into an RST: the client sees a reset mid-request, as
+                # on a dropped WAN link, not a clean empty answer.
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                           struct.pack("ii", 1, 0))
+                self.close_connection = True
+                self.connection.close()
+                return
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         status, ctype, data = self.server.pms.handle(method, self.path, body, self.headers)
         with self.server.pms.lock:
             self.server.pms.requests.append((self.path, status))
@@ -2188,7 +2557,71 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Plex-Protocol", "1.0")
         self.end_headers()
         if method != "HEAD":
+            if plan is not None and plan.kbit:
+                link_conditioner.write_throttled(self.wfile.write, data, plan.kbit)
+            else:
+                self.wfile.write(data)
+        self._wire(plan, split, t_recv, len(data), status, False)
+
+    def _wire(self, plan, split, t_recv, nbytes, status, failed):
+        """One row of `GET /_mock/wire`: when the request arrived and when its answer finished
+        (both `time.monotonic()` seconds on THIS process's clock), so a test reads how long each
+        page spent in flight. Control requests are never logged. A row is appended after the
+        answer's last byte is written, so a client that has just read the whole body can see the
+        log before its row: a reader waits for the row (bounded) instead of reading once."""
+        if plan is None:
+            return
+        q = {k: v[-1] for k, v in urllib.parse.parse_qs(split.query).items()}
+        row = {"t_recv": t_recv, "t_done": time.monotonic(), "class": plan.klass, "path": split.path,
+               # a poster transcode names its item here (`/library/metadata/<rk>/thumb/..`)
+               "url": q.get("url"),
+               "start": q.get("X-Plex-Container-Start", self.headers.get("X-Plex-Container-Start")),
+               "size": q.get("X-Plex-Container-Size", self.headers.get("X-Plex-Container-Size")),
+               "bytes": nbytes, "status": status, "failed": failed}
+        with self.server.pms.lock:
+            self.server.pms.wire_log.append(row)
+
+    def _link_control(self, method, path, body):
+        """`/_mock/link` (read or change the link profile at run time) and `/_mock/wire` (the wire
+        log). Loopback only: the profile is a test knob, and a LAN-facing mock must not let a
+        neighbour slow the owner's server down."""
+        def send(status, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
             self.wfile.write(data)
+        if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return send(403, {"error": "loopback only"})
+        pms = self.server.pms
+        if path == "/_mock/wire":
+            if method == "DELETE":
+                with pms.lock:
+                    pms.wire_log.clear()
+                return send(200, {"ok": True})
+            with pms.lock:
+                return send(200, {"now": time.monotonic(), "rows": list(pms.wire_log)})
+        if method == "POST":
+            try:
+                req = json.loads(body or b"{}")
+                if "faults" in req:  # replaces the targeted faults (and zeroes their counts)
+                    pms.link.set_faults([link_conditioner.make_fault(**f) for f in req["faults"]])
+                if "faults" in req and not ({"spec", "class", "profile", "overrides"} & set(req)):
+                    return send(200, {"faults": [f.to_json() for f in pms.link.faults()]})
+                if "spec" in req:
+                    klass, profile = link_conditioner.parse_spec(req["spec"])
+                else:
+                    klass = req.get("class", link_conditioner.ALL)
+                    profile = link_conditioner.make_profile(req.get("profile", "none"),
+                                                            **req.get("overrides", {}))
+                pms.link.set(klass, profile)
+            except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as e:
+                return send(400, {"error": str(e)})
+        elif method != "GET":
+            return send(405, {"error": "method not allowed"})
+        send(200, dict({c: p.to_json() for c, p in pms.link.profiles().items()},
+                       faults=[f.to_json() for f in pms.link.faults()]))
 
     def do_GET(self):
         self._do("GET")
@@ -2236,7 +2669,9 @@ def serve(port, seed=1, host="127.0.0.1", verbose=False, movies=48, rail_fixture
           authorize_after=None, plex_pass=True, loudness_analysis=True,
           refuse_enhancements=False, ignore_enhancements=False, transcode_fixture=None,
           home_hubs=0, section_hubs=0, section_hubs_linked=0, decision_delay_ms=0,
-          home_users=1):
+          home_users=1, link=(), link_faults=(), shows=6, seasons=2, episodes=6,
+          resume_fixture=False, media_next_episode=False, next_episode_remux=False,
+          media_forced_subtitle=False):
     """Start a mock PMS in a daemon thread; returns (server, pms). Loopback only by default: the
     app on the simulator is on this machine, and a LAN-facing listener would be one more thing
     the outbound guard has to reason about. `catalog` serves the demo library instead of a seed.
@@ -2258,16 +2693,34 @@ def serve(port, seed=1, host="127.0.0.1", verbose=False, movies=48, rail_fixture
     live, through `POST /_mock/config`. `transcode_fixture` is the file every
     `/video/:/transcode/universal/start*` request serves instead of the plain 404, Range/206
     included; `None` (default) leaves that endpoint unchanged. `decision_delay_ms` sleeps that long
-    before answering a transcode decision or start request (`0`, the default, answers at once)."""
+    before answering a transcode decision or start request (`0`, the default, answers at once).
+
+    `link` is a list of `tests/link_conditioner.py` specs (`"3g"`, `"image=edge"`, ...) applied in
+    order to the link the listener answers through; `seed` also seeds its jitter and failures.
+    `shows`/`seasons`/`episodes` size the generated TV library (an `episodes` over 60 is a season
+    that pages). `resume_fixture` adds the two shows of `Library._add_resume_fixture` (seeded
+    library only). `media_next_episode` adds the verification show's second episode (module doc;
+    needs `media`); `next_episode_remux` makes it a copy remux at a high bitrate (needs
+    `media_next_episode`); `media_forced_subtitle` flags the English subtitle of the verification
+    episodes forced (module doc; needs `media`)."""
     if transcode_fixture is not None and not pathlib.Path(transcode_fixture).is_file():
         raise ValueError(f"--transcode-fixture file is missing: {transcode_fixture}")
     if catalog is not None:
         lib = CatalogLibrary(catalog, cache=catalog_cache, hero=hero,
                              loudness_analysis=loudness_analysis)
     else:
-        lib = Library(seed=seed, movies=movies, rail_fixture=rail_fixture, media=media,
-                      extra_media=extra_media, loudness_analysis=loudness_analysis)
+        lib = Library(seed=seed, movies=movies, shows=shows, seasons=seasons, episodes=episodes,
+                      rail_fixture=rail_fixture, media=media, extra_media=extra_media,
+                      loudness_analysis=loudness_analysis, resume_fixture=resume_fixture,
+                      media_next_episode=media_next_episode,
+                      next_episode_remux=next_episode_remux,
+                      media_forced_subtitle=media_forced_subtitle)
     pms = MockPms(lib)
+    pms.link = link_conditioner.Conditioner(seed=seed)
+    for spec in link:
+        klass, profile = link_conditioner.parse_spec(spec)
+        pms.link.set(klass, profile)
+    pms.link.set_faults([link_conditioner.parse_fault(f) for f in link_faults])
     pms.plex_pass = plex_pass
     pms.home_hubs = home_hubs
     pms.section_hubs = section_hubs
@@ -2522,15 +2975,126 @@ def selftest():
         method="PUT")
     urllib.request.urlopen(put).read()
     assert media_pms.writes and media_pms.writes[-1][0] == "PUT"
-    assert not pms.unknown, pms.unknown
+    # `--media-next-episode`: a third item, a second episode of the verification show with its own
+    # ratingKey and part, and a continuous queue that follows the show and nothing else.
+    def queue_keys(base, rk, continuous=True):
+        uri = urllib.parse.quote(f"server://machine/com.plexapp.plugins.library/library/metadata/{rk}")
+        request = urllib.request.Request(
+            base + f"/playQueues?type=video&uri={uri}&continuous={int(continuous)}", method="POST")
+        rows = json.load(urllib.request.urlopen(request))["MediaContainer"]["Metadata"]
+        return [int(row["ratingKey"]) for row in rows]
+
+    def part_streams(base, rk):
+        body = json.load(urllib.request.urlopen(base + f"/library/metadata/{rk}"))
+        part = body["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]
+        return part["id"], part["Stream"]
+
+    assert V3_RATING_KEY not in media_pms.lib.items, "the third item is opt-in"
+    assert queue_keys(media_base, V1_RATING_KEY) == [V1_RATING_KEY], "the seeded queue of one"
+    try:
+        Library(media_next_episode=True)
+    except ValueError as e:
+        assert "needs --media" in str(e)
+    else:
+        raise AssertionError("--media-next-episode without --media must be refused")
+    next_srv, next_pms = serve(0, seed=7, media=media, media_next_episode=True)
+    next_base = f"http://127.0.0.1:{next_srv.server_address[1]}"
+    second = next_pms.lib.items[V3_RATING_KEY]
+    assert (second["type"], second["index"], second["parentIndex"]) == ("episode", 2, 1)
+    assert second["parentRatingKey"] == str(VERIFY_SEASON_RK)
+    assert next_pms.lib.items[VERIFY_SEASON_RK]["leafCount"] == 2
+    assert next_pms.lib.items[VERIFY_SHOW_RK]["leafCount"] == 2
+    assert queue_keys(next_base, V1_RATING_KEY) == [V1_RATING_KEY, V3_RATING_KEY]
+    assert queue_keys(next_base, V3_RATING_KEY) == [V3_RATING_KEY]
+    assert queue_keys(next_base, V1_RATING_KEY, continuous=False) == [V1_RATING_KEY]
+    assert queue_keys(next_base, V2_RATING_KEY) == [V2_RATING_KEY], "a movie never follows a show"
+    first_part, first_streams = part_streams(next_base, V1_RATING_KEY)
+    second_part, second_streams = part_streams(next_base, V3_RATING_KEY)
+    assert (first_part, second_part) == (VERIFY_PARTS[V1_RATING_KEY], VERIFY_PARTS[V3_RATING_KEY])
+    assert [s_["codec"] for s_ in first_streams] == [s_["codec"] for s_ in second_streams]
+    assert not {s_["id"] for s_ in first_streams} & {s_["id"] for s_ in second_streams}
+    # A selection PUT on episode 1's part must leave episode 2's streams alone.
+    audio = [s_ for s_ in first_streams if s_["streamType"] == 2 and not s_["selected"]][0]
+    urllib.request.urlopen(urllib.request.Request(
+        next_base + f"/library/parts/{first_part}?allParts=1&audioStreamID={audio['id']}",
+        method="PUT")).read()
+    assert [s_ for s_ in part_streams(next_base, V1_RATING_KEY)[1]
+            if s_["streamType"] == 2 and s_["selected"]][0]["id"] == audio["id"]
+    assert part_streams(next_base, V3_RATING_KEY)[1] == second_streams, "episode 2 is untouched"
+    assert not next_pms.unknown, next_pms.unknown
+    # `--media-next-episode-remux`: the second episode alone is a copy remux at a high bitrate.
+    def decision(base, rk, shape):
+        query = urllib.parse.urlencode({"path": f"/library/metadata/{rk}", **shape})
+        body = json.load(urllib.request.urlopen(base + f"/video/:/transcode/universal/decision?{query}"))
+        return body["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]
+
+    def bitrate(base, rk):
+        body = json.load(urllib.request.urlopen(base + f"/library/metadata/{rk}"))
+        return body["MediaContainer"]["Metadata"][0]["Media"][0]["bitrate"]
+
+    mde_shape = {"directPlay": 1, "directStreamAudio": 1, "hasMDE": 1}
+    remux_shape = {"directPlay": 0, "directStream": 1}
+    for base in (media_base, next_base):  # without the flag the second episode is an ordinary file
+        assert V3_REMUX_KBPS > 30000 > bitrate(base, V1_RATING_KEY) > 0
+    assert bitrate(next_base, V3_RATING_KEY) < 30000, "no flag, no high bitrate"
+    assert decision(next_base, V3_RATING_KEY, mde_shape)["decision"] == "directplay"
+    for bad in ({"media_next_episode": False}, {}):
+        try:
+            Library(media=media, next_episode_remux=True, **bad)
+        except ValueError as e:
+            assert "needs --media-next-episode" in str(e)
+        else:
+            raise AssertionError("--media-next-episode-remux without --media-next-episode must be refused")
+    remux_srv, remux_pms = serve(0, seed=7, media=media, media_next_episode=True,
+                                 next_episode_remux=True)
+    remux_base = f"http://127.0.0.1:{remux_srv.server_address[1]}"
+    assert bitrate(remux_base, V3_RATING_KEY) == V3_REMUX_KBPS
+    assert bitrate(remux_base, V1_RATING_KEY) == bitrate(next_base, V1_RATING_KEY), "episode 1 is untouched"
+    for shape in (mde_shape, remux_shape):
+        part = decision(remux_base, V3_RATING_KEY, shape)
+        assert part["decision"] == "transcode", part
+        assert {s_["decision"] for s_ in part["Stream"]} == {"copy"}, "a copy remux encodes nothing"
+        assert part["id"] == VERIFY_PARTS[V3_RATING_KEY]
+    assert decision(remux_base, V1_RATING_KEY, mde_shape)["decision"] == "directplay"
+    assert decision(remux_base, V1_RATING_KEY, remux_shape)["decision"] == "directplay"
+    assert queue_keys(remux_base, V1_RATING_KEY) == [V1_RATING_KEY, V3_RATING_KEY]
+    assert not remux_pms.unknown, remux_pms.unknown
+    # `--media-forced-subtitle`: the English subtitle of the verification episodes is forced on the
+    # wire, and nothing else about them (or the second film) moves.
+    def subtitles(base, rk):
+        return [s_ for s_ in part_streams(base, rk)[1] if s_["streamType"] == 3]
+
+    assert [s_["forced"] for s_ in subtitles(media_base, V1_RATING_KEY)] == [False], "off by default"
+    try:
+        Library(media_forced_subtitle=True)
+    except ValueError as e:
+        assert "needs --media" in str(e)
+    else:
+        raise AssertionError("--media-forced-subtitle without --media must be refused")
+    forced_srv, forced_pms = serve(0, seed=7, media=media, media_next_episode=True,
+                                   media_forced_subtitle=True)
+    forced_base = f"http://127.0.0.1:{forced_srv.server_address[1]}"
+    for rk in (V1_RATING_KEY, V3_RATING_KEY):
+        english = subtitles(forced_base, rk)
+        assert [(s_["languageCode"], s_["forced"]) for s_ in english] == [("eng", True)], english
+    assert not any(s_["forced"] for s_ in subtitles(forced_base, V2_RATING_KEY)), "the film is untouched"
+    without = [{k: v for k, v in s_.items() if k not in ("id", "forced")}
+               for s_ in subtitles(next_base, V1_RATING_KEY)]
+    flagged = [{k: v for k, v in s_.items() if k not in ("id", "forced")}
+               for s_ in subtitles(forced_base, V1_RATING_KEY)]
+    assert flagged == without, "only the forced flag differs"
+    assert not forced_pms.unknown, forced_pms.unknown
     assert not media_pms.unknown, media_pms.unknown
-    for s_ in (srv, srv2, srv3, srv4, media_srv):
+    assert not pms.unknown, pms.unknown
+    for s_ in (srv, srv2, srv3, srv4, media_srv, next_srv, remux_srv, forced_srv):
         s_.shutdown()
         s_.server_close()
     tmp.cleanup()
 
     _selftest_plaintext_only_lan()
     _selftest_section_hubs()
+    _selftest_paging()
+    _selftest_link()
     print("mock_pms selftest: ok")
 
 
@@ -2562,6 +3126,156 @@ def _selftest_section_hubs():
         for h in hubs[2:]:
             assert h["Metadata"], h["hubIdentifier"]
             assert jget(h["key"])["Metadata"], h["key"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _selftest_paging():
+    """Every endpoint the app pages (`ci/plex-requests.ini`, class `paged`) honours
+    `X-Plex-Container-Start`/`-Size` in BOTH forms (query and header) with a correct `totalSize`,
+    `size` and `offset`, and 24-row windows walked end to end return the unpaged list exactly."""
+    import urllib.request
+
+    srv, pms = serve(0, seed=3, movies=130, shows=1, seasons=1, episodes=75, home_hubs=4,
+                     section_hubs=4)
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def get(path, headers=None):
+            req = urllib.request.Request(base + path, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read())["MediaContainer"]
+
+        def rows(mc):
+            for k in ("Metadata", "SearchResult", "Hub", "Directory"):
+                if k in mc:
+                    return mc[k]
+            return []
+
+        def ident(row):
+            return row.get("ratingKey") or row.get("hubIdentifier") or json.dumps(row, sort_keys=True)
+
+        season = next(rk for rk, it in pms.lib.items.items() if it["type"] == "season")
+        coll = pms.lib.collections[1]["ratingKey"]
+        endpoints = {
+            "section all": "/library/sections/1/all?type=1",
+            "section recentlyAdded": "/library/sections/1/recentlyAdded",
+            "section collections": "/library/sections/1/collections",
+            "home hub list": "/hubs",
+            "section hub list": "/hubs/sections/1",
+            "home hub items": "/hubs/mock/shelf/2",
+            "section hub items": "/hubs/mock/section/1/shelf/3",
+            "continue watching": "/hubs/continueWatching/items",
+            "typed search": f"/library/search?query={pms.lib.items[1001]['title'][:2]}&searchTypes=movies",
+            "season children": f"/library/metadata/{season}/children",
+            "related tail": "/library/metadata/1001/similar",
+            "collection children": f"/library/collections/{coll}/children",
+        }
+        sep = lambda path: "&" if "?" in path else "?"
+        for name, path in endpoints.items():
+            whole = get(path)
+            assert "totalSize" not in whole, f"{name}: an unpaged read must not carry totalSize"
+            full = [ident(r) for r in rows(whole)]
+            assert full, f"{name}: empty list, nothing to page"
+            for form in ("query", "header"):
+                got, start, total = [], 0, None
+                while True:
+                    if form == "query":
+                        mc = get(f"{path}{sep(path)}X-Plex-Container-Start={start}"
+                                 f"&X-Plex-Container-Size=24")
+                    else:
+                        mc = get(path, {"X-Plex-Container-Start": str(start),
+                                        "X-Plex-Container-Size": "24"})
+                    page = rows(mc)
+                    assert mc["offset"] == start, (name, form, mc["offset"], start)
+                    assert mc["size"] == len(page) <= 24, (name, form, mc["size"], len(page))
+                    total = mc["totalSize"] if total is None else total
+                    assert mc["totalSize"] == total == len(full), (name, form, mc["totalSize"], len(full))
+                    got += [ident(r) for r in page]
+                    start += 24
+                    if not page or start >= total:
+                        break
+                assert got == full, f"{name} ({form}): windows do not add up to the whole list"
+            past = get(f"{path}{sep(path)}X-Plex-Container-Start={len(full) + 5}&X-Plex-Container-Size=24")
+            assert rows(past) == [] and past["totalSize"] == len(full), name
+        # a Size without a Start is ignored, as PMS ignores it
+        lone = get("/library/sections/1/all?type=1&X-Plex-Container-Size=5")
+        assert lone["size"] > 5 and "totalSize" not in lone
+        # a season longer than the 60-row page is really longer, with unique ids
+        eps = pms.lib.children(season)
+        assert len(eps) == 75 and len({e["ratingKey"] for e in eps}) == 75
+        assert len(pms.lib.items) == len({int(k) for k in pms.lib.items})
+        # the related hub names the list its tail pages
+        rel = get("/library/metadata/1001/related")["Hub"][0]
+        assert rel["key"] == "/library/metadata/1001/similar", rel.get("key")
+        # the hub rows page far beyond one window (these are the rows the sliding window reads)
+        assert get("/hubs/mock/shelf/2?X-Plex-Container-Start=0&X-Plex-Container-Size=1")["totalSize"] == len(pms.lib.recent("movie", 1000)) >= 130
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _selftest_link():
+    """The conditioner end to end: latency delays an answer, `kbit` paces the body, a class override
+    leaves the other class alone, the profile changes at run time, errors are reset or 503 and
+    reproducible under one seed, and the control surface is never conditioned."""
+    import urllib.error
+    import urllib.request
+
+    def timed(base, path):
+        t = time.monotonic()
+        try:
+            with urllib.request.urlopen(base + path, timeout=10) as r:
+                n = len(r.read())
+                return r.status, n, time.monotonic() - t
+        except urllib.error.HTTPError as e:
+            return e.code, 0, time.monotonic() - t
+        except (urllib.error.URLError, ConnectionError, OSError):
+            return 0, 0, time.monotonic() - t
+
+    def post(base, obj):
+        req = urllib.request.Request(base + "/_mock/link", data=json.dumps(obj).encode(),
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+
+    srv, pms = serve(0, seed=5, movies=60, link=["listing=none:latency=150", "image=none:kbit=40"])
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        status, _, took = timed(base, "/library/sections/1/all?type=1")
+        assert status == 200 and took >= 0.14, (status, took)
+        status, n, took = timed(base, "/photo/:/transcode?url=%2Fx&width=250&height=375")
+        assert status == 200 and took >= n * 8 / 40000 * 0.9, (n, took)  # paced at 40 kbit/s
+        _, _, fast = timed(base, "/_mock/requests")
+        assert fast < 0.1, fast  # control surface unconditioned
+        post(base, {"spec": "all=none"})
+        _, _, took = timed(base, "/library/sections/1/all?type=1")
+        assert took < 0.1, took  # fast again, mid-run
+        got = post(base, {"class": "listing", "profile": "very-bad"})
+        assert got["listing"]["error_rate"] == 0.2 and got["image"]["kbit"] == 0
+        try:
+            post(base, {"spec": "nope"})
+            raise AssertionError("a bad spec must be refused")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+        # errors: reproducible under a seed, and both kinds really fail
+        post(base, {"spec": "all=none:error=0.5,kind=503"})
+        first = [timed(base, f"/library/metadata/{1001 + i}")[0] for i in range(30)]
+        srv2, _ = serve(0, seed=5, movies=60, link=["all=none:error=0.5,kind=503"])
+        try:
+            base2 = f"http://127.0.0.1:{srv2.server_address[1]}"
+            second = [timed(base2, f"/library/metadata/{1001 + i}")[0] for i in range(30)]
+        finally:
+            srv2.shutdown()
+            srv2.server_close()
+        assert first == second and 503 in first and 200 in first, (first, second)
+        post(base, {"spec": "all=none:error=1,kind=reset"})
+        assert timed(base, "/library/metadata/1001")[0] == 0
+        post(base, {"spec": "all=none"})
+        assert timed(base, "/library/metadata/1001")[0] == 200
+        wire = json.loads(urllib.request.urlopen(base + "/_mock/wire", timeout=5).read())["rows"]
+        assert wire and any(r["failed"] for r in wire) and all(r["t_done"] >= r["t_recv"] for r in wire)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -2606,6 +3320,7 @@ def _selftest_plaintext_only_lan():
             raw = socket.create_connection(("127.0.0.1", cfg["fail_port"]), timeout=5)
             try:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
                 ctx.wrap_socket(raw, server_hostname="127.0.0.1").close()
@@ -2660,6 +3375,16 @@ def main():
     ap.add_argument("--rail-fixture", action="store_true", help="synthetic A/C/F/M/Z sort-title groups for rail tests")
     ap.add_argument("--media", type=pathlib.Path,
                     help="opt-in mockverify directory; ffprobe derives its stream metadata")
+    ap.add_argument("--media-next-episode", action="store_true",
+                    help="with --media: add the verification show's second episode (same file, own "
+                         "ratingKey and part id) and let a continuous PlayQueue follow the show")
+    ap.add_argument("--media-next-episode-remux", action="store_true",
+                    help="with --media-next-episode: the second episode is a copy remux at "
+                         f"{V3_REMUX_KBPS} kbps (the decision says transcode/copy; the app's "
+                         "subtitle side reader is not admitted)")
+    ap.add_argument("--media-forced-subtitle", action="store_true",
+                    help="with --media: flag the verification episodes' English subtitle forced on "
+                         "the wire (the surface has no forced track otherwise)")
     ap.add_argument("--extra-media", type=pathlib.Path, action="append", default=[],
                     help="opt-in arbitrary media file (repeatable); each becomes one movie, "
                          "ratingKey assigned from EXTRA_MEDIA_RK_BASE and printed at startup")
@@ -2725,11 +3450,40 @@ def main():
     ap.add_argument("--decision-delay-ms", type=int, default=0, metavar="N",
                     help="sleep N ms before answering a /video/:/transcode/universal/decision or "
                          "start.* request, so a route flight is observably in flight (default 0)")
+    ap.add_argument("--link-fault", action="append", default=[], metavar="REGEX[@k=v,..]",
+                    help="fail the first `attempts` (default 1) requests for each page (same path and "
+                         "X-Plex-Container-Start >= min_start, default 1) of every endpoint whose path "
+                         "matches REGEX, kind=reset|503; repeatable. Re-arm live with POST /_mock/link "
+                         "{\"faults\": [{\"path\": REGEX, \"attempts\": 1, \"kind\": \"503\"}]}")
+    ap.add_argument("--link", action="append", default=[], metavar="SPEC",
+                    help="condition the link like macOS Network Link Conditioner: "
+                         "[class=]profile[:k=v,...], class listing|image|all, profile "
+                         f"{'|'.join(sorted(link_conditioner.PROFILES))}, keys latency/jitter/"
+                         "kbit/error/kind; repeatable, later wins. e.g. --link 3g --link "
+                         "image=edge:error=0.1. Change it live with POST /_mock/link")
+    ap.add_argument("--link-latency-ms", type=float, metavar="N",
+                    help="explicit latency for every class, applied after --link")
+    ap.add_argument("--link-jitter-ms", type=float, metavar="N", help="explicit jitter, as above")
+    ap.add_argument("--link-kbit", type=float, metavar="N", help="explicit downlink kbit/s (0: unlimited)")
+    ap.add_argument("--link-error-rate", type=float, metavar="F",
+                    help="fraction of requests that fail (0..1)")
+    ap.add_argument("--link-error-kind", choices=("reset", "503"), help="how a failing request fails")
+    ap.add_argument("--shows", type=int, default=6, help="generated shows (default 6)")
+    ap.add_argument("--seasons", type=int, default=2, help="seasons per show (default 2)")
+    ap.add_argument("--episodes", type=int, default=6,
+                    help="episodes per season (default 6; over 60 makes a season that pages)")
+    ap.add_argument("--resume-fixture", action="store_true",
+                    help="two extra shows in the shows section: 970001 has 12 seasons and an "
+                         "on-deck episode (S12E14, part-way through, the newest Continue Watching "
+                         "entry); 970002 has 3 seasons and no on-deck. Default off: every other "
+                         "answer is byte-identical")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.hero and a.catalog is None:
         ap.error("--hero needs --catalog")
+    if a.resume_fixture and a.catalog is not None:
+        ap.error("--resume-fixture is for the seeded library, not --catalog")
     if a.home_hubs < 0:
         ap.error("--home-hubs must not be negative")
     if a.section_hubs < 0 or a.section_hubs_linked < 0:
@@ -2738,6 +3492,21 @@ def main():
         ap.error("--section-hubs-linked must not exceed --section-hubs")
     if a.decision_delay_ms < 0:
         ap.error("--decision-delay-ms must not be negative")
+    link = list(a.link)
+    explicit = {k: v for k, v in (("latency", a.link_latency_ms), ("jitter", a.link_jitter_ms),
+                                  ("kbit", a.link_kbit), ("error", a.link_error_rate),
+                                  ("kind", a.link_error_kind)) if v is not None}
+    if explicit:
+        link.append(":" + ",".join(f"{k}={v}" for k, v in explicit.items()))
+    try:
+        for spec in link:
+            link_conditioner.parse_spec(spec)
+        for spec in a.link_fault:
+            link_conditioner.parse_fault(spec)
+    except ValueError as e:
+        ap.error(f"--link/--link-fault: {e}")
+    if not (1 <= a.shows <= 200 and 1 <= a.seasons <= 20 and 1 <= a.episodes <= 900):
+        ap.error("--shows 1..200, --seasons 1..20, --episodes 1..900")
     if not 0 <= a.movies <= 1000:
         ap.error("--movies must be between 0 and 1000")
     if (a.advertise_ip or a.insecure_fail_mode != "handshake") and not a.plaintext_only_lan:
@@ -2762,7 +3531,12 @@ def main():
                          transcode_fixture=a.transcode_fixture, home_hubs=a.home_hubs,
                          section_hubs=a.section_hubs,
                          section_hubs_linked=a.section_hubs_linked,
-                         decision_delay_ms=a.decision_delay_ms, home_users=a.home_users)
+                         decision_delay_ms=a.decision_delay_ms, home_users=a.home_users,
+                         link=link, link_faults=a.link_fault, shows=a.shows, seasons=a.seasons, episodes=a.episodes,
+                         resume_fixture=a.resume_fixture,
+                         media_next_episode=a.media_next_episode,
+                         next_episode_remux=a.media_next_episode_remux,
+                         media_forced_subtitle=a.media_forced_subtitle)
     except ValueError as e:
         ap.error(str(e))
     what = f"catalog={a.catalog}" if a.catalog else f"seed={a.seed}"
@@ -2772,6 +3546,8 @@ def main():
                    "host": "<TV-REACHABLE-HOST>", "port": srv.server_address[1],
                    "token": "mock-pms", "v1_rating_key": str(V1_RATING_KEY),
                    "v2_rating_key": str(V2_RATING_KEY)}
+        if a.media_next_episode:
+            trigger["v3_rating_key"] = str(V3_RATING_KEY)
         print(json.dumps(trigger, separators=(",", ":")), flush=True)
     if a.plaintext_only_lan:
         cfg = pms.plaintext_only_lan

@@ -463,15 +463,57 @@ fn frame_clear_alpha(r: f32, g: f32, b: f32, a: f32) {
     if !frame_clear_allowed() {
         return;
     }
-    plx_base::diag::spans::span("clear", || unsafe {
-        glClearColor(r, g, b, a);
-        glClear(GL_COLOR_BUFFER_BIT);
+    probed_clear(|| {
+        plx_base::diag::spans::span("clear", || unsafe {
+            glClearColor(r, g, b, a);
+            glClear(GL_COLOR_BUFFER_BIT);
+        })
     });
 }
 
-/// Block until the GPU has finished all queued commands. Used ONLY as a completion boundary and
-/// coarse wall-clock aid for the draw profiler (`ui::profile`) — it is not a GPU timestamp and it
-/// serializes the pipeline, so never call it on the normal render path.
+/// Run `clear`, bracketed by the installed probe when [`arm_clear_probe`] offered it this frame.
+fn probed_clear(clear: impl FnOnce()) {
+    let probe = CLEAR_PROBE.with(|p| p.armed.replace(false).then(|| p.hooks.get())).flatten();
+    if let Some((waiting, _)) = probe {
+        waiting();
+    }
+    clear();
+    if let Some((_, acquired)) = probe {
+        acquired();
+    }
+}
+
+/// The frame's first framebuffer-0 command is where this driver parks the wait for a free back
+/// buffer, and on every route but the player it is the page's [`frame_clear`]. The dev frame
+/// probe (`/tmp/plxnative-framecb`) prices that wait, but its clock is `platform`'s and this
+/// crate does not depend on `platform`, so the application hands the two edges down once at boot:
+/// `waiting` runs just before the clear, `acquired` just after it returns.
+pub fn install_clear_probe(waiting: fn(), acquired: fn()) {
+    CLEAR_PROBE.with(|p| p.hooks.set(Some((waiting, acquired))));
+}
+
+/// Offer the installed probe the next clear, and only the next one: the first clear that actually
+/// reaches the framebuffer after this call brackets the wait, later clears of the same frame (a
+/// popover's, a second pass) do not, so one frame yields one waiting/acquired pair. The loop calls
+/// this once per non-player frame; the player clears from the loop and brackets that itself.
+pub fn arm_clear_probe() {
+    CLEAR_PROBE.with(|p| p.armed.set(p.hooks.get().is_some()));
+}
+
+#[derive(Default)]
+struct ClearProbe {
+    hooks: std::cell::Cell<Option<(fn(), fn())>>,
+    armed: std::cell::Cell<bool>,
+}
+
+thread_local! {
+    static CLEAR_PROBE: ClearProbe = ClearProbe::default();
+}
+
+/// Block until the GPU has finished all queued commands. Used as a completion boundary by the draw
+/// profiler (`ui::profile`), a coarse wall-clock aid, and by dump mode's GPU wait
+/// (`snapshot_frame_begin`, only while `crate::dump` is armed). It is not a GPU timestamp and it
+/// serializes the pipeline, so never call it on the normal render path of a live loop.
 #[cfg(feature = "devtriggers")]
 pub fn gl_finish() {
     unsafe { glFinish() }
@@ -940,6 +982,7 @@ fn bind_core_profile_vao() {
 
 pub fn init_gl() {
     unsafe {
+        WARM_TARGET = None;
         // Before any buffer or attribute state is touched — in a core profile the calls below are
         // errors without it.
         #[cfg(feature = "hostsim")]
@@ -2127,10 +2170,23 @@ pub mod tex_ledger {
     thread_local! {
         static LIVE: RefCell<HashMap<c_uint, (u64,u64)>> = RefCell::new(HashMap::new());
         static REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        #[cfg(any(test, feature = "test-support"))]
+        static MUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
+
+    /// Test-support: how many times a texture was specified or deleted on this thread, ever. A
+    /// test that must show "no texture work happened across this span" compares two readings; the
+    /// live set alone cannot (a delete paired with a re-specify leaves it unchanged).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mutations() -> u64 { MUTATIONS.with(|n| n.get()) }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn note_mutation() { MUTATIONS.with(|n| n.set(n.get().wrapping_add(1))); }
 
     /// `tex` was (re)specified at `w`×`h`: a re-spec of a known name replaces its size.
     pub fn specified(tex: c_uint, w: c_int, h: c_int) {
+        #[cfg(any(test, feature = "test-support"))]
+        note_mutation();
         let bytes = w.max(0) as u64 * h.max(0) as u64 * 4;
         LIVE.with(|m| {
             let revision=REVISION.with(|n| { let next=n.get().wrapping_add(1); n.set(next); next });
@@ -2140,6 +2196,8 @@ pub mod tex_ledger {
 
     /// `tex` was deleted. A name this ledger never saw is ignored.
     pub fn deleted(tex: c_uint) {
+        #[cfg(any(test, feature = "test-support"))]
+        note_mutation();
         LIVE.with(|m| {
             m.borrow_mut().remove(&tex);
         });
@@ -2190,6 +2248,19 @@ pub fn snapshot_defers(fence: Option<bool>, deferred: u32) -> bool {
     fence == Some(false) && deferred < SNAPSHOT_DEFER_MAX
 }
 
+/// Dump mode's GPU wait. `glFinish` is bound only in a `devtriggers` build (the dump driver's own
+/// build), so a shipping binary has no call to it here at all.
+fn dump_wait_for_gpu() {
+    #[cfg(feature = "devtriggers")]
+    gl_finish();
+}
+
+/// [`snapshot_defers`] under dump mode, which never defers: the GPU was just waited out, so
+/// readiness is a constant instead of an environmental observation.
+pub fn snapshot_defers_in(dump: bool, fence: Option<bool>, deferred: u32) -> bool {
+    !dump && snapshot_defers(fence, deferred)
+}
+
 /// Close a presented frame: a frame that captured the page leaves a fence behind it.
 pub fn snapshot_frame_end() {
     if SNAPSHOT_THIS_FRAME.swap(false, Ordering::Relaxed) {
@@ -2204,10 +2275,16 @@ pub fn snapshot_frame_end() {
 /// answer; controlled replay supplies the recorded one. Native fence retirement still follows
 /// the actual GPU, and the independent physical window gate still governs every swap.
 pub fn snapshot_frame_begin(readiness: impl FnOnce(bool) -> bool) {
+    // DUMP MODE (`crate::dump`): the GPU is waited out BEFORE the sample, so the fence has
+    // signalled and the capture is never pending; GPU speed is not an input to the dump.
+    let dump = crate::dump::armed();
+    if dump {
+        dump_wait_for_gpu();
+    }
     // SAFETY: main render thread.
     let fence = unsafe { (*std::ptr::addr_of!(SNAPSHOT_FENCE)).as_ref().map(|f| f.signaled()) };
     let n = SNAPSHOT_DEFERRED.load(Ordering::Relaxed);
-    let defer = snapshot_defers(fence, n);
+    let defer = snapshot_defers_in(dump, fence, n);
     if defer {
         SNAPSHOT_DEFERRED.store(n + 1, Ordering::Relaxed);
     } else if fence.is_some() {
@@ -2237,15 +2314,68 @@ pub fn snapshot_pending() -> bool {
 /// the row that was actually scrolling, took under 1 ms. That is the hitch a headshot shelf shows
 /// while it rolls, and the "freeze" a cold detail page shows as its backdrop, logo and posters
 /// land one after another. Paying it HERE moves the cost into the pump, whose budget already
-/// bounds uploads per frame, and off the draw, which cannot bound anything. One pixel is enough:
-/// residency is per texture, not per texel. The page's `frame_clear` overwrites the pixel.
+/// bounds uploads per frame, and off the draw, which cannot bound anything.
+///
+/// **The sample lands in a tiny offscreen target ([`WARM_PX`] square), never on framebuffer 0.**
+/// The first draw of a frame into framebuffer 0 is where this driver blocks on the back buffer
+/// (5-9 ms in `poll` on the television, 2026-10-08). A warm drawn there took that wait inside
+/// `prepare`, so the prepare clock read a 7-10 ms "upload" and admitted one poster per frame, and
+/// the page's draw work queued behind the wait instead of overlapping it. Drawn offscreen the
+/// wait stays with the frame's `clear`; the warm costs 0.3-0.4 ms. Residency is per texture, not
+/// per texel, so a draw into any target forces it. The target is built on the first warm and
+/// kept; if it cannot be built the warm is skipped, never redirected to framebuffer 0.
+///
+/// Leaves the default framebuffer bound and the viewport at `surface::viewport()`, exactly as
+/// every other offscreen pass in this file does.
 pub fn warm_tex(tex: c_uint) {
     if tex == 0 {
         return;
     }
     const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-    draw_tex(tex, 0.0, 0.0, 1.0, 1.0, 0.0, WHITE.as_ptr());
+    unsafe {
+        let slot = &mut *std::ptr::addr_of_mut!(WARM_TARGET);
+        let target = *slot.get_or_insert_with(|| fbo_target(WARM_PX, WARM_PX, "warm"));
+        let Some((_, fbo)) = target else { return };
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        // The whole logical screen maps onto the target, so a screen-sized quad fills it and
+        // every texel of it samples `tex`.
+        glViewport(0, 0, WARM_PX, WARM_PX);
+        // `Class::Blur`, like every other offscreen pass: the quad writes a 16x16 target, not the
+        // panel, so the overdraw ledger must not book it as a full-screen `Image` and a
+        // `drawmask` of `image` must not skip it (`overdraw::gate` never books or masks `Blur`).
+        draw_tex_core(
+            Class::Blur,
+            tex,
+            0.0,
+            0.0,
+            SCR_W,
+            SCR_H,
+            UV_FULL,
+            0.0,
+            WHITE.as_ptr(),
+            0.0,
+            NO_RIM.as_ptr(),
+            0.0,
+            0.0,
+            0.0,
+            NO_RIM.as_ptr(),
+            0.0,
+            0.0,
+            None,
+        );
+        glBindFramebuffer(GL_FRAMEBUFFER, plx_base::surface::default_fb());
+        let (vx, vy, vw, vh) = plx_base::surface::viewport();
+        glViewport(vx, vy, vw, vh);
+    }
 }
+
+/// Side, in pixels, of the offscreen target [`warm_tex`] draws into.
+const WARM_PX: c_int = 16;
+
+/// [`warm_tex`]'s target: unbuilt (`None`), failed (`Some(None)`, latched so a driver that refuses
+/// it is asked once) or ready (texture, framebuffer). Main render thread only, like every cached
+/// target here; `init_gl` clears it, so a fresh GL context never sees a stale name.
+static mut WARM_TARGET: Option<Option<(c_uint, c_uint)>> = None;
 
 /// Delete a texture created by upload_rgba (0 = no-op). Main-thread only.
 ///
@@ -3659,6 +3789,10 @@ const POPOVER_MAX_RISE: f32 = 20.0;
 /// comes to rest; every later frame moves it back INTO that region. Cache hits are therefore
 /// containment tests — key on equality, or grab only `BLUR_REACH`, and even a cached popover would
 /// recapture on every frame of its appear.
+///
+/// **Only for a glass that RISES.** A glass that stays at its rest rect is grabbed [`BLUR_REACH`] out
+/// and no more ([`blur_region_for`]); `BLUR_MARGIN` is the figure for the ones that slide
+/// (`ui::hold_hint`) and the conservative upper bound the band budget is priced at.
 pub const BLUR_MARGIN: f32 = BLUR_REACH + POPOVER_MAX_RISE;
 
 /// The region area a MOVING host can carry at 60 fps, in authored px² — the design system's
@@ -3685,10 +3819,25 @@ pub const GLASS_REGION_BUDGET: f32 = 300_000.0;
 /// existed. The graded expression is now this one.
 #[inline]
 pub fn blur_region(x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
-    let x0 = (x - BLUR_MARGIN).max(0.0);
-    let y0 = (y - BLUR_MARGIN).max(0.0);
-    let x1 = (x + w + BLUR_MARGIN).min(SCR_W);
-    let y1 = (y + h + BLUR_MARGIN).min(SCR_H);
+    blur_region_for(true, x, y, w, h)
+}
+
+/// [`blur_region`] for a glass that is KNOWN not to rise (`rises == false`): the panel plus
+/// [`BLUR_REACH`] and nothing more.
+///
+/// [`POPOVER_MAX_RISE`] exists for one reason: a rising glass's first draw sits a full `rise` away
+/// from where it settles, and the region is grabbed around the rest rect, so the slide has to stay
+/// inside the grab (see [`BLUR_MARGIN`]). A glass that never moves from its rest rect has no slide
+/// to carry, so those 20 px would only widen what the retained source depends on: any draw in the
+/// band between `BLUR_REACH` and `BLUR_MARGIN` of the panel is outside everything the lens and the
+/// kernel can read for a pixel of the panel, yet it would still invalidate the source.
+#[inline]
+pub fn blur_region_for(rises: bool, x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
+    let m = if rises { BLUR_MARGIN } else { BLUR_REACH };
+    let x0 = (x - m).max(0.0);
+    let y0 = (y - m).max(0.0);
+    let x1 = (x + w + m).min(SCR_W);
+    let y1 = (y + h + m).min(SCR_H);
     [x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0)]
 }
 
@@ -4499,6 +4648,26 @@ impl ProbeCadence {
     }
 }
 
+/// How a ground sampler answers a call: see [`probe_mode`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeMode {
+    /// The product: queue a fenced copy on a cadence, collect it a frame later ([`ProbeCadence`]).
+    Cadenced,
+    /// Dump mode: copy and read inside the call, every call, so the answer is a function of the
+    /// frame being drawn and not of how many loop iterations went by (`crate::dump`).
+    Sync,
+}
+
+/// The mode, as a pure function of the dump switch (the half a host test can reach).
+#[inline(always)]
+pub fn probe_mode(dump_armed: bool) -> ProbeMode {
+    if dump_armed {
+        ProbeMode::Sync
+    } else {
+        ProbeMode::Cadenced
+    }
+}
+
 /// **A ground sampler's asynchronous read-back**: `N` boxes of `px` square, copied side by side
 /// into one `N*px x px` target, fenced, and read once finished. See [`ProbeCadence`] for why.
 ///
@@ -4560,12 +4729,39 @@ impl<const N: usize> GroundProbe<N> {
         self.ready = Some(buf);
     }
 
+    /// Dump mode's answer: build the target if needed, copy the boxes, read them back now.
+    #[cold]
+    unsafe fn read_now(&mut self, origins: &[(c_int, c_int); N], who: &str) -> Option<Vec<u8>> {
+        if self.target.is_none() {
+            self.target = fbo_target(self.px * N as c_int, self.px, who);
+            if self.target.is_none() {
+                self.off = true;
+                return None;
+            }
+        }
+        let (tex, fbo) = self.target?;
+        let px = self.px;
+        glBindTexture(GL_TEXTURE_2D, tex);
+        for (i, &(x, y)) in origins.iter().enumerate() {
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, i as c_int * px, 0, x, y, px, px);
+        }
+        let (w, h) = (px * N as c_int, px);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf.as_mut_ptr() as *mut c_void);
+        glBindFramebuffer(GL_FRAMEBUFFER, plx_base::surface::default_fb());
+        Some(buf)
+    }
+
     /// One sampler call. `origins` are the boxes' lower-left corners in framebuffer pixels, already
     /// clamped — used only on a kick. Returns the collected `N*px x px` RGBA row-major buffer on a
     /// collect, `None` otherwise.
     unsafe fn step(&mut self, have: bool, origins: &[(c_int, c_int); N], who: &str) -> Option<Vec<u8>> {
         if self.off {
             return None;
+        }
+        if probe_mode(crate::dump::armed()) == ProbeMode::Sync {
+            return self.read_now(origins, who);
         }
         match self.cadence.step(have, drawn_frames(), self.ready.is_some()) {
             ProbeStep::Keep => None,
@@ -5371,8 +5567,9 @@ pub fn draw_blur_backdrop(
     rim: GlassRim,
     face: GlassFace,
     deep: f32,
+    rises: bool,
 ) -> bool {
-    let live = backdrop::surface(Rect::new(x,y,w,h));
+    let live = backdrop::surface_with(Rect::new(x,y,w,h), rises);
     if live.is_some_and(|r| !r.draw) { return true; }
     unsafe {
         // Direct jobs never intersect a lower glass: those bands capture the visible prefix
@@ -5404,7 +5601,7 @@ pub fn draw_blur_backdrop(
         if masked(Class::Glass) {
             return false;
         }
-        let need = blur_region(rest[0], rest[1], rest[2], rest[3]);
+        let need = blur_region_for(rises, rest[0], rest[1], rest[2], rest[3]);
         let retained;
         let c = if let Some(request) = live {
             if !BLUR_IN_PASS && (request.refresh || backdrop::image(request.z).is_none_or(|image| !image.covers(request.rect))) {
@@ -5413,7 +5610,7 @@ pub fn draw_blur_backdrop(
                 if !backdrop::begin_inline_capture(request.z) { return false; }
                 BLUR_VALID=false;
                 let r = backdrop::region(request.z).unwrap_or(Rect::new(x,y,w,h));
-                blur_snapshot(blur_region(r.x,r.y,r.w,r.h));
+                blur_snapshot(blur_region_for(backdrop::rises(request.z), r.x,r.y,r.w,r.h));
                 if !retain_backdrop(request.z) {
                     backdrop::capture_failed(request.z);
                     return false;
@@ -7438,6 +7635,37 @@ mod tests {
         assert!(!blur_region_covers(reg, 40.0, 40.0, w, h));
     }
 
+    /// A glass that never rises is grabbed `BLUR_REACH` out and no further, and `BLUR_REACH` is
+    /// what the lens and the kernel can read: [`GLASS_LENS`] plus the chain's own spread.
+    ///
+    /// Why the blurred pixels of the panel cannot change with the band between `BLUR_REACH` and
+    /// `BLUR_MARGIN`: an output pixel inside the panel samples the snapshot at most `GLASS_LENS`
+    /// (38) outward of itself (the lens displaces along the outward normal) and then the blur taps
+    /// spread about 10 px around that sample (0.35 and 0.75 texels at quarter res, the up pass, the
+    /// reductions' box), 48 px from the panel in all. `BLUR_REACH` (68) is that plus ~20 of slack,
+    /// and it is the figure `blur_region_covers` has always accepted a cached grab on. A draw
+    /// farther out than 68 therefore feeds no tap of any panel pixel.
+    #[test]
+    fn j_a_glass_that_never_rises_is_grabbed_reach_out_and_no_further() {
+        // The tab track on Home: bottom edge 130, so the rising grab ends at 218 and the
+        // non-rising one at 198 — above the focused card's top edge at 211.
+        let (x, y, w, h) = (96.0f32, 54.0f32, 1130.0f32, 76.0f32);
+        let still = blur_region_for(false, x, y, w, h);
+        let rising = blur_region_for(true, x, y, w, h);
+        assert_eq!(still[1] + still[3], y + h + BLUR_REACH);
+        assert_eq!(rising[1] + rising[3], y + h + BLUR_MARGIN);
+        assert_eq!(still[0], x - BLUR_REACH);
+        assert_eq!(still[0] + still[2], x + w + BLUR_REACH);
+        assert!(still[1] + still[3] < 211.0 && rising[1] + rising[3] > 211.0);
+        // it still holds everything a pixel of the panel can read...
+        assert!(BLUR_REACH >= GLASS_LENS + 10.0);
+        assert!(blur_region_covers(still, x, y, w, h));
+        // ...and the rising default is exactly the old `blur_region`
+        assert_eq!(rising, blur_region(x, y, w, h));
+        // a still glass hands the rim exactly the margin a cached grab is later tested against
+        assert!(still[2] * still[3] < rising[2] * rising[3]);
+    }
+
     /// Two glass surfaces in one frame must converge to ONE grab, and it must SHRINK again when one
     /// of them goes away.
     ///
@@ -7697,6 +7925,34 @@ mod tests {
             uv[3] < 0.0,
             blur_is_bottom_up(),
             "the v span runs backwards iff stored bottom-up"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clear_probe_tests {
+    use std::cell::RefCell;
+
+    thread_local! { static LOG: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) }; }
+
+    #[test]
+    fn a_frame_brackets_its_first_clear_once() {
+        super::install_clear_probe(
+            || LOG.with(|l| l.borrow_mut().push("waiting")),
+            || LOG.with(|l| l.borrow_mut().push("acquired")),
+        );
+        let clear = || LOG.with(|l| l.borrow_mut().push("clear"));
+        super::probed_clear(clear);
+        super::arm_clear_probe();
+        super::probed_clear(clear);
+        super::probed_clear(clear);
+        super::arm_clear_probe();
+        super::probed_clear(clear);
+        let log = LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        assert_eq!(
+            log,
+            ["clear", "waiting", "clear", "acquired", "clear", "waiting", "clear", "acquired"],
+            "an unarmed clear is bare; an armed frame gets one pair, and its second clear none"
         );
     }
 }

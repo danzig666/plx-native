@@ -1,5 +1,10 @@
 //! Route/chrome identity and the surface architecture: profile/card menus, Settings and
 //! player panels, and the heartbeat word each mounted screen reports.
+//!
+//! The tests marked `#[cfg(feature = "hostsim")]` below (the item-menu opener-lift ones) run ONLY
+//! with that feature: `make test-crate C=app T=<filter>` filters them out and exits 0. Run them with
+//! `CARGO_INCREMENTAL=0 PATH="$HOME/.cargo/bin:$PATH" cargo +nightly test --lib -p plxnative-modules --features hostsim -- <filter>`
+//! from `rust-modules/`.
 
 use super::*;
 use plx_machine::machine::Chrome;
@@ -168,6 +173,35 @@ fn switching_profile_leaves_the_container_holding_nothing_of_the_previous_profil
         !d.nav.tabs.stack.entries.iter().any(|e| e.arg.same_instance(&detail_arg("2002"))),
         "the parked push did not mint itself in behind the reset",
     );
+}
+
+/// **A profile switch dismisses an open Settings surface, at once.** The Playback page names the
+/// seated profile and lists that profile's own picks, so it must not survive the switch to the next
+/// one: it would say "for Maya" over Noah's values for as long as it stayed up. The surfaces go
+/// in `Navigator::reset_for_profile` (they are dropped first, then the page stack), which is
+/// called before the switch commits. Graded the moment `switch_profile` returns, before any frame
+/// runs: `Root(Profiles)` alone would sweep the surface a frame LATER (it retires the page the
+/// surface stands over), so only the reset itself can make this true immediately, and a frame in
+/// between would be a window in which the old profile's page is still drawn.
+///
+/// Not behind `hostsim`: nothing here needs the desktop simulator, so `make check` runs it.
+#[test]
+fn a_profile_switch_dismisses_an_open_settings_surface() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    open_settings_at(&mut d, SettingsPage::Playback);
+    frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+    assert!(settings_up(&d), "the Settings surface is up on the Playback page");
+    assert_eq!(overlay_word(&d), Some("playback"));
+
+    switch_profile(&mut d);
+    assert!(!settings_up(&d), "the switch dismissed Settings before any frame ran");
+
+    for i in 0..20u32 { frame(&mut d, &mut rig, AppArg::Profiles, tick(2 + i), vec![]); }
+    assert!(!settings_up(&d), "and it stays gone behind the picker");
+    assert!(d.nav.top_page().is_some_and(|e| e.arg == AppArg::Profiles));
 }
 
 /// **An app switch parks the tree; it does not tear the session's page history down.**
@@ -634,6 +668,95 @@ fn opening_the_item_menu_leaves_the_press_springing_and_the_opener_lift_follows_
     assert_eq!(opener_press(&d).scale, 1.0, "at rest the lift is the resting pop");
 }
 
+/// **A card hold the app takes: the release spring under the open item menu is the LIFT's, not
+/// the page's.** The page under a panel is one frozen snapshot, re-taken whenever the page raises
+/// damage (`popover::host_refresh`), and every re-take is a full-page capture that holds the next
+/// present back. The spring of #484 reported each visibly moving frame as page damage, so the open
+/// re-captured the page 7-8 times (21 fps on the set). The lifted card is now left out of the page
+/// pass and drawn only by the lift, so after the menu mounts and ONE page pass has said so, the
+/// spring raises no page damage at all. Counts the damage `begin_frame` would read per frame
+/// (`idle::take_page_damage`), over the whole spring, with the real dispatcher and Home's
+/// frames (a host test has no GL, so the page PASS itself, which is what tells the press the card
+/// is left out, is `cards::tests::the_lifted_card_is_left_out_of_the_page_pass_and_drawn_by_the_lift`;
+/// here it is said by hand after the mount frame). The control run (no lift owning the card) proves the counter sees the old behaviour.
+#[cfg(feature = "hostsim")]
+fn page_damage_frames_across_a_taken_holds_spring(lift_owns_the_card: bool) -> (usize, usize) {
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    let mut t = 0u32;
+    let run = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, t: &mut u32| {
+        *t += 1;
+        frame(d, rig, AppArg::Home, tick(*t), vec![]);
+        let damage = plx_machine::idle::take_page_damage();
+        damage
+    };
+    run(&mut d, &mut rig, &mut t);
+    rig.seed_hub_grid_for_test(3, 4);
+    for _ in 0..6 { run(&mut d, &mut rig, &mut t); }
+    let host = d.nav.top_page().unwrap().id;
+    let instance = d.nav.instance_of(host).unwrap();
+    d.emit(MachineId::Nav, plx_machine::machine::Fx::Deliver(
+        MachineId::Instance(instance),
+        plx_machine::machine::Delivery::Screen(plx_ui::screen::ScreenEvent::App(
+            plx_screens::registry::AppMsg::Home(plx_screens::registry::HomeCmd::FocusGrid { row: 0, col: 0 })))));
+    for _ in 0..40 { run(&mut d, &mut rig, &mut t); }
+    let key = d.focus().expect("the grid card is focused");
+    assert_eq!(key.entry, host);
+
+    // The hold: armed, dipped, latched long; then the app answers it (what `content_requests` does).
+    d.input.arm(
+        plx_machine::machine::PressArm { key, from: plx_machine::machine::PressFrom::Key, holdable: true },
+        MachineId::Nav,
+        t * 16,
+    );
+    for _ in 0..80 {
+        run(&mut d, &mut rig, &mut t);
+        if d.input.press.is_long(t * 16) { break; }
+    }
+    assert!(d.input.press.is_long(t * 16) && d.input.press.scale() < 0.99, "premise: a latched, dipped hold");
+    d.input.cancel_press();
+    let mut row = plx_data::pms::PmsMovie::default();
+    row.rk = "1".into();
+    row.kind = 0;
+    open_item_menu(&mut d, card_menu_arg(&row, false, true, host, Some(key), None));
+
+    // The mount frame (its page pass takes the one designed capture and the card sections say they
+    // left the card out), then the spring.
+    run(&mut d, &mut rig, &mut t);
+    assert!(item_menu_up(&d), "the menu mounted");
+    assert_eq!(opener_lift(&d), Some((host, Some(key))));
+    plx_ui::popover::set_lift_owns(lift_owns_the_card);
+    let (mut moving, mut damaged) = (0, 0);
+    for _ in 0..40 {
+        let damage = run(&mut d, &mut rig, &mut t);
+        // A frame the spring visibly moves the card on (half a percent of its size or more).
+        if (d.input.press.scale() - 1.0).abs() > 0.005 {
+            moving += 1;
+            if damage { damaged += 1; }
+        }
+    }
+    // The flag is per thread and a later test on this thread must not inherit it.
+    plx_ui::popover::set_lift_owns(false);
+    (moving, damaged)
+}
+
+#[cfg(feature = "hostsim")]
+#[test]
+fn a_taken_holds_release_spring_raises_no_page_damage_under_the_open_menu() {
+    let _g = plx_base::testlock::serial();
+    let (moving, damaged) = page_damage_frames_across_a_taken_holds_spring(true);
+    assert!(moving > 8, "the spring ran for {moving} frames under the menu");
+    assert_eq!(damaged, 0, "none of its {moving} moving frames may be page damage (each is a full page capture)");
+}
+
+#[cfg(feature = "hostsim")]
+#[test]
+fn the_page_damage_counter_sees_a_spring_the_lift_does_not_own() {
+    let _g = plx_base::testlock::serial();
+    let (moving, damaged) = page_damage_frames_across_a_taken_holds_spring(false);
+    assert!(moving > 8 && damaged * 2 > moving, "control: {damaged} of {moving} moving frames were page damage");
+}
+
 /// **OK on a row reports ONE request and dismisses in the same drain**, carrying the row and
 /// the server the panel captured.
 ///
@@ -724,6 +847,12 @@ fn a_card_menus_commit_reports_one_request_carrying_the_row_it_captured() {
 #[test]
 fn account_to_settings_never_unfreezes_the_host() {
     let _g = plx_base::testlock::serial();
+    // The account menu builds its rows only from a SETTLED session (`peek_settled`), and the first
+    // read of one is asynchronous (a job on the storage worker). Run alone, in a fresh process, the
+    // three frames below beat that read about one run in forty and the menu had no rows to walk
+    // (`d.focus()` was `None`). The scratch session is saved through the cache, so it is settled and
+    // signed out (a client id, no account) before the first frame, whatever ran before this test.
+    let _session = plx_plex::plex::session::TempSession::new("account-to-settings");
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -732,8 +861,8 @@ fn account_to_settings_never_unfreezes_the_host() {
     frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
     assert_eq!(d.host_policy(), (HostUpdate::Frozen, HostRender::Cached));
 
-    // Focus the Settings row and commit it. Signed out (a host test has no session file the
-    // fixture wrote), the rows are [Sign in, Settings], so one DOWN then OK.
+    // Focus the Settings row and commit it. Signed out (the scratch session carries a client id and
+    // no account), the rows are [Sign in, Settings], so one DOWN then OK.
     let menu_entry = d.nav.modals.top().unwrap().entry.id;
     let mut t = 2;
     let mut press = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, key: Key| {
@@ -1194,4 +1323,91 @@ fn a_second_open_of_the_pending_detail_page_leaves_no_seed_behind() {
     for i in 1..30u32 { super::frame(&mut d, &mut rig, tick(400 + i * 16), vec![]); }
     assert_eq!(d.nav.tabs.stack.depth(), 2, "one detail page, not two");
     assert!(rig.mounter.seed.is_none(), "no unspent seed is left for a later mount");
+}
+
+/// **A dismissed item menu's opener lift stands down once focus has left the opener tile.**
+/// `dismiss` returns input to the page on the same frame but the surface lingers (`Closing`) for
+/// its fade; a D-pad press in that window moves the page's focus to the neighbour, and a lift that
+/// kept repainting the menu's ORIGINAL key drew the old tile fully popped and captioned above the
+/// page — two tiles focused at once (Collection, owner's recording). The decision is
+/// [`opener_lift`], shared by every page.
+#[test]
+fn a_closing_item_menus_opener_lift_stands_down_when_focus_moves_off_the_opener() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    let host = d.nav.top_page().unwrap().id;
+    let mut row = plx_data::pms::PmsMovie::default();
+    row.rk = "42".into();
+    row.kind = 0;
+    let key = |elem| plx_machine::machine::FocusKey { entry: host, elem };
+    open_item_menu(&mut d, card_menu_arg(&row, false, true, host, Some(key(7)), None));
+    frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+    assert_eq!(opener_lift(&d), Some((host, Some(key(7)))), "open: the lift paints the opener");
+
+    let ev = script_key(Key::Back, tick(2));
+    frame(&mut d, &mut rig, AppArg::Home, tick(2), ev);
+    assert_eq!(d.nav.modals.top().map(|s| s.phase), Some(Phase::Closing));
+    d.set_focus(Some(key(7)));
+    assert_eq!(opener_lift(&d), Some((host, Some(key(7)))), "closing, focus still on the opener: it stays lifted");
+    d.set_focus(Some(key(8)));
+    assert_eq!(opener_lift(&d), None, "closing, focus moved to the neighbour: the old tile is NOT repainted as focused");
+}
+
+/// **OK on a Continue Watching EPISODE opens the SHOW on the card's season** (Settings > Playback >
+/// Continue Watching = "Open details"): the decision `activate_deck_card` makes from the card, the
+/// shelf's `from_deck` and whether the press plays. The pure half pins every case that must NOT
+/// reroute — a discovery shelf's episode (its OK opens the episode's page), a press that plays
+/// (`DeckPress::Play` arrives as `want_play`), a movie, a show/season card, and an episode whose
+/// row names no show.
+#[test]
+fn a_deck_episode_press_opens_the_show_and_nothing_else_reroutes() {
+    use crate::app::input::deck_press_opens_show;
+    let card = |kind: i32, show_rk: &str| {
+        let mut m = plx_data::pms::PmsMovie::default();
+        m.rk = "ep".into();
+        m.kind = kind;
+        m.show_rk = show_rk.into();
+        m.season_index = 3;
+        m
+    };
+    let episode = card(3, "show");
+    assert!(deck_press_opens_show(&episode, true, false), "deck episode, OK opens details");
+    assert!(!deck_press_opens_show(&episode, false, false), "a discovery shelf's episode keeps its own page");
+    assert!(!deck_press_opens_show(&episode, true, true), "a press that plays plays");
+    assert!(!deck_press_opens_show(&card(3, ""), true, false), "no show row: today's episode page");
+    for kind in [0, 1, 2] {
+        assert!(!deck_press_opens_show(&card(kind, "show"), true, false), "kind {kind} is unchanged");
+    }
+}
+
+/// …and the other half: the page that is actually opened. A deck episode seeds the SHOW's detail
+/// page with the card's season; the same card from a discovery shelf seeds the episode's own page
+/// with no season (`open_detail` writes the seed in the call, before any frame spends it).
+#[test]
+fn activating_a_deck_episode_seeds_the_show_page_on_its_season_and_a_discovery_one_its_own() {
+    let _g = plx_base::testlock::serial();
+    let mut ps = plx_media::route::PlaybackSession::default();
+    let mt = unsafe { plx_base::task::MainThread::assume() };
+    let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
+    let mut wait = None;
+    let mut episode = plx_data::pms::PmsMovie::default();
+    episode.sid = plx_plex::plex::ServerId::UNSET;
+    episode.rk = "ep-55".into();
+    episode.kind = 3;
+    episode.show_rk = "show-7".into();
+    episode.season_index = 3;
+
+    for (from_deck, rk, season) in [(true, "show-7", Some(3)), (false, "ep-55", None)] {
+        let mut d = Dispatcher::<AppHost>::new();
+        let mut rig = Bridge::for_test(|| 0);
+        frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+        unsafe {
+            crate::app::input::activate_deck_card(&mut ps, &mut pa, &episode, from_deck, false, 0, None,
+                &mut d, &mut rig, &mut wait, 0);
+        }
+        let seed = rig.mounter.seed.as_ref().expect("a detail page was opened");
+        assert_eq!((seed.rk.as_str(), seed.spot.season), (rk, season), "from_deck {from_deck}");
+    }
 }

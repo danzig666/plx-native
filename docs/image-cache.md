@@ -17,7 +17,13 @@ Existing avatar files migrate on their first hit while preserving their original
 
 The cache chooses a writable persistent directory through `paths::image_cache_candidates`,
 isolated by installation flavour (or simulator instance). It caps committed storage at **128 MiB**
-and **8,192 files**, with **4 MiB** maximum compressed image size. One temporary write can consume
+and **8,192 files**, with **4 MiB** maximum compressed image size. The byte cap is further limited
+to half of what the chosen filesystem can spare (its free space plus the cache's own files), and
+below 8 MiB of spare the disk tier is off: on webOS 3.4.3 the only writable persistent directory is
+`/media/developer/temp`, on the partition installed apps share, which had 76.5 MB free. That
+directory is world-writable, so the cache directory inside it is created `0700` (an existing one we
+own is tightened to `0700`; a foreign-owned one or a symlink is refused); the other candidates keep
+the mode they are given. One temporary write can consume
 up to another image's size. A lazy startup scan builds a byte-accounted LRU index; normal reads
 and writes use that index, avoiding repeated directory scans. Reads advance recency in memory;
 file modification times persist recency at most once an hour per accessed entry. The header's
@@ -34,8 +40,9 @@ the old image. Changed versioned source paths miss immediately rather than waiti
 RAM residency remains independent of library size: 64 source slots and a 44 MiB GPU texture
 budget. Demand workers stop claiming requests when combined decoded and pending-upload pixels
 reach 8 MiB; already active decodes can temporarily exceed this admission threshold. If the GPU evicts an image while its source slot survives, the next draw requests its
-pixels again through the same disk-first path, respecting scrolling deferral and the source's
-residency backoff. Sign-out advances the cache epoch and sweeps all
+pixels again through the same disk-first path, subject to the source's residency backoff (a card is
+deferred only while its placement is still unknown, one sample; a moving card is no longer
+deferred unless the dev trigger `plxnative-cardspeed=<px/s>` arms the decline). Sign-out advances the cache epoch and sweeps all
 candidate directories; requests capture that epoch when queued, so old work cannot read, remove,
 write or publish images after account erasure. Profile switching within one account retains
 reusable artwork. Filesystem deletion failures remain best effort, like the existing avatar cache.

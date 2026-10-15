@@ -53,6 +53,7 @@ rust-modules/target-lab/
 rust-modules/target-sim-lab/
 # `make screenshots-sim` — the documentation-screenshot simulator (hostsim + devtriggers).
 rust-modules/target-sim-shots/
+rust-modules/target-sim-video/
 # pkg/plxnative-storage's own target dir, deliberately separate from $(RUST_TDIR) — see the
 # Makefile's STORAGE_TDIR comment. One glob for every RELEASE/LAB/SYMBOLS combination.
 rust-modules/target*-storage/
@@ -124,6 +125,8 @@ vendor/vendor/
 # them, so a fresh clone rebuilds FFmpeg either way, and tracking them costs 2.1 MB per version
 # bump forever in a repo whose reproducibility rests on the pinned tarball.
 pkg/lib*-plx.so.*
+# ...and the `.debug` files `make symbols-libs` separates from them (symbols for the Sentry upload).
+pkg/symbols/
 pkg/libass-plx-host.so.0*
 pkg/libass-plx.0.dylib.*.new
 pkg/.ffabi-ok
@@ -156,9 +159,11 @@ tests/fixtures/**/*.mkv
 tests/fixtures/**/*.mp4
 tests/fixtures/**/*.sup
 tests/fixtures/fixtures.json
-# ...except one deliberate 13 KB regression fixture, which is not generated media but the input of
-# `ff_image_subtitle_tests.rs` (`make check-ffmpeg`): mkvmerge's zlib-compressed subtitle tracks.
+# ...except two deliberate small regression fixtures, which are not generated media but inputs of
+# `ff_image_subtitle_tests.rs` (`make check-ffmpeg`): mkvmerge's zlib-compressed subtitle tracks,
+# and the NUL-terminated ASS header and packets (`make_ass_header_fixture.py`).
 !tests/fixtures/mkv_zlib_subs.mkv
+!tests/fixtures/ass-terminated-header.mkv
 
 # Python bytecode from the host-side test/tooling scripts.
 __pycache__/

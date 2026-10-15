@@ -137,6 +137,13 @@ pub struct ProfilePublication {
     pub epoch: u64,
     pub profile: Option<UserRef>,
     pub scope: ProfileScope,
+    /// `grant::account_key` of the account token the profile is published under: the half of the
+    /// seat (`plex::session::Seat`) that says which sign-in the profile belongs to. Empty with no
+    /// account token, and in a recording made before the field existed. An empty stamp is left off
+    /// the wire: a controlled replay grades the regenerated effect as complete canonical JSON
+    /// against the committed recordings, which hold `{epoch, profile, scope}` alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stamp: String,
 }
 
 /// Credentials-owned patch data. The adapter merges it into the current disk value, retaining
@@ -568,7 +575,7 @@ pub enum SessionFx {
     SelectionReply { to: ReplyTo, accepted: bool, flow_epoch: u64 },
     BackReply { to: ReplyTo, resumed: bool },
     /// Record the person's plaintext answer for one server: this launch's grant authority
-    /// (`plex::grant::answer`) and the persisted choice (`Session::plaintext_consent`), under
+    /// (`plex::grant::answer`) and the persisted choice (`Preferences::plaintext_consent`), under
     /// `account` — `plex::grant::account_key` of the account signed in when it was given.
     PlaintextAnswer { machine_id: String, choice: plx_plex::plex::session::PlaintextChoice, account: String },
 }
@@ -918,8 +925,8 @@ pub fn write_persisted(w: &mut Canon, s: &PersistedSession) {
         w.str(&recent.user).seq(recent.terms.len());
         for term in &recent.terms { w.str(term); }
     }
-    w.seq(s.last_library.len());
-    for last in &s.last_library {
+    w.seq(s.prefs.last_library.len());
+    for last in &s.prefs.last_library {
         w.str(&last.user).seq(last.libs.len());
         for lib in &last.libs { w.str(&lib.kind).str(&lib.machine_id).u64(lib.key as u64); }
     }
@@ -931,10 +938,10 @@ pub fn write_persisted(w: &mut Canon, s: &PersistedSession) {
             for lib in list { w.str(&lib.machine_id).u64(lib.key as u64); }
         }
     }
-    w.option(s.last_hero_blur, |w, blur| {
+    w.option(s.prefs.last_hero_blur, |w, blur| {
         for corner in blur { for channel in corner { w.f32(channel); } }
     });
-    w.option(s.playback_quality, |w, quality| {
+    w.option(s.prefs.playback_quality, |w, quality| {
         use plx_plex::plex::session::PlaybackQuality;
         w.u8(match quality { PlaybackQuality::Auto => 0, PlaybackQuality::Original => 1,
             PlaybackQuality::P1080High => 2, PlaybackQuality::P1080 => 3,
@@ -1807,6 +1814,7 @@ impl SessionMachine {
         self.state.active_profile = profile;
         emit(SessionFx::PublishProfile(ProfilePublication {
             epoch: self.state.epoch, profile: self.state.active_profile.clone(), scope: self.state.profile_scope,
+            stamp: plx_plex::plex::grant::account_key(&self.state.persisted.account_token),
         }));
     }
 
@@ -1917,12 +1925,13 @@ impl SessionMachine {
     }
 
     fn request_endpoint(&mut self, sid: plx_plex::plex::ServerId, emit: &mut impl FnMut(SessionFx)) -> bool {
-        let sid = sid.raw();
-        if usize::from(sid) >= plx_plex::plex::MAX_SERVERS
+        // The registry's own validity rule: every id but the reserved UNSET names a slot.
+        if !sid.is_set()
             || self.state.persisted.account_token.is_empty()
-            || self.state.pending.values().any(|pending| pending.key.op == SessionOp::Endpoint(sid)) {
+            || self.state.pending.values().any(|pending| pending.key.op == SessionOp::Endpoint(sid.raw())) {
             return false;
         }
+        let sid = sid.raw();
         let Some(req) = self.allocate(SessionOp::Endpoint(sid), None) else { return false };
         self.state.pending.get_mut(&req).unwrap().capture = Some(CaptureIntent::Endpoint { sid });
         emit(SessionFx::Capture { req, epoch: self.state.epoch, request: SessionReadRequest::Endpoint { sid } });
@@ -3855,6 +3864,23 @@ mod tests {
         assert_eq!(owner.snapshot_init().pending.values()
             .filter(|p| p.key.op == SessionOp::Endpoint(sid)).count(), 1,
             "still exactly one outstanding attempt for this sid — one per backoff step, not per fire");
+    }
+
+    #[test]
+    fn request_endpoint_admits_a_server_past_the_old_sixteen_slot_table() {
+        let mut init = captured_session();
+        init.persisted.account_token = "synthetic-account".into();
+        let mut owner = SessionMachine::from_init(init);
+        let sid: u16 = 40;
+        let fx = step(&mut owner, SessionEvent::Command(Command::RequestEndpoint {
+            sid: plx_plex::plex::ServerId::from_raw(sid) }));
+        assert!(fx.iter().any(|f| matches!(f,
+            SessionFx::Capture { request: SessionReadRequest::Endpoint { sid: s }, .. } if *s == sid)),
+            "a server the registry issued past slot 15 must reach its endpoint probe");
+        // The reserved UNSET id names no server, so it is still refused.
+        let fx = step(&mut owner, SessionEvent::Command(Command::RequestEndpoint {
+            sid: plx_plex::plex::ServerId::UNSET }));
+        assert!(fx.is_empty());
     }
 
     #[test]

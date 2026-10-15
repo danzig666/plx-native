@@ -1205,6 +1205,84 @@ class FrameCeilingsManifest(unittest.TestCase):
                          "a cold open grades its FIRST frames")
 
 
+class UploadPacingGrading(unittest.TestCase):
+    """`grade_upload_pacing` — `upload_per_frame_min`/`upload_late_share_max` over the heartbeat's `pupf=` tally."""
+
+    HB = ("loop=60 route=library fps=60 worstframe=1.0ms worstprep=0.4ms carried=0 dropped=0 "
+          "budget=3/0 evicted_hot=0 frame_n=60 frame_gt16=3 frame_gt33=0 frame_gt50=0 "
+          "frame_gt100=0 frame_max=20.0ms frame_p95=17.0ms frame_p99=18.0ms")
+
+    def _lines(self, *tallies, route="library"):
+        out = []
+        for frames, late, uploads in tallies:
+            out.append(self.HB.replace("route=library", f"route={route}")
+                       + f" pupf={frames} pupf_ge22={late} pup={uploads}")
+        return out
+
+    def test_the_share_of_late_upload_frames_is_graded_against_the_limit(self):
+        scene = {"upload_late_share_max": 0.35}
+        ok, detail = run.grade_upload_pacing(scene, self._lines((10, 1, 14), (17, 0, 25)),
+                                             "library", None)
+        self.assertTrue(ok, detail)
+        self.assertIn("1/27", detail)
+        # the backstop: well over a third of the upload frames late
+        ok, detail = run.grade_upload_pacing(scene, self._lines((10, 5, 10), (17, 8, 17)),
+                                             "library", None)
+        self.assertFalse(ok)
+        self.assertIn("FAIL", detail)
+        # the limit is inclusive
+        ok, _ = run.grade_upload_pacing({"upload_late_share_max": 0.2}, self._lines((20, 4, 30)),
+                                        "library", None)
+        self.assertTrue(ok)
+
+    def test_the_uploads_per_frame_floor_passes_the_fix_and_fails_the_base(self):
+        scene = {"upload_per_frame_min": 1.25}
+        # the fix's weakest measured run: 1.41 uploads per upload frame
+        ok, detail = run.grade_upload_pacing(scene, self._lines((20, 6, 28), (17, 5, 24)),
+                                             "library", None)
+        self.assertTrue(ok, detail)
+        self.assertIn("1.41", detail)
+        # the base: exactly one upload per upload frame, however few late frames it had
+        ok, detail = run.grade_upload_pacing(scene, self._lines((20, 0, 20), (17, 0, 17)),
+                                             "library", None)
+        self.assertFalse(ok)
+        self.assertIn("FAIL", detail)
+        self.assertIn("1.00", detail)
+        # both keys together: the floor can fail while the backstop passes, and the reverse
+        both = {"upload_per_frame_min": 1.25, "upload_late_share_max": 0.35}
+        self.assertFalse(run.grade_upload_pacing(both, self._lines((20, 0, 20)), "library", None)[0])
+        self.assertFalse(run.grade_upload_pacing(both, self._lines((20, 10, 40)), "library", None)[0])
+        self.assertTrue(run.grade_upload_pacing(both, self._lines((20, 6, 30)), "library", None)[0])
+
+    def test_a_scene_that_loaded_nothing_or_a_log_without_the_field_fails_not_passes(self):
+        scene = {"upload_late_share_max": 0.35, "upload_per_frame_min": 1.25}
+        for lines in ([], [self.HB], self._lines((5, 0, 9)), self._lines((40, 0, 70), route="home")):
+            ok, detail = run.grade_upload_pacing(scene, lines, "library", None)
+            self.assertFalse(ok, lines)
+            self.assertIn("need 15", detail)
+        ok, _ = run.grade_upload_pacing({**scene, "upload_frames_min": 5}, self._lines((5, 0, 9)),
+                                        "library", None)
+        self.assertTrue(ok)
+
+    def test_a_scene_without_the_key_is_untouched_and_the_key_arms_the_detector_quietly(self):
+        self.assertEqual(run.grade_upload_pacing({}, [], "library", None), (True, ""))
+        self.assertIsNone(run.frame_ceiling_threshold({"loop_floor": 30}))
+        self.assertEqual(run.frame_ceiling_threshold({"upload_late_share_max": 0.35}),
+                         str(run.UPLOAD_GATE_THRESHOLD_MS))
+        self.assertEqual(run.frame_ceiling_threshold({"upload_per_frame_min": 1.25}),
+                         str(run.UPLOAD_GATE_THRESHOLD_MS))
+        # an explicit ceiling still wins: its threshold is the lower one
+        self.assertEqual(run.frame_ceiling_threshold({"upload_late_share_max": 0.35,
+                                                      "stall_ceiling_ms": 60}), "60")
+
+    def test_library_scroll_declares_the_gate_and_arms_the_detector(self):
+        s = {x["name"]: x for x in _manifest()["fps_scenes"]}["library-scroll"]
+        self.assertEqual(s["upload_late_share_max"], 0.35)
+        self.assertEqual(s["upload_per_frame_min"], 1.25)
+        self.assertGreaterEqual(s["upload_frames_min"], 1)
+        self.assertIsNotNone(run.frame_ceiling_threshold(s))
+
+
 class BenchGrading(unittest.TestCase):
     """`parse_bench`/`grade_bench` — the stress-bench (`push-100`/`modal-100`) parser and its four
     fail conditions (missed refreshes, drift, rss-growth, incomplete-run). Synthetic `bench:`
@@ -1235,10 +1313,47 @@ class BenchGrading(unittest.TestCase):
                          {"cycle": 1, "n": 2, "target": "detail", "worst_ms": 5.0, "frames": 5,
                           "dur_ms": 1400, "rss_kb": 1000, "first_ms": 6.0, "missed": 0,
                           "open": "first:6.0,worst:5.0@3,iv:5.0,missed:0",
-                          "close": "first:5.0,worst:16.9@2,iv:17.0,missed:0"})
+                          "close": "first:5.0,worst:16.9@2,iv:17.0,missed:0",
+                          "iv_max_ms": 17.0, "defer_first": None})
         modal_cycles, modal_done = run.parse_bench(lines, "modal")
         self.assertTrue(modal_done)
         self.assertEqual(len(modal_cycles), 1)
+
+    def test_the_new_half_fields_are_parsed_and_an_old_line_still_is(self):
+        new = ("bench: kind=hold cycle=1/2 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+               "rss_kb=1000 first_ms=6.0 missed=3 "
+               "open=first:6.0,worst:14.0@4,iv:47.2,missed:3,defer_first:2 "
+               "close=first:5.0,worst:12.0@2,iv:33.3,missed:0,defer_first:1")
+        old = ("bench: kind=hold cycle=2/2 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+               "rss_kb=1000 first_ms=6.0 missed=0 open=first:6.0,worst:14.0@4,iv:17.0,missed:0")
+        cycles, _ = run.parse_bench([new, old], "hold")
+        self.assertEqual((cycles[0]["iv_max_ms"], cycles[0]["defer_first"]), (47.2, 3))
+        self.assertEqual((cycles[1]["iv_max_ms"], cycles[1]["defer_first"]), (17.0, None))
+
+    def test_bench_iv_max_ms_fails_a_slow_interval_and_defer_first_is_reported_not_graded(self):
+        line = ("bench: kind=hold cycle=1/1 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+                "rss_kb=1000 first_ms=6.0 missed=0 "
+                "open=first:6.0,worst:14.0@4,iv:{iv},missed:0,defer_first:2")
+        done = "bench: kind=hold done cycles=1"
+        scene = {"bench": "hold", "bench_missed_max": 0}
+        ok, detail = run.grade_bench(scene, [line.format(iv="30.0"), done])
+        self.assertTrue(ok, detail)  # no ceiling set: defer_first never fails a run
+        self.assertIn("defer_first=2", detail)
+        scene["bench_iv_max_ms"] = 40.0
+        ok, detail = run.grade_bench(scene, [line.format(iv="30.0"), done])
+        self.assertTrue(ok, detail)
+        ok, detail = run.grade_bench(scene, [line.format(iv="47.0"), done])
+        self.assertFalse(ok)
+        self.assertIn("worst present interval=47.0ms vs bench_iv_max_ms 40.0", detail)
+
+    def test_a_missed_ceiling_below_the_deferral_misses_fails_the_21_fps_open(self):
+        line = ("bench: kind=hold cycle=1/1 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+                "rss_kb=1000 first_ms=6.0 missed=2 open=first:6.0,worst:14.0@4,iv:47.0,missed:2,"
+                "defer_first:0")
+        ok, detail = run.grade_bench({"bench": "hold", "bench_missed_max": 1},
+                                     [line, "bench: kind=hold done cycles=1"])
+        self.assertFalse(ok)
+        self.assertIn("missed refreshes=2", detail)
 
     def test_a_healthy_run_of_100_cycles_passes(self):
         lines = self._lines("push", [5.0] * 100, rss=[1000] * 100)
@@ -1365,7 +1480,8 @@ class DeepBenchGrading(unittest.TestCase):
             steps[0],
             {"cycle": 1, "n": 6, "target": "detail", "dir": "push", "depth": 1,
              "worst_ms": 5.0, "frames": 5, "dur_ms": 1400, "rss_kb": 1000, "first_ms": 6.0,
-             "missed": 0, "open": "first:6.0,worst:5.0@2,iv:17.0,missed:0", "close": None},
+             "missed": 0, "open": "first:6.0,worst:5.0@2,iv:17.0,missed:0", "close": None,
+             "iv_max_ms": 17.0, "defer_first": None},
         )
         self.assertEqual([s["dir"] for s in steps], ["push"] * 3 + ["pop"] * 3)
         self.assertEqual([s["depth"] for s in steps], [1, 2, 3, 2, 1, 0])
@@ -1682,6 +1798,9 @@ class PipelineTier(unittest.TestCase):
             # issue #266 PR4 review: EVERY case forces the persisted audio-enhancement preference
             # too, default "off" -- see test_audio_enhancement_boot_trigger_defaults_off_and_is_overridable.
             ("plxnative-audioenh", "off"),
+            # track memory: EVERY case forgets what a menu pick on an episode remembered -- see
+            # test_every_case_forgets_track_memory_at_the_seat.
+            ("plxnative-trackmemory", "clear"),
         ])
 
     def test_an_integration_case_can_explicitly_grade_auto(self):
@@ -3232,6 +3351,20 @@ class AbrTraceMetrics(unittest.TestCase):
         })
         self.assertIn(("plxnative-audioenh", "loudness"), files)
 
+    def test_every_case_forgets_track_memory_at_the_seat(self):
+        """A `menupick` is a viewer's pick, and a pick on an episode is remembered for its show by
+        the SEATED profile; without a per-case `clear` the next case that plays that show would start
+        from the previous case's tracks. Both tiers write it, and a case cannot opt out of it."""
+        for case in ({"rk": "1", "operations": [{"op": "play"}]},
+                     {"rk": "1", "operations": [{"op": "play"}, {"op": "subtitle", "tab": 1, "track": 0}]},
+                     {"rk": "1", "operations": [{"op": "play"}, {"op": "audio_switch", "tab": 0, "row": 1}]}):
+            files = run.triggers_for_case(case)
+            self.assertEqual([f for f in files if f[0] == "plxnative-trackmemory"],
+                             [("plxnative-trackmemory", "clear")], case)
+        pipeline = run.triggers_for_case({"fixture": "x.mkv", "operations": [{"op": "play"}]},
+                                         url_base="http://192.0.2.10:8020")
+        self.assertIn(("plxnative-trackmemory", "clear"), pipeline)
+
     def test_audio_enhancement_op_grades_applied_remux_and_ac3(self):
         """A live Normalize Loudness pick that took effect: the server ran the DSP params
         (`enhancement: applied ..`, printed only for `EnhancementOutcome::Applied`), the Load
@@ -4305,6 +4438,96 @@ class AbrSegmentVariation(unittest.TestCase):
                     "delivers one byte size for the whole playback")
 
 
+class LateAudioFixture(unittest.TestCase):
+    """The late-audio clip and its case (PR #603): a file whose audio starts 11 s after its video.
+
+    Static only. The clip is only worth anything if it really puts more video than the video lane
+    holds ahead of its first audio packet, and the case is only worth anything if it can tell a
+    stalled clock and an audio lane that never reached Starfish from a healthy start.
+    """
+
+    KEY = "pipe_h264_eac3_late_audio"
+
+    def _packets(self, audio_at, video_every=1 / 24.0, video_size=1000, seconds=14):
+        pkts = [{"stream_index": 0, "pts_time": f"{i * video_every:.3f}", "size": str(video_size)}
+                for i in range(int(seconds / video_every))]
+        return pkts + [{"stream_index": 1, "pts_time": f"{audio_at + i * 0.032:.3f}",
+                        "size": "700"} for i in range(20)]
+
+    def test_the_lead_is_the_audio_start_and_the_video_bytes_before_it(self):
+        first, ahead = fixturegen.late_audio_lead(self._packets(11.008), 0, 1)
+        self.assertAlmostEqual(first, 11.008, places=3)
+        # 24 fps, 1000 bytes a frame: frames at t < 11.008 are indices 0..264, i.e. 265 of them.
+        self.assertEqual(ahead, 265 * 1000)
+
+    def test_an_on_time_audio_track_has_no_video_ahead_of_it(self):
+        first, ahead = fixturegen.late_audio_lead(self._packets(0.0), 0, 1)
+        self.assertEqual((first, ahead), (0.0, 0))
+
+    def test_a_file_without_audio_or_a_timestamp_is_refused_not_zeroed(self):
+        with self.assertRaises(ValueError):
+            fixturegen.late_audio_lead(self._packets(11.0)[:-20], 0, 1)
+        broken = self._packets(11.0)
+        broken[-1] = {"stream_index": 1, "size": "700"}
+        with self.assertRaises(ValueError):
+            fixturegen.late_audio_lead(broken, 0, 1)
+
+    def test_the_shape_is_built_to_fill_the_video_lane_before_the_first_audio_packet(self):
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        (audio,) = spec["audio"]
+        self.assertAlmostEqual(audio["delay"], 11.008)
+        # The design arithmetic, written down where a change to either number trips it: the
+        # rate-targeted video must queue more than the lane's cap in the delay it sits behind,
+        # even at the verify() band's lower edge (0.70x), or the clip can not park the demuxer.
+        video_bytes_by_audio = spec["video"]["vbr"] * 1000 / 8 * audio["delay"] * 0.70
+        self.assertGreater(video_bytes_by_audio, fixturegen.AQ_VIDEO_BYTES)
+        self.assertEqual(spec["late_audio"]["min_video_bytes_before_audio"],
+                         fixturegen.AQ_VIDEO_BYTES)
+        self.assertLess(audio["delay"], fixturegen.PIPE_SECS - 20,
+                        "the audio must leave the case a long stretch to climb through")
+
+    def test_the_audio_input_is_offset_by_exactly_the_delay(self):
+        """`-itsoffset` must precede the delayed track's `-i` and no other input's."""
+        captured = []
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(fixturegen, "run",
+                                  side_effect=lambda argv, quiet=True: captured.append(list(argv)) or ""):
+            work = fixturegen.Path(d)
+            fixturegen.build_generic(
+                mock.Mock(markers=False), self.KEY, fixturegen.PIPE_SHAPES[self.KEY], 4, None,
+                work / "out.mkv", work)
+        argv = captured[0]
+        self.assertEqual(argv.count("-itsoffset"), 1, "only the delayed track is offset")
+        at = argv.index("-itsoffset")
+        self.assertEqual(argv[at + 1], "11.008")
+        self.assertEqual(argv[at + 2:at + 5], ["-t", "4", "-f"], "it must sit right before the audio -i")
+        self.assertIn("sine=", argv[at + 7], "and the input it offsets is the audio graph")
+
+    def test_the_case_grades_the_stalled_clock_and_the_unfed_audio_lane(self):
+        case = next(c for c in _manifest()["pipeline_cases"] if c["name"] == "pipe_late_audio_eac3")
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        self.assertEqual(case["fixture"], self.KEY + ".mkv")
+        for k in ("vcodec", "acodec", "fps"):
+            self.assertEqual(case["declare"][k], spec["declare"][k], f"declare.{k} drifted from the shape")
+        exp = case["expect"]
+        # The two stalls are separate failures: a stalled clock and an audio lane that never
+        # reached Starfish. A case that graded only the first would pass a fix for stall 1 alone.
+        self.assertTrue(exp["require_audio_feed_ready"])
+        self.assertGreaterEqual(exp["min_pos_climb_s"], 12)
+        self.assertEqual(exp["audio_stream_index"], 1)
+        self.assertEqual(exp["load_audio"], "AC3 PLUS")
+        self.assertLess(exp["min_pos_climb_s"] + 5, case["run_secs"])
+        self.assertLess(case["run_secs"], fixturegen.PIPE_SECS, "the clip must not end in the window")
+
+    def test_a_stalled_clock_and_a_silent_audio_lane_both_fail_the_case_assertions(self):
+        # What the broken player logs: heartbeat position pinned at 0, video fed, audio never.
+        stalled = [f"loop=100 fps=60 pos=0s stage=Playing" for _ in range(6)]
+        self.assertFalse(run.a_timeline_climb(stalled, 15, dense_only=True)[0])
+        climbing = [f"loop=100 fps=60 pos={t}s stage=Playing" for t in range(0, 20)]
+        self.assertTrue(run.a_timeline_climb(climbing, 15, dense_only=True)[0])
+        self.assertFalse(run.a_audio_feed_ready(["feed v#1 sz=9 fed=0 reply=O qbytes=1"])[0])
+
+
 class AbrResponseProfile(unittest.TestCase):
     """One request actuator may produce different completed renditions in fresh PMS sessions."""
 
@@ -5337,7 +5560,7 @@ class DepGates(unittest.TestCase):
             with self.subTest(input=rel):
                 self.assertIn(rel, reported, out)
 
-    def _plant(self, name, content):
+    def _plant(self, name, content, crate_dir=None):
         """Write `content` to a temp file under rust-modules/src that no ci/allow/*.txt names,
         run the private copy's ci/check-deps.sh with it present, and guarantee removal even if
         the assertion that follows fails. An orphan .rs file with no `mod` statement pointing at
@@ -5345,7 +5568,7 @@ class DepGates(unittest.TestCase):
         '*.rs'`, which is all these gates scan with — so this is the cheapest way to prove a gate
         catches a shape without touching a real, permanent source file."""
         # `player/` and `route/` are the media layer crate's now (docs/module-layers.md, Split 11).
-        crate = "media" if name.split("/")[0] in ("player", "route") else None
+        crate = crate_dir or ("media" if name.split("/")[0] in ("player", "route") else None)
         target = os.path.join(self.tree, "rust-modules", *([crate] if crate else []), "src", name)
         self.assertFalse(os.path.exists(target), f"stale self-test artifact at {target} — remove it by hand")
         try:
@@ -5784,6 +6007,39 @@ impl PersonOwnerGateFixture {
         self.assertEqual(r.returncode, 0, out)
         self.assertIn("ok — tmppath", out)
 
+    def test_cards_gate_catches_a_screen_assembling_its_own_strip(self):
+        """Shared-card-sections L1: a screen draws card sections with `plx_ui::cards::{Shelf, Grid}`.
+        `card_row` / `poster_grid` are `pub(crate)`, so the gate polices what `plx_ui::cards`
+        re-exports. RED: a file in `screens/` outside ci/allow/cards.txt that calls a tile painter
+        through the re-export surface (qualified, or imported by name), names an L0 type, or names
+        `AvatarRow` outside the profile picker must fail `cards`."""
+        r = self._plant(
+            "_check_deps_selftest_cards_strip.rs",
+            "pub fn draw_row() {\n    plx_ui::cards::paint_visible(p, rect, 1.0, true);\n}\n"
+            "use plx_ui::cards::{paint_visible, RowStyle};\n"
+            "pub struct Mine(CardRow);\n"
+            "pub struct Pop(GridPop);\n"
+            "pub struct Bands(GridBands);\n"
+            "pub fn scale() -> f32 { press::scale() }\n"
+            "pub struct Avatars(plx_ui::cards::AvatarRow);\n",
+            crate_dir="screens",
+        )
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("cards:", out)
+        for line in (2, 4, 5, 6, 7, 8, 9):
+            self.assertIn(f"_check_deps_selftest_cards_strip.rs:{line}", out)
+
+    def test_cards_gate_allows_the_shared_component(self):
+        r = self._plant(
+            "_check_deps_selftest_cards_ok.rs",
+            "pub struct Mine(plx_ui::cards::Shelf);\n",
+            crate_dir="screens",
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("ok — cards", out)
+
     def test_sink_gate_catches_the_video_sink_named_outside_the_player(self):
         """Step L15: the Starfish/ACB verbs are the player's alone. RED: a module outside
         `player/`, `port.rs` and `tv/` that reaches `tv::sink::installed()` must fail `sink`."""
@@ -5929,7 +6185,10 @@ impl PersonOwnerGateFixture {
         # that step's entries: 0 + 42 = 42. Merging main brought main's system toast (#392) and its
         # two callers: 42 + 2 = 44. Step L15 moved all 44 behind the `tv` interfaces and the port:
         # 44 - 44 = 0.
+        "cards-conformance.txt": 0,  # card-screen Tier 2 expected failures (PR 0, 2026-10-07; Home and Detail added; Collection adopted Grid, PR 2b); only shrinks
+        "cards.txt": 0,  # screens still assembling card sections from the L0 primitives; empty since the profile picker adopted AvatarRow (2026-10-08)
         "blocking.txt": 2,  # frame-thread allow_blocking sites, 2026-10-06; only shrinks
+        "dump.txt": 9,  # files that may name the frame-dump switch (ci/check-dump-consumers.py); a new file fails the gate
         "layers.txt": 0,
         "libm.txt": 6,  # widgets.rs's existing test helper moved to widgets_test_support.rs
         "mutators.txt": 0,
@@ -5969,6 +6228,11 @@ class PosterGateCoverage(unittest.TestCase):
         for scene in scenes.values():
             self.assertGreaterEqual(scene['poster_gate']['moving_fps_floor'], 55)
             self.assertIn('plxnative-postergate', scene['triggers'])
+            # The app no longer declines a moving card by default; these scenes grade that decline.
+            self.assertEqual(scene['triggers'].get('plxnative-cardspeed'), '120')
+            # Nor is the settled window left unwarmed by default: the at-rest lookahead (3 rows)
+            # would answer the settle from art no draw has asked for, which proves nothing.
+            self.assertEqual(scene['triggers'].get('plxnative-lookahead'), '0')
 
     def test_poster_grade_requires_real_work_and_complete_settle(self):
         import poster_gate
@@ -6243,30 +6507,105 @@ class FpsMock(unittest.TestCase):
         import mock_fps
         cls.mf = mock_fps
 
+    PAGING_SURFACES = tuple(f"{b}-paging-held-{l}" for b in ("library-grid", "library-shelf", "search-row",
+                                                              "related-row", "collection", "long-season")
+                            for l in ("3g", "remote-wan"))
+
     # --- scene selection --------------------------------------------------------------
     def test_under_mock_only_scenes_with_a_mock_block_run(self):
         runnable, skipped = self.mf.partition_mock(list(self.scenes.values()), True)
         names = {s["name"] for s in runnable}
-        self.assertEqual(names, {"home-grid", "home-grid-deep", "home-hint", "library-shelves-deep",
-                                 "hero-pong", "grid-pong"})
+        self.assertEqual(names, {"home-grid", "home-grid-deep", "home-recent-paging", "home-recent-paging-held", "home-recent-paging-held-3g",
+                                 "home-recent-paging-held-remote-wan", "home-hint",
+                                 *self.PAGING_SURFACES,
+                                 "library-shelves-deep", "library-burst", "library-hold",
+                                 "hero-pong", "grid-pong", "home-idle", "item-menu", "library-scroll",
+                                 "library-idle", "collection-page", "person-page", "search-type",
+                                 "show-detail", "home-hold", "collection-hold", "home-tap",
+                                 "collection-tap"})
         self.assertEqual(len(runnable) + len(skipped), len(self.scenes))
         for _, why in skipped:
             self.assertIn("real library content", why)
 
     def test_without_mock_a_mock_only_scene_is_skipped_and_the_rest_unchanged(self):
         runnable, skipped = self.mf.partition_mock(list(self.scenes.values()), False)
-        self.assertEqual([n for n, _ in skipped], ["home-grid-deep", "library-shelves-deep"])
+        self.assertEqual([n for n, _ in skipped], ["home-grid-deep", "home-recent-paging",
+                                                   "home-recent-paging-held",
+                                                   "home-recent-paging-held-3g",
+                                                   "home-recent-paging-held-remote-wan",
+                                                   *self.PAGING_SURFACES,
+                                                   "library-shelves-deep", "library-burst",
+                                                   "library-hold"])
         self.assertIn("--mock", skipped[0][1])
         self.assertIn("home-grid", {s["name"] for s in runnable})
-        self.assertEqual(len(runnable), len(self.scenes) - 2)
+        self.assertEqual(len(runnable), len(self.scenes) - 8 - len(self.PAGING_SURFACES))
 
-    def test_no_scene_runnable_under_mock_names_a_library_item(self):
-        # a scene that needs a ratingKey from the overlay can never run without one
+    def test_a_mock_scene_naming_a_library_item_carries_its_own_rating_key(self):
+        # the overlay's ratingKey is the real server's; under --mock the scene opens `mock.rk`
         for s in self.scenes.values():
             if self.mf.scene_mock(s) is not None:
-                self.assertNotIn("item", s, s["name"])
+                if s.get("item"):
+                    self.assertIsInstance(s["mock"].get("rk"), int, s["name"])
                 self.assertNotIn("needs_shared_server", s, s["name"])
                 self.assertEqual(s.get("tier", "ui"), "ui", s["name"])
+
+    def test_the_press_scenes_drive_a_real_press_and_never_a_plain_ok(self):
+        # home-hold/collection-hold/home-tap/collection-tap (`plxnative-holdbench`): counted bench
+        # scenes graded off `bench: kind=hold` lines, mock-runnable, with the same trigger on
+        # a Home card and on the Collection page (a cards::Stack page, mock rk 50002).
+        for name, tap in (("home-hold", False), ("collection-hold", False),
+                          ("home-tap", True), ("collection-tap", True)):
+            s = self.scenes[name]
+            self.assertEqual(s["bench"], "hold", name)
+            self.assertEqual(s["route"], "home" if name.startswith("home") else "collection", name)
+            # limits measured on the television 2026-10-08 (fixed build); the unfixed 21 fps open
+            # (home-hold 525, collection-hold 498, home-tap 12 missed) must fail them
+            limits = {"home-hold": (110, 55, 525), "collection-hold": (60, 50, 498),
+                      "home-tap": (8, 40, 12), "collection-tap": (8, 40, None)}[name]
+            self.assertEqual(s["bench_missed_max"], limits[0], name)
+            self.assertEqual(s["bench_iv_max_ms"], limits[1], name)
+            if limits[2] is not None:
+                self.assertLess(s["bench_missed_max"], limits[2], name)
+            if not tap:
+                self.assertLess(s["bench_missed_max"], 30 * 16, name)
+            self.assertEqual(s.get("bench_drift_ms"), 4.0 if tap else None, name)
+            self.assertNotIn("PROVISIONAL", s["comment"], name)
+            self.assertIn("2026-10-08", s["comment"], name)
+            if not tap:
+                self.assertIn("#561", s["comment"], name)
+            value = s["triggers"]["plxnative-holdbench"]
+            self.assertEqual(value.endswith(",tap"), tap, name)
+            # the press itself is the bench's: no separate press/itemmenu trigger may ride along
+            self.assertNotIn("plxnative-press", s["triggers"], name)
+            self.assertNotIn("plxnative-itemmenu", s["triggers"], name)
+            # the bench ends on its own `done` line, with room to finish its cycles
+            n, period = int(value.split(",")[0]), (350 if tap else 1500)
+            self.assertGreater(s["run_secs"] - s["warmup_s"], n * 2 * period / 1000, name)
+        collection = self.mf.mock_scene(self.scenes["collection-hold"])
+        self.assertEqual(collection["rk"], 50002)
+        self.assertEqual(collection["triggers"]["plxnative-collection"], "$rk")
+        self.assertEqual(self.mf.mock_server_args(self.scenes["collection-hold"]), ["--movies", "240"])
+        self.assertIn("plxnative-grid", self.scenes["home-hold"]["triggers"])
+        with open(os.path.join(TESTS_DIR, "run.py")) as fh:
+            self.assertIn('"plxnative-holdbench"', fh.read(), "run.py clears the trigger between cases")
+
+    def test_a_hold_bench_cycle_that_pressed_nothing_or_opened_no_menu_fails_the_grade(self):
+        scene = {"bench": "hold", "bench_missed_max": 0}
+
+        def line(i, target, missed=0):
+            return (f"bench: kind=hold cycle={i}/2 target={target} worst_ms=18.0 frames=40 dur_ms=3000 "
+                    f"rss_kb=1000 first_ms=17.0 missed={missed} open=first:17.0,worst:18.0@3,iv:17.0,missed:0 "
+                    f"close=first:17.0,worst:18.0@3,iv:17.0,missed:0")
+        done = "bench: kind=hold done cycles=2"
+        ok, detail = run.grade_bench(scene, [line(1, "home"), line(2, "home"), done])
+        self.assertTrue(ok, detail)
+        ok, detail = run.grade_bench(scene, [line(1, "home"), line(2, "home-nomenu"), done])
+        self.assertFalse(ok)
+        self.assertIn("did not exercise the animation", detail)
+        ok, detail = run.grade_bench(scene, [line(1, "collection-nocard"), line(2, "collection"), done])
+        self.assertFalse(ok)
+        ok, detail = run.grade_bench(scene, [line(1, "home", 1), line(2, "home"), done])
+        self.assertFalse(ok, "a missed refresh in the press window fails the zero budget")
 
     def test_mock_server_args(self):
         self.assertEqual(self.mf.mock_server_args(self.scenes["home-grid"]), [])
@@ -6282,6 +6621,76 @@ class FpsMock(unittest.TestCase):
             self.mf.mock_server_args({"name": "x", "mock": {"section_hubs": 3, "section_hubs_linked": 4}})
         with self.assertRaises(ValueError):
             self.mf.mock_server_args({"name": "x", "mock": {"section_hubs": -1}})
+
+    def test_mock_scene_substitutes_rk_and_trigger_values_on_a_copy(self):
+        page = self.scenes["collection-page"]
+        ran = self.mf.mock_scene(page)
+        self.assertEqual(ran["rk"], 50002)
+        self.assertNotIn("rk", page)
+        self.assertEqual(run.fps_trigger_files(ran), [("plxnative-collection", "50002")])
+        self.assertEqual(self.mf.mock_server_args(page), ["--movies", "240"])
+        search = self.mf.mock_scene(self.scenes["search-type"])
+        self.assertEqual(search["triggers"]["plxnative-search"], "sb")
+        self.assertTrue(search["triggers"]["plxnative-searchosc"])  # the rest is kept
+        self.assertEqual(self.scenes["search-type"]["triggers"]["plxnative-search"], "th")
+        with self.assertRaises(ValueError):
+            self.mf.mock_server_args({"name": "x", "mock": {"movies": 1001}})
+
+    def test_an_item_scene_without_mock_rk_is_skipped_under_mock(self):
+        scene = {"name": "x", "item": "movie", "mock": {}}
+        runnable, skipped = self.mf.partition_mock([scene], True)
+        self.assertEqual(runnable, [])
+        self.assertIn("mock.rk", skipped[0][1])
+
+    def test_new_mock_scenes_resolve_to_content_the_mock_serves(self):
+        """Each card-screen scene, as it runs under --mock, points at a ratingKey / query the
+        synthetic library really answers with realistically sized content."""
+        def get(port, path):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as r:
+                return json.load(r)["MediaContainer"]
+
+        def check(name, fn):
+            scene = self.mf.mock_scene(self.scenes[name])
+            port = self._free_port()
+            with self.mf.MockPms("127.0.0.1", port, self.mf.mock_server_args(scene)):
+                with self.subTest(scene=name):
+                    fn(port, scene, dict(run.fps_trigger_files(scene)))
+
+        def collection(port, scene, trig):
+            rk = trig["plxnative-collection"]
+            head = get(port, f"/library/metadata/{rk}")["Metadata"]
+            self.assertEqual(head[0]["type"], "collection")
+            kids = get(port, f"/library/collections/{rk}/children")["Metadata"]
+            self.assertGreaterEqual(len(kids), 18)  # several poster rows
+            self.assertTrue(all(k.get("thumb") for k in kids))
+
+        def person(port, scene, trig):
+            movie = get(port, f"/library/metadata/{trig['plxnative-detail']}")["Metadata"][0]
+            self.assertEqual(movie["type"], "movie")
+            pid = movie["Role"][0]["id"]  # detailsec=1 + detailok opens cast[0]
+            titles = get(port, f"/library/people/{pid}/media")["Metadata"]
+            self.assertGreaterEqual(len({t["type"] for t in titles}), 2)  # two shelves
+            self.assertGreaterEqual(len(titles), 6)
+
+        def search(port, scene, trig):
+            hubs = get(port, f"/hubs/search?query={trig['plxnative-search']}&limit=8")["Hub"]
+            filled = [h for h in hubs if h["size"] > 0]
+            self.assertGreaterEqual(len(filled), 4)
+            self.assertGreaterEqual(sum(h["size"] for h in filled), 12)
+
+        def show(port, scene, trig):
+            rk = trig["plxnative-detail"]
+            self.assertEqual(get(port, f"/library/metadata/{rk}")["Metadata"][0]["type"], "show")
+            seasons = get(port, f"/library/metadata/{rk}/children")["Metadata"]
+            self.assertGreaterEqual(len(seasons), 2)
+            eps = get(port, f"/library/metadata/{seasons[0]['ratingKey']}/children")["Metadata"]
+            self.assertGreaterEqual(len(eps), 6)
+            self.assertGreaterEqual(len(get(port, f"/library/metadata/{rk}/related")["Hub"]), 1)
+
+        check("collection-page", collection)
+        check("person-page", person)
+        check("search-type", search)
+        check("show-detail", show)
 
     def test_an_exact_scene_name_selects_only_that_scene(self):
         scenes = list(self.scenes.values())
@@ -6307,6 +6716,171 @@ class FpsMock(unittest.TestCase):
         for s in self.scenes.values():
             if s.get("walk"):
                 self.assertLessEqual(self.mf.walk_secs_needed(s), s["run_secs"], s["name"])
+
+    # --- the row walk (home-recent-paging) ---------------------------------------------
+    def test_recent_paging_scene_is_a_mock_only_row_walk_of_the_deep_scenes_pace(self):
+        sc, deep = self.scenes["home-recent-paging"], self.scenes["home-grid-deep"]
+        self.assertEqual((sc["tier"], sc["route"]), ("ui", "home"))
+        self.assertEqual(sc["mock"], {"movies": 300, "only": True})
+        self.assertEqual(self.mf.mock_server_args(sc), ["--movies", "300"])
+        self.assertEqual(sc["triggers"], deep["triggers"])
+        self.assertEqual(sc["walk"]["key_gap_s"], deep["walk"]["key_gap_s"])
+        self.assertEqual((sc["walk"]["row_down"], sc["walk"]["cards"]), (1, 96))
+        self.assertEqual((sc["loop_floor"], sc["fps_floor"]), (deep["loop_floor"], deep["fps_floor"]))
+        self.assertIn("./tests/run.py --fps --mock --filter home-recent-paging", sc["comment"])
+
+    def test_row_walk_plan_is_down_right_left_and_nothing_else(self):
+        walk = self.scenes["home-recent-paging"]["walk"]
+        plan = self.mf.row_walk_plan(walk)
+        self.assertEqual(plan, ["down"] + ["right"] * 96 + ["left"] * 96)
+        self.assertEqual(self.mf.row_walk_plan({"row_down": 2, "cards": 3}),
+                         ["down", "down", "right", "right", "right", "left", "left", "left"])
+        self.assertTrue(set(plan) <= set(self.mf.ROW_WALK_KEYS))
+        for banned in ("ok", "enter", "back", "up"):
+            self.assertNotIn(banned, plan)
+        # the walker and the grader take the plan from the same place; the rest is at the turn
+        sc = self.scenes["home-recent-paging"]
+        steps = self.mf.walk_steps(sc, 5)
+        self.assertEqual([k for k, _ in steps], plan)
+        self.assertEqual(self.mf.walk_expected_keys(sc, 5), len(plan))
+        self.assertEqual(self.mf.walk_expected_keys(sc, 0), 0)
+        gap, rest = sc["walk"]["key_gap_s"], sc["walk"].get("rest_s", 4)
+        self.assertEqual([i for i, (_, d) in enumerate(steps) if d > gap], [1 + 96 - 1])
+        self.assertAlmostEqual(steps[96][1], gap + rest)
+
+    def test_row_walk_run_secs_covers_the_walk(self):
+        sc = self.scenes["home-recent-paging"]
+        self.assertTrue(self.mf.is_row_walk(sc["walk"]))
+        self.assertGreaterEqual(sc["run_secs"], self.mf.walk_secs_needed(sc))
+        self.assertAlmostEqual(
+            self.mf.walk_secs_needed(sc),
+            self.mf.LAUNCH_WAIT_S + 5 + 15 + 3 + 193 * 0.33 + 4 + 5)
+        self.assertFalse(self.mf.is_row_walk(self.scenes["home-grid-deep"]["walk"]))
+
+    def test_the_surface_paging_scenes_walk_a_list_and_are_graded_on_how_deep_focus_got(self):
+        # one pair (3g, remote-wan) per surface; the walk is the Home row walk with its own keys, and
+        # `walk.reach` replaces the `hubs: landed` grading only Home logs
+        self.assertEqual(sorted(n for n in self.scenes if "-paging-held-" in n
+                                and not n.startswith("home-")), sorted(self.PAGING_SURFACES))
+        for name in self.PAGING_SURFACES:
+            sc = self.scenes[name]
+            w = sc["walk"]
+            self.assertTrue(sc["mock"]["only"] and sc["mock"]["link"], name)
+            self.assertIn("plxnative-focusx", sc["triggers"], name)
+            self.assertTrue(self.mf.is_row_walk(w), name)
+            plan = self.mf.row_walk_plan(w)
+            self.assertEqual(plan, ["down"] * w["row_down"] + [w["key"]] * w["cards"] + [w["back"]] * w["cards"])
+            self.assertTrue(set(plan) <= set(self.mf.ROW_WALK_KEYS))
+            for banned in ("ok", "enter", "back"):
+                self.assertNotIn(banned, plan)
+            self.assertLessEqual(self.mf.walk_secs_needed(sc), sc["run_secs"], name)
+            self.assertEqual(w["reach"]["route"], sc["route"], name)
+            self.assertIn(f"--filter {name}", sc["comment"])
+            args = self.mf.mock_server_args(sc)
+            self.assertIn("--link", args)
+            self.assertEqual(args[args.index("--link") + 1], sc["mock"]["link"][0])
+
+    FOCUSX = ("focus route=library pill=-1 card=1 menu=0 region=grid row=4 col=2 sid=0 rk=77 cdx={x} cdy=300 "
+              "cdw=255 cdi=2 cdn=36 cdg={g} cda=1 cdr=0 cdk={k} cdc=100 cdcw=140 press=0")
+
+    def test_describe_reach_fails_a_walk_that_never_paged_and_counts_frames_off_the_canvas(self):
+        reach = {"route": "library", "region": "grid", "min_global": 120}
+        deep = [self.FOCUSX.format(x=90, g=6, k=77), self.FOCUSX.format(x=-300, g=130, k=130), self.FOCUSX.format(x=1800, g=131, k=131),
+                "focus route=detail region=grid cdx=1 cdy=1 cdw=1 cdg=9999"]
+        fail, detail = self.mf.describe_reach(deep, "library", reach)
+        self.assertIsNone(fail)
+        self.assertIn("reached item 131 (3 drawn frames, 2 partly off the canvas, 3 distinct cards focused)", detail)
+        fail, _ = self.mf.describe_reach(deep[:1], "library", reach)
+        self.assertIn("paging did not happen", fail)
+        self.assertIn("reached item 6", fail)
+        fail, _ = self.mf.describe_reach([], "library", reach)
+        self.assertIn("reached item none", fail)
+        # a different region's lines do not count towards a region's reach
+        fail, _ = self.mf.describe_reach([self.FOCUSX.format(x=90, g=500, k=500).replace("region=grid", "region=shelf")],
+                                         "library", reach)
+        self.assertIn("paging did not happen", fail)
+
+    def test_describe_reach_names_the_distinct_cards_so_a_stalled_cdg_is_visible(self):
+        """A probe that reports the window slot as `cdg` (the defect behind six TV scenes failing
+        at "item 23") stalls `cdg` while the cards keep changing: the failure must say so."""
+        reach = {"route": "library", "region": "shelf", "min_global": 48}
+        stalled = [self.FOCUSX.format(x=90, g=i % 24, k=1000 + i).replace("region=grid", "region=shelf")
+                   for i in range(75)]
+        fail, detail = self.mf.describe_reach(stalled, "library", reach)
+        self.assertIn("reached item 23", fail)
+        self.assertIn("75 distinct cards were focused", fail)
+        self.assertIn("probe's `cdg` is wrong", fail)
+        self.assertIn("75 distinct cards focused", detail)
+        healthy = [self.FOCUSX.format(x=90, g=i, k=1000 + i).replace("region=grid", "region=shelf") for i in range(75)]
+        fail, detail = self.mf.describe_reach(healthy, "library", reach)
+        self.assertIsNone(fail)
+        self.assertIn("reached item 74 (75 drawn frames, 0 partly off the canvas, 75 distinct cards focused)", detail)
+
+    def test_a_reach_walk_is_up_once_its_first_fingerprint_is_logged(self):
+        sc = self.scenes["search-row-paging-held-3g"]
+        self.assertIsNone(self.mf.landed_shelves(sc, ["hubs: landed — 24 items, 3 shelves (merge 1 us)"]))
+        self.assertEqual(self.mf.landed_shelves(sc, ["focus route=search zone=Field row=-1"]), 1)
+        self.assertEqual(self.mf.landed_lands(sc, ["focus route=search zone=Field row=-1"]), 1)
+        self.assertEqual(self.mf.landed_lands(sc, []), 0)
+
+    LANDED = "hubs: landed — 24 items, 3 shelves (merge 10 us, catalog ~5 KB)"
+
+    def test_page_landings_counts_forward_and_total_inside_the_window(self):
+        win = [self.KEY, self.LANDED, self.KEY, self.LANDED, self.KEY, self.LANDED,
+               self.KEY, self.LANDED]
+        self.assertEqual(self.mf.page_landings(win, 3), (3, 4))
+        self.assertEqual(self.mf.page_landings(win, None), (4, 4))
+        self.assertEqual(self.mf.page_landings(win, 99), (4, 4))
+        self.assertEqual(self.mf.page_landings([], 3), (0, 0))
+
+    def _paging_log(self, landings, keys=7):
+        """A synthetic row-walk log: the initial landing BEFORE the first key, then `keys` key
+        lines of which the first `keys - 2` are the forward half; `landings` land in it."""
+        out = [self.SYN, self.LANDED] + [self._beat(fps=1)] * 3
+        for i in range(keys):
+            out += [self.KEY, self._beat(fps=40)]
+            if i < landings:
+                out.append(self.LANDED)
+        return out + [self._beat(fps=40)] * 2 + [self._beat(fps=1)] * 5
+
+    def _paging_scene(self):
+        s = copy.deepcopy(self.scenes["home-recent-paging"])
+        s["walk"].update(row_down=1, cards=4, min_page_landings=3)  # 1 down, 4 right, 4 left
+        return s
+
+    def test_row_walk_prints_the_landings_and_frame_stats(self):
+        ok, detail = self._run_scene(self._paging_scene(), self._paging_log(4, keys=9),
+                                     {"rows": 3, "sent": 9, "error": None})
+        self.assertTrue(ok, detail)
+        self.assertIn("page landings in window: 4 forward, 4 total", detail)
+        self.assertIn("gt33=", detail)
+        self.assertIn("worst=", detail)
+        self.assertIn("p99max=", detail)
+        self.assertIn("median=", detail)
+
+    def test_row_walk_fails_when_the_forward_half_did_not_page(self):
+        # 2 landings in the forward half (keys 1..5) against a required 3: paging did not happen
+        ok, detail = self._run_scene(self._paging_scene(), self._paging_log(2, keys=9),
+                                     {"rows": 3, "sent": 9, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("paging did not happen", detail)
+        self.assertIn("2 page landing(s)", detail)
+        # landings only AFTER the turn-around do not count toward the forward half
+        log = self._paging_log(0, keys=9) + [self.KEY, self.LANDED] * 0
+        late = [ln for ln in log]
+        idx = [i for i, ln in enumerate(late) if ln == self.KEY]
+        for i in reversed(idx[6:]):
+            late.insert(i + 2, self.LANDED)
+        ok, detail = self._run_scene(self._paging_scene(), late,
+                                     {"rows": 3, "sent": 9, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("paging did not happen", detail)
+
+    def test_row_walk_fails_when_it_sent_fewer_keys_than_its_plan(self):
+        ok, detail = self._run_scene(self._paging_scene(), self._paging_log(4, keys=9),
+                                     {"rows": 3, "sent": 5, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("never ran to completion", detail)
 
     def test_walk_secs_needed_counts_the_launch_wait(self):
         # KeyWalk sleeps `LAUNCH_WAIT_S` before it looks at the log; the sleep is part of run_secs
@@ -6348,6 +6922,176 @@ class FpsMock(unittest.TestCase):
         self.assertEqual(self.mf.linked_landed(deep, 1), 0)
         plain = {"walk": {"landed": "library", "extra_rows": 2}, "mock": {"section_hubs": 50}}
         self.assertEqual(self.mf.walk_downs(plain, 7), 9)
+
+    # --- the burst walk (library-burst) -------------------------------------------------
+    def test_burst_scene_is_an_ungraded_instrument_on_the_library_grid(self):
+        b = self.scenes["library-burst"]
+        self.assertEqual(b["route"], "library")
+        self.assertTrue(b["mock"]["only"])
+        self.assertEqual(b["mock"]["movies"], 1000)
+        self.assertEqual(self.mf.mock_server_args(b), ["--movies", "1000"])
+        for t in ("plxnative-library", "plxnative-framedrop", "plxnative-focus", "plxnative-phcount"):
+            self.assertIn(t, b["triggers"])
+        self.assertNotIn("plxnative-libosc", b["triggers"])  # the walk is the stimulus
+        # nothing is graded on rates or frame times: it prints, it does not gate
+        for k in ("loop_floor", "fps_floor", "fps_ceiling", "worst_ceiling_ms", "stall_ceiling_ms",
+                  "upload_per_frame_min", "upload_late_share_max", "upload_frames_min"):
+            self.assertNotIn(k, b, k)
+        self.assertEqual(b["walk"]["fingerprint_region"], "grid")
+        self.assertTrue(self.mf.is_burst(b))
+        self.assertFalse(self.mf.is_burst(self.scenes["library-shelves-deep"]))
+
+    def test_burst_plan_is_bursts_of_down_with_rests_then_the_same_of_up(self):
+        w = {"burst": 3, "bursts": 2, "key_ms": 100, "rest_ms": 1500, "max_rows": 40}
+        steps = self.mf.burst_plan(2, w)
+        self.assertEqual([k for k, _ in steps], ["down"] * 2 + ["down"] * 6 + ["up"] * 6)
+        # the prelude is paced at key_ms and rests after its last key before the first burst
+        self.assertEqual([d for _, d in steps[:2]], [0.1, 1.5])
+        # inside a burst the keys are key_ms apart, each burst's last is followed by the rest
+        self.assertEqual([d for _, d in steps[2:8]], [0.1, 0.1, 1.5, 0.1, 0.1, 1.5])
+        self.assertEqual([d for _, d in steps[8:]], [0.1, 0.1, 1.5, 0.1, 0.1, 1.5])
+        self.assertEqual(set(k for k, _ in steps), set(self.mf.WALK_KEYS))
+        # the prelude is capped at max_rows, like every other walk
+        capped = self.mf.burst_plan(500, dict(w, max_rows=7))
+        self.assertEqual(sum(1 for k, _ in capped if k == "down"), 7 + 6)
+        for bad in (dict(w, burst=0), dict(w, bursts=0), dict(w, key_ms=0), dict(w, rest_ms=-1)):
+            with self.assertRaises(ValueError):
+                self.mf.burst_plan(2, bad)
+
+    def test_burst_scene_key_count_and_timing(self):
+        b = self.scenes["library-burst"]
+        w = b["walk"]
+        # a 7-shelf landing: 7 Downs + extra_rows into the grid, 8 bursts of 4 each way
+        self.assertEqual(self.mf.walk_downs(b, 7), 7 + w["extra_rows"])
+        steps = self.mf.walk_steps(b, 7)
+        self.assertEqual(len(steps), 7 + 6 + 2 * 8 * 4)
+        self.assertEqual(self.mf.walk_expected_keys(b, 7), len(steps))
+        self.assertEqual(self.mf.walk_expected_keys(b, 0), 0)
+        keys = [k for k, _ in steps]
+        self.assertEqual((keys.count("down"), keys.count("up")), (13 + 32, 32))
+        # first press to last press: 12 prelude gaps and its rest, then 16 bursts of three gaps
+        # and a rest, less the final rest (nothing is pressed after the last key)
+        want = 12 * 0.125 + 1.5 + 16 * (3 * 0.125 + 1.5) - 1.5
+        self.assertAlmostEqual(sum(d for _, d in steps[:-1]), want, places=6)
+        # and the scene's run_secs covers the worst case (the generic test also holds it)
+        self.assertLessEqual(self.mf.walk_secs_needed(b), b["run_secs"])
+
+    def test_hold_scene_is_the_burst_scene_with_a_longer_held_scroll(self):
+        b, h = self.scenes["library-burst"], self.scenes["library-hold"]
+        # the same instrument: mock, triggers, route and walk parameters differ only in the shape
+        for k in ("tier", "route", "warmup_s", "triggers", "mock"):
+            self.assertEqual(h[k], b[k], k)
+        shape = ("burst", "bursts", "rest_ms")
+        self.assertEqual({k: v for k, v in h["walk"].items() if k not in shape},
+                         {k: v for k, v in b["walk"].items() if k not in shape})
+        self.assertEqual((h["walk"]["burst"], h["walk"]["bursts"], h["walk"]["rest_ms"]), (16, 3, 2000))
+        self.assertTrue(self.mf.is_burst(h))
+        self.assertEqual(self.mf.mock_server_args(h), ["--movies", "1000"])
+        for k in ("loop_floor", "fps_floor", "fps_ceiling", "worst_ceiling_ms", "stall_ceiling_ms",
+                  "upload_per_frame_min", "upload_late_share_max", "upload_frames_min"):
+            self.assertNotIn(k, h, k)
+
+    def test_hold_scene_key_count_and_timing(self):
+        h = self.scenes["library-hold"]
+        # a 7-shelf landing: 7 Downs + extra_rows into the grid, 3 bursts of 16 each way
+        steps = self.mf.walk_steps(h, 7)
+        self.assertEqual(len(steps), 7 + 6 + 2 * 3 * 16)
+        self.assertEqual(self.mf.walk_expected_keys(h, 7), len(steps))
+        self.assertEqual(self.mf.walk_expected_keys(h, 0), 0)
+        keys = [k for k, _ in steps]
+        self.assertEqual((keys.count("down"), keys.count("up")), (13 + 48, 48))
+        # the library is deep enough for the held scroll: 48 rows down past the prelude
+        cols = 6
+        self.assertGreaterEqual(-(-h["mock"]["movies"] // cols), 13 + 48)
+        # first press to last press: 12 prelude gaps and its rest, then 6 bursts of fifteen gaps
+        # and a rest, less the final rest (nothing is pressed after the last key)
+        want = 12 * 0.125 + 2.0 + 6 * (15 * 0.125 + 2.0) - 2.0
+        self.assertAlmostEqual(sum(d for _, d in steps[:-1]), want, places=6)
+        self.assertAlmostEqual(want, 24.75, places=6)
+        # inside a burst the keys are key_ms apart; every burst ends in the 2 s rest
+        self.assertEqual([d for _, d in steps[13:13 + 16]], [0.125] * 15 + [2.0])
+        # and the scene's run_secs covers the worst case (the generic test also holds it)
+        self.assertLessEqual(self.mf.walk_secs_needed(h), h["run_secs"])
+
+    def test_a_plain_walk_still_paces_like_it_always_did(self):
+        deep = self.scenes["home-grid-deep"]
+        steps = self.mf.walk_steps(deep, 5)
+        self.assertEqual([k for k, _ in steps], ["down"] * 5 + ["up"] * 5)
+        gap, rest = deep["walk"]["key_gap_s"], deep["walk"]["rest_s"]
+        self.assertEqual([d for _, d in steps], [gap] * 4 + [gap + rest] + [gap] * 5)
+        self.assertEqual(self.mf.walk_expected_keys(deep, 5), 10)
+
+    PH = "phcount: frames=40 ph_frames=9 draws=240 ph=12"
+
+    @staticmethod
+    def _ph(ph, frames=40, ph_frames=3, draws=240):
+        return f"phcount: frames={frames} ph_frames={ph_frames} draws={draws} ph={ph}"
+
+    def test_phcount_line_parses_only_in_the_format_the_app_writes(self):
+        win = [self.KEY, self.PH, "phcount: armed", "phcount: frames=1 ph=2", self._beat()]
+        self.assertEqual(self.mf.phcount_samples(win), [(1, 40, 9, 240, 12)])
+        self.assertEqual(self.mf.phcount_samples([]), [])
+
+    def test_placeholders_are_attributed_to_the_burst_of_the_last_key(self):
+        w = {"burst": 2, "bursts": 2, "key_ms": 100, "rest_ms": 1000, "max_rows": 40}
+        # a 3-key prelude, then bursts: down{k4,k5} down{k6,k7} up{k8,k9} up{k10,k11}
+        win = [self.KEY, self._ph(1), self.KEY, self.KEY, self._ph(2),            # prelude
+               self.KEY, self.KEY, self._ph(10), self._ph(20),                    # burst 0
+               self.KEY, self.KEY, self._ph(100),                                 # burst 1
+               self.KEY, self.KEY, self._ph(1000),                                # burst 2
+               self.KEY, self.KEY, self._ph(5), self._beat()]                     # burst 3
+        t = self.mf.placeholder_tally(win, w, 3)
+        self.assertEqual(t["per_burst"], [30, 100, 1000, 5])
+        self.assertEqual((t["prelude"], t["ph"], t["lines"]), (3, 1138, 7))
+        self.assertEqual((t["frames"], t["ph_frames"], t["draws"]), (7 * 40, 7 * 3, 7 * 240))
+        self.assertIsNone(self.mf.placeholder_tally([self.KEY, self._beat()], w, 3))
+
+    def test_describe_burst_prints_totals_per_burst_median_fps_and_uploads(self):
+        w = {"burst": 2, "bursts": 2, "key_ms": 100, "rest_ms": 1000, "max_rows": 40}
+        beat = self._beat(fps=50) + " pupf=4 pupf_ge22=1 pup=6"
+        win = [self.KEY, self.KEY, self._ph(2), self.KEY, self.KEY, self._ph(7), beat,
+               self._beat(fps=60) + " pupf=2 pupf_ge22=0 pup=3"]
+        text = self.mf.describe_burst(win, "home", w, 2)
+        self.assertIn("ph=9 tile-frames in 2 s", text)
+        self.assertIn("per burst down [7, 0] up [0, 0]", text)
+        self.assertIn("prelude ph=2", text)
+        self.assertIn("median fps 60 (min 50, max 60, n=2)", text)
+        self.assertIn("pupf=6 pupf_ge22=1 pup=9", text)
+        self.assertIn("not graded", text)
+        # an unarmed instrument is "n/a", never a reassuring zero
+        quiet = self.mf.describe_burst([self.KEY, self._beat()], "home", w, 1)
+        self.assertIn("placeholders: n/a", quiet)
+        self.assertIn("pupf/pup n/a", quiet)
+
+    def _burst_run(self, tail, sent=None, landed=7):
+        b = self.scenes["library-burst"]
+        want = self.mf.walk_expected_keys(b, landed)
+        w = type("W", (), {"error": None, "rows": landed, "sent": want if sent is None else sent})
+        lines = [self.SYN, f"libhubs: section 0 landed {landed} shelves, {landed * 12} items",
+                 self.KEY, self._beat()] + tail
+        return b, want, lines, w
+
+    def test_grade_walk_prelude_grades_only_keys_and_the_grid_fingerprint_for_a_burst_walk(self):
+        b, want, lines, w = self._burst_run([self.GRID_FP, self._ph(4)])
+        fail, window, detail = run.grade_walk_prelude(b, lines, w)
+        self.assertIsNone(fail, fail)
+        self.assertIn("7 shelf(s) landed", detail)
+        self.assertIn("burst: placeholders: ph=4 tile-frames", detail)
+        self.assertIn("(recorded, not graded)", detail)
+        self.assertIn(self._ph(4), window)
+        # fewer keys than the plan: not a finished walk
+        b, want, lines, w = self._burst_run([self.GRID_FP], sent=want - 1)
+        fail, _, _ = run.grade_walk_prelude(b, lines, w)
+        self.assertIn(f"sent {want - 1} of {want}", fail)
+        # no grid fingerprint in the window: the keys never carried focus into the grid
+        b, _, lines, w = self._burst_run([self._ph(4)])
+        fail, _, _ = run.grade_walk_prelude(b, lines, w)
+        self.assertIn("region=grid", fail)
+        # an unarmed build still grades: the count reads n/a, not a pass on zero
+        b, _, lines, w = self._burst_run([self.GRID_FP])
+        fail, _, detail = run.grade_walk_prelude(b, lines, w)
+        self.assertIsNone(fail, fail)
+        self.assertIn("placeholders: n/a", detail)
 
     GRID_FP = "focus route=library pill=-1 card=1 menu=0 region=grid row=0 col=0 viewport_x=0.000"
 

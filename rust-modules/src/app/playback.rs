@@ -20,6 +20,7 @@
 //! through a `PlayerReq`.
 
 use super::*;
+use plx_media::player::report::AttemptOrigin;
 // The list is what the LOOP still spells, and phase 12 (PX-PLAYER) is why it is short: the scrub
 // gesture's constants and its two pure policies (`scrub_press`, `failed_key_action`) are read by
 // `screens::player` alone now, so re-exporting them here would be this module claiming a
@@ -120,7 +121,7 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
             let failed = matches!(plx_media::player::state(ps), plx_media::player::PlaybackState::Error);
             if failed {
                 plx_media::route::set_quality_for_retry(q);
-                retry_failed_playback(ps, pa, bridge.metadata_mut(), None);
+                retry_failed_playback(ps, pa, bridge.metadata_mut(), None, AttemptOrigin::QualityChange);
             } else {
                 plx_media::route::set_quality(ps, q);
             }
@@ -140,12 +141,15 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
 /// the current playhead and the Engine lifecycle.
 ///
 /// `direct_play` overrides the Direct Play mode the retry resolves under; `None` keeps the failed
-/// attempt's own (a retry is the SAME request).
+/// attempt's own (a retry is the SAME request). `origin` is why the viewer asked — a Retry press
+/// or a quality pick on the failure screen — and rides to the error report of the attempt this
+/// starts, which is the next open of the same session.
 pub(crate) fn retry_failed_playback(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     meta: &mut plx_data::stores::metadata::MetadataStore,
     direct_play: Option<plx_plex::plex::session::DirectPlayMode>,
+    origin: AttemptOrigin,
 ) -> bool {
     // URL/dev-trigger playback has no Plex descriptor.  Check BEFORE teardown: extinguishing its
     // Error Engine and only then discovering it cannot be rebuilt would replace an actionable
@@ -162,7 +166,7 @@ pub(crate) fn retry_failed_playback(
         .max(plx_media::route::unpresented_resume_ns(ps))
         .max(0);
     plx_media::player::stop_bufferfeed(ps, pa);
-    if plx_media::route::retry_current_play(ps, meta, resume_ns, direct_play) {
+    if plx_media::route::retry_current_play(ps, meta, resume_ns, direct_play, origin) {
         plx_machine::idle::invalidate();
         true
     } else {
@@ -175,24 +179,21 @@ pub(crate) fn retry_failed_playback(
 ///
 /// A PERSISTENT switch, deliberately, not a one-shot: Force is what made this play fail, and it
 /// would make the next unsupported file fail the same way. The preference moves to Auto now (the
-/// in-memory value every later resolve reads) and is saved on the storage worker exactly as the
-/// Settings row saves it (`app::preferences`' `DirectPlay` arm), since the frame may not block on
-/// storage. The retry resolves under Auto explicitly rather than inheriting the failed attempt's
-/// Force, which a plain retry keeps on purpose.
+/// in-memory value every later resolve reads) and is saved on the storage worker behind it, both
+/// by the one write door (`route::choose`, `How::Optimistic`), as the SEATED profile's own pick: it
+/// resets that profile's Direct Play mode and no other's, and with nobody seated the door refuses
+/// the save and the pick stands live only. The frame may not block on storage,
+/// the cell is published ONCE, and a failed save is logged by the door while the pick stands for
+/// this session. The retry resolves under Auto explicitly rather than inheriting the failed
+/// attempt's Force, which a plain retry keeps on purpose.
 pub(crate) fn play_automatically(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     meta: &mut plx_data::stores::metadata::MetadataStore,
 ) -> bool {
-    use plx_plex::plex::session::DirectPlayMode;
-    plx_media::route::restore_direct_play_mode(DirectPlayMode::Auto);
-    let _ = plx_base::storage_worker::submit_retained(|| {
-        if !plx_media::route::set_direct_play_mode(DirectPlayMode::Auto) {
-            log("play automatically: the Direct Play preference was not saved");
-        }
-        plx_machine::idle::invalidate();
-    });
-    retry_failed_playback(ps, pa, meta, Some(DirectPlayMode::Auto))
+    use plx_plex::plex::session::{DirectPlayMode, DirectPlayModePref};
+    plx_media::route::choose::<DirectPlayModePref>(DirectPlayMode::Auto, plx_media::route::How::Optimistic(None));
+    retry_failed_playback(ps, pa, meta, Some(DirectPlayMode::Auto), AttemptOrigin::UserRetry)
 }
 
 /// **Where a session that is STARTING returns to** — the whole of what `app::nav::Origin` was,
@@ -343,7 +344,9 @@ impl PlaybackResources for LivePlaybackResources {
         // `seek_to_ns < 0`, so that stray armed seek blocks feeding forever: no frames, no
         // ACB bind, timeline frozen at the resume point. (Exactly what broke
         // transcode_av1_no_dp_audio. Direct-play never noticed because arm_seek is what the
-        // correct branch does anyway.) Defer it to `pump_play`, after apply_plan.
+        // correct branch does anyway. That item is a transcode only where the codec table lists
+        // no AV1 decoder, which the dev set does not; on a set that does, it direct-streams video.)
+        // Defer it to `pump_play`, after apply_plan.
         let pending = plx_media::route::play_pending();
         // A transcode's rebuild at the saved position is a flight (`begin_resume`): the Load is
         // started by the run loop's drain when it lands, so a pending resume enters the player and
@@ -445,7 +448,7 @@ pub(crate) fn request_loaded_hero(ps: &mut plx_media::route::PlaybackSession, me
 
 pub(crate) fn request_loaded_episode(ps: &mut plx_media::route::PlaybackSession, meta: &mut plx_data::stores::metadata::MetadataStore, rk: &str) -> bool {
     let Some(d) = meta.view().current().cloned() else { return false };
-    let Some(ep) = d.episodes.iter().find(|e| e.rk == rk).cloned() else { return false };
+    let Some(ep) = d.episodes.position(rk).and_then(|i| d.episodes.get(i)).cloned() else { return false };
     request_episode(ps, meta, &d, &ep)
 }
 
@@ -498,39 +501,47 @@ pub(crate) unsafe fn commit_info_press(
     apply_info_action(ps, pa, action, refresh_hubs_at, pages, bridge);
 }
 
-/// **Perform what a player overlay decided** (§14): the panel owns its own state and its own
-/// input, but not the playback — seeking, pausing, applying a quality rung and leaving for a
-/// detail page all need the player adapter, the route or the trail, none of which a screen may
-/// name. Drained once per frame, after the dispatcher's, exactly as the Library's requests are.
-#[allow(clippy::too_many_arguments)]
 /// **Perform the track menu's pick.**
 ///
-/// `route::commit_audio_selection`/`commit_subtitle_selection` take the playback session's `&mut`,
-/// which no screen has (§2.2) — the panel returns a
+/// `route::commit_audio_pick`/`commit_subtitle_pick`/`commit_forced_only_pick` take the playback
+/// session's `&mut`, which no screen has (§2.2) — the panel returns a
 /// [`TrackCommit`](plx_appkit::track_menu::TrackCommit) and this is where it lands, from the
-/// overlay's `PlayerReq` and from the headless `plxnative-menupick` trigger alike.
+/// overlay's `PlayerReq` and from the headless `plxnative-menupick` trigger alike. The two subtitle
+/// arms go through `route::commit_subtitle_and_sidecar` / `commit_forced_only_and_sidecar`, which
+/// make the same pick commit and also perform its sidecar half (select or deselect), so the sidecar
+/// policy is the route's and not this file's.
+///
+/// **This is where a track pick is also REMEMBERED** (the `memo` the panel built from the picked
+/// row): the `*_pick` commits write the show's track memory when, and only when, the route
+/// accepted the pick, an episode is playing and the seat is the viewer's. A subtitle OK that
+/// changes nothing (the menu closed on the row already shown) commits without a memo and writes
+/// nothing; the same holds for an OK on the Forced only row that already holds the mode
+/// (`TrackCommit::SubtitleForcedOnly`'s `changed`), which recommits what is on screen. No other door writes it:
+/// an automatic pick (the ladder at start, a retry or a rescue) and the commits derived
+/// from the Forced only mode (a new audio re-pointing it, the first frame's container-name
+/// re-match) go through the bare `*_selection` commits and remember nothing, and an audio pick
+/// deferred behind an Original handoff was remembered when the viewer made it, so its later replay
+/// writes nothing.
 pub(crate) fn commit_track(
     ps: &mut plx_media::route::PlaybackSession,
     commit: plx_appkit::track_menu::TrackCommit,
 ) {
     use plx_appkit::track_menu::TrackCommit;
     match commit {
-        TrackCommit::Audio(audio) => plx_media::route::commit_audio_selection(ps, audio),
+        TrackCommit::Audio { carried, memo } => {
+            plx_media::route::commit_audio_pick(ps, carried, memo);
+        }
         TrackCommit::AudioEnhancement(a) => plx_media::player::request_audio_enhancement(ps, a),
-        TrackCommit::Subtitle { render_ordinal, stream_id, sidecar_key, sidecar_codec } => {
-            // What the client can draw itself — an embedded ordinal or an external sidecar — is
-            // what an Original route (issue #266's candidate) can carry without a burn.
-            let client_renderable = render_ordinal >= 0 || sidecar_key.is_some();
-            plx_media::route::commit_subtitle_selection(ps, render_ordinal, stream_id, client_renderable);
-            // An EXTERNAL pick has no demuxer ordinal (`render_ordinal` is -1, so the embedded
-            // renderer is off) — on direct play `player::sidecar` fetches and draws it instead.
-            // While transcoding the commit above already asked for a burn and the sidecar draw
-            // is silenced for as long as that is true, so selecting here is harmless and means
-            // the line survives the playback going BACK to direct play.
-            match sidecar_key {
-                Some(key) => plx_media::player::sidecar::select(plx_media::route::cur_sid(ps), stream_id, key, sidecar_codec),
-                None => plx_media::player::sidecar::deselect(),
-            }
+        // The route commits the pick and performs the sidecar half of it too
+        // (`route::commit_subtitle_and_sidecar`): the sidecar policy lives beside the track memory's.
+        TrackCommit::Subtitle { render_ordinal, stream_id, sidecar_key, sidecar_codec, memo } => {
+            plx_media::route::commit_subtitle_and_sidecar(ps, render_ordinal, stream_id, sidecar_key, sidecar_codec, memo);
+        }
+        // Forced only (FO): the panel matched the forced track for the playing audio (or nothing),
+        // the route holds the mode and remembers `ForcedOnly { lang }` when it changed, and drops
+        // any sidecar (`route::commit_forced_only_and_sidecar`).
+        TrackCommit::SubtitleForcedOnly { render_ordinal, stream_id, lang, changed } => {
+            plx_media::route::commit_forced_only_and_sidecar(ps, render_ordinal, stream_id, &lang, changed);
         }
         TrackCommit::SubtitleTone(tone) => plx_media::player::set_subtitle_tone(tone),
         // live first, persisted after, nothing republished on completion (`route::select_subtitle_size`)
@@ -543,6 +554,11 @@ pub(crate) fn commit_track(
     }
 }
 
+/// **Perform what a player overlay decided** (§14): the panel owns its own state and its own
+/// input, but not the playback — seeking, pausing, applying a quality rung and leaving for a
+/// detail page all need the player adapter, the route or the trail, none of which a screen may
+/// name. Drained once per frame, after the dispatcher's, exactly as the Library's requests are.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn player_requests(
     repair: &mut plx_media::player::machine::RepairAttempt,
     ps: &mut plx_media::route::PlaybackSession,
@@ -560,7 +576,7 @@ pub(crate) fn player_requests(
     for req in reqs {
         match req {
             PlayerReq::RetryPlayback => {
-                retry_failed_playback(ps, pa, bridge.metadata_mut(), None);
+                retry_failed_playback(ps, pa, bridge.metadata_mut(), None, AttemptOrigin::UserRetry);
             }
             PlayerReq::PlayAutomatically => {
                 play_automatically(ps, pa, bridge.metadata_mut());

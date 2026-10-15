@@ -55,6 +55,10 @@
     "value": "Off",
     "description": "Label or formatted fact in the media track information sheet or track selector."
   },
+  "widgets.tracks.forced_only": {
+    "value": "Forced only",
+    "description": "Subtitles tab of the player's track selector. The row directly after Off: show only the forced subtitle in the language of the audio that is playing (the lines that translate foreign speech or on-screen text), or nothing when the episode has none. Remembered per show, like Off or a chosen track. While it is the choice, the row reads out the language it shows or looked for, so keep it short enough to share the line with a language name. Same words as the account-wide Forced Subtitles setting's short value (settings.audio.only_forced.short)."
+  },
   "widgets.tracks.mono": {
     "value": "Mono",
     "description": "Label or formatted fact in the media track information sheet or track selector."
@@ -472,7 +476,7 @@
     }
   },
   "widgets.reason.jail_help": {
-    "value": "Repair requires a rooted TV and Homebrew Channel access. See github.com/GLinnik21/plx-native/issues/74 for help.",
+    "value": "Repair requires a rooted TV and Homebrew Channel access. See plxnative.com/troubleshooting/#playback-reports-jail_missing_rtkmem for help.",
     "description": "reason jail_help"
   },
   "widgets.tracks.empty": {
@@ -686,6 +690,10 @@
     "value": "Drawn by your server at this quality.",
     "description": "Subtitles tab of the player's track selector. One-line reason under the DIMMED Timing and Style rows while the subtitle on screen is drawn into the picture by the server for any reason other than converting the audio (a quality-limited re-encode, a picture subtitle that must be burned): the text is already in the video, so neither control can reach it. No jargon: never say burn/remux/transcode."
   },
+  "widgets.tracks.sub_remembered_note": {
+    "value": "The subtitles you chose for this show can’t be shown with this video.",
+    "description": "Subtitles tab of the player's track selector. A short reason under the first group of rows, shown only when the show's remembered subtitle choice was applied to this episode but this way of playing it can show none of it (the player cannot draw that subtitle itself and the server would have to re-encode the picture to do it), so Off is what is on screen. Wraps over several lines on the panel (three in English). No jargon: never say burn/remux/transcode."
+  },
   "widgets.tracks.style": {
     "value": "Style",
     "description": "Subtitles tab of the player's track selector. The drill-in row that opens the caption style pages (Size, Position, Color), and the title of that page."
@@ -801,14 +809,6 @@
   },
   "widgets.ass.track_too_large": {
     "value": "This styled subtitle track is too large",
-    "description": "Message drawn in place of styled (ASS/SSA) subtitles when they cannot be shown."
-  },
-  "widgets.ass.too_many_fonts": {
-    "value": "This styled subtitle track contains too many fonts",
-    "description": "Message drawn in place of styled (ASS/SSA) subtitles when they cannot be shown."
-  },
-  "widgets.ass.invalid_fonts": {
-    "value": "This styled subtitle track contains invalid fonts",
     "description": "Message drawn in place of styled (ASS/SSA) subtitles when they cannot be shown."
   },
   "widgets.ass.render_failed": {

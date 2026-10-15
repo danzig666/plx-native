@@ -1234,6 +1234,23 @@ fn http_open_with_timeouts(
             close_owned(hs);
             return Err(HttpOpenError::Aborted);
         }
+        // The caller's header block is request text, so it is checked before anything is dialled or
+        // sent ([`crate::net::headers`]): a line that ends a header or the head, or names one this
+        // function writes itself (`Host`, the installed `User-Agent`), is refused.
+        let extra_s: String = if extra.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(extra).to_string_lossy().into_owned()
+        };
+        let caller_accept = match crate::net::headers::check_wire_block(&extra_s) {
+            Ok(lines) => crate::net::headers::names_header(&lines, "accept"),
+            Err(refusal) => {
+                plx_base::eventlog::log(&format!("stream: {method} request refused: {refusal}"));
+                close_owned(hs);
+                return Err(HttpOpenError::Transport);
+            }
+        };
+        let extra = extra_s.as_str();
         let reuse = can_reuse(hs, &host_s, port);
         if !reuse {
             close_owned(hs);
@@ -1255,6 +1272,7 @@ fn http_open_with_timeouts(
                 port,
                 &path_s,
                 extra,
+                caller_accept,
                 method,
                 open_deadline,
                 restore_media_timeouts,
@@ -1386,6 +1404,7 @@ fn http_open_with_timeouts(
             port,
             &path_s,
             extra,
+            caller_accept,
             method,
             open_deadline,
             restore_media_timeouts,
@@ -1400,29 +1419,29 @@ unsafe fn perform_http_request(
     host_s: &str,
     port: c_int,
     path_s: &str,
-    extra: *const c_char,
+    extra_s: &str,
+    caller_accept: bool,
     method: &str,
     open_deadline: Option<Instant>,
     restore_media_timeouts: bool,
     pacer: &mut Pacer,
 ) -> Result<(), HttpOpenError> {
-    // build + send the request (default Accept only if caller set none)
-    let extra_s: String = if extra.is_null() {
-        String::new()
-    } else {
-        CStr::from_ptr(extra).to_string_lossy().into_owned()
-    };
-    let accept = if extra_s.to_ascii_lowercase().contains("accept:") {
+    // build + send the request. `extra_s` passed `headers::check_wire_block` in the caller; the
+    // default Accept goes only when no line of it is named `Accept` (the NAME, not a substring: an
+    // `X-Accept:` line is not one).
+    let accept = if caller_accept {
         ""
     } else {
         "Accept: */*\r\n"
     };
     // `Host:` is the ORIGIN, never the address `connect_any` reached — see `host_header`.
     let host_hdr = host_header(host_s, port);
+    // The process's one name, as the curl paths send it (`net::apply_user_agent`); none before boot.
+    let ua = crate::net::user_agent_header_line();
     // HTTP/1.1 keep-alive is the default; omitting Connection lets the server reuse this
     // socket for the next HLS segment instead of forcing a fresh TCP handshake each time.
     let req = format!(
-        "{method} {path_s} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: plxnative/0.1\r\n{accept}{extra_s}\r\n"
+        "{method} {path_s} HTTP/1.1\r\nHost: {host_hdr}\r\n{ua}{accept}{extra_s}\r\n"
     );
     let bytes = req.as_bytes();
     let mut off = 0usize;
@@ -1752,12 +1771,12 @@ pub fn http_read_until(
         }
         let mut n = n;
         if hs.content_length >= 0 {
-            let remain = (hs.content_length - hs.consumed).max(0) as usize;
+            let remain = body_take(n, hs.content_length - hs.consumed);
             if remain == 0 {
                 finish_body(hs);
                 return 0;
             }
-            n = n.min(remain);
+            n = remain;
         }
         // serve buffered body first
         if (hs.bpos as usize) < (hs.blen as usize) {
@@ -1800,6 +1819,18 @@ pub fn http_read_until(
             }
             return r as c_int;
         }
+    }
+}
+
+/// How many of the `n` bytes a read asks for the body still holds, `remaining` being what is left
+/// of it. Compared as `i64`, never cast first: on the 32-bit television `usize` keeps only the low
+/// 32 bits of a remainder over 4 GiB, which read a 23 GB film as finished 1.87 GB in
+/// (`stream_body_take_tests.rs`).
+fn body_take(n: usize, remaining: i64) -> usize {
+    if remaining <= 0 {
+        0
+    } else {
+        usize::try_from(remaining).map_or(n, |r| r.min(n))
     }
 }
 
@@ -2081,9 +2112,9 @@ pub fn http_drain_available(hs: *mut HttpStream, dst: &mut [u8]) -> c_int {
             }
         }
         let remain = if hs.chunked != 0 {
-            hs.chunk_left.max(0) as usize
+            body_take(dst.len(), hs.chunk_left)
         } else if hs.content_length >= 0 {
-            (hs.content_length - hs.consumed).max(0) as usize
+            body_take(dst.len(), hs.content_length - hs.consumed)
         } else {
             dst.len()
         };
@@ -2213,8 +2244,12 @@ pub mod redirect;
 
 // ---------------------------------------------------------------------------------------
 #[cfg(test)]
+#[path = "stream_body_take_tests.rs"]
+mod body_take_tests;
+
+#[cfg(test)]
 #[path = "stream_test_support.rs"]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "stream_deadline_connect_tests.rs"]
@@ -2239,3 +2274,12 @@ mod chunked_drain_tests;
 #[cfg(test)]
 #[path = "stream_checkpoint_tests.rs"]
 mod checkpoint_tests;
+
+#[cfg(test)]
+#[path = "stream_user_agent_tests.rs"]
+mod user_agent_tests;
+
+/// The plaintext request head's bytes, pinned as they are before request validation.
+#[cfg(test)]
+#[path = "stream_wire_characterization_tests.rs"]
+mod wire_characterization_tests;

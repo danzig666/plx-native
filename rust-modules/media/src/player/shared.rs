@@ -379,9 +379,11 @@ pub struct SubRect {
 }
 
 impl SubRect {
-    /// the bytes this rect holds in the store (what the byte budget counts)
+    /// the bytes this rect holds in the store (what the byte budget counts): its index buffer as
+    /// ALLOCATED (a `Vec` that grew by doubling holds its spare capacity) plus its palette. The
+    /// store holds only this indexed form; the RGBA expansion exists for the one set on screen.
     pub fn bytes(&self) -> usize {
-        self.index.len() + std::mem::size_of::<[[u8; 4]; 256]>()
+        self.index.capacity() + std::mem::size_of::<[[u8; 4]; 256]>()
     }
 
     /// The straight-alpha RGBA bitmap of `w`×`h` the renderer uploads.
@@ -555,6 +557,9 @@ pub struct Shared {
     pub load_completed: AtomicBool,          // bf_loaded signal
     pub media_id: Mutex<Option<CString>>,    // bf_mediaId (captured once)
     pub source_info: Mutex<Option<Vec<u8>>>, // sourceInfoRaw, VERBATIM incl NUL
+    /// What the demuxer read of a VP9 stream's colour (PQ tag, mastering display, light level). Set
+    /// only for VP9, cleared per session; `pump` writes it into `source_info` before ACB is sent it.
+    pub container_hdr: Mutex<Option<super::vp9_hdr::ContainerHdr>>,
 
     // main/pump (M) -> library callback thread (K)
     pub pts_shift: AtomicI64, // g_pts_shift
@@ -776,11 +781,28 @@ pub struct Shared {
     /// session, and the index says whether it was immediate or after a long healthy run.
     pub dg_cb_err: AtomicI32,
     pub dg_cb_err_at: AtomicU32,
+    /// The firmware's own error NUMBER (`num`) of that same first `ty == 18` callback — the
+    /// `601` of `type=18 num=601 Resource Allocation Error`. Latched together with `dg_cb_err`
+    /// (first one wins, so a later callback cannot overwrite the explanation) and cleared where
+    /// that clears. Already clamped to the `i32` range: it is the one number a handled `tv_pipeline`
+    /// report carries about the refusal, never the callback's string. A SYNCHRONOUS Load refusal
+    /// (`sf_load` returning 0) has no number to latch — Starfish's `Load` hands back a bare
+    /// success flag, and the other refusals inside `sf_load` are the seam's own lifecycle gates —
+    /// so a session that failed that way leaves this at 0 ("none recorded").
+    pub dg_cb_err_num: AtomicI32,
     /// The media GET's HTTP status and the bytes actually delivered to the demuxer. Written by the
     /// DEMUX thread — the third writer of this block. 0/0 = no connection was ever made, which is
     /// a different failure from a connection that answered 401.
     pub dg_http_status: AtomicI32,
     pub dg_net_rx: AtomicI64,
+    /// WHY the media transfer died, when it was a curl transfer dying mid-body (issue #504): the
+    /// libcurl code (0 = none recorded), the transfer's age in ms (-1 = unknown) and whether the
+    /// reopen that follows a failed read was refused as well. Written by the demux thread beside
+    /// `demux_io_failed` (`ff::frame_read_failed`), read by the handled playback error as a
+    /// class and an age bucket — never as these numbers.
+    pub dg_transport_rc: AtomicI32,
+    pub dg_transport_age_ms: AtomicI64,
+    pub dg_transport_reopen_failed: AtomicBool,
     /// SDL ticks when `loadCompleted` landed, and when `frames` last CHANGED. A photograph has no
     /// time axis: "Load completed, 0 frames" is innocent at 2 s and damning at 4 minutes, and the
     /// panel cannot tell the difference without these. Stamped in the pump, never in `app::diagnostics` —
@@ -818,7 +840,7 @@ pub struct Shared {
     pub dg_fed_v_pts: AtomicI64,
     pub dg_fed_a_pts: AtomicI64,
     /// The codec strings this session actually put in the Starfish Load payload, as small codes
-    /// (0 = none/not built; video 1 = H264, 2 = H265; audio 1 = AC3, 2 = AC3 PLUS, 3 = AAC).
+    /// (0 = none/not built; video 1 = H264, 2 = H265, 3 = AV1, 4 = VP9; audio 1 = AC3, 2 = AC3 PLUS, 3 = AAC).
     ///
     /// Codes rather than strings so they need no lock on the render path — and the PAYLOAD's view
     /// rather than a re-derivation, because the whole class of bug here is the payload disagreeing
@@ -900,6 +922,13 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// The container's track names ([`Shared::track_names`]) for a READER on the main thread. A
+    /// panicked writer cannot leave the names half-built (they are replaced whole), so a poisoned
+    /// lock still holds a usable value and the reader takes it rather than panic.
+    pub fn track_names_lenient(&self) -> std::sync::MutexGuard<'_, TrackNames> {
+        self.track_names.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub const fn new() -> Self {
         Shared {
             native_session: Mutex::new(NativeSessionState::new()),
@@ -908,7 +937,11 @@ impl Shared {
             dg_feed_state: AtomicU8::new(0),
             dg_cb_err: AtomicI32::new(0),
             dg_cb_err_at: AtomicU32::new(0),
+            dg_cb_err_num: AtomicI32::new(0),
             dg_http_status: AtomicI32::new(0),
+            dg_transport_rc: AtomicI32::new(0),
+            dg_transport_age_ms: AtomicI64::new(-1),
+            dg_transport_reopen_failed: AtomicBool::new(false),
             dg_net_rx: AtomicI64::new(0),
             side_anchor: Mutex::new(None),
             side_subs_owner: AtomicBool::new(false),
@@ -959,6 +992,7 @@ impl Shared {
             load_completed: AtomicBool::new(false),
             media_id: Mutex::new(None),
             source_info: Mutex::new(None),
+            container_hdr: Mutex::new(None),
             pts_shift: AtomicI64::new(0),
             disp_base: AtomicI64::new(0),
             seek_to_ns: AtomicI64::new(-1),
@@ -1220,6 +1254,18 @@ impl Shared {
         }
         state.phase = NativeSessionPhase::Abandoned { epoch };
         true
+    }
+
+    /// Whether a timed-out Load is parked ([`NativeSessionPhase::Abandoned`]): the native object
+    /// is still owned by a `Load` that has not returned, so every native start is refused.
+    pub fn native_load_abandoned(&self) -> bool {
+        matches!(
+            self.native_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
+            NativeSessionPhase::Abandoned { .. }
+        )
     }
 
     /// Test-only: drop an abandoned phase that a failing test left behind, which
@@ -1500,7 +1546,11 @@ impl Shared {
         // playback red for the life of the process.
         self.dg_cb_err.store(0, Ordering::Relaxed);
         self.dg_cb_err_at.store(0, Ordering::Relaxed);
+        self.dg_cb_err_num.store(0, Ordering::Relaxed);
         self.dg_http_status.store(0, Ordering::Relaxed);
+        self.dg_transport_rc.store(0, Ordering::Relaxed);
+        self.dg_transport_age_ms.store(-1, Ordering::Relaxed);
+        self.dg_transport_reopen_failed.store(false, Ordering::Relaxed);
         self.dg_net_rx.store(0, Ordering::Relaxed);
         self.dg_load_at.store(0, Ordering::Relaxed);
         self.dg_frame_at.store(0, Ordering::Relaxed);
@@ -1563,6 +1613,7 @@ impl Shared {
         self.native_load_elapsed_ms.store(0, Ordering::Relaxed);
         *self.media_id.lock().unwrap() = None;
         *self.source_info.lock().unwrap() = None;
+        *self.container_hdr.lock().unwrap() = None;
         self.pts_shift.store(0, Ordering::Relaxed);
         self.disp_base.store(0, Ordering::Relaxed);
         self.seek_to_ns.store(-1, Ordering::Relaxed);
@@ -2333,6 +2384,49 @@ pub struct Transport {
     pub seek_reqs: AtomicU32,
 }
 
+/// The instant the user-pause clock reads for a transition or a sample. `Instant::now()`, except
+/// that a host test may pin it for its own thread (`pinned_pause_clock`) so a Pause->Resume
+/// cycle can be given an exact length instead of being slept through.
+fn pause_clock_now() -> Instant {
+    #[cfg(test)]
+    if let Some(pinned) = pinned_pause_clock::read() {
+        return pinned;
+    }
+    Instant::now()
+}
+
+/// A per-thread virtual reading for `pause_clock_now`: time moves only when `advance` is called.
+/// Dropping the guard restores the real clock for the thread.
+#[cfg(test)]
+pub(crate) mod pinned_pause_clock {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static PINNED: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn read() -> Option<Instant> { PINNED.with(Cell::get) }
+
+    pub(crate) struct Pinned;
+
+    impl Pinned {
+        /// Pin this thread's pause clock at the real time now.
+        pub(crate) fn now() -> Self {
+            PINNED.with(|pinned| pinned.set(Some(Instant::now())));
+            Pinned
+        }
+
+        pub(crate) fn advance(&self, by: Duration) {
+            PINNED.with(|pinned| pinned.set(pinned.get().map(|at| at + by)));
+        }
+    }
+
+    impl Drop for Pinned {
+        fn drop(&mut self) { PINNED.with(|pinned| pinned.set(None)); }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct UserPauseClock {
     completed: Duration,
@@ -2416,7 +2510,7 @@ impl Transport {
         // The timestamp belongs to the mutex-order transition. Sampling it before `lock` lets a
         // concurrent clock snapshot linearize first while this transition carries an earlier
         // time, manufacturing paused duration before the transaction's own W0.
-        let now = Instant::now();
+        let now = pause_clock_now();
         match (clock.active_since, paused) {
             (None, true) => {
                 clock.active_since = Some(now);
@@ -2450,7 +2544,7 @@ impl Transport {
 
     pub fn pause_state_sample(&self) -> UserPauseSnapshot {
         let clock = self.pause_clock.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
+        let now = pause_clock_now();
         UserPauseSnapshot {
             now,
             elapsed: clock.elapsed_at(now),
@@ -3325,6 +3419,9 @@ mod tests {
         s.seen_frame.store(true, Ordering::Relaxed);
         s.frames.store(9, Ordering::Relaxed);
         s.demux_io_failed.store(true, Ordering::Relaxed);
+        s.dg_transport_rc.store(56, Ordering::Relaxed);
+        s.dg_transport_age_ms.store(60_000, Ordering::Relaxed);
+        s.dg_transport_reopen_failed.store(true, Ordering::Relaxed);
         s.playback_trace
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3352,6 +3449,15 @@ mod tests {
         assert!(
             !s.demux_io_failed.load(Ordering::Relaxed),
             "a new session must not inherit an I/O failure"
+        );
+        assert_eq!(
+            (
+                s.dg_transport_rc.load(Ordering::Relaxed),
+                s.dg_transport_age_ms.load(Ordering::Relaxed),
+                s.dg_transport_reopen_failed.load(Ordering::Relaxed),
+            ),
+            (0, -1, false),
+            "nor the cause of the last session's transfer failure"
         );
         assert_eq!(
             s.playback_trace

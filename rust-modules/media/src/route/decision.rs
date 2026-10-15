@@ -10,15 +10,34 @@
 //!
 //! The claim worker's plumbing (the work/fallback enums, the landing mailbox, the spawn, the drain
 //! and the stale-landing discard rules) is [`super::flight`]; the route DECISIONS that feed it
-//! (the claim table, the enhancement step, the plans and the PMS attempts) stay here.
+//! (the claim table, the enhancement step, the plans and the PMS attempts) stay here. The track
+//! memory's effects (the recall at a resolve, the parked write-back, the track menu's picks) are the
+//! child module `memory` (`decision_memory.rs`); the fields it works on stay on [`PlaybackSession`].
 
 use plx_plex::plex::ServerId;
+use plx_plex::plex::session::QualityPref;
 use plx_data::pms::PmsMovie;
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use super::flight::*;
 use super::plan::*;
+use super::prefs::*;
+use super::track_memory::{SubMode, TrackContext};
+
+// The track memory's effects: the recall at a resolve, the parked write-back and the track menu's
+// picks. A child module so the file that declares `PlaybackSession` is not also the one that
+// says what is remembered about it; every public name keeps its `route::` path.
+#[path = "decision_memory.rs"]
+mod memory;
+pub use memory::{
+    commit_audio_pick, commit_forced_only_and_sidecar, commit_forced_only_pick, commit_subtitle_and_sidecar, commit_subtitle_pick,
+    on_decoded_frame, persist_subtitle_offset, rematch_subtitle_with_names, repoint_parked_subtitle, send_parked_write_back,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use memory::{park_write_back_for_test, write_back_parked};
+pub(super) use memory::ParkedWriteBack;
+use memory::{follow_audio_with_forced_only, parked_write_back, recalled_track_memory, remembered_subtitle_offset, settle_landing_selection};
 
 // ---- ONE playback session, as ONE value -----------------------------------------------------
 
@@ -46,14 +65,23 @@ struct PlaybackRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RetryContext {
     resume_ns: i64,
-    audio_sid: i64,
-    sub_sid: i64,
+    /// `(audio_sid, sub_sid)` the session HELD when this retry was built, `Some` only when that
+    /// selection was KNOWN ([`PlaybackSession::selection_known`]): a playable plan landed, or the
+    /// viewer picked a track. `0` is both "subtitles Off" and "nothing landed yet", so the pair
+    /// cannot be told apart from the cleared defaults by value; `None` says that nothing landed
+    /// (a quality change or contract bump while loading, a retry of a refused plan) and leaves the
+    /// fresh defaults (the account / show / server rules) in charge instead of forcing the
+    /// subtitle Off. Applied by [`apply_retry`].
+    selection: Option<(i64, i64)>,
     sub_offset_ms: i64,
     direct_play_mode: DirectPlayMode,
     /// Issue #266: resolve this retry WITHOUT the audio enhancement. Set only by a start-failure
     /// rescue ([`retry_current_play`]) of a playback that was enhanced: an enhanced `start.mkv`
     /// that failed to open is the one failure a plain retry would repeat verbatim.
     suppress_enhancement: bool,
+    /// The subtitle MODE the session held ([`PlaybackSession::sub_mode`]), so a retry of Forced only
+    /// is still Forced only: `selection` carries stream ids, which cannot say so.
+    sub_mode: SubMode,
 }
 
 /// Everything the main thread needs to resolve and render the playback in progress, in one struct.
@@ -87,6 +115,12 @@ pub struct PlaybackSession {
     /// This playback was refused by the cached device sandbox preflight. No Engine exists.
     /// Cleared with the playback verdict on exit/reset, never a process-global error latch.
     pub jail_load_blocked: bool,
+    /// The last FRESH native start was refused because a timed-out Load is still inside
+    /// `sf_load` (an `AbandonedLoad` owns the one native object). No Engine exists, so nothing
+    /// else would publish the failure and the player sat Idle with no read-out. `player::state`
+    /// derives `Error` (cause `load_timeout`) from it. Cleared by the next start attempt and,
+    /// like [`jail_load_blocked`](Self::jail_load_blocked), with the playback verdict.
+    pub native_start_refused: bool,
     /// Read-only publication of Player.repair for the HUD. Never authorizes a resource effect.
     pub repair_status: plx_platform::tv::sandbox::State,
     /// The request which produced this attempt, retained for terminal Retry / Choose quality.
@@ -155,8 +189,9 @@ pub struct PlaybackSession {
     ///
     /// It answers the one question the word "Original" is a claim about: false means the server
     /// MUST re-encode the pixels, whatever rung is picked and whatever the link does, so the
-    /// quality menu's Original row cannot deliver the original. AV1, VP9 and MPEG-2 are the cases;
-    /// see the `!video_dp` arm's own comment.
+    /// quality menu's Original row cannot deliver the original. MPEG-2 always, AV1 / VP9 unless
+    /// the device table lists that decoder (`devcaps::Caps::av1` / `vp9`) are the cases; see the
+    /// `!video_dp` arm's own comment.
     ///
     /// **Carried, because re-deriving it at draw time would be a second copy of the gate.** The
     /// menu is drawn from a different thread of control and a different set of facts than the
@@ -245,6 +280,21 @@ pub struct PlaybackSession {
     /// Plex's decision is burn), or client-rendered from the demuxer on direct play
     /// (`player::request_subtitle`).
     cur_sub_sid: i64,
+    /// Do [`Self::cur_audio`] and [`Self::cur_sub_sid`] name a selection that is KNOWN rather than
+    /// the cleared `0` a play request leaves (`0` is both "Off" and "nothing landed yet")? True
+    /// only after a PLAYABLE plan landed ([`apply_plan`]; a refused plan installs too, with a
+    /// selection nobody made) or after the viewer picked a track ([`commit_audio_selection`],
+    /// [`commit_subtitle_selection`]); cleared with the selection by [`clear_track_selection`].
+    /// [`RetryContext::selection`] is `Some` exactly when this held at capture time.
+    selection_known: bool,
+    /// The `(audio_sid, sub_sid)` a RETRY carried into the request now loading, kept while no
+    /// playable plan has landed: the request clears the live selection ([`Self::selection_known`]
+    /// goes false), so a second retry built before this one lands (a contract bump in flight, or
+    /// *Switch to Auto and play* after a refusal) would otherwise find nothing to carry and lose
+    /// the viewer's choice, an explicit subtitles Off included. Set by [`begin_track_selection`],
+    /// kept across a refused landing, dropped by a playable one ([`apply_plan`]).
+    /// [`current_retry_context`] reads it only while the selection is unknown.
+    carried_selection: Option<(i64, i64)>,
     /// Is [`Self::cur_sub_sid`] an external sidecar (`metadata::Stream::sidecar_renderable`) rather
     /// than an embedded (in-container) track? Meaningless when `cur_sub_sid == 0`. Issue #266 I6:
     /// this is what tells `route::decision::facts`'s [`super::plan::SubtitleEffect::Sidecar`]
@@ -268,6 +318,29 @@ pub struct PlaybackSession {
     /// else the account's — carried straight from [`super::plan::Plan::sub_pref_lang`] so the
     /// Subtitles menu's "yours" grouping (`metadata::sub_layout::sub_sections`) survives a reload.
     cur_sub_pref_lang: Option<String>,
+    /// The show the playing item belongs to (`PlayingItem::show_rk`, empty for anything but an
+    /// episode) and its Plex type (`PlayingItem::kind`), carried from the landing: the key and the
+    /// gate of the track memory, which remembers a pick per SHOW and only for an episode.
+    cur_show_rk: String,
+    cur_kind: String,
+    /// A remembered subtitle was chosen for this play but the route shows none of it
+    /// ([`super::plan::Plan::memory_note`]): the Subtitles menu says why. Set by a landing; cleared
+    /// by the first commit that changes the subtitle shown, because a pick the app draws in place
+    /// runs no landing to clear it.
+    cur_memory_note: bool,
+    /// **A remembered choice this landing applied that the server does not have yet** (W6),
+    /// parked by [`apply_plan`] and sent by [`send_parked_write_back`] on the landing's first
+    /// decoded frame. `take`n by the send, so a play writes at most once; every other landing
+    /// (a retry, a rescue, a seek rebuild) installs a session with nothing parked.
+    write_back: Option<ParkedWriteBack>,
+    /// Which of the three subtitle states the playback is in ([`SubMode`]): `cur_sub_sid` alone
+    /// cannot tell Forced only from a pick of the forced track it drew. Set by a landing from the
+    /// plan (or the retry that led to it), by every ordinary subtitle commit from the stream it
+    /// picked, and back to Forced only by the commits derived from it.
+    sub_mode: SubMode,
+    /// What the audio follow and the first-frame names re-match need of the playing item (neither
+    /// can read the metadata store); NOT published ([`Self::publication`]). `None` without an item.
+    track_ctx: Option<TrackContext>,
     /// the playing item's Part id (from the part key), so an audio switch can PUT the
     /// server-side stream selection — the transcoder encodes the part's SELECTED audio.
     cur_part_id: i64,
@@ -340,7 +413,13 @@ pub struct PlaybackSession {
     /// The next episode of the item now playing, or None (a movie, the last episode, or a queue
     /// that failed). Installed by [`apply_plan`]; [`request_play`] retires it the moment a new item
     /// resolves. Read through [`up_next`], which lends a `&'static`.
-    up_next: Option<UpNext>,
+    ///
+    /// Shared, not owned: [`publication`](Self::publication) copies the session every frame, and
+    /// the Up Next still is a card whose placement history is keyed by the address of this row's
+    /// `thumb` (`plx_ui::widgets::Art::motion_identity`). A deep copy gave the card a new identity
+    /// every frame, so a still that was not cached yet was declined for ever and the player
+    /// screen never came to rest.
+    up_next: Option<std::sync::Arc<UpNext>>,
     /// The whole queue behind the item now playing — the playing row included, in queue order,
     /// projected to `plex::QueueRow` ON THE RESOLVE WORKER (a `Metadata` row carries its entire
     /// Media/Part/Stream/Role tree; a show's queue is dozens of them, and this device is 32-bit).
@@ -402,6 +481,7 @@ impl PlaybackSession {
     pub const IDLE: PlaybackSession = PlaybackSession {
         direct_play_mode: DirectPlayMode::Auto,
         jail_load_blocked: false,
+        native_start_refused: false,
         repair_status: plx_platform::tv::sandbox::State::Idle,
         request: None,
         requested_resume_ns: 0,
@@ -425,11 +505,19 @@ impl PlaybackSession {
         cur_sid: ServerId::UNSET,
         cur_audio: None,
         cur_sub_sid: 0,
+        selection_known: false,
+        carried_selection: None,
         cur_sub_sidecar: false,
         cur_sub_client_drawable: false,
         cur_sub_ordinal: -1,
         side_subs_refused: false,
         cur_sub_pref_lang: None,
+        cur_show_rk: String::new(),
+        cur_kind: String::new(),
+        cur_memory_note: false,
+        write_back: None,
+        sub_mode: SubMode::Track,
+        track_ctx: None,
         cur_part_id: 0,
         sess: String::new(),
         machine_id: String::new(),
@@ -474,6 +562,7 @@ impl PlaybackSession {
         let PlaybackSession {
             direct_play_mode,
             jail_load_blocked,
+            native_start_refused,
             repair_status,
             request,
             requested_resume_ns,
@@ -497,11 +586,20 @@ impl PlaybackSession {
             cur_sid,
             cur_audio,
             cur_sub_sid,
+            selection_known,
+            carried_selection,
             cur_sub_sidecar,
             cur_sub_client_drawable,
             cur_sub_ordinal,
             side_subs_refused,
             cur_sub_pref_lang,
+            cur_show_rk,
+            cur_kind,
+            cur_memory_note,
+            // The parked write is the loop's to send, not a screen's to see.
+            write_back: _,
+            sub_mode,
+            track_ctx: _,
             cur_part_id,
             sess,
             machine_id,
@@ -527,6 +625,7 @@ impl PlaybackSession {
         PlaybackSession {
             direct_play_mode: *direct_play_mode,
             jail_load_blocked: *jail_load_blocked,
+            native_start_refused: *native_start_refused,
             repair_status: *repair_status,
             request: request.clone(),
             requested_resume_ns: *requested_resume_ns,
@@ -550,11 +649,19 @@ impl PlaybackSession {
             cur_sid: *cur_sid,
             cur_audio: cur_audio.clone(),
             cur_sub_sid: *cur_sub_sid,
+            selection_known: *selection_known,
+            carried_selection: *carried_selection,
             cur_sub_sidecar: *cur_sub_sidecar,
             cur_sub_client_drawable: *cur_sub_client_drawable,
             cur_sub_ordinal: *cur_sub_ordinal,
             side_subs_refused: *side_subs_refused,
             cur_sub_pref_lang: cur_sub_pref_lang.clone(),
+            cur_show_rk: cur_show_rk.clone(),
+            cur_kind: cur_kind.clone(),
+            cur_memory_note: *cur_memory_note,
+            write_back: None,
+            sub_mode: *sub_mode,
+            track_ctx: None,
             cur_part_id: *cur_part_id,
             sess: sess.clone(),
             machine_id: machine_id.clone(),
@@ -696,6 +803,16 @@ pub enum RecoveryCause {
 }
 
 impl RecoveryCause {
+    /// Why the open this recovery makes is made, as a failed open reports it: the viewer asked for
+    /// it (an Original pick, or the enhancement they turned off) or the Auto worker did.
+    pub const fn attempt_origin(self) -> crate::player::report::AttemptOrigin {
+        use crate::player::report::AttemptOrigin as O;
+        match self {
+            Self::Automatic => O::AutoHandoff,
+            Self::ManualOriginal | Self::EnhancementReleased => O::QualityChange,
+        }
+    }
+
     /// The log prefix this cause's recovery lines carry.
     fn log_tag(self) -> &'static str {
         match self {
@@ -4079,6 +4196,13 @@ pub(super) fn install_auto_hls_outcome(
         crate::player::report::DeliveryClass::Hls,
         crate::player::report::rung_quality_class(rung),
         reason,
+        match reason {
+            // The source that never opened is replaced by HLS: the app's own recovery.
+            crate::player::report::DeliveryReason::OriginalOpenRollback => {
+                crate::player::report::AttemptOrigin::Recovery
+            }
+            _ => crate::player::report::AttemptOrigin::AutoHandoff,
+        },
     );
     Some(installed)
 }
@@ -4438,6 +4562,7 @@ pub(super) fn install_original_recovery(
         crate::player::report::DeliveryClass::Remux,
         crate::player::report::QualityClass::Original,
         crate::player::report::DeliveryReason::OriginalRecovery,
+        plan.cause.attempt_origin(),
     );
     Some(AutoOriginalReload::Remux)
 }
@@ -4626,6 +4751,7 @@ fn recover_original_direct(
         crate::player::report::DeliveryClass::Direct,
         crate::player::report::QualityClass::Original,
         crate::player::report::DeliveryReason::OriginalRecovery,
+        cause.attempt_origin(),
     );
     Some(AutoOriginalReload::Direct)
 }
@@ -5050,6 +5176,7 @@ fn clear_play_verdict(ps: &mut PlaybackSession) {
     { let s = &mut *ps; {
         s.play_verdict = None;
         s.jail_load_blocked = false;
+        s.native_start_refused = false;
         s.resolve_failed = false;
         s.requested_resume_ns = 0;
     } }
@@ -5093,6 +5220,13 @@ pub fn refuse_by_server_for_test(
     ps.src_vcodec = src_vcodec.to_owned();
     ps.src_acodec = src_acodec.to_owned();
 }
+/// Test-only: leave `ps` as [`apply_plan`] leaves a session RESOLVED for a hero preview, after the
+/// preview machinery has retired it (`preview` cleared, `resolved_as_preview` kept).
+#[cfg(any(test, feature = "test-support"))]
+pub fn resolve_as_preview_for_test(ps: &mut PlaybackSession) {
+    ps.preview = false;
+    ps.resolved_as_preview = true;
+}
 /// Test-only: install a live transcode route (`encoder` session, optional remux, optional
 /// fixed-HLS delivery) the way a successful [`apply_plan`] leaves it.
 #[cfg(any(test, feature = "test-support"))]
@@ -5119,6 +5253,21 @@ pub fn cur_sub_sid(ps: &PlaybackSession) -> i64 {
 /// account type.
 pub fn cur_sub_pref_lang(ps: &PlaybackSession) -> Option<&str> {
     ps.cur_sub_pref_lang.as_deref()
+}
+/// The show the playing item belongs to (`""` for anything but an episode): the key the track
+/// memory is written under.
+pub fn cur_show_rk(ps: &PlaybackSession) -> &str {
+    &ps.cur_show_rk
+}
+/// The playing item's Plex type (`episode`, `movie`, ...), empty when the server sent none. Track
+/// memory is written for `episode` only.
+pub fn cur_kind(ps: &PlaybackSession) -> &str {
+    &ps.cur_kind
+}
+/// A remembered subtitle was chosen for this play but the route shows none of it, so the
+/// Subtitles menu says why.
+pub fn cur_memory_note(ps: &PlaybackSession) -> bool {
+    ps.cur_memory_note
 }
 /// ratingKey of the currently-playing item (for /:/timeline progress reports).
 pub fn cur_rk(ps: &PlaybackSession) -> String {
@@ -5667,6 +5816,17 @@ impl ScrobbleJoin {
         self.changed.notify_all();
     }
 
+    /// Whether no stop report is still on its way to the server: no worker was ever reserved, the
+    /// last one has been joined, or its thread has returned. Never blocks, and never joins - the
+    /// frame loop asks this every frame while it waits to re-read what the stop committed.
+    fn settled(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.completed >= state.generation
+            || (!state.spawn_pending
+                && !state.joining
+                && state.handle.as_ref().is_some_and(|(_, handle)| handle.is_finished()))
+    }
+
     fn drain(&self) {
         loop {
             let (generation, handle) = {
@@ -5791,6 +5951,13 @@ impl Drop for TimelineStopCompletion {
 /// SDL thread.
 pub fn drain_scrobble() {
     SCROBBLE_JOIN.drain();
+}
+
+/// Whether the last [`scrobble_stop`] has finished posting (see [`ScrobbleJoin::settled`]): true
+/// once the server holds the resume point the stop reported, so a re-read of the item sees it.
+/// Non-blocking, unlike [`drain_scrobble`].
+pub fn scrobble_settled() -> bool {
+    SCROBBLE_JOIN.settled()
 }
 
 /// Seek within a LIVE TRANSCODE by restarting it at a time offset — a transcode has no byte-Cues,
@@ -6289,260 +6456,6 @@ pub fn available_quality_ladder() -> &'static [Quality] {
     quality_ladder_for(auto_quality_ready())
 }
 
-/// An in-memory index back to a rung — out of range is `Original`, never a neighbouring rung,
-/// for the same reason the more menu resolves a press by row identity rather than position: the ladder can grow or shrink.
-fn quality_from_index(i: u8) -> Quality {
-    QUALITY_LADDER
-        .get(i as usize)
-        .copied()
-        .unwrap_or(Quality::Original)
-}
-
-fn quality_index(q: Quality) -> u8 {
-    QUALITY_LADDER.iter().position(|&r| r == q).unwrap_or(1) as u8
-}
-
-/// Install-wide preference; each resolve captures its own immutable mode.
-static DIRECT_PLAY_MODE: AtomicU8 = AtomicU8::new(0);
-
-pub fn direct_play_mode() -> DirectPlayMode {
-    match DIRECT_PLAY_MODE.load(Ordering::Relaxed) {
-        1 => DirectPlayMode::Forced,
-        2 => DirectPlayMode::Disabled,
-        _ => DirectPlayMode::Auto,
-    }
-}
-
-pub fn restore_direct_play_mode(mode: DirectPlayMode) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("direct-play preference");
-    DIRECT_PLAY_MODE.store(match mode {
-        DirectPlayMode::Auto => 0, DirectPlayMode::Forced => 1, DirectPlayMode::Disabled => 2,
-    }, Ordering::Relaxed);
-}
-
-/// Blocking persistence seam; Settings dispatches it on the storage worker.
-pub fn set_direct_play_mode(mode: DirectPlayMode) -> bool {
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_direct_play_mode(mode)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved { restore_direct_play_mode(mode); plx_machine::idle::invalidate(); }
-    saved
-}
-
-/// What the player does at an episode's credits when a successor is queued — install-wide, like
-/// [`DIRECT_PLAY_MODE`]. Read by `appkit::player_hud::slot` every frame and by `finish_playback` at
-/// the end of the stream.
-static NEXT_EPISODE_MODE: AtomicU8 = AtomicU8::new(0); // NextEpisodeMode::Countdown's index
-
-pub fn next_episode_mode() -> NextEpisodeMode {
-    NextEpisodeMode::from_index(NEXT_EPISODE_MODE.load(Ordering::Relaxed))
-}
-
-pub fn restore_next_episode_mode(mode: NextEpisodeMode) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("next episode preference");
-    NEXT_EPISODE_MODE.store(mode.index(), Ordering::Relaxed);
-}
-
-/// Blocking persistence seam; Settings dispatches it on the storage worker. The live value changes
-/// only once the write is durable, so a failed save claims nothing.
-pub fn set_next_episode_mode(mode: NextEpisodeMode) -> bool {
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_next_episode_mode(mode)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved {
-        restore_next_episode_mode(mode);
-        plx_machine::idle::invalidate();
-        plx_telemetry::diag::event(plx_telemetry::diag::schema::DiagEvent::FeatureUsed {
-            feature: plx_telemetry::diag::schema::Feature::NextEpisode(mode),
-        });
-    }
-    saved
-}
-
-/// How far one Left/Right press jumps in the player and the trailer transport — install-wide,
-/// like [`NEXT_EPISODE_MODE`]. Read per press by `appkit::player_hud::scrub_step_ns`.
-static SKIP_INTERVAL: AtomicU8 = AtomicU8::new(1); // SkipInterval::Seconds10's index
-
-pub fn skip_interval() -> SkipInterval {
-    SkipInterval::from_index(SKIP_INTERVAL.load(Ordering::Relaxed))
-}
-
-pub fn restore_skip_interval(interval: SkipInterval) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("skip interval preference");
-    SKIP_INTERVAL.store(interval.index(), Ordering::Relaxed);
-}
-
-/// Blocking persistence seam; Settings dispatches it on the storage worker. The live value changes
-/// only once the write is durable, so a failed save claims nothing.
-pub fn set_skip_interval(interval: SkipInterval) -> bool {
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_skip_interval(interval)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved {
-        restore_skip_interval(interval);
-        plx_machine::idle::invalidate();
-        plx_telemetry::diag::event(plx_telemetry::diag::schema::DiagEvent::FeatureUsed {
-            feature: plx_telemetry::diag::schema::Feature::SkipInterval(interval),
-        });
-    }
-    saved
-}
-
-/// What OK does on a Continue Watching card — install-wide, like [`NEXT_EPISODE_MODE`]. Read by
-/// every deck's press and draw (Home's and the Library's) and by the item menu when it builds its
-/// rows; `DeckPress::press_plays` is the one question they all ask of it.
-static DECK_PRESS: AtomicU8 = AtomicU8::new(0); // DeckPress::Details's index
-
-pub fn deck_press() -> DeckPress {
-    DeckPress::from_index(DECK_PRESS.load(Ordering::Relaxed))
-}
-
-pub fn restore_deck_press(mode: DeckPress) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("deck press preference");
-    DECK_PRESS.store(mode.index(), Ordering::Relaxed);
-}
-
-/// Blocking persistence seam; Settings dispatches it on the storage worker. The live value changes
-/// only once the write is durable, so a failed save claims nothing.
-pub fn set_deck_press(mode: DeckPress) -> bool {
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_deck_press(mode)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved {
-        restore_deck_press(mode);
-        plx_machine::idle::invalidate();
-    }
-    saved
-}
-
-/// **Skip intros / Skip credits** — install-wide, like [`DECK_PRESS`]. Read once per segment offer
-/// by the frame loop (`skip_pill::auto_skip`), never per frame.
-static SKIP_INTRO: AtomicU8 = AtomicU8::new(0); // MarkerSkip::Button's index
-static SKIP_CREDITS: AtomicU8 = AtomicU8::new(0);
-
-pub fn skip_intro() -> MarkerSkip {
-    MarkerSkip::from_index(SKIP_INTRO.load(Ordering::Relaxed))
-}
-
-pub fn skip_credits() -> MarkerSkip {
-    MarkerSkip::from_index(SKIP_CREDITS.load(Ordering::Relaxed))
-}
-
-pub fn restore_marker_skip(intro: MarkerSkip, credits: MarkerSkip) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("marker skip preferences");
-    SKIP_INTRO.store(intro.index(), Ordering::Relaxed);
-    SKIP_CREDITS.store(credits.index(), Ordering::Relaxed);
-}
-
-/// Blocking persistence seam for Skip intros; Settings dispatches it on the storage worker. The
-/// live value changes only once the write is durable, so a failed save claims nothing.
-pub fn set_skip_intro(mode: MarkerSkip) -> bool {
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_skip_intro(mode)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved {
-        SKIP_INTRO.store(mode.index(), Ordering::Relaxed);
-        plx_machine::idle::invalidate();
-    }
-    saved
-}
-
-/// [`set_skip_intro`]'s credits twin.
-pub fn set_skip_credits(mode: MarkerSkip) -> bool {
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_skip_credits(mode)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved {
-        SKIP_CREDITS.store(mode.index(), Ordering::Relaxed);
-        plx_machine::idle::invalidate();
-    }
-    saved
-}
-
-pub fn set_default_quality(q: Quality) -> bool {
-    let q = supported_quality(q);
-    let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_playback_quality(q)))
-        .is_some_and(|write| matches!(write.classify(),
-            plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-    if saved { restore_quality(q); plx_machine::idle::invalidate(); }
-    saved
-}
-
-/// The client-rendered subtitle caption's text size — install-wide, like [`DIRECT_PLAY_MODE`].
-static SUBTITLE_SIZE: AtomicU8 = AtomicU8::new(1); // SubtitleSize::Medium's index
-
-pub fn subtitle_size() -> SubtitleSize {
-    SubtitleSize::from_index(SUBTITLE_SIZE.load(Ordering::Relaxed))
-}
-
-pub fn restore_subtitle_size(size: SubtitleSize) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("subtitle size preference");
-    SUBTITLE_SIZE.store(size.index(), Ordering::Relaxed);
-}
-
-/// **Pick a caption size: one optimistic operation, on the main thread.** The live atomic is
-/// stored and the frame invalidated FIRST, so the caption changes on the next frame; then a
-/// persist-only closure is retained for the shared storage worker. The closure writes the session
-/// store and NEVER touches the atomic (the pattern of `player::set_subtitle_tone`), so no
-/// completion can overwrite a newer live pick: live = the latest pick, durable writes are FIFO on
-/// the worker, last submitted wins. `reply` (Settings) learns whether the write was durable; a
-/// failure claims nothing about the next boot and republishes nothing.
-pub fn select_subtitle_size(size: SubtitleSize, reply: Option<std::sync::mpsc::Sender<bool>>) {
-    restore_subtitle_size(size);
-    plx_machine::idle::invalidate();
-    let _ = plx_base::storage_worker::submit_retained(move || {
-        let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_subtitle_size(size)))
-            .is_some_and(|write| matches!(write.classify(),
-                plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-        if !saved {
-            plx_base::eventlog::log("subtitle size: durable write failed (live value kept for this session)");
-        }
-        if let Some(reply) = reply {
-            let _ = reply.send(saved);
-        }
-        plx_machine::idle::invalidate();
-    });
-}
-
-/// The client-rendered subtitle caption's vertical placement — install-wide, like
-/// [`DIRECT_PLAY_MODE`]. Only the plain-text caption draw moves with this; image (PGS/VobSub)
-/// captions and native ASS/SSA keep their own placement.
-static SUBTITLE_POSITION: AtomicU8 = AtomicU8::new(0); // SubtitlePosition::Low's index
-
-pub fn subtitle_position() -> SubtitlePosition {
-    SubtitlePosition::from_index(SUBTITLE_POSITION.load(Ordering::Relaxed))
-}
-
-pub fn restore_subtitle_position(position: SubtitlePosition) {
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("subtitle position preference");
-    SUBTITLE_POSITION.store(position.index(), Ordering::Relaxed);
-}
-
-/// [`select_subtitle_size`] for the caption's vertical placement.
-pub fn select_subtitle_position(position: SubtitlePosition, reply: Option<std::sync::mpsc::Sender<bool>>) {
-    restore_subtitle_position(position);
-    plx_machine::idle::invalidate();
-    let _ = plx_base::storage_worker::submit_retained(move || {
-        let saved = plx_plex::plex::session::update_with_outcome(|s| Some(s.with_subtitle_position(position)))
-            .is_some_and(|write| matches!(write.classify(),
-                plx_plex::plex::session::async_persistence::CompletionOutcome::Durable(_)));
-        if !saved {
-            plx_base::eventlog::log("subtitle position: durable write failed (live value kept for this session)");
-        }
-        if let Some(reply) = reply {
-            let _ = reply.send(saved);
-        }
-        plx_machine::idle::invalidate();
-    });
-}
-
 pub fn forced_direct_play(ps: &PlaybackSession) -> bool {
     ps.direct_play_mode == DirectPlayMode::Forced
 }
@@ -6562,33 +6475,6 @@ pub fn audio_track_direct_plays(ps: &PlaybackSession, codec: &str, channels: i64
 pub fn audio_converted_by_server(codec: &str, channels: i64) -> bool {
     let mode = direct_play_mode();
     mode != DirectPlayMode::Forced && !audio_direct_plays(mode, codec, channels)
-}
-
-/// The user's current pick. An atomic rather than a field on [`Session`] because it OUTLIVES a
-/// playback — it is a preference, not session state — and because `appkit::more_menu` reads it to draw
-/// the checkmark while [`ResolveEnv::snapshot`] reads it to hand the worker a copy.
-///
-/// Seeded to Original even before the boot gate restores the session: no call path may turn a
-/// missing preference into Auto simply because initialization order changed.
-static QUALITY: AtomicU8 = AtomicU8::new(1);
-
-/// The selected ceiling. Safe from any thread; the resolve worker gets a COPY through
-/// [`ResolveEnv`] rather than reading this, per that struct's own rule.
-pub fn quality() -> Quality {
-    quality_from_index(QUALITY.load(Ordering::Relaxed))
-}
-
-/// Restore the persisted preference without writing it back. The distinction matters for legacy
-/// sessions: their missing field resolves to Original but remains missing until the user makes an
-/// explicit choice, so a future Auto-ready build still cannot reinterpret that old install.
-pub fn restore_quality(q: Quality) {
-    // `QUALITY` is a process global `quality()` reads without taking any lock, so a test that
-    // writes it without `testlock::serial()` lands the write mid some OTHER test's read —
-    // `on_deck_hevc_p5_preview_uses_the_selected_episodes_codec` flaked exactly this way. Same
-    // guard as the plex server registry (`plex::servers::register_with_client_id`).
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("the playback quality ceiling (restore_quality)");
-    QUALITY.store(quality_index(supported_quality(q)), Ordering::Relaxed);
 }
 
 /// Select a rung. MAIN THREAD (it writes the session).
@@ -6615,22 +6501,11 @@ pub fn restore_quality(q: Quality) {
 fn persist_quality_choice(q: Quality) -> Quality {
     let q = supported_quality(q);
     crate::player::report::note_quality_selected_for(playback_trace_generation(), q);
-    // See `restore_quality`: the same process global, the same lock requirement in tests.
-    #[cfg(any(test, feature = "test-support"))]
-    plx_base::testlock::assert_held("the playback quality ceiling (persist_quality_choice)");
-    QUALITY.store(quality_index(q), Ordering::Relaxed);
-    // A session write is a read-modify-write under the session lock: changing this preference
-    // must not overwrite a roster refresh, a profile switch, or another profile's recents.
-    let _ = plx_plex::plex::session::queue_update(move |s| {
-        if s.playback_quality == Some(q) {
-            None
-        } else {
-            Some(s.with_playback_quality(q))
-        }
-    });
-    // The picker's checkmark moves on this and on nothing else — a settled popover presents no
-    // frames, so without this the row would still read as the old rung until the next keypress.
-    plx_machine::idle::invalidate();
+    // The picker's checkmark moves on the door's own `invalidate`, and on nothing else — a settled
+    // popover presents no frames, so without it the row would still read as the old rung until the
+    // next keypress. The persist is the door's FIFO read-modify-write under the session lock, so it
+    // cannot overwrite a roster refresh, a profile switch, or another profile's recents.
+    choose::<QualityPref>(q, How::Optimistic(None));
     q
 }
 
@@ -6725,8 +6600,9 @@ fn apply_quality_choice(ps: &mut PlaybackSession, q: Quality) {
     // Link class cannot create a source candidate. Local normally needs no throughput proof, but
     // it still needs Original to be technically possible. `build_stream` records that fact as
     // `auto_original`: `None` means the source codec/container/audio combination already failed
-    // feasibility. Treating Local alone as sufficient here turns a fixed-rung AV1 transcode into
-    // progressive MKV when the user returns to Auto, so no HLS controller is rebuilt.
+    // feasibility. Treating Local alone as sufficient here turns a fixed-rung AV1 transcode (a set
+    // whose table lists no AV1 decoder, or a source over its row) into progressive MKV when the
+    // user returns to Auto, so no HLS controller is rebuilt.
     let original_feasible = ps.auto_original.is_some();
     let auto_original = q == Quality::Auto
         && original_feasible
@@ -6812,6 +6688,23 @@ fn apply_quality_choice(ps: &mut PlaybackSession, q: Quality) {
             .map(|rung| format!(" at {}kbps HLS", rung.kbps()))
             .unwrap_or_default(),
     ));
+    // The pick is a new open of the route it names, whatever the pump makes of the refresh: say so
+    // now, or a failure of that open reads as one of the route the playback had (S5a left this
+    // path with no `DeliveryRequested`, so `attempted_delivery` fell back to the installed route).
+    crate::player::report::note_delivery_requested_for(
+        playback_trace_generation(),
+        if adaptive {
+            crate::player::report::DeliveryClass::Hls
+        } else {
+            crate::player::report::DeliveryClass::Transcode
+        },
+        starting_rung.map_or_else(
+            || crate::player::report::selected_quality_class(q),
+            crate::player::report::rung_quality_class,
+        ),
+        crate::player::report::DeliveryReason::QualityPick,
+        crate::player::report::AttemptOrigin::QualityChange,
+    );
     crate::player::request_transcode_refresh(ps);
 }
 
@@ -7031,16 +6924,21 @@ pub(super) fn forced_server_decision(
 /// default-selected sub, only the PUT does). The direct-play profile advertises text and
 /// client-rendered bitmap codecs; burn is still the remux/re-encode path when we PUT a
 /// positive subtitle id. We PUT subtitleStreamID=0 to keep subs OFF (no burn), or the chosen
-/// id to burn it; audioStreamID only when the user switched (else keep default).
+/// id to burn it; audioStreamID only when the user switched or the profile remembered a track for
+/// the show (else keep default).
 ///
 /// Never `0` for a subtitle the app draws itself: PMS discards a DOWNLOADED subtitle the moment the
-/// selection moves off it (docs/pms-api.md, 2026-10-06), so `0` means the viewer chose Off or nothing
-/// is selected; "do not burn" is the transcode wire's `subtitles=none` alone.
+/// selection moves off it (docs/pms-api.md, 2026-10-06), so `0` means the viewer chose Off (now
+/// or, for a show, earlier: a remembered Off) or nothing is selected; "do not burn" is the
+/// transcode wire's `subtitles=none` alone.
 ///
 /// `sid` names the server that owns `part` — the resolve worker passes the id it was given, and the
 /// in-playback callers pass [`cur_sid`]. A `Part.id` is server-local, so a PUT sent to the wrong
 /// one either 404s or, worse, re-selects streams on a stranger's part that happens to share the
-/// number.
+/// number. The queued callers ([`queue_put_selection`], the write-back) also carry the slot's
+/// credential stamp, `(instance_gen, grant_epoch)` of `client_for(sid)` at queue time, and a queued
+/// request is dropped, not sent, if the slot's client or grant moved before the worker ran it
+/// ([`QueuedSelection`], W11).
 pub(super) fn put_selection(_off: &plx_base::task::OffFrame, sid: ServerId, part: i64, aud: i64, sub: i64) {
     if part <= 0 {
         return;
@@ -7049,21 +6947,61 @@ pub(super) fn put_selection(_off: &plx_base::task::OffFrame, sid: ServerId, part
         Some(c) => c,
         None => return,
     };
+    send_selection(c, part, aud, Some(sub));
+}
+
+/// The PUT itself, on a client the CALLER chose: [`put_selection`] resolves it per call, the queue
+/// worker checks the credential it was queued under first and sends on that same `&Client`.
+/// `sub == None` omits `subtitleStreamID` (an audio-only write-back with no subtitle to keep), and
+/// the log line says `-` for it.
+fn send_selection(c: &plx_plex::plex::Client, part: i64, aud: i64, sub: Option<i64>) {
     let st = c.select_streams(&plx_plex::plex::StreamSelection {
         part_id: part,
         audio_stream_id: aud,
         subtitle_stream_id: sub,
     });
+    let sub = sub.map_or_else(|| "-".to_string(), |s| s.to_string());
     crate::player::log(&format!(
         "select streams: part={part} audio={aud} sub={sub} -> HTTP {st}"
     ));
 }
 
+/// One queued selection PUT and WHO it was queued for. `(instance_gen, grant_epoch)` is the
+/// identity of `client_for(sid)` at queue time: the slot is stable across a profile switch
+/// (`revoke_for_profile_switch` blanks its token and the next profile's grant re-tokens the SAME
+/// slot), so the server id alone cannot say whose request this is. The worker drops the request
+/// when either value moved (W11). `write_back` marks the request an applied remembered choice made
+/// (WB), so the drop can say so.
 struct QueuedSelection {
     sid: ServerId,
     part: i64,
     aud: i64,
-    sub: i64,
+    sub: Option<i64>,
+    instance_gen: u32,
+    grant_epoch: u32,
+    write_back: bool,
+}
+
+/// `Some` when `queued` may still be sent on `c`: the slot holds the same client incarnation and the
+/// same credential epoch it held when the request was queued. `c` is `client_for(queued.sid)` as the
+/// WORKER resolves it, so a request queued under one profile's token never goes out under the next.
+fn credential_unchanged(queued: &QueuedSelection, c: &plx_plex::plex::Client) -> bool {
+    c.instance_gen() == queued.instance_gen && c.grant_epoch() == queued.grant_epoch
+}
+
+/// Run one dequeued request: the PUT, unless the credential changed since it was queued.
+fn run_queued_selection(_off: &plx_base::task::OffFrame, req: &QueuedSelection) {
+    let Some(c) = plx_plex::plex::client_for(req.sid) else {
+        return;
+    };
+    if !credential_unchanged(req, c) {
+        crate::player::log("select streams: dropped (credential changed since queued)");
+        if req.write_back {
+            crate::player::log("track-memory: write-back dropped (profile changed)");
+        }
+        return;
+    }
+    send_selection(c, req.part, req.aud, req.sub);
 }
 
 /// The pending selection PUTs and whether a worker is draining them. One lock covers both, so the
@@ -7096,13 +7034,37 @@ fn selection_queue_idle() -> bool {
 /// receives last, so two picks made in quick succession (audio, then subtitle) must land on the
 /// server in the order the viewer made them, not in whatever order two independent threads happen
 /// to finish their requests.
+///
+/// Each request is stamped with `client_for(sid)`'s `(instance_gen, grant_epoch)` at queue time and is
+/// dropped, not sent, if either moved before the worker runs it (W11; it logs `select streams:
+/// dropped (credential changed since queued)`), so a request queued behind a slow server never goes
+/// out under the next profile's token.
 pub(super) fn queue_put_selection(sid: ServerId, part: i64, aud: i64, sub: i64) {
+    queue_selection(sid, part, aud, Some(sub), false);
+}
+
+/// [`queue_put_selection`] with the subtitle optional and the request's provenance. The credential
+/// identity is captured HERE, on the thread that knows who is asking, and checked again when the
+/// worker runs the request (W11).
+fn queue_selection(sid: ServerId, part: i64, aud: i64, sub: Option<i64>, write_back: bool) {
     if part <= 0 {
         return;
     }
+    let Some(c) = plx_plex::plex::client_for(sid) else {
+        return;
+    };
+    let request = QueuedSelection {
+        sid,
+        part,
+        aud,
+        sub,
+        instance_gen: c.instance_gen(),
+        grant_epoch: c.grant_epoch(),
+        write_back,
+    };
     let spawn = {
         let mut queue = selection_queue();
-        queue.pending.push_back(QueuedSelection { sid, part, aud, sub });
+        queue.pending.push_back(request);
         !std::mem::replace(&mut queue.worker_running, true)
     };
     if spawn {
@@ -7122,7 +7084,7 @@ fn spawn_selection_worker() {
             };
             req
         };
-        put_selection(off, req.sid, req.part, req.aud, req.sub);
+        run_queued_selection(off, &req);
     });
     if !spawned {
         // The OS refused the thread. Drop the running flag so a later `queue_put_selection` gets a
@@ -7149,7 +7111,7 @@ pub(super) struct QueueInfo {
 /// only writer is what keeps that reference sound. A caller that STARTS the next episode must
 /// clone first: `request_play` clears this before the new plan lands.
 pub fn up_next(ps: &PlaybackSession) -> Option<&UpNext> {
-    ps.up_next.as_ref()
+    ps.up_next.as_deref()
 }
 
 /// The current playback's queue rows, in queue order, the row now playing among them — locate it
@@ -7285,6 +7247,8 @@ impl ResolveEnv {
                 && (ps.cur_sub_sidecar || side_reader_admitted(ps)))
                 .then_some(ps.cur_sub_ordinal),
             subtitle_override: None,
+            sub_mode: SubMode::Track,
+            forced_lang: forced_only_lang(ps).to_string(),
             cached_item: meta.cached_playing(sid, rk),
             quality: quality(),
             direct_play_mode: direct_play_mode(),
@@ -7293,6 +7257,11 @@ impl ResolveEnv {
             preview: false,
             audio_enhancements: crate::player::audio_enhancements(),
             pass: plx_plex::plex::serverinfo::subscription_of(sid),
+            memory: recalled_track_memory(sid),
+            // Set in exactly one place, `request_env`: nothing else may default it on.
+            fresh_play: false,
+            #[cfg(any(test, feature = "test-support"))]
+            account_subtitles: None,
             #[cfg(any(test, feature = "test-support"))]
             dv_capability: None,
         }
@@ -7325,7 +7294,7 @@ fn playback_preview_with_capability(
     let mode = direct_play_mode();
     if mode == DirectPlayMode::Forced {
         return (!part.is_empty() && part_is_streamable(part)
-            && video_feed_supported(vcodec, presentation)
+            && video_feed_supported(vcodec, presentation, plx_platform::devcaps::caps())
             && d.audio.iter().any(|a| audio_direct_plays(mode, &a.codec, a.channels)))
             .then_some(Preview::DirectPlay);
     }
@@ -7491,7 +7460,8 @@ pub fn clear_preview(ps: &mut PlaybackSession) {
 
 /// Was the installed session resolved for a hero preview? Unlike [`is_preview`], which the
 /// preview machinery clears as it retires the session, this is fixed at landing and only the next
-/// landing replaces it — so no teardown bookkeeping can turn a trailer into a playback.
+/// landing, or the next FILM request (`request_play_inner`), replaces it — so no teardown
+/// bookkeeping can turn a trailer into a playback, and a film that never lands is never told as one.
 ///
 /// **The one gate on every account write a session makes**: the timeline lease
 /// ([`begin_timeline_reporting`]) and the stop scrobble ([`scrobble_stop`]) both ask it, as do the
@@ -7564,6 +7534,7 @@ pub fn request_play(
         None,
         None,
         false,
+        crate::player::report::AttemptOrigin::Fresh,
     )
 }
 
@@ -7595,7 +7566,32 @@ pub fn request_preview(
         None,
         None,
         false,
+        // A preview mints no attempt (`requested` is not called), so the ledger never reads this;
+        // it names the cause truthfully for whoever reads the request.
+        crate::player::report::AttemptOrigin::Preview,
     )
+}
+
+/// The resolve environment a play REQUEST hands its worker: the snapshot taken AFTER the request
+/// cleared the live selection, the request's own flags, and the retry (if any) applied over it.
+/// MAIN THREAD.
+///
+/// **`fresh_play` is set here and nowhere else (W4).** A viewer's launch is fresh; a retry is not,
+/// whichever of its callers built it (the Retry press, Play Automatically, the start-failure rescue,
+/// the in-flight contract re-resolve all pass `Some(retry)`), and neither is a preview. Only a fresh
+/// play may write a remembered choice back to the server.
+fn request_env(
+    ps: &PlaybackSession, meta: plx_data::metadata::MetadataView<'_>, request: &PlaybackRequest,
+    retry: Option<RetryContext>,
+) -> ResolveEnv {
+    let mut env = ResolveEnv::snapshot(ps, meta, request.sid, &request.rk);
+    env.omit_queue_continuous = plx_data::metadata::context_omits_queue_continuous(&request.ctx);
+    env.set_preview(request.preview);
+    env.fresh_play = retry.is_none() && !request.preview;
+    if let Some(retry) = retry {
+        apply_retry(&mut env, retry);
+    }
+    env
 }
 
 /// Common async request transaction. A retry waits for the real stop's PMS work on THIS worker
@@ -7608,6 +7604,7 @@ fn request_play_inner(
     retry: Option<RetryContext>,
     trace_generation: Option<u32>,
     drain_previous: bool,
+    origin: crate::player::report::AttemptOrigin,
 ) -> bool {
     let sid = request.sid;
     let rk = &request.rk;
@@ -7630,9 +7627,11 @@ fn request_play_inner(
     // under-counts exactly the failure it exists to measure. It is after the empty-request guard
     // above, so a press that resolves to nothing is not an attempt.
     let trace_generation = if request.preview {
+        // No attempt, but a failure latch of its own, reset here as `requested` resets the film's.
+        crate::player::report::preview_requested();
         0
     } else {
-        trace_generation.unwrap_or_else(|| crate::player::report::requested(ps, sid))
+        trace_generation.unwrap_or_else(|| crate::player::report::requested(ps, sid, origin))
     };
     // The fields a play REQUEST owns, as against the ones only a landing may install: the HUD
     // strings (published now, so the pre-roll has a title through the whole resolve) and the five
@@ -7652,12 +7651,7 @@ fn request_play_inner(
             set_c(s.title.as_mut_ptr(), s.title.len(), title);
             set_c(s.ctxline.as_mut_ptr(), s.ctxline.len(), plx_data::metadata::context_label(ctx));
         }
-        s.cur_audio = None;
-        s.cur_sub_sid = 0;
-        s.cur_sub_sidecar = false;
-        s.cur_sub_client_drawable = false;
-        s.cur_sub_ordinal = -1;
-        s.side_subs_refused = false;
+        begin_track_selection(s, retry);
         // The outgoing item's enhancement outcome is not this one's; the landing installs its own.
         s.cur_enhancement = EnhancementOutcome::Off;
         // Retire the OUTGOING item's queue before its successor resolves: this names the episode
@@ -7673,7 +7667,17 @@ fn request_play_inner(
         // a resolve that never lands (a refused spawn) would leave nothing else to clear it.
         s.play_verdict = None;
         s.jail_load_blocked = false;
+        s.native_start_refused = false;
         s.resolve_failed = false;
+        // A film request retires the previous trailer's mark: `resolved_as_preview` is otherwise
+        // replaced only by a LANDING, so a film whose resolve never lands (a refused worker spawn)
+        // would report its failure as that trailer's — its origin, fingerprint and flags. The
+        // trailer's engine is already gone: a Play is held until the preview machine releases it
+        // (`content::hold_feature`), so no preview write gate (`scrobble_stop`,
+        // `begin_timeline_reporting`) is still waiting on the mark. A preview request keeps it.
+        if !request.preview {
+            s.resolved_as_preview = false;
+        }
     } };
     // …and the outgoing item's track/marker/chapter store, for exactly the reason above: it stays
     // the PREVIOUS leaf's until this resolve lands. See `metadata::retire_playing_item`.
@@ -7686,19 +7690,7 @@ fn request_play_inner(
     // and makes the landing stale instead of installing an old plan beneath a new checkmark.
     let contract_revision = desired_contract_revision();
     // captured HERE, on the main thread, and moved into the worker — see ResolveEnv
-    let mut env = ResolveEnv::snapshot(ps, meta.view(), sid, rk);
-    env.omit_queue_continuous = plx_data::metadata::context_omits_queue_continuous(ctx);
-    env.set_preview(request.preview);
-    if let Some(retry) = retry {
-        apply_retry_enhancement(&mut env, retry);
-        // `request_play` resets the live selection because that is correct for a new item.  A
-        // retry is the SAME item: override the fresh defaults with the selection captured before
-        // that reset so a rescue does not silently turn subtitles/audio back to server default.
-        env.direct_play_mode = retry.direct_play_mode;
-        env.audio_sid = retry.audio_sid;
-        env.sub_sid = retry.sub_sid;
-        env.subtitle_override = Some(retry.sub_sid);
-    }
+    let env = request_env(ps, meta.view(), &request, retry);
     let gen = PLAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(resume_ns) = retry.map(|r| r.resume_ns).filter(|ns| *ns > 0) {
         *PLAY_RESUME.lock().unwrap_or_else(|e| e.into_inner()) = Some((gen, resume_ns));
@@ -7758,11 +7750,34 @@ fn request_play_inner(
     spawned
 }
 
+/// What a play REQUEST clears of the outgoing item's live track selection (the landing installs
+/// the incoming item's own).
+fn clear_track_selection(s: &mut PlaybackSession) {
+    s.cur_audio = None;
+    s.cur_sub_sid = 0;
+    s.selection_known = false;
+    s.cur_sub_sidecar = false;
+    s.cur_sub_client_drawable = false;
+    s.cur_sub_ordinal = -1;
+    s.side_subs_refused = false;
+}
+
+/// What a play request does to the live track selection: clear it, and keep the pair a RETRY
+/// carried ([`PlaybackSession::carried_selection`]) so a retry built before this one lands still
+/// finds it. A new item (`None`) carries nothing.
+fn begin_track_selection(s: &mut PlaybackSession, retry: Option<RetryContext>) {
+    clear_track_selection(s);
+    s.carried_selection = retry.and_then(|r| r.selection);
+    // The mode rides the retry the same way the pair does: kept while no playable plan has landed,
+    // so a second retry built before this one lands still finds Forced only.
+    s.sub_mode = retry.map_or(SubMode::Track, |r| r.sub_mode);
+}
+
 /// Clear the outgoing item's live track selection for a play request. A retry is the SAME item
-/// resolved again with the subtitle it had (`RetryContext::sub_sid`, applied to the resolve env
-/// below), so the timing offset tuned against that subtitle is carried with it. A genuinely NEW
-/// request (no retry) instead resumes whatever this profile last tuned for THIS item, if anything
-/// (`Session::subtitle_offset_for`, keyed by machine id + ratingKey, never by track — a track
+/// resolved again with the subtitle it had when that was known (`RetryContext::selection`, applied
+/// to the resolve env by [`apply_retry`]), so the timing offset tuned against that subtitle is
+/// carried with it. A genuinely NEW request (no retry) instead resumes whatever this profile last tuned for THIS item, if anything
+/// ([`recall`] of the subtitle-offset memory, keyed by machine id + ratingKey, never by track — a track
 /// CHANGE within one playback already zeros it, `commit_subtitle_selection`'s own doc). Either way
 /// the landing re-clamps it once the subtitle is re-selected (`player::reclamp_subtitle_offset`),
 /// since the reset has just deselected the sidecar whose range allows an advance.
@@ -7777,44 +7792,6 @@ fn reset_track_selection(sid: ServerId, rk: &str, retry: Option<RetryContext>) {
             }
         }
     }
-}
-
-/// This profile's remembered subtitle sync-timing correction for `rk` on `sid`'s server, if this
-/// television has ever tuned one — the read half of [`persist_subtitle_offset`]. `None` when the
-/// server is not (yet) registered, which a resolve about to fail for the same reason would find
-/// out anyway.
-fn remembered_subtitle_offset(sid: ServerId, rk: &str) -> Option<i64> {
-    let machine_id = plx_plex::plex::client_for(sid)?.machine_id();
-    if machine_id.is_empty() {
-        return None;
-    }
-    plx_plex::plex::session::peek().subtitle_offset_for(&plx_plex::plex::session::current_profile_key(), machine_id, rk)
-}
-
-/// Persist the viewer's subtitle sync-timing correction for the CURRENTLY PLAYING item, so the
-/// next resume of this exact file starts from where they left it (`remembered_subtitle_offset`'s
-/// own doc). Fire-and-forget on the storage worker, like every other in-player preference edit
-/// (`player::set_subtitle_tone`) — the live atomic ([`crate::player::set_subtitle_offset`]) is
-/// already applied by the time this queues, so a slow or lost write costs only the NEXT resume,
-/// never this one.
-pub fn persist_subtitle_offset(ps: &PlaybackSession, offset_ms: i64) {
-    let Some(machine_id) = plx_plex::plex::client_for(cur_sid(ps)).map(|c| c.machine_id().to_string()) else {
-        return;
-    };
-    if machine_id.is_empty() {
-        return;
-    }
-    let rk = cur_rk(ps);
-    let user = plx_plex::plex::session::current_profile_key();
-    let wanted = (offset_ms != 0).then_some(offset_ms);
-    plx_plex::plex::session::queue_update(move |current| {
-        if current.subtitle_offset_for(&user, &machine_id, &rk) == wanted {
-            return None;
-        }
-        let mut next = current.clone();
-        next.set_subtitle_offset_for(&user, &machine_id, &rk, wanted);
-        Some(next)
-    });
 }
 
 /// Start a fresh resolve for the item whose terminal error is still on screen.
@@ -7843,11 +7820,15 @@ pub fn confirm_resume_presented(ps: &mut PlaybackSession) {
 fn current_retry_context(ps: &PlaybackSession, resume_ns: i64) -> RetryContext {
     RetryContext {
         resume_ns: resume_ns.max(0),
-        audio_sid: cur_audio_sid(ps),
-        sub_sid: cur_sub_sid(ps),
+        selection: if ps.selection_known {
+            Some((cur_audio_sid(ps), cur_sub_sid(ps)))
+        } else {
+            ps.carried_selection
+        },
         sub_offset_ms: crate::player::subtitle_offset_ms(),
         direct_play_mode: ps.direct_play_mode,
         suppress_enhancement: false,
+        sub_mode: ps.sub_mode,
     }
 }
 
@@ -7862,6 +7843,26 @@ fn rescue_retry_context(ps: &PlaybackSession, resume_ns: i64) -> RetryContext {
     }
 }
 
+/// Everything a retry overrides in the resolve environment it is about to hand the worker.
+fn apply_retry(env: &mut ResolveEnv, retry: RetryContext) {
+    apply_retry_enhancement(env, retry);
+    env.direct_play_mode = retry.direct_play_mode;
+    // `request_play` resets the live selection because that is correct for a new item.  A
+    // retry is the SAME item: override the fresh defaults with the selection captured before
+    // that reset so a rescue does not silently turn subtitles/audio back to server default.
+    // Only a KNOWN selection is carried: with nothing landed the captured pair is the cleared `0`
+    // sentinel, and applying it would force subtitles Off over the account's own rule.
+    if let Some((audio_sid, sub_sid)) = retry.selection {
+        env.audio_sid = audio_sid;
+        env.sub_sid = sub_sid;
+        env.subtitle_override = Some(sub_sid);
+        env.sub_mode = retry.sub_mode;
+        // That selection is the viewer's own pick of THIS playback and outranks anything the
+        // profile remembered for the show.
+        env.memory.clear();
+    }
+}
+
 /// Apply a retry's enhancement decision to the resolve environment it is about to hand the worker.
 fn apply_retry_enhancement(env: &mut ResolveEnv, retry: RetryContext) {
     if retry.suppress_enhancement {
@@ -7870,12 +7871,15 @@ fn apply_retry_enhancement(env: &mut ResolveEnv, retry: RetryContext) {
 }
 
 /// `direct_play` replaces the failed attempt's Direct Play mode for this resolve (the failure
-/// read-out's *Switch to Auto and play*); `None` keeps it.
+/// read-out's *Switch to Auto and play*); `None` keeps it. `origin` is why the viewer asked: a
+/// Retry press is `user_retry`, a quality pick on the failure screen is `quality_change`. The new
+/// attempt is the NEXT open of the same session, so its ordinal continues the failed one's.
 pub fn retry_current_play(
     ps: &mut PlaybackSession,
     meta: &mut plx_data::stores::metadata::MetadataStore,
     resume_ns: i64,
     direct_play: Option<DirectPlayMode>,
+    origin: crate::player::report::AttemptOrigin,
 ) -> bool {
     let Some(request) = ps.request.clone() else {
         crate::player::log("playback retry: no Plex request descriptor");
@@ -7886,7 +7890,7 @@ pub fn retry_current_play(
         quality(),
     ));
     let retry = retry_context_with(ps, resume_ns, direct_play);
-    request_play_inner(ps, meta, request, Some(retry), None, true)
+    request_play_inner(ps, meta, request, Some(retry), None, true, origin)
 }
 
 /// [`rescue_retry_context`] with the failed attempt's Direct Play mode optionally replaced — the
@@ -8039,7 +8043,16 @@ pub fn pump_play(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata
             crate::player::log(
                 "playback resolve: desired contract changed in flight; discarding and resolving the latest contract",
             );
-            let _ = request_play_inner(ps, meta, request, Some(retry), Some(trace_generation), false);
+            let _ = request_play_inner(
+                ps,
+                meta,
+                request,
+                Some(retry),
+                Some(trace_generation),
+                false,
+                // Unused: the attempt is already minted and this resolve continues it.
+                crate::player::report::AttemptOrigin::Fresh,
+            );
         } else {
             cancel_playback_request(ps, has_url(ps));
         }
@@ -8048,7 +8061,7 @@ pub fn pump_play(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata
     PLAY_BUSY.store(false, Ordering::SeqCst);
     let ok = !plan.url.is_empty();
     // A refusing `/decision` is a real landing (its verdict must still be installed for the error
-    // read-out), but it has no Engine and therefore no ACTIVE_ENCODER/scrobble owner. The cold
+    // read-out; `apply_plan` leaves the selection UNKNOWN for it), but it has no Engine and therefore no ACTIVE_ENCODER/scrobble owner. The cold
     // source probe or the decision itself may already have registered the logical resource.
     let refused_resources = (!ok).then(|| abandoned_plan_resources(&plan)).flatten();
     let resume_ns = {
@@ -8111,6 +8124,19 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
         String::new()
     };
     let resolve_failed = plan.url.is_empty() && plan.verdict.is_none();
+    // A REFUSED plan installs too (its verdict feeds the error read-out) but selected nothing, so
+    // only a playable one makes the selection below known.
+    let selection_known = !plan.url.is_empty();
+    // The playing item moves into the store below; the session keeps the two facts the track
+    // memory is keyed and gated on.
+    let (cur_show_rk, cur_kind) = plan
+        .playing
+        .as_ref()
+        .map(|p| (p.show_rk.clone(), p.kind.clone()))
+        .unwrap_or_default();
+    // The remembered choice this landing applied and the server may not have (W6). Computed here
+    // because the playing item moves into the store just below, and only for a playable landing.
+    let write_back = parked_write_back(&plan);
     meta.run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(
         plan.playing,
     ));
@@ -8153,11 +8179,17 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
         } else {
             (plan.vcodec, plan.acodec, plan.src_vcodec, plan.src_acodec)
         };
+        // A refused landing selected nothing, so it keeps what the retry that led here carried; a
+        // playable one has a known selection of its own.
+        let carried_selection = if selection_known { None } else { s.carried_selection };
+        // …and the subtitle mode with it: a refused landing keeps the retry's.
+        let sub_mode = if selection_known { plan.sub_mode } else { s.sub_mode };
         let now_ms = s.now_ms;
         let preview = request.as_ref().is_some_and(|r| r.preview);
         *s = PlaybackSession {
             direct_play_mode: plan.direct_play_mode,
             jail_load_blocked: false,
+            native_start_refused: false,
             repair_status: plx_platform::tv::sandbox::State::Idle,
             request,
             requested_resume_ns,
@@ -8196,6 +8228,8 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             // the part/show-selected subtitle (0 = none), so the menu checkmark, the timeline report
             // and any later transcode of this item all agree with what the renderer is told below
             cur_sub_sid: plan.sub_sid,
+            selection_known,
+            carried_selection,
             // Negative = an external sidecar the client draws itself (`sub_render_ordinal`'s own
             // convention); `None` (Off) never sets `sub_sid` either, so this reads `false` for it.
             cur_sub_sidecar: plan.sub_render_ordinal.is_some_and(|ord| ord < 0),
@@ -8204,6 +8238,12 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             cur_sub_ordinal: plan.sub_render_ordinal.unwrap_or(-1),
             side_subs_refused: false,
             cur_sub_pref_lang: plan.sub_pref_lang,
+            cur_show_rk,
+            cur_kind,
+            cur_memory_note: plan.memory_note,
+            write_back,
+            sub_mode,
+            track_ctx: plan.track_ctx,
             cur_part_id: plan.part_id,
             sess: plan.sess,
             machine_id,
@@ -8220,7 +8260,7 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             stream_immersive: plan.immersive,
             title,
             ctxline,
-            up_next: plan.up_next,
+            up_next: plan.up_next.map(std::sync::Arc::new),
             queue: plan.queue,
             // The frame tick is the MACHINE's, not the plan's: a landing replaces the session's
             // contents and must not rewind the stamp `Player::set_now` wrote this iteration.
@@ -8242,17 +8282,23 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
     }
     // Restore the external renderer AND the route's stream identity before publishing the
     // start contract, so timeline reports and later audio/quality transcodes keep this pick.
-    // Also over a plain remux: the server carries no subtitle there, so the app draws the sidecar
-    // (`side_subs_allowed`). Every other transcode keeps the server's burn and no client sidecar.
+    // The sidecar is the server's own selection, else the one the profile's memory chose for this
+    // episode (`plan.memory_sidecar`, its key and codec read from the playing item: one restore, one
+    // selection list). Also over a plain remux: the server carries no subtitle there, so the app
+    // draws the sidecar (`side_subs_allowed`). Every other transcode keeps the server's burn and no
+    // client sidecar.
     if plan.sub_render_ordinal.is_none()
         && (!is_transcoding(ps) || (ps.cur_contract.remux && original_remux_shape(ps)))
     {
-        if let Some(id) = crate::player::sidecar::restore_server_selection(cur_sid(ps), meta.view()) {
+        if let Some(id) =
+            crate::player::sidecar::restore_selection(cur_sid(ps), meta.view(), plan.memory_sidecar)
+        {
             set_subtitle(ps, id);
             ps.cur_sub_sidecar = true;
             ps.cur_sub_client_drawable = true;
         }
     }
+    settle_landing_selection(ps);
     let start = prepare_playback_landing(ps, !ps.url.is_empty());
     // SHARED.desired_audio_idx is read by the DEMUX THREAD on every reopen — main thread only.
     if let Some(ord) = plan.feed_audio_ordinal {
@@ -9847,6 +9893,9 @@ pub struct EnhTestFixture {
     /// Part bitrate, with the client able to draw it. Only meaningful with
     /// `subtitle_effect: Embedded` on a remux.
     pub side_reader: bool,
+    /// A remembered subtitle was chosen for this play but the route shows none of it
+    /// ([`cur_memory_note`]): the Subtitles tab says why.
+    pub memory_note: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -9866,6 +9915,7 @@ impl Default for EnhTestFixture {
             applied_burn: false,
             in_flight: false,
             side_reader: false,
+            memory_note: false,
         }
     }
 }
@@ -9903,6 +9953,7 @@ pub fn enhancement_test_session(route: EnhTestFixture) -> (PlaybackSession, Serv
     ps.cur_sub_sid = if route.subtitle_effect == SubtitleEffect::None { 0 } else { 999 };
     ps.cur_sub_sidecar = route.subtitle_effect == SubtitleEffect::Sidecar;
     ps.cur_sub_client_drawable = ps.cur_sub_sidecar;
+    ps.cur_memory_note = route.memory_note;
     ps.cur_enhancement = if route.refused {
         EnhancementOutcome::Refused
     } else if route.unverified {
@@ -9981,10 +10032,30 @@ pub fn enhancement_test_session(route: EnhTestFixture) -> (PlaybackSession, Serv
 /// direct-playable; else a server re-transcode with that stream selected. `audio.ordinal` is the
 /// CONTAINER audio ordinal (the menu converts its row via metadata::audio_ordinal); `audio` itself
 /// is the frozen `CarriedAudio` snapshot (issue #266) the menu built via `CarriedAudio::from_stream`.
-pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
+///
+/// **Returns whether the route accepted the pick**, which is what the track memory is written on: it
+/// is `false` only for the Forced refusal (the pick is not played and the verdict says so). A pick
+/// deferred behind a pending Original handoff, or one the enhancement reconcile re-routes, is
+/// accepted.
+///
+/// **While the subtitle mode is Forced only the pick also re-points it** (FO): the forced
+/// track in the language of the audio just chosen is committed as a derived selection
+/// ([`follow_audio_with_forced_only`]), which PUTs like any in-playback subtitle change and writes
+/// NO memory: the memo stays Forced only.
+pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) -> bool {
+    let sid = audio.sid;
+    let accepted = commit_audio_route(ps, audio);
+    if accepted {
+        follow_audio_with_forced_only(ps, sid);
+    }
+    accepted
+}
+
+/// The route half of [`commit_audio_selection`]: which way the pick reloads, and what it displaces.
+fn commit_audio_route(ps: &mut PlaybackSession, audio: CarriedAudio) -> bool {
     if forced_direct_play(ps) && !audio_track_direct_plays(ps, &audio.codec, audio.channels) {
         ps.play_verdict = Some(PlayVerdict::Forced(ForcedFailure::AudioNeedsConversion));
-        return;
+        return false;
     }
     if original_recovery_pending() {
         if let Some(pending) = PLAYER_CONTROL
@@ -9996,7 +10067,7 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
             pending.deferred_audio = Some(audio);
         }
         crate::player::log("audio: deferred until pending Original handoff commits or rolls back");
-        return;
+        return true;
     }
     // Audio always changes the decoder/server route contract, even when the eventual route stays
     // direct. Fence the old worker before publishing the selected stream or invalidating its
@@ -10031,13 +10102,14 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
     let stream_id = audio.sid;
     let native = family == RouteFamily::Direct && direct_plays;
     let (ordinal, codec) = (audio.ordinal, audio.codec.clone());
-    { let s = &mut *ps; s.cur_audio = Some(audio) };
+    { let s = &mut *ps; s.cur_audio = Some(audio); s.selection_known = true };
     if native {
         // record the pick: the timeline then reports the stream that actually plays, and a
         // later transcode event (subtitle burn refresh / transcode seek) keeps this track.
         // persist the USER's pick server-side (official-client behavior): /status/sessions'
-        // selected-stream display keys on the part selection, not the timeline report. Only
-        // user picks persist — the start-of-play auto-pick (eng preference) reports only. Reached
+        // selected-stream display keys on the part selection, not the timeline report. User picks
+        // persist here; an applied remembered pick is written once, on its first decoded frame
+        // (`send_parked_write_back`); a fall-through auto-pick still only reports. Reached
         // from `app/playback.rs::commit_track` inside the run-loop's `FrameScope`, so this PUT runs
         // on the serial selection worker instead of blocking the frame thread.
         queue_put_selection(cur_sid(ps), cur_part_id(ps), cur_audio_sid(ps), cur_sub_sid(ps));
@@ -10048,7 +10120,7 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
     if reconcile_enhancement(ps, true) {
         // the reconcile's Retranscode owes this pick its reload
         crate::player::note_audio_pick();
-        return;
+        return true;
     }
     if native {
         crate::player::request_audio_track(ps, ordinal, &codec);
@@ -10057,6 +10129,7 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
     }
     // the rebuild now loading is this pick's: the read-out says "Switching audio…"
     crate::player::note_audio_pick();
+    true
 }
 
 /// Apply commands which were attached to one exact Original trial, after either the candidate or
@@ -10087,6 +10160,29 @@ pub fn commit_subtitle_selection(
     stream_id: i64,
     client_renderable: bool,
 ) {
+    commit_subtitle_selection_inner(ps, sub_idx, stream_id, client_renderable, true);
+}
+
+/// [`commit_subtitle_selection`] with the direct-play selection PUT optional. `put == false` is for
+/// the commit whose server write is accounted for or must not happen: the first frame's
+/// container-name re-match while a live write-back is parked, which carries the re-matched subtitle
+/// itself ([`repoint_parked_subtitle`]), and that re-match over a Part that carries an external
+/// stream, where W5 forbids any subtitle write. Everything else a commit does (the burn refresh, the
+/// side reader, the route projection) is unchanged.
+fn commit_subtitle_selection_inner(
+    ps: &mut PlaybackSession,
+    sub_idx: i32,
+    stream_id: i64,
+    client_renderable: bool,
+    put: bool,
+) {
+    // An ORDINARY commit settles the mode from the stream it picks (Forced only is put back by the
+    // commits derived from it), and a viewer's pick ends any owed container-name re-match: the
+    // viewer has decided what is on screen.
+    ps.sub_mode = SubMode::of_stream(stream_id);
+    if let Some(ctx) = ps.track_ctx.as_mut() {
+        ctx.rematch = None;
+    }
     let transcoding = is_transcoding(ps);
     // A live plain remux whose new pick is Off or a subtitle the app draws over it (a sidecar, or
     // an embedded track the side reader is admitted for) keeps its stream: the server never carried
@@ -10138,9 +10234,17 @@ pub fn commit_subtitle_selection(
     // always republishes — keeps what the viewer found.
     if stream_id != ps.cur_sub_sid {
         crate::player::set_subtitle_offset(0);
+        // What the track-memory note explained (the remembered subtitle is not what is shown) ends
+        // with the first commit that changes what is shown. A landing sets the flag afresh from its
+        // plan, but a pick the app draws in place (a sidecar, a track the side reader draws) runs
+        // none, and the note would go on denying a subtitle the viewer can see. Pressing OK on what
+        // is already shown (Off, while the note is up) is not such a commit: the memory still holds
+        // a track the route still cannot show.
+        ps.cur_memory_note = false;
     }
     crate::player::request_subtitle(sub_idx);
     set_subtitle(ps, stream_id);
+    ps.selection_known = true;
     // `sub_idx` is `metadata::sub_render_ordinal`'s own convention: negative for an external
     // sidecar (and for Off, where `stream_id == 0` disambiguates), non-negative for an embedded
     // track. Issue #266 I6 reads this back through `facts` to tell a sidecar (unaffected by the
@@ -10157,7 +10261,9 @@ pub fn commit_subtitle_selection(
         // stale server-side selection that would otherwise burn on the next transcode). Reached
         // from `app/playback.rs::commit_track` inside the run-loop's `FrameScope`, so this PUT runs
         // on the serial selection worker instead of blocking the frame thread.
-        queue_put_selection(cur_sid(ps), cur_part_id(ps), cur_audio_sid(ps), cur_sub_sid(ps));
+        if put {
+            queue_put_selection(cur_sid(ps), cur_part_id(ps), cur_audio_sid(ps), cur_sub_sid(ps));
+        }
     }
     if in_place {
         // The stream stays; what the app reads beside it follows the pick (start, switch or stop
@@ -10172,6 +10278,32 @@ pub fn commit_subtitle_selection(
     if transcoding && !in_place {
         crate::player::request_transcode_refresh(ps); // retranscode PUTs the selection itself
     }
+}
+
+/// Which of the three subtitle states the playback is in ([`SubMode`]).
+pub fn cur_sub_mode(ps: &PlaybackSession) -> SubMode {
+    ps.sub_mode
+}
+
+/// Put `ps` in `mode` as a Forced only pick would, for a menu test that cannot reach the field.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_sub_mode_for_test(ps: &mut PlaybackSession, mode: SubMode) {
+    ps.sub_mode = mode;
+}
+
+/// **The language Forced only falls back to** when the audio that plays names none: the one the
+/// remembered Forced only (or the row's last choice) recorded, kept on the landing's
+/// [`TrackContext`]. Empty when nothing recorded one or no item has landed. The resolve and the
+/// audio follow already match with it; the Subtitles menu reads it too, so the row and the next
+/// episode choose by one rule.
+pub fn forced_only_lang(ps: &PlaybackSession) -> &str {
+    ps.track_ctx.as_ref().map_or("", |c| c.forced_lang.as_str())
+}
+
+/// Give `ps` the Forced only fallback language `lang`, for a menu test that cannot reach the field.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_forced_only_lang_for_test(ps: &mut PlaybackSession, lang: &str) {
+    ps.track_ctx.get_or_insert_with(TrackContext::default).forced_lang = lang.to_string();
 }
 
 /// Atomically publish the main-thread session fields a newly spawned timeline reporter may read.
@@ -10342,6 +10474,10 @@ mod direct_play_mode_tests;
 mod subtitle_style_tests;
 
 #[cfg(test)]
+#[path = "decision_selection_known_tests.rs"]
+mod selection_known_tests;
+
+#[cfg(test)]
 #[path = "carried_audio_tests.rs"]
 mod carried_audio_tests;
 
@@ -10352,3 +10488,23 @@ mod plan_audio_enhancement_tests;
 #[cfg(test)]
 #[path = "decision_audio_enhancement_tests.rs"]
 mod audio_enhancement_tests;
+
+#[cfg(test)]
+#[path = "decision_prefs_characterisation_tests.rs"]
+mod prefs_characterisation_tests;
+
+#[cfg(test)]
+#[path = "decision_prefs_door_tests.rs"]
+mod prefs_door_tests;
+
+#[cfg(test)]
+#[path = "decision_memory_tests.rs"]
+mod memory_tests;
+
+#[cfg(test)]
+#[path = "decision_track_memory_tests.rs"]
+mod track_memory_tests;
+
+#[cfg(test)]
+#[path = "decision_write_back_tests.rs"]
+mod write_back_tests;

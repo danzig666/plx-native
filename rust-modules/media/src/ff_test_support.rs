@@ -137,6 +137,78 @@ pub(super) fn with_counting_listener(
     });
 }
 
+/// A server that honours `Range` and cuts the body: the first `cuts` connections send `per` bytes
+/// of what was asked for and then close, so each cut is a transfer that dies mid-body. `reset` ends a
+/// cut connection with an RST (`SO_LINGER` 0) instead of a short close. Returns the port, the file
+/// served and the `Range` start of every request in arrival order (`None` for a plain GET).
+pub(super) fn cutting_server(
+    n: usize,
+    cuts: usize,
+    per: usize,
+    reset: bool,
+) -> (u16, Vec<u8>, std::sync::Arc<std::sync::Mutex<Vec<Option<usize>>>>) {
+    use std::io::{Read, Write};
+    let file: Vec<u8> = (0..n).map(|i| (i * 7 + i / 251) as u8).collect();
+    let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = srv.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (f2, s2) = (file.clone(), seen.clone());
+    std::thread::spawn(move || {
+        let mut conn = 0usize;
+        for s in srv.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            let start = head.lines().find_map(|l| {
+                l.strip_prefix("range: bytes=")
+                    .and_then(|r| r.split('-').next().and_then(|a| a.trim().parse::<usize>().ok()))
+            });
+            let at = start.unwrap_or(0);
+            let cut = conn < cuts;
+            let send = if cut { per.min(n - at) } else { n - at };
+            s2.lock().unwrap().push(start);
+            conn += 1;
+            let h = match start {
+                Some(_) => format!(
+                    "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {at}-{}/{n}\r\nContent-Length: {}\r\n\r\n",
+                    n - 1,
+                    n - at
+                ),
+                None => format!("HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {n}\r\n\r\n"),
+            };
+            let _ = s.write_all(h.as_bytes());
+            let _ = s.write_all(&f2[at..at + send]);
+            let _ = s.flush();
+            if cut {
+                // Past the client's header phase, so the death is a BODY failure.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if reset {
+                    use std::os::fd::AsRawFd;
+                    let l = libc::linger { l_onoff: 1, l_linger: 0 };
+                    unsafe {
+                        libc::setsockopt(
+                            s.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
+                            &l as *const _ as *const c_void,
+                            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                        );
+                    }
+                }
+            }
+            drop(s);
+        }
+    });
+    (port, file, seen)
+}
+
 /// An open stream plus the aborted video lane behind its AVIO — the state teardown leaves:
 /// `engine::teardown` aborts both lanes, `http_shutdown`s this socket, then joins the demuxer.
 pub(super) fn opened_stream_with_aborted_lane(
@@ -189,4 +261,56 @@ pub(super) fn opened_curl_with_aborted_lane(port: u16) -> (Box<crate::curlio::Cu
     let mut aq = crate::aq::aq_new(1 << 20);
     crate::aq::aq_abort(&mut *aq);
     (cs, aq)
+}
+
+/// Serve media bytes over HTTP with Range support for the native subtitle readers.
+pub(super) fn serve_file(body: Vec<u8>, stop: &'static AtomicBool) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let srv = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = srv.local_addr().unwrap().port();
+    srv.set_nonblocking(true).unwrap();
+    let h = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            let Ok((mut s, _)) = plx_base::testnet::accept(&srv) else {
+                std::thread::yield_now();
+                continue;
+            };
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let Some(k) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        match s.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                continue;
+                            }
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..k]).to_ascii_lowercase();
+                    buf.drain(..k + 4);
+                    let from = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .and_then(|r| r.trim_end_matches('-').parse::<usize>().ok());
+                    let reply = match from {
+                        Some(n) if n < body.len() => format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {n}-{}/{}\r\n\r\n",
+                            body.len() - n,
+                            body.len() - 1,
+                            body.len()
+                        ),
+                        _ => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+                    };
+                    let n = from.filter(|n| *n < body.len()).unwrap_or(0);
+                    if s.write_all(reply.as_bytes()).is_err() || s.write_all(&body[n..]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, h)
 }

@@ -43,6 +43,8 @@ pub(crate) mod screenshot;
 #[cfg(feature = "devtriggers")]
 pub(crate) mod clock_fact;
 #[cfg(feature = "devtriggers")]
+pub(crate) mod phcount;
+#[cfg(feature = "devtriggers")]
 pub(crate) mod poster_gate;
 #[cfg(feature = "devtriggers")]
 pub(crate) mod tls_selftest;
@@ -160,6 +162,8 @@ pub(crate) struct Scenarios {
     pub(crate) deep_bench: Option<bench::DeepBench>,
     /// `/tmp/plxnative-herobench` — see [`bench`]'s module doc and [`bench::HeroBench`].
     pub(crate) hero_bench: Option<bench::HeroBench>,
+    /// `/tmp/plxnative-holdbench` — see [`bench::PressBench`].
+    pub(crate) hold_bench: Option<bench::PressBench>,
     /// The boot-time trigger flags the loop consults every frame after.
     pub(crate) dev: DevFlags,
     /// The screenshot pipeline's arms (`plxnative-libtype`, `-libgrid`, `-libshelf`, `-libmenu`, `-clockstop`) — see [`screenshot`].
@@ -338,15 +342,15 @@ pub(crate) fn arm_noidle() {
     }
 }
 
-/// `/tmp/plxnative-audioenh=off|boost|loudness` — force the PERSISTED Boost Dialog / Normalize
-/// Loudness preference (issue #266) at boot, harness-only.
+/// `/tmp/plxnative-audioenh=off|boost|loudness` — force the Boost Dialog / Normalize Loudness
+/// preference (issue #266) at boot, harness-only.
 ///
 /// Every other boot override here (`dev::playback_quality_override`, `arm_glassload`, …) is
 /// deliberately in-memory-only, so a test can never mutate a real person's saved preference. This
 /// one is the one exception, and on purpose: `player::set_audio_enhancements` is the SAME call a
-/// person's own track-menu pick makes (it both updates the live route and re-persists through the
-/// storage worker), and an on-device harness case needs the persisted value itself pinned before
-/// boot, not just the in-memory copy — one case proves the cold-start "a saved preference turns an
+/// person's own track-menu pick makes (it both updates the live route and, for a seated profile,
+/// re-persists through the storage worker), and an on-device harness case needs its starting value
+/// pinned before boot — one case proves the cold-start "a saved preference turns an
 /// otherwise-direct-playable route into a remux" path (`route::plan`'s cold-start audio branch) by
 /// booting with the preference already ON, and the very next boot must not inherit whatever a
 /// FAILED previous case's toggle left behind. A toggle-based reset cannot promise that: if the
@@ -354,6 +358,26 @@ pub(crate) fn arm_noidle() {
 /// Forcing the value at boot, every time, is what makes a case's starting preference a property of
 /// the manifest instead of of history — the same argument `run_case`'s per-case viewOffset reset
 /// already makes for resume position.
+///
+/// **Whose record it forces (P1a).** The preference is a PROFILE's, so the persisted value is the
+/// SEATED profile's, and it only exists once a profile is seated. The arm runs twice, both through
+/// the same setter. Boot runs it with nobody seated, which sets the live cell alone (the door
+/// refuses to save for nobody). The seat trigger (`app::bridge::SeatWatch`) runs it again right
+/// after the restore of the process's first `Unseated` to `Seated` change, which writes that
+/// profile's record. Whether that second run happens depends on how the harness boots:
+///
+/// * A token-injected boot (the default, `--guest` included, since `tools/tv-session.sh` and
+///   `tests/run.py` both write `plxnative-token`) is a dev-token boot that never seats, so the arm
+///   sets the live value only, and the next dev-token boot reads the fallback rather than a previous
+///   run's pick.
+/// * A `session: stored` case (`offline_play`, `offline_play_v6` and `offline_pick_cached` in
+///   `tests/manifest.json`) skips the token and boots the install's own sign-in, which seats.
+///   `triggers_for_case` still writes `plxnative-audioenh` for it (`off` by default), so the second
+///   run writes that real profile's own record, and under §3.8.4 it records an own value even for
+///   `off`: such a case leaves `audio_enhancements: NONE` in the install's signed-in profile.
+///
+/// Either way no boot inherits what a failed case left: the token boots never persist it, and a
+/// seated boot overwrites it.
 ///
 /// `off` clears both flags; `boost`/`loudness` sets exactly one (never both — no case here needs
 /// both at once, and a value this test-only can grow a second name later without breaking the
@@ -377,6 +401,79 @@ pub(crate) fn arm_audio_enhancements() {
         "audioenh: forced boost_dialog={} normalize_loudness={} by /tmp/plxnative-audioenh",
         a.boost_dialog, a.normalize_loudness,
     ));
+}
+
+/// `/tmp/plxnative-trackmemory=clear` — forget everything the seated profile's track memory holds,
+/// harness-only.
+///
+/// Track memory is the per-profile record a harness case writes without meaning to: a menu pick on
+/// an episode (`route::commit_audio_pick` / `commit_subtitle_pick`) lands in it, and the next case
+/// that plays the same show would then start from the previous case's tracks. `tests/run.py` writes
+/// `clear` for every case beside `plxnative-audioenh`, so a case's starting memory is a property of
+/// the manifest instead of of history, the argument `arm_audio_enhancements` makes for the
+/// preference. An unrecognised value is ignored rather than guessed at.
+///
+/// **It needs a seat, and so does the memory it clears.** The entries are the seated profile's, read
+/// and removed through the memory door (`route::recall_all`, then `route::remember` with a removal:
+/// the same refusal, the same queued delta, never a write around the door), which refuses for nobody.
+/// A dev-token boot never seats, so it neither remembers nor has anything to clear. The seat trigger
+/// (`app::bridge::SeatWatch`) runs this once, right after the restore of the process's first
+/// `Unseated` to `Seated` change and beside `arm_audio_enhancements`, with the profile it seated: a
+/// stored-session boot (the harness's seated cases) or a picker boot.
+pub(crate) fn arm_track_memory(user: &str) {
+    use plx_plex::plex::session::prefs::{MemoryEntry, TrackMemoryEntry};
+    let Some(v) = plx_base::devtrig::read("trackmemory") else { return };
+    let v = v.trim();
+    if let Some(count) = v.strip_prefix("fill") {
+        fill_track_memory(user, count.strip_prefix(':').unwrap_or(""));
+        return;
+    }
+    if v != "clear" {
+        #[cfg(feature = "devtriggers")]
+        plx_base::eventlog::log(&format!("trackmemory: unrecognised value {v:?} — ignored"));
+        return;
+    }
+    let cleared = plx_media::route::recall_all::<TrackMemoryEntry>(user)
+        .into_iter()
+        .filter(|entry| plx_media::route::remember::<TrackMemoryEntry>(user, entry.key(), |_| None))
+        .count();
+    #[cfg(feature = "devtriggers")]
+    plx_base::eventlog::log(&format!("trackmemory: cleared {cleared} shows by /tmp/plxnative-trackmemory"));
+    #[cfg(not(feature = "devtriggers"))]
+    let _ = cleared;
+}
+
+/// `/tmp/plxnative-trackmemory=fill[:N]` — give the seated profile `N` (default and ceiling: the
+/// per-profile cap, 64) remembered shows with every string at its bound, harness-only.
+///
+/// This is what makes the DB8 write cost of a document carrying `track_memory` at its budget
+/// readable from the log (`session: db8 document bytes=… track_memory=…`, then `session: canonical
+/// write took … ms`): one profile's 64 worst-case entries are the household budget's size
+/// (`one_profile_keeps_64_worst_case_entries`), which no sequence of menu picks reaches on a mock with
+/// a handful of shows. The entries are keyed on a machine id no server has, so they never match a
+/// playback, and are written through the same door as a menu pick (`route::remember`), so a seatless
+/// boot refuses them exactly as it refuses a pick. `clear` removes them.
+fn fill_track_memory(user: &str, count: &str) {
+    use plx_plex::plex::session::prefs::{MemoryEntry, TrackMemoryEntry};
+    // The per-profile cap is the ceiling: a larger count would only evict its own first entries.
+    let cap = plx_plex::plex::session::prefs::TRACK_MEMORY_CAP;
+    let wanted = if count.is_empty() { Some(cap) } else { count.parse::<usize>().ok() };
+    let Some(wanted) = wanted.filter(|n| (1..=cap).contains(n)) else {
+        #[cfg(feature = "devtriggers")]
+        plx_base::eventlog::log(&format!("trackmemory: fill count {count:?} is not 1..={cap} — ignored"));
+        return;
+    };
+    let written = (0..wanted as u32)
+        .map(TrackMemoryEntry::worst_case)
+        .filter(|entry| {
+            let value = entry.clone();
+            plx_media::route::remember::<TrackMemoryEntry>(user, entry.key(), move |_| Some(value.clone()))
+        })
+        .count();
+    #[cfg(feature = "devtriggers")]
+    plx_base::eventlog::log(&format!("trackmemory: filled {written} of {wanted} shows by /tmp/plxnative-trackmemory"));
+    #[cfg(not(feature = "devtriggers"))]
+    let _ = written;
 }
 
 /// `/tmp/plxnative-nobudget` — the frame budget's A/B CONTROL LEG (spec §8.1, phase 11).
@@ -513,6 +610,24 @@ pub(crate) fn herobench_value() -> Option<(u32, u32, bench::PongTarget)> {
         let period = parts.next().and_then(|p| p.parse().ok()).unwrap_or(bench::DEFAULT_HERO_PERIOD_MS);
         let target = if parts.next() == Some("grid") { bench::PongTarget::Grid } else { bench::PongTarget::Hero };
         (n, period, target)
+    })
+}
+/// `/tmp/plxnative-holdbench[=<n>[,<period_ms>[,tap]]]` — `(n, period_ms, kind)`: `n` cycles
+/// (default 100) of a REAL press-and-hold on the focused card — OK down and kept down so the hold
+/// fill runs and the item menu opens out of it, then Back — or, with `tap`, of OK down and a
+/// direction key before the hold threshold (the press-cancel path). `period_ms` is each half's
+/// length, defaulted and clamped per kind by [`bench::PressBench::new`].
+pub(crate) fn holdbench_value() -> Option<(u32, u32, bench::PressKind)> {
+    plx_base::devtrig::read("holdbench").map(|v| {
+        let mut parts = v.trim().split(',').map(str::trim);
+        let n = parse_bench_n(parts.next().unwrap_or(""));
+        let period = parts.next().and_then(|p| p.parse().ok());
+        let tap = parts.next() == Some("tap");
+        if tap {
+            (n, period.unwrap_or(bench::DEFAULT_TAP_PERIOD_MS), bench::PressKind::Tap)
+        } else {
+            (n, period.unwrap_or(bench::DEFAULT_HOLD_PERIOD_MS), bench::PressKind::Hold)
+        }
     })
 }
 fn parse_bench_n(v: &str) -> u32 {
@@ -763,6 +878,110 @@ fn detail_boot_ready(sid: plx_plex::plex::ServerId, rk: &str, want_season: Optio
     loaded: Option<(plx_plex::plex::ServerId, &str, Option<i64>)>, detail_loading: bool, season_loading: bool) -> bool {
     !detail_loading && !season_loading && loaded.is_some_and(|(server, key, season)|
         server == sid && key == rk && want_season.is_none_or(|wanted| season == Some(wanted)))
+}
+
+#[cfg(test)]
+mod track_memory_arm_tests {
+    use super::arm_track_memory;
+    use plx_media::route::{recall_all, remember, seed_memory_for_test, unseed_memory_for_test};
+    use plx_plex::plex::session::prefs::{AudioMemo, TrackMemoryEntry};
+    use plx_plex::plex::session::{self, Session, TempSession};
+
+    const MACHINE: &str = "machine-1";
+
+    fn entry(show: &str) -> TrackMemoryEntry {
+        let japanese = AudioMemo { lang: "jpn".into(), codec: "eac3".into(), channels: 6, ..Default::default() };
+        TrackMemoryEntry::new(MACHINE, show, Some(japanese), None)
+    }
+
+    fn held(user: &str) -> usize {
+        recall_all::<TrackMemoryEntry>(user).len()
+    }
+
+    fn filed() -> usize {
+        session::load().prefs.track_memory.iter().map(|list| list.items.len()).sum()
+    }
+
+    /// **`plxnative-trackmemory=clear` forgets what the SEATED profile remembered, through the door.**
+    /// Each case in the harness starts from empty memory, so a pick one case made is not the next
+    /// case's starting tracks. Armed with `clear` only; another profile's seat clears nothing of
+    /// this one's; the file loses the entries too, not just the mirror.
+    #[test]
+    fn trackmemory_clear_forgets_the_seated_profiles_shows_and_nothing_else() {
+        let _serial = plx_base::testlock::serial();
+        assert!(plx_base::devtrig::ENABLED, "this test arms a dev trigger, which a build without devtriggers cannot");
+        let session = TempSession::new("arm-track-memory");
+        session::save(&Session { client_id: "cid-1".into(), account_token: "acct".into(), ..Default::default() });
+        session.seated("", "acct");
+        seed_memory_for_test::<TrackMemoryEntry>(&session::peek());
+        for show in ["100", "200"] {
+            assert!(remember::<TrackMemoryEntry>("", (MACHINE.to_string(), show.to_string()), move |_| Some(entry(show))));
+        }
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!((held(""), filed()), (2, 2), "setup: two shows remembered, in the mirror and in the file");
+
+        plx_base::devtrig::with_private_triggers(|| {
+            arm_track_memory("");
+            assert_eq!(held(""), 2, "nothing is armed, so nothing is forgotten");
+
+            std::fs::write(plx_base::devtrig::path("trackmemory"), "keep").unwrap();
+            arm_track_memory("");
+            assert_eq!(held(""), 2, "an unrecognised value is ignored, not guessed at");
+
+            std::fs::write(plx_base::devtrig::path("trackmemory"), "clear").unwrap();
+            arm_track_memory("kid");
+            assert_eq!(held(""), 2, "a profile that is not the seated one clears nothing");
+
+            arm_track_memory("");
+            assert_eq!(held(""), 0, "armed with clear, the seated profile's shows are forgotten");
+        });
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(filed(), 0, "and the file forgot them through the same queued update");
+        unseed_memory_for_test::<TrackMemoryEntry>();
+    }
+
+    /// **`plxnative-trackmemory=fill[:N]` writes `N` worst-case shows through the door, and `clear`
+    /// takes them back.** The count defaults to, and is bounded by, the per-profile cap; a count
+    /// outside `1..=CAP` or one that is not a number writes nothing (a guess would put an unplanned
+    /// document size on the set); a profile that is not the seated one gets none.
+    #[test]
+    fn trackmemory_fill_writes_worst_case_shows_through_the_door_and_clear_takes_them_back() {
+        let _serial = plx_base::testlock::serial();
+        assert!(plx_base::devtrig::ENABLED, "this test arms a dev trigger, which a build without devtriggers cannot");
+        let session = TempSession::new("arm-track-memory-fill");
+        session::save(&Session { client_id: "cid-1".into(), account_token: "acct".into(), ..Default::default() });
+        session.seated("", "acct");
+        seed_memory_for_test::<TrackMemoryEntry>(&session::peek());
+        let cap = plx_plex::plex::session::prefs::TRACK_MEMORY_CAP;
+
+        plx_base::devtrig::with_private_triggers(|| {
+            let arm = |value: &str, user: &str| {
+                std::fs::write(plx_base::devtrig::path("trackmemory"), value).unwrap();
+                arm_track_memory(user);
+            };
+            for refused in ["fill:0", &format!("fill:{}", cap + 1), "fill:many", "fill:-3"] {
+                arm(refused, "");
+                assert_eq!(held(""), 0, "{refused:?} is not a count in 1..={cap}, so it fills nothing");
+            }
+            arm("fill:3", "kid");
+            assert_eq!(held(""), 0, "a profile that is not the seated one is given nothing");
+
+            arm("fill:3", "");
+            assert_eq!(held(""), 3, "fill:3 writes three shows");
+            arm("fill", "");
+            assert_eq!(held(""), cap, "a bare fill writes the cap, and the three it overlaps are the same shows");
+            plx_base::storage_worker::drain_for_test();
+            assert_eq!(filed(), cap, "the file holds them too, not only the mirror");
+            assert!(recall_all::<TrackMemoryEntry>("").iter().all(|e| e.audio.is_some() && e.subtitle.is_some()),
+                "each is the worst-case shape, both halves present");
+
+            arm("clear", "");
+            assert_eq!(held(""), 0, "clear takes the filled shows back like any others");
+        });
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(filed(), 0, "and the file forgot them");
+        unseed_memory_for_test::<TrackMemoryEntry>();
+    }
 }
 
 #[cfg(test)]
@@ -1415,6 +1634,12 @@ fn menu_arm(app: &mut App, fr: &mut Frame) {
 /// itself, which is the issue #266 PR4 fix this trigger inherits (see
 /// `TrackMenuState::row_for_audio_target`'s doc for that history). An unrecognized name logs a
 /// clear line and commits nothing, same shape as the existing "row already active" no-commit log.
+///
+/// **The pick is a viewer's.** It goes through the menu's own commit, so it carries the pick's
+/// descriptor and `commit_track` remembers it for the show (seated, episode, accepted), exactly as a
+/// press would; `plxnative-trackmemory=clear` ([`arm_track_memory`]) is what keeps one case's pick
+/// out of the next case's starting tracks. [`subtiming_arm`] and the other setup arms commit with no
+/// descriptor and remember nothing.
 fn menupick_arm(app: &mut App, fr: &mut Frame) {
     if !app.scenarios.menupick_tried && matches!(app.route(), AppArg::Player) && fr.now.wrapping_sub(app.t0) > 7000 {
         app.scenarios.menupick_tried = true;
@@ -1733,6 +1958,8 @@ fn subtiming_arm(app: &mut App, fr: &mut Frame) {
             stream_id,
             sidecar_key: None,
             sidecar_codec: String::new(),
+            // A setup commit, not the viewer's choice: it remembers nothing.
+            memo: None,
         },
     );
 }
@@ -1903,6 +2130,8 @@ mod replay_after_eos_tests {
 pub(crate) unsafe fn each_frame(app: &mut App, fr: &mut Frame) -> bool {
     #[cfg(feature = "devtriggers")]
     poster_gate::tick(app, fr.now);
+    #[cfg(feature = "devtriggers")]
+    phcount::tick(fr.now);
     autoplay_arm(app, fr);
     grid_library_search_heroidx_arm(app, fr);
     settings_boot_arm(app, fr);
@@ -2158,7 +2387,21 @@ fn tex_field() -> String {
 /// frame's total. Gated on `presented`: an iteration the idle gate skipped drew nothing, so
 /// counting it toward `frames` or `worst_ms` would grade an absent frame as a fast one, exactly
 /// the reasoning `Instruments::frame_drop_line`'s own `worst` peak already uses.
-pub(crate) fn bench_frame_tick(app: &mut App, presented: bool, now: u32) {
+pub(crate) fn bench_frame_tick(app: &mut App, presented: bool, deferred: bool, now: u32) {
+    if deferred {
+        for clock in [
+            app.scenarios.push_bench.as_mut().map(|b| &mut b.clock),
+            app.scenarios.modal_bench.as_mut().map(|b| &mut b.clock),
+            app.scenarios.deep_bench.as_mut().map(|b| &mut b.clock),
+            app.scenarios.hero_bench.as_mut().map(|b| &mut b.clock),
+            app.scenarios.hold_bench.as_mut().map(|b| &mut b.clock),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bench::bench_note_defer(clock);
+        }
+    }
     if !presented {
         return;
     }
@@ -2174,6 +2417,9 @@ pub(crate) fn bench_frame_tick(app: &mut App, presented: bool, now: u32) {
         bench::bench_note_frame(&mut b.clock, now, total, interval);
     }
     if let Some(b) = app.scenarios.hero_bench.as_mut() {
+        bench::bench_note_frame(&mut b.clock, now, total, interval);
+    }
+    if let Some(b) = app.scenarios.hold_bench.as_mut() {
         bench::bench_note_frame(&mut b.clock, now, total, interval);
     }
 }
@@ -2531,6 +2777,91 @@ pub(crate) fn hero_bench_tick(app: &mut App, now: u32) {
         bench::BenchStep::Done(n) => {
             plx_base::eventlog::log(&format!("bench: kind=hero done cycles={n}"));
             app.scenarios.hero_bench = None;
+        }
+    }
+}
+
+/// The surface the press bench can press a card of right now, and whether a card is focused on it.
+fn press_host(app: &App) -> Option<(bench::PressHost, bool)> {
+    match app.route() {
+        AppArg::Home => Some((bench::PressHost::Home, app.bridge.home_grid_focused(&app.pages))),
+        AppArg::Library => Some((bench::PressHost::Library, crate::app::bridge::Bridge::library_card_focused(&app.pages))),
+        AppArg::Content(plx_screens::registry::ContentArg::Collection(_)) =>
+            Some((bench::PressHost::Collection, app.bridge.collection_card_focused(&app.pages))),
+        _ => None,
+    }
+}
+
+/// `/tmp/plxnative-holdbench` — see [`bench::PressBench`]: `n` cycles of a REAL press on the focused
+/// card, through the key path a remote uses (`script_key`'s edges into `app.inputs`, the same queue
+/// `press_arm` and the grid pong use), so the card's press-in, the hold capsule's fill, the item
+/// menu's open and its dismissal are all inside the graded halves.
+///
+/// Open half (`Start` -> `Settle`): hold sends OK-DOWN and nothing else — no key-up, ever (the
+/// dispatcher abandons the press when it answers the hold, and an OK edge while the menu is up
+/// would land on its Play row). Close half (`Settle` -> `Report`): hold sends Back, only while the
+/// item menu is up ([`bench::press_close_key`]); tap sends a direction key, which abandons the press (the pressed card springs back while focus moves).
+/// OK is only ever sent by [`bench::press_allowed`]: no menu up, a card focused.
+///
+/// Reported as `bench: kind=hold ... target=<host>` (`<host>-nomenu` when a hold did not open the
+/// menu, `<host>-nocard` when no card could be pressed; `grade_bench` fails both).
+pub(crate) fn hold_bench_tick(app: &mut App, now: u32) {
+    let Some(period) = app.scenarios.hold_bench.as_ref().map(|b| b.period_ms) else { return };
+    let host = press_host(app);
+    let menu_up = crate::app::bridge::item_menu_up(&app.pages);
+    let step = {
+        let b = app.scenarios.hold_bench.as_mut().unwrap();
+        bench::bench_advance(&mut b.clock, now, period)
+    };
+    let tick = Tick { ms: now, dt_us: 0 };
+    match step {
+        bench::BenchStep::Nothing => {}
+        bench::BenchStep::Settled(waited, capped) => {
+            log_bench_settled("hold", waited, capped);
+            // A collection page opens on its header: seat the first card before the first press,
+            // a full half-period ahead of it.
+            if let Some((bench::PressHost::Collection, false)) = host {
+                app.inputs.extend(crate::app::bridge::script_key(Key::Down, tick));
+            }
+        }
+        bench::BenchStep::Start(_) => {
+            let b = app.scenarios.hold_bench.as_mut().unwrap();
+            b.host = host.map(|h| h.0);
+            b.menu_opened = false;
+            b.in_flight = host.is_some_and(|(_, focused)| bench::press_allowed(menu_up, focused));
+            if b.in_flight {
+                // The DOWN edge only: the up edge is the press's release, which a hold never gets
+                // and a tap replaces with a cancelling direction key.
+                app.inputs.push(crate::app::bridge::script_edge(Key::Ok, plx_machine::machine::Edge::Down, tick));
+            }
+        }
+        bench::BenchStep::Settle(cycle) => {
+            let b = app.scenarios.hold_bench.as_mut().unwrap();
+            b.menu_opened = menu_up;
+            let kind = b.kind;
+            if b.in_flight {
+                if let Some(key) = bench::press_close_key(kind, menu_up, cycle) {
+                    app.inputs.extend(crate::app::bridge::script_key(key, tick));
+                }
+            }
+        }
+        bench::BenchStep::Report(cycle) => {
+            let b = app.scenarios.hold_bench.as_ref().unwrap();
+            let c = &b.clock;
+            let host_name = b.host.map_or("none", bench::PressHost::name);
+            let miss = if !b.in_flight { "-nocard" }
+                else if b.kind == bench::PressKind::Hold && !b.menu_opened { "-nomenu" }
+                else { "" };
+            plx_base::eventlog::log(&format!(
+                "bench: kind=hold cycle={}/{} target={}{} worst_ms={:.1} frames={} dur_ms={} rss_kb={} {} {}",
+                cycle + 1, c.n, host_name, miss,
+                c.worst_ms(), c.frames(), now.wrapping_sub(c.cycle_start), read_rss_kb(),
+                tex_field(), c.fields(),
+            ));
+        }
+        bench::BenchStep::Done(n) => {
+            plx_base::eventlog::log(&format!("bench: kind=hold done cycles={n}"));
+            app.scenarios.hold_bench = None;
         }
     }
 }

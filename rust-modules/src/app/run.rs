@@ -73,6 +73,10 @@ pub(crate) struct Frame {
     pub(crate) player: bool,
     /// This iteration draws and swaps (the present decision, spec §3.3 step 8).
     pub(crate) present: bool,
+    /// This iteration did NOT present only because a page capture is still in flight on the GPU
+    /// (`gfx::snapshot_pending`): the window was active, so the fence was the one reason. Pure
+    /// bookkeeping for the present-interval stamps and the bench; it never feeds a decision.
+    pub(crate) deferred: bool,
     /// The heartbeat's route word for this frame (`route_word`).
     pub(crate) rn: &'static str,
 }
@@ -86,6 +90,7 @@ impl Frame {
             underlay_moving: false,
             player: false,
             present: false,
+            deferred: false,
             rn: "",
         }
     }
@@ -133,6 +138,12 @@ pub(crate) unsafe fn run(app: &mut App) {
             for v in app.rec.replay_inputs() {
                 replay_inject(app, fr, &v);
             }
+        }
+        // The frame dump (`dev::framedump`) owns the clock and the placeholder count from here:
+        // it must run before anything reads `clock::now()`.
+        #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+        if crate::dev::framedump::requested() {
+            crate::dev::framedump::iteration_begin(app);
         }
         plx_platform::tv::window::pump_bus();
         plx_platform::tv::home::poll();
@@ -261,6 +272,7 @@ pub(crate) unsafe fn run(app: &mut App) {
         // dithers on every frame.)
         fr.underlay_moving |= tree_report.underlay_moving;
         if was_player && super::bridge::player(&app.pages).is_none() { restore_played_entry(app); }
+        refresh_after_playback(app);
         content_requests(app, fr);
         crate::dev::scenarios::advance_content_boot(app, fr);
         loop_requests(app);
@@ -268,7 +280,9 @@ pub(crate) unsafe fn run(app: &mut App) {
         update(app, fr);
         app.rec.content_results();
         app.instr.mark(plx_base::diag::heartbeat::Phase::TickDrain); // tick_drain
+        plx_platform::tv::window::frame_probe_prepare_begin();
         prepare_window(app, fr);
+        plx_platform::tv::window::frame_probe_prepare_end();
         present_and_swap(
             app,
             fr,
@@ -309,7 +323,13 @@ fn clock_and_press(app: &mut App, fr: &mut Frame) {
     // phase below re-steps every spring, so the flag it leaves describes THIS frame, and
     // stamp `dt` so a spring's velocity can be judged as travel-this-frame rather than as
     // a bare units-per-second. The decision itself is taken just above `glViewport`.
-    plx_machine::idle::frame_begin(fr.dt);
+    // A dump's held repeat judges rest with its first pass's `dt` (`framedump::idle_dt`); the
+    // clock `now_ms` reads still advances by `fr.dt` alone.
+    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    let rest_dt = if crate::dev::framedump::active() { crate::dev::framedump::idle_dt(fr.dt) } else { fr.dt };
+    #[cfg(not(all(feature = "hostsim", feature = "devtriggers")))]
+    let rest_dt = fr.dt;
+    plx_machine::idle::frame_begin_judging_rest_with(fr.dt, rest_dt);
     // Is a page capture still in flight on the GPU, and is recorded text still warming? Latched
     // once, before the springs step, so the held appear spring and the present gate below read
     // the same answer — and, being the machine's speed rather than the inputs, recorded or
@@ -421,6 +441,15 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
         && app.window_activity.allow_present(
             plx_machine::idle::should_present(fr.now) || app.pages.budget.has_queued_work(),
         );
+    // Read-only: was the fence the only thing standing between this iteration and a present? An
+    // inactive window would not have presented either way. (`should_present` is deliberately not
+    // asked: it takes-and-clears the damage the deferred frame still needs.)
+    fr.deferred = !fr.present && plx_gfx::gfx::snapshot_pending() && app.window_activity.allow_present(true);
+    // A dump draws every iteration: a held repeat and a written frame alike are a draw.
+    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    if crate::dev::framedump::active() {
+        fr.present = true;
+    }
     app.rec.present(fr.present);
     if fr.present {
         app.window_activity.begin_present(fr.player);
@@ -430,12 +459,14 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
     // The render cache's upload step under the frame budget (§3.3 step 9, §10: "a frame that
     // does not present uploads nothing"). Two placement rules, both load-bearing:
     //
-    // * **Only on a presenting frame.** `GfxUploader::warm` is `gfx::warm_tex`, which DRAWS
-    //   a 1x1 quad to force residency; there is no GL scope to draw into on a frame that is
-    //   skipped wholesale.
-    // * **Before the draw, never after.** That quad goes into framebuffer 0, and the page's
-    //   own `frame_clear` overwrites the pixel. After the draw it would be a white pixel over
-    //   the finished picture — over FILM, on a player frame.
+    // * **Only on a presenting frame.** The spec's rule: a frame that is skipped wholesale
+    //   uploads nothing and the queue waits (`GfxUploader::warm` is `gfx::warm_tex`, which
+    //   also draws, so it wants the frame's GL state in place).
+    // * **Before the draw.** `warm_tex` draws into its own tiny offscreen target and never
+    //   touches framebuffer 0 (the first framebuffer-0 draw of a frame is where the back-buffer
+    //   wait lands, and it must stay with the page's `frame_clear`, not with this window), so
+    //   there is no pixel to show over the picture — film included — wherever it runs; it stays
+    //   here so the upload's cost is bounded by the budget and off the draw.
     if fr.present {
         // A Tracks/More page's text, recorded in `update` or, on the mount frame, in the overlay's
         // `prepare` (`PanelMotion::prewarm_text`), and uploaded here: `fr.present` already carries the window-activity gate, so a frame that
@@ -504,6 +535,11 @@ unsafe fn present_and_swap(
     wslg_frame_budget: Option<super::window_activity::WslgFrameBudget>,
 ) {
     if fr.present {
+        // The dump's full prewarm drain and pre-draw debt sample, after the takes and before the draw.
+        #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+        if crate::dev::framedump::active() {
+            crate::dev::framedump::pre_draw(app);
+        }
         // the glyph cache's frame serial (phase 11, text.rs's hot window): a drawn frame
         plx_gfx::text::begin_frame();
         // A finished underlay-field reduction is read HERE, before framebuffer 0 holds anything
@@ -529,8 +565,20 @@ unsafe fn present_and_swap(
             plx_media::player::sim_video::composite_under();
         }
         // Before the swap, never after: the back buffer is undefined once presented.
+        // A dump decides here whether this frame is written (`dev::framedump`); otherwise the
+        // ordinary screenshot seam.
+        #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+        let dumping = crate::dev::framedump::active();
+        #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+        if dumping && crate::dev::framedump::after_draw(app, _vx, _vy, _vw, _vh) {
+            app.running = false;
+        }
+        #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+        let screenshot_seam = !dumping;
+        #[cfg(all(feature = "hostsim", not(feature = "devtriggers")))]
+        let screenshot_seam = true;
         #[cfg(feature = "hostsim")]
-        if crate::shot::maybe_capture(_vx, _vy, _vw, _vh) {
+        if screenshot_seam && crate::shot::maybe_capture(_vx, _vy, _vw, _vh) {
             // The headless one-shot is done: finish this frame, then leave through the ordinary
             // shutdown rather than exiting from inside the frame (see `shot::maybe_capture`).
             app.running = false;
@@ -582,7 +630,14 @@ unsafe fn present_and_swap(
             budget.finish();
         }
     } else {
-        app.instr.skip_present_phases();
+        if fr.deferred {
+            // The fence held a present back: the panel kept the old picture for this iteration, so
+            // the next presented frame's interval must span it. An idle gap breaks the cadence; a
+            // deferral is part of it.
+            app.instr.defer_present_phases();
+        } else {
+            app.instr.skip_present_phases();
+        }
         // The one stretch of main-thread time nothing is waiting on: spend a bounded slice of it
         // opening the theme faces and loading their glyph metrics (`text::warm_fonts_idle`), so
         // a page's first layout does not pay for them inside a transition. A no-op once warm.
@@ -677,6 +732,22 @@ fn ingest_text(app: &mut App, text: &str, panel: bool, source: plx_machine::mach
     plx_machine::idle::invalidate();
 }
 
+/// Revoke the borrowed SDL window handles on background. `release` answers whether a surface was
+/// held; only a real release is a crash-report step, since WILL and DID background both arrive.
+fn release_borrowed_window(release: impl FnOnce() -> bool) {
+    if release() {
+        window_step(plx_telemetry::telemetry::window::Stage::WaylandReleased, None);
+    }
+}
+
+/// One closed lifecycle step on a native crash event (`window::Stage`): consent-gated and a no-op
+/// while the crash backend is off. `playing` is the same flag the WILL/DID edges carry.
+fn window_step(stage: plx_telemetry::telemetry::window::Stage, playing: Option<bool>) {
+    plx_telemetry::telemetry::window::record(
+        plx_telemetry::telemetry::window::Observation::step(stage, playing),
+    );
+}
+
 /// One polled event. Shared by ordinary polling and ordered FIFO/replay ingestion.
 unsafe fn ingest_sdl_event(app: &mut App, fr: &mut Frame) {
     ingest_sdl_event_with_window(app, fr, plx_platform::tv::window::grab);
@@ -688,7 +759,8 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
     restore_window: impl FnOnce(*mut c_void)) {
     let et = rd_u32(&app.ev, 0);
     app.window_activity.event(et);
-    plx_telemetry::telemetry::window::lifecycle(et, matches!(app.route(), AppArg::Player));
+    let playing = matches!(app.route(), AppArg::Player);
+    plx_telemetry::telemetry::window::lifecycle(et, playing);
     if controlled_replay(app) {
         // The tape owns logical ingress; real SDL startup notifications must not be
         // counted a second time. The real compositor still owns window safety.
@@ -795,7 +867,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         super::bridge::background(&mut app.pages);
         // Revoke our borrowed SDL proxies before another frame can use them while backgrounded.
         // SDL owns their lifetime; foreground must query its current window again.
-        plx_platform::tv::window::release();
+        release_borrowed_window(plx_platform::tv::window::release);
         // A trailer preview is not parked: the OS taking the screen ends it, like any other way
         // off its page (`content::halt_preview_off_its_page`). A Load that has not returned is
         // left Abandoning, and a preview session is never parked for the foreground reload —
@@ -855,6 +927,11 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             // now, so destroying entries destroys the way back. See
             // `an_app_switch_parks_the_page_stack_and_gives_the_same_entries_back`.
         }
+        // The DID edge finished its work (the WILL edge is only the notice): a crash after this
+        // crumb is not inside the background arm.
+        if et == 0x104 {
+            window_step(plx_telemetry::telemetry::window::Stage::BackgroundDone, Some(playing));
+        }
     } else if et == 0x105 || et == 0x106 {
         // WILL/DID ENTER FOREGROUND
         log(&format!(
@@ -887,6 +964,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             if matches!(activation, ForegroundActivation::Launched) {
                 finish_foreground_launch(app);
             }
+            window_step(plx_telemetry::telemetry::window::Stage::ForegroundDone, Some(playing));
         }
     } else if et == SDL_KEYDOWN || et == SDL_KEYUP {
         let (state, wcode, sym) = decode_key(&app.ev);
@@ -1167,6 +1245,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
     } else if et == SDL_MOUSEMOTION {
         app.last_input = clock::now();
         app.ptr.last_motion = app.last_input;
+        if app.ptr.cur_hidden {
+            show_cursor_after_motion();
+        }
         app.ptr.cur_hidden = false;
         let (mx, my) = ptr_xy(&app.ev);
         if app.boot_initial.is_none() {
@@ -1912,6 +1993,8 @@ pub(crate) unsafe fn land_results(app: &mut App, fr: &mut Frame) {
         crate::dev::scenarios::deep_bench_tick(app, fr.now);
         // dev: /tmp/plxnative-herobench — `crate::dev::scenarios::hero_bench_tick`.
         crate::dev::scenarios::hero_bench_tick(app, fr.now);
+        // dev: /tmp/plxnative-holdbench — `crate::dev::scenarios::hold_bench_tick`.
+        crate::dev::scenarios::hold_bench_tick(app, fr.now);
 
         // ---- the page cross-fade's commit frame ------------------------------------------
         // Stepped UNCONDITIONALLY, never per-route: a fader only one screen advances is a fader
@@ -2446,6 +2529,9 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                             app.diagnostics.draw();
                         }
                     } else {
+                        // dev (`/tmp/plxnative-framecb`): the page's first clear is this route's
+                        // first framebuffer command, so `gfx` brackets the back-buffer wait there.
+                        plx_gfx::gfx::arm_clear_probe();
                         // Open the shared popover frame FIRST: it takes this frame's page damage
                         // and decides whether the frozen-host snapshot still describes the page. Route-agnostic by construction —
                         // see `ui::popover::host::begin_frame`.
@@ -2485,12 +2571,17 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                             plx_base::diag::spans::span("disc", || page(Z::ALL));
                         }
                         sources.borrow_mut().resolve();
+                        // `plxnative-framedrop` armed: which recorded draw invalidated a source.
+                        // Empty (no allocation, no work) unarmed.
+                        for line in sources.borrow_mut().take_diffs() {
+                            log(&line);
+                        }
                         let jobs = sources.borrow().jobs();
                         // Independent bands replay only the strict prefix below their ceiling.
                         // A band intersecting lower glass captures that composite in visible order.
                         for (ceiling, rect) in jobs {
                             let _source_walk = plx_ui::frame::backdrop::enter(sources.clone(), ceiling);
-                            let reg = plx_gfx::gfx::blur_region(rect.x, rect.y, rect.w, rect.h);
+                            let reg = plx_gfx::gfx::blur_region_for(plx_ui::frame::backdrop::rises(ceiling), rect.x, rect.y, rect.w, rect.h);
                             // `src`: one blur source job, its replay of the page prefix included.
                             plx_base::diag::spans::span("src", || {
                                 if plx_gfx::gfx::blur_snapshot_direct(reg, &mut || page(ceiling)) {
@@ -2578,7 +2669,7 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
         // dev: the stress-bench oscillators' own frame-time accumulator — right after Swap is
         // stamped (`present_and_swap`, just above this call in `run()`), the earliest point this
         // iteration's total is known. See `crate::dev::scenarios::bench_frame_tick`'s doc.
-        crate::dev::scenarios::bench_frame_tick(app, fr.present, fr.now);
+        crate::dev::scenarios::bench_frame_tick(app, fr.present, fr.deferred, fr.now);
         fr.rn = super::words::route_word(&app.route());
     let rn = fr.rn;
     if plx_gfx::text::take_measure_fault() && !app.measure_fault_logged {
@@ -2729,6 +2820,9 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
                 app.running = false;
             }
         }
+        // `plxnative-focusx`: the card read-out belongs to the frame just sampled.
+        #[cfg(feature = "devtriggers")]
+        plx_ui::card_probe::clear();
         // `coldopen screen=<name> ms=<n> prepared=<bool>` — one line per screen MOUNT, on every
         // build, no trigger (spec §8.4). The dispatcher owns both ends of the measurement (the
         // mount at nav commit, the first prepared+drawn frame); this drains what it closed.
@@ -3095,6 +3189,7 @@ mod lifecycle_regression_tests {
             menu_play_await: Default::default(),
             prev: Default::default(),
             refresh_hubs_at: Default::default(),
+            refresh_detail: None,
             plaintext_upgrade: Default::default(),
             ev: [0; 128],
             remote: Default::default(),
@@ -3167,6 +3262,7 @@ mod lifecycle_regression_tests {
                 modal_bench: Default::default(),
                 deep_bench: Default::default(),
                 hero_bench: Default::default(),
+                hold_bench: Default::default(),
                 dev: crate::dev::scenarios::DevFlags {
                     detail_osc: Default::default(),
                     home_osc: Default::default(),
@@ -3220,6 +3316,66 @@ mod lifecycle_regression_tests {
         unsafe {
             ingest_sdl_event(app, fr);
         }
+    }
+
+    /// Crash-report consent for the test's duration, so `window::record` reaches its test capture;
+    /// the previous answer comes back on drop.
+    struct CrashReports(Option<plx_telemetry::telemetry::consent::Consent>);
+
+    impl CrashReports {
+        fn granted() -> Self {
+            use plx_telemetry::telemetry::consent::{self, Consent};
+            let previous = consent::current();
+            let mut granted = Consent::default();
+            granted.errors = true;
+            granted.asked_version = consent::POLICY_VERSION;
+            consent::install(granted);
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+            Self(previous)
+        }
+    }
+
+    impl Drop for CrashReports {
+        fn drop(&mut self) {
+            plx_telemetry::telemetry::consent::install(self.0.take().unwrap_or_default());
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+        }
+    }
+
+    /// S12a: one WILL/DID background and foreground cycle leaves exactly these closed steps, in
+    /// this order. `*_done` close the DID edges only (the WILL edge has not finished the step), and
+    /// the rig holds no Wayland surface, so no `wayland_released` appears.
+    #[test]
+    fn background_cycle_records_closed_steps_in_order() {
+        let _serial = plx_base::testlock::serial();
+        let _consent = CrashReports::granted();
+        let mut app = app();
+        let mut fr = Frame::begin(&app.player.session, app.bridge.metadata_view());
+        for et in [0x103, 0x104, 0x105, 0x106] {
+            event(&mut app, &mut fr, et);
+        }
+        assert_eq!(
+            plx_telemetry::telemetry::window::take_recorded_for_test(),
+            [
+                "will_background",
+                "did_background",
+                "background_done",
+                "will_foreground",
+                "did_foreground",
+                "foreground_done",
+            ],
+        );
+    }
+
+    /// `wayland_released` is a step only when a borrowed surface was actually released (the second
+    /// of WILL + DID background finds none), so a reader can tell "released" from "nothing held".
+    #[test]
+    fn wayland_release_is_a_step_only_when_a_surface_was_held() {
+        let _serial = plx_base::testlock::serial();
+        let _consent = CrashReports::granted();
+        release_borrowed_window(|| true);
+        release_borrowed_window(|| false);
+        assert_eq!(plx_telemetry::telemetry::window::take_recorded_for_test(), ["wayland_released"]);
     }
 
     #[test]
@@ -3567,6 +3723,38 @@ mod lifecycle_regression_tests {
         plx_machine::landgate::disarm();
     }
 
+    /// The fixture's original answers, verbatim: `/decision` direct-plays, anything else is the
+    /// PlayQueue (two episodes, or one film when `successor` is false).
+    fn queue_body(request: &str, successor: bool) -> &'static str {
+        if request.contains("/decision?") {
+            r#"{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"decision":"directplay"}]}]}]}}"#
+        } else if !successor {
+            r#"{"MediaContainer":{"machineIdentifier":"lifecycle-fixture","size":1,
+            "playQueueID":1,"playQueueSelectedItemID":11,"playQueueTotalCount":1,
+            "Metadata":[
+            {"ratingKey":"1","playQueueItemID":11,"type":"movie","title":"First",
+             "duration":60000,
+             "Media":[{"videoCodec":"h264","audioCodec":"aac","width":1280,"height":720,
+             "Part":[{"id":1,"key":"/library/parts/1/file.mkv","Stream":[
+             {"id":1,"streamType":1,"codec":"h264"},
+             {"id":2,"streamType":2,"codec":"aac","selected":true}]}]}]}]}}"#
+        } else {
+            r#"{"MediaContainer":{"machineIdentifier":"lifecycle-fixture","size":2,
+            "playQueueID":1,"playQueueSelectedItemID":11,"playQueueTotalCount":2,
+            "Metadata":[
+            {"ratingKey":"1","playQueueItemID":11,"type":"episode","title":"First",
+             "parentIndex":1,"index":1,"duration":60000,
+             "Media":[{"videoCodec":"h264","audioCodec":"aac","width":1280,"height":720,
+             "Part":[{"id":1,"key":"/library/parts/1/file.mkv","Stream":[
+             {"id":1,"streamType":1,"codec":"h264"},
+             {"id":2,"streamType":2,"codec":"aac","selected":true}]}]}]},
+            {"ratingKey":"2","playQueueItemID":12,"type":"episode","title":"Next",
+             "parentIndex":1,"index":2,"duration":60000,
+             "Media":[{"videoCodec":"h264","audioCodec":"aac",
+             "Part":[{"id":2,"key":"/library/parts/2/file.mkv"}]}]}]}}"#
+        }
+    }
+
     struct Rig {
         app: App,
         sid: plx_plex::plex::ServerId,
@@ -3605,6 +3793,12 @@ mod lifecycle_regression_tests {
         /// `successor: false` serves a one-row queue — a film, with no Up Next to hand off to — so
         /// an end of stream leaves the player instead of starting the next item.
         fn serving(successor: bool) -> Option<Rig> {
+            Self::serving_with(move |request: &str| queue_body(request, successor).to_owned())
+        }
+
+        /// [`Self::serving`] with the server's answers chosen by `respond(request line)`. The first
+        /// request still parks until [`Self::resolve`] releases it.
+        fn serving_with(respond: impl Fn(&str) -> String + Send + 'static) -> Option<Rig> {
             plx_plex::plex::reset_servers_for_test();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -3653,33 +3847,7 @@ mod lifecycle_regression_tests {
                         arrived.send(()).unwrap();
                         let _ = wait.recv_timeout(Duration::from_secs(5));
                     }
-                    let body = if request.contains("/decision?") {
-                        r#"{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"decision":"directplay"}]}]}]}}"#
-                    } else if !successor {
-                        r#"{"MediaContainer":{"machineIdentifier":"lifecycle-fixture","size":1,
-                        "playQueueID":1,"playQueueSelectedItemID":11,"playQueueTotalCount":1,
-                        "Metadata":[
-                        {"ratingKey":"1","playQueueItemID":11,"type":"movie","title":"First",
-                         "duration":60000,
-                         "Media":[{"videoCodec":"h264","audioCodec":"aac","width":1280,"height":720,
-                         "Part":[{"id":1,"key":"/library/parts/1/file.mkv","Stream":[
-                         {"id":1,"streamType":1,"codec":"h264"},
-                         {"id":2,"streamType":2,"codec":"aac","selected":true}]}]}]}]}}"#
-                    } else {
-                        r#"{"MediaContainer":{"machineIdentifier":"lifecycle-fixture","size":2,
-                        "playQueueID":1,"playQueueSelectedItemID":11,"playQueueTotalCount":2,
-                        "Metadata":[
-                        {"ratingKey":"1","playQueueItemID":11,"type":"episode","title":"First",
-                         "parentIndex":1,"index":1,"duration":60000,
-                         "Media":[{"videoCodec":"h264","audioCodec":"aac","width":1280,"height":720,
-                         "Part":[{"id":1,"key":"/library/parts/1/file.mkv","Stream":[
-                         {"id":1,"streamType":1,"codec":"h264"},
-                         {"id":2,"streamType":2,"codec":"aac","selected":true}]}]}]},
-                        {"ratingKey":"2","playQueueItemID":12,"type":"episode","title":"Next",
-                         "parentIndex":1,"index":2,"duration":60000,
-                         "Media":[{"videoCodec":"h264","audioCodec":"aac",
-                         "Part":[{"id":2,"key":"/library/parts/2/file.mkv"}]}]}]}}"#
-                    };
+                    let body = respond(&request);
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 }
             }) {
@@ -3754,6 +3922,11 @@ mod lifecycle_regression_tests {
         fn due_up_next(&mut self) -> Frame {
             self.request();
             self.resolve();
+            self.expire_up_next_countdown()
+        }
+
+        /// The resolved item's Player page, mounted, with its Up Next countdown run out.
+        fn expire_up_next_countdown(&mut self) -> Frame {
             // A mounted, resolved Player whose Engine has already drained still owns its
             // session and successor. No native decoding is needed to exercise the countdown.
             super::super::bridge::nav_push(&mut self.app.pages, AppArg::Player);
@@ -3810,6 +3983,354 @@ mod lifecycle_regression_tests {
             plx_media::route::reset_player_control_for_test(&self.app.player.session);
             plx_plex::plex::reset_servers_for_test();
         }
+    }
+
+    // ---- track memory: what the viewer picked on one episode is what the next episode plays -----
+
+    /// One stream of a [`show_episode`], as the server describes it.
+    fn show_stream(id: i64, kind: i64, index: i64, codec: &str, lang: Option<(&str, &str)>, selected: bool) -> String {
+        let (code, name) = lang.unwrap_or(("", ""));
+        format!(
+            r#"{{"id":{id},"streamType":{kind},"index":{index},"codec":"{codec}","channels":{},
+            "languageCode":"{code}","language":"{name}","selected":{selected}}}"#,
+            if kind == 2 { 6 } else { 0 },
+        )
+    }
+
+    /// An episode of show 4242 with English and Japanese E-AC3 5.1 and English and Spanish SRT.
+    /// `audio` and `subs` list `(language, id)` in file order; the server has the FIRST audio and
+    /// the SPANISH subtitle selected, which is what plays unless something remembered overrides it.
+    fn show_episode(rk: &str, item: i64, index: i64, audio: [(&str, i64); 2], subs: [(&str, i64); 2]) -> String {
+        let name = |code: &str| match code {
+            "eng" => "English",
+            "jpn" => "Japanese",
+            _ => "Spanish",
+        };
+        let mut streams = vec![show_stream(item * 10 + 1, 1, 0, "hevc", None, false)];
+        for (i, (code, id)) in audio.into_iter().enumerate() {
+            streams.push(show_stream(id, 2, 1 + i as i64, "eac3", Some((code, name(code))), i == 0));
+        }
+        for (i, (code, id)) in subs.into_iter().enumerate() {
+            streams.push(show_stream(id, 3, 3 + i as i64, "srt", Some((code, name(code))), code == "spa"));
+        }
+        format!(
+            r#"{{"ratingKey":"{rk}","playQueueItemID":{item},"type":"episode","title":"Episode {index}",
+            "grandparentRatingKey":"4242","parentIndex":1,"index":{index},"duration":60000,
+            "Media":[{{"videoCodec":"hevc","audioCodec":"eac3","width":1920,"height":1080,"bitrate":8000,
+            "Part":[{{"id":{item},"key":"/library/parts/{rk}/file.mkv","Stream":[{}]}}]}}]}}"#,
+            streams.join(","),
+        )
+    }
+
+    /// E1's streams and E2's: the SAME tracks under other ids and in another order, so only a
+    /// remembered DESCRIPTOR (never a stream id) can carry a pick from one to the other.
+    const E1_AUDIO: [(&str, i64); 2] = [("eng", 1012), ("jpn", 1013)];
+    const E1_SUBS: [(&str, i64); 2] = [("spa", 1014), ("eng", 1015)];
+    const E2_AUDIO: [(&str, i64); 2] = [("eng", 2012), ("jpn", 2013)];
+    const E2_SUBS: [(&str, i64); 2] = [("eng", 2014), ("spa", 2015)];
+
+    /// A PMS that serves the two episodes of show 4242 per ratingKey: the PlayQueue carries both,
+    /// `/library/metadata/<rk>` answers with the one asked for, `/decision` direct-plays, and every
+    /// other request (a PUT, the show's preferences, a timeline) is an empty container. It keeps NO
+    /// state: a `PUT /library/parts` selection is never echoed into the next episode's answer, so
+    /// nothing but the app's own memory can carry a pick from E1 to E2.
+    fn show_fixture(request: &str) -> String {
+        serve_show(request, show_episode("1", 11, 1, E1_AUDIO, E1_SUBS), show_episode("2", 12, 2, E2_AUDIO, E2_SUBS))
+    }
+
+    /// [`show_fixture`]'s answers for any pair of episode bodies `e1` and `e2`.
+    fn serve_show(request: &str, e1: String, e2: String) -> String {
+        let path = request.split_whitespace().nth(1).unwrap_or("").split('?').next().unwrap_or("");
+        if request.contains("/decision?") {
+            queue_body(request, true).to_owned()
+        } else if path.starts_with("/playQueues") {
+            format!(
+                r#"{{"MediaContainer":{{"machineIdentifier":"lifecycle-fixture","size":2,"playQueueID":1,
+                "playQueueSelectedItemID":11,"playQueueTotalCount":2,"Metadata":[{e1},{e2}]}}}}"#
+            )
+        } else if request.starts_with("GET ") && path == "/library/metadata/1" {
+            format!(r#"{{"MediaContainer":{{"size":1,"Metadata":[{e1}]}}}}"#)
+        } else if request.starts_with("GET ") && path == "/library/metadata/2" {
+            format!(r#"{{"MediaContainer":{{"size":1,"Metadata":[{e2}]}}}}"#)
+        } else {
+            r#"{"MediaContainer":{"size":0}}"#.to_owned()
+        }
+    }
+
+    /// An episode of show 4242 for Forced only: English and Japanese E-AC3 5.1, and three SRT tracks
+    /// `(language, id, forced)` in file order. NO subtitle is selected on the server, so what plays
+    /// is whatever the viewer's memory says.
+    fn forced_show_episode(
+        rk: &str, item: i64, index: i64, audio: [(&str, i64); 2], subs: [(&str, i64, bool); 3],
+    ) -> String {
+        let name = |code: &str| if code == "jpn" { "Japanese" } else { "English" };
+        let mut streams = vec![show_stream(item * 10 + 1, 1, 0, "hevc", None, false)];
+        for (i, (code, id)) in audio.into_iter().enumerate() {
+            streams.push(show_stream(id, 2, 1 + i as i64, "eac3", Some((code, name(code))), i == 0));
+        }
+        for (i, (code, id, forced)) in subs.into_iter().enumerate() {
+            streams.push(format!(
+                r#"{{"id":{id},"streamType":3,"index":{},"codec":"srt","channels":0,
+                "languageCode":"{code}","language":"{}","forced":{forced},"selected":false}}"#,
+                3 + i as i64,
+                name(code),
+            ));
+        }
+        format!(
+            r#"{{"ratingKey":"{rk}","playQueueItemID":{item},"type":"episode","title":"Episode {index}",
+            "grandparentRatingKey":"4242","parentIndex":1,"index":{index},"duration":60000,
+            "Media":[{{"videoCodec":"hevc","audioCodec":"eac3","width":1920,"height":1080,"bitrate":8000,
+            "Part":[{{"id":{item},"key":"/library/parts/{rk}/file.mkv","Stream":[{}]}}]}}]}}"#,
+            streams.join(","),
+        )
+    }
+
+    /// [`show_fixture`] for Forced only. E2 has the same tracks as E1 under other ids and in another
+    /// order (the Japanese forced track first), so only the remembered MODE can find E2's.
+    fn forced_show_fixture(request: &str) -> String {
+        serve_show(
+            request,
+            forced_show_episode("1", 11, 1, E1_AUDIO, [("eng", 1014, false), ("eng", 1015, true), ("jpn", 1016, true)]),
+            forced_show_episode("2", 12, 2, E2_AUDIO, [("jpn", 2014, true), ("eng", 2015, true), ("eng", 2016, false)]),
+        )
+    }
+
+    /// Sign the fixture in as the account owner and give track memory a mirror seeded for that
+    /// account, empty: the state of a stored-session boot (the harness's seated cases).
+    fn seated_with_empty_memory(tag: &str) -> plx_plex::plex::session::TempSession {
+        let session = plx_plex::plex::session::TempSession::new(tag);
+        session.seated("", "acct");
+        plx_media::route::seed_memory_for_test::<plx_plex::plex::session::prefs::TrackMemoryEntry>(
+            &plx_plex::plex::session::Session {
+                client_id: "cid-1".into(),
+                account_token: "acct".into(),
+                ..Default::default()
+            },
+        );
+        session
+    }
+
+    impl Rig {
+        /// Play E1 of [`show_fixture`] and wait for its plan to land.
+        fn play_show_episode_one(&mut self) {
+            assert!(plx_media::route::request_play(
+                &mut self.app.player.session,
+                self.app.bridge.metadata_mut(),
+                self.sid,
+                "1",
+                "/library/parts/1/file.mkv",
+                "hevc",
+                "eac3",
+                "Episode 1",
+                ""
+            ));
+            self.entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            self.resolve();
+        }
+
+        /// Pick the subtitle `id` through the track menu, as OK on its row, and perform the commit
+        /// the way the loop does.
+        fn pick_subtitle(&mut self, id: i64) {
+            let meta = self.app.bridge.metadata_view();
+            let playing = meta.playing().expect("the item is installed");
+            let index = playing.subs.iter().position(|s| s.id == id).unwrap_or_else(|| panic!("no subtitle {id}"));
+            let mut menu = plx_appkit::track_menu::TrackMenuState::new(&self.app.player.session, meta, 1, Vec::new());
+            let plx_appkit::track_menu::TrackOk::Commit { commit, .. } = menu.commit_sub_track(index, meta) else {
+                panic!("the menu committed nothing for subtitle {id}");
+            };
+            super::super::playback::commit_track(&mut self.app.player.session, commit);
+        }
+
+        /// Pick the Subtitles tab's Forced only row through the track menu: focus it, OK, and perform
+        /// the commit the way the loop does.
+        fn pick_forced_only(&mut self) {
+            let meta = self.app.bridge.metadata_view();
+            let mut menu = plx_appkit::track_menu::TrackMenuState::new(&self.app.player.session, meta, 1, Vec::new());
+            assert!(menu.focus_id(plx_appkit::track_menu::TrackRow::SubForcedOnly), "the Forced only row is on the page");
+            let plx_appkit::track_menu::TrackOk::Commit { commit, .. } = menu.on_ok(meta) else {
+                panic!("the menu committed nothing for Forced only");
+            };
+            super::super::playback::commit_track(&mut self.app.player.session, commit);
+        }
+
+        /// Pick the audio track `id` through the track menu: focus its row, OK.
+        fn pick_audio(&mut self, id: i64) {
+            let meta = self.app.bridge.metadata_view();
+            let playing = meta.playing().expect("the item is installed");
+            let index = playing.audio.iter().position(|s| s.id == id).unwrap_or_else(|| panic!("no audio {id}"));
+            let mut menu = plx_appkit::track_menu::TrackMenuState::new(&self.app.player.session, meta, 0, Vec::new());
+            assert!(menu.focus_id(plx_appkit::track_menu::TrackRow::Audio(index)), "the audio row is on the page");
+            let plx_appkit::track_menu::TrackOk::Commit { commit, .. } = menu.on_ok(meta) else {
+                panic!("the menu committed nothing for audio {id}");
+            };
+            super::super::playback::commit_track(&mut self.app.player.session, commit);
+        }
+
+        /// Advance to the queue's next episode the way the countdown does (the loop's
+        /// `play_up_next`, run by `playback_tick` once the countdown expires), and wait for its plan.
+        fn advance_to_next_episode(&mut self) {
+            let mut fr = self.expire_up_next_countdown();
+            unsafe {
+                playback_tick(&mut self.app, &mut fr);
+            }
+            assert!(plx_media::route::play_pending(), "the countdown requested the successor");
+            poll_until("E2's plan did not land", || {
+                plx_media::route::pump_play(&mut self.app.player.session, self.app.bridge.metadata_mut()).is_some()
+            });
+            assert_eq!(plx_media::route::cur_rk(&self.app.player.session), "2");
+        }
+    }
+
+    /// **The bug, end to end (Step 0).** A viewer who picks a subtitle and an audio track on episode 1
+    /// finds them again on episode 2 of the same show: the pick goes through the track menu's OK
+    /// and the loop's `commit_track`, the next episode is resolved against a server that remembers
+    /// nothing, and E2's plan carries the remembered English subtitle and Japanese audio instead of
+    /// the server's Spanish and English.
+    #[test]
+    fn a_pick_on_one_episode_is_what_the_next_episode_plays() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving_with(show_fixture) else {
+            eprintln!("SKIPPED a_pick_on_one_episode_is_what_the_next_episode_plays: no fixture worker thread");
+            return;
+        };
+        let _session = seated_with_empty_memory("track-memory-step-0");
+
+        rig.play_show_episode_one();
+        let ps = &rig.app.player.session;
+        assert_eq!(plx_media::route::cur_sub_sid(ps), 1014, "E1 starts on the server's Spanish subtitle");
+        assert_eq!(plx_media::route::cur_audio_sid(ps), 1012, "and its first audio, English");
+        rig.pick_subtitle(1015);
+        rig.pick_audio(1013);
+        let ps = &rig.app.player.session;
+        assert_eq!((plx_media::route::cur_sub_sid(ps), plx_media::route::cur_audio_sid(ps)), (1015, 1013), "the picks stood");
+
+        rig.advance_to_next_episode();
+        let ps = &rig.app.player.session;
+        assert_eq!(
+            (plx_media::route::cur_sub_sid(ps), plx_media::route::cur_audio_sid(ps)),
+            (2014, 2013),
+            "E2 shows the English subtitle and plays the Japanese audio the viewer chose on E1 \
+             (the server's own selection there is Spanish, English)"
+        );
+    }
+
+    /// **Forced only, end to end (FO, §4.9).** The viewer picks the Subtitles tab's Forced only row on
+    /// episode 1 (which shows its English forced track), and episode 2, whose forced tracks have
+    /// other ids and sit in another order, draws ITS English forced track: the mode is what was
+    /// remembered, not a track. An audio switch on E2 then re-points the subtitle to the Japanese
+    /// forced track, which a remembered TRACK would not do.
+    #[test]
+    fn forced_only_on_one_episode_draws_the_next_episodes_forced_track() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving_with(forced_show_fixture) else {
+            eprintln!("SKIPPED forced_only_on_one_episode_draws_the_next_episodes_forced_track: no fixture worker thread");
+            return;
+        };
+        let _session = seated_with_empty_memory("track-memory-forced-only");
+
+        rig.play_show_episode_one();
+        let ps = &rig.app.player.session;
+        assert_eq!(
+            (plx_media::route::cur_sub_sid(ps), plx_media::route::cur_audio_sid(ps)),
+            (0, 1012),
+            "E1 starts with no subtitle (the server selected none) and its first audio"
+        );
+        rig.pick_forced_only();
+        let ps = &rig.app.player.session;
+        assert_eq!(
+            (plx_media::route::cur_sub_sid(ps), plx_media::route::cur_sub_mode(ps)),
+            (1015, plx_media::route::SubMode::ForcedOnly),
+            "Forced only drew E1's English forced track"
+        );
+
+        rig.advance_to_next_episode();
+        let ps = &rig.app.player.session;
+        assert_eq!(
+            (plx_media::route::cur_sub_sid(ps), plx_media::route::cur_sub_mode(ps)),
+            (2015, plx_media::route::SubMode::ForcedOnly),
+            "E2 draws ITS English forced track (not the Japanese one listed first, not the full track)"
+        );
+        assert_eq!(plx_media::route::cur_audio_sid(ps), 2012, "under the English audio it plays");
+
+        rig.pick_audio(2013);
+        let ps = &rig.app.player.session;
+        assert_eq!(
+            (plx_media::route::cur_audio_sid(ps), plx_media::route::cur_sub_sid(ps)),
+            (2013, 2014),
+            "the Japanese audio re-points Forced only at the Japanese forced track"
+        );
+    }
+
+    /// **The GL-while-backgrounded audit (S12a), as far as a host can run it.** One iteration of
+    /// `run`'s loop from the playback tick to the end of `present_and_swap`, the way `step` runs
+    /// its first half, and then the two phases `step` leaves out. With the gate closed
+    /// (`fr.present == false`) `present_and_swap` takes only its `else` branch, so this is the
+    /// whole frame the loop runs between WILL background and DID foreground.
+    fn backgrounded_iteration(app: &mut App, t: &mut u32) -> bool {
+        *t += 16;
+        let mut fr = Frame::begin(&app.player.session, app.bridge.metadata_view());
+        fr.now = *t;
+        fr.dt = 0.016;
+        let was_player = super::super::bridge::player(&app.pages).is_some();
+        unsafe { playback_tick(app, &mut fr); }
+        super::super::bridge::frame(&mut app.pages, &mut app.bridge,
+            plx_machine::machine::Tick { ms: *t, dt_us: 16_000 }, std::mem::take(&mut app.inputs));
+        if was_player && super::super::bridge::player(&app.pages).is_none() {
+            restore_played_entry(app);
+        }
+        content_requests(app, &fr);
+        loop_requests(app);
+        unsafe {
+            update(app, &mut fr);
+            prepare_window(app, &mut fr);
+            if !fr.present {
+                present_and_swap(
+                    app,
+                    &mut fr,
+                    #[cfg(all(feature = "hostsim", target_os = "linux"))]
+                    None,
+                );
+            }
+        }
+        fr.present
+    }
+
+    /// Is a texture specified or deleted (through `gfx::tex_ledger`, which every `upload_rgba` and
+    /// `delete_tex` goes through) anywhere between WILL background and DID foreground, on the frames
+    /// the loop runs while the player page is mounted? The meter is proved live first: a delete
+    /// moves it. Not covered, because they bypass the ledger: VAO/VBO/FBO creation and deletion, and
+    /// `glCopyTexSubImage2D` into existing textures (the snapshot, blur, field and ground-probe
+    /// captures), all of which sit under `if fr.present` or in `frame_end` calls that do.
+    #[test]
+    fn no_texture_work_between_background_and_did_foreground() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("SKIPPED no_texture_work_between_background_and_did_foreground: \
+                 lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        let before_probe = plx_gfx::gfx::tex_ledger::mutations();
+        plx_gfx::gfx::delete_tex(0xfeed);
+        assert_eq!(plx_gfx::gfx::tex_ledger::mutations(), before_probe + 1, "the meter is live");
+
+        let mut fr = rig.due_up_next();
+        assert!(super::super::bridge::player(&rig.app.pages).is_some(), "the player page is mounted");
+        let mut t = fr.now;
+        let start = plx_gfx::gfx::tex_ledger::mutations();
+        event(&mut rig.app, &mut fr, 0x103);
+        event(&mut rig.app, &mut fr, 0x104);
+        for i in 0..30 {
+            let presented = backgrounded_iteration(&mut rig.app, &mut t);
+            assert!(!presented, "iteration {i} presented while backgrounded");
+        }
+        assert_eq!(
+            plx_gfx::gfx::tex_ledger::mutations(), start,
+            "texture work between background and DID foreground"
+        );
+        event(&mut rig.app, &mut fr, 0x105);
+        assert!(!rig.app.window_activity.allow_present(true), "WILL foreground authorizes nothing");
+        event(&mut rig.app, &mut fr, 0x106);
+        assert!(rig.app.window_activity.allow_present(true), "DID foreground allows the next present");
     }
 
     #[test]
@@ -4107,6 +4628,7 @@ mod lifecycle_regression_tests {
         if was_player && super::super::bridge::player(&app.pages).is_none() {
             restore_played_entry(app);
         }
+        refresh_after_playback(app);
         content_requests(app, &fr);
         loop_requests(app);
         unsafe { update(app, &mut fr); }
@@ -4201,6 +4723,107 @@ mod lifecycle_regression_tests {
         assert_eq!(app.pages.input.press.scale(), 1.0);
     }
 
+    /// What `hold_bench_tick` put on the input queue in one frame: `(ok_down, ok_up, back, direction)`
+    /// counts, plus whether an item menu was up when it ran (so an OK edge can be held against it).
+    #[derive(Default, Debug)]
+    struct BenchInputs { ok_down: u32, ok_up: u32, back: u32, dir: u32, ok_with_menu_up: u32 }
+
+    /// One frame of the press bench exactly as the loop runs it: the tick, then the frame.
+    fn bench_step(app: &mut App, t: &mut u32, seen: &mut BenchInputs) {
+        use plx_machine::machine::{Edge, InputKind, Key};
+        let before = app.inputs.len();
+        let menu_up = super::super::bridge::item_menu_up(&app.pages);
+        crate::dev::scenarios::hold_bench_tick(app, *t + 16);
+        for ev in &app.inputs[before..] {
+            if let InputKind::Key { key, edge, .. } = ev.kind {
+                match (key, edge) {
+                    (Key::Ok, Edge::Down) => seen.ok_down += 1,
+                    (Key::Ok, Edge::Up) => seen.ok_up += 1,
+                    (Key::Back, Edge::Down) => seen.back += 1,
+                    (Key::Left | Key::Right, Edge::Down) => seen.dir += 1,
+                    _ => {}
+                }
+                if key == Key::Ok && menu_up { seen.ok_with_menu_up += 1; }
+            }
+        }
+        step(app, t, vec![]);
+    }
+
+    /// Home with the first grid card focused and a press bench of `n` cycles armed and past its
+    /// settle gate (the gate waits on presented frames, which this host loop does not produce).
+    fn home_press_bench(n: u32, kind: crate::dev::scenarios::bench::PressKind) -> (App, u32) {
+        let mut app = app();
+        let mut t = 0u32;
+        super::super::bridge::show_page(&mut app.pages, AppArg::Home);
+        app.bridge.seed_hub_grid_for_test(3, 4);
+        settle(&mut app, &mut t);
+        let entry = app.pages.nav.top_page().unwrap().id;
+        let instance = app.pages.nav.instance_of(entry).unwrap();
+        app.pages.emit(plx_machine::machine::MachineId::Nav, plx_machine::machine::Fx::Deliver(
+            plx_machine::machine::MachineId::Instance(instance),
+            plx_machine::machine::Delivery::Screen(plx_ui::screen::ScreenEvent::App(
+                plx_screens::registry::AppMsg::Home(plx_screens::registry::HomeCmd::FocusGrid { row: 0, col: 0 })))));
+        for _ in 0..40 { step(&mut app, &mut t, vec![]); }
+        assert!(app.bridge.home_grid_focused(&app.pages), "premise: a grid card is focused");
+        use crate::dev::scenarios::bench;
+        let period = match kind { bench::PressKind::Hold => bench::DEFAULT_HOLD_PERIOD_MS, bench::PressKind::Tap => bench::DEFAULT_TAP_PERIOD_MS };
+        let mut b = bench::PressBench::new(n, period, kind);
+        b.clock.phase = bench::BenchPhase::Waiting;
+        b.clock.last = t;
+        app.scenarios.hold_bench = Some(b);
+        (app, t)
+    }
+
+    /// **The hold trigger performs a real hold.** Every cycle: ONE OK-down and no OK-up (the press is
+    /// never released), the hold fill runs past `LONG_MS` and the dispatcher answers it with the item
+    /// menu, then ONE Back dismisses it. No OK edge is ever queued while a menu is up (a hold menu
+    /// opens on its Play row), the page is still Home at the end, and the bench counts its cycles
+    /// through to `done`.
+    #[test]
+    fn the_hold_bench_opens_the_item_menu_from_a_real_hold_and_dismisses_it_with_back_only() {
+        let _serial = plx_base::testlock::serial();
+        let (mut app, mut t) = home_press_bench(3, crate::dev::scenarios::bench::PressKind::Hold);
+        let (mut seen, mut menu_frames, mut menu_cycles, mut was_up) = (BenchInputs::default(), 0u32, 0u32, false);
+        for _ in 0..1500 {
+            bench_step(&mut app, &mut t, &mut seen);
+            let up = super::super::bridge::item_menu_up(&app.pages);
+            menu_frames += u32::from(up);
+            menu_cycles += u32::from(up && !was_up);
+            was_up = up;
+            if app.scenarios.hold_bench.is_none() { break; }
+        }
+        assert!(app.scenarios.hold_bench.is_none(), "the bench ran its cycles to `done`: {seen:?}");
+        assert_eq!((seen.ok_down, seen.back), (3, 3), "one press and one dismissal per cycle: {seen:?}");
+        assert_eq!(seen.ok_up, 0, "a hold is never released: {seen:?}");
+        assert_eq!(seen.ok_with_menu_up, 0, "no OK is queued onto an open menu: {seen:?}");
+        assert_eq!(menu_cycles, 3, "every hold opened the menu (and every Back closed it)");
+        assert!(menu_frames > 30, "the menu stayed up across frames, not for one: {menu_frames}");
+        for _ in 0..120 { step(&mut app, &mut t, vec![]); }
+        assert!(!super::super::bridge::item_menu_up(&app.pages), "Back closed the last menu");
+        assert!(matches!(app.route(), AppArg::Home), "nothing navigated away");
+    }
+
+    /// The tap-and-cancel variant: OK down, then a direction key BEFORE the hold threshold, so the
+    /// press is abandoned (the real cancel path) without activating a card or opening a menu.
+    #[test]
+    fn the_tap_bench_cancels_the_press_without_activating_or_opening_a_menu() {
+        let _serial = plx_base::testlock::serial();
+        let (mut app, mut t) = home_press_bench(4, crate::dev::scenarios::bench::PressKind::Tap);
+        let (mut seen, mut menu_seen) = (BenchInputs::default(), false);
+        for _ in 0..1500 {
+            bench_step(&mut app, &mut t, &mut seen);
+            menu_seen |= super::super::bridge::item_menu_up(&app.pages);
+            assert!(matches!(app.route(), AppArg::Home), "a cancelled press never navigates: {seen:?}");
+            if app.scenarios.hold_bench.is_none() { break; }
+        }
+        assert!(app.scenarios.hold_bench.is_none(), "the bench ran to `done`: {seen:?}");
+        assert_eq!((seen.ok_down, seen.dir), (4, 4), "{seen:?}");
+        assert_eq!((seen.ok_up, seen.back, seen.ok_with_menu_up), (0, 0, 0), "{seen:?}");
+        assert!(!menu_seen, "a press cancelled under LONG_MS never opens the menu");
+        for _ in 0..60 { step(&mut app, &mut t, vec![]); }
+        assert!(!app.pages.input.press.is_active(), "the spring came to rest");
+    }
+
     /// A hold the app DECLINES (nothing to offer a collection) is not taken: the dispatcher
     /// abandons the press and it springs back, then comes to rest.
     #[test]
@@ -4282,6 +4905,121 @@ mod lifecycle_regression_tests {
             rig.app.route().id(),
         );
         assert_eq!(rig.app.pages.nav.top_page().map(|e| e.id), Some(origin));
+    }
+
+    /// **Issue #575: a stop is not reflected in the page it returns to.** The Detail page keeps
+    /// the `viewOffset` it fetched when it opened, and Play reads its resume point from that copy,
+    /// so a second Play after a stop starts from where the FIRST one did (or from 0:00 when the
+    /// page opened on an item with no offset). The return must re-read the item once the stop
+    /// report has landed - the server is the only one that knows what it committed.
+    #[test]
+    fn back_from_the_player_rereads_the_page_so_play_resumes_where_the_stop_left_off() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else {
+            eprintln!("SKIPPED back_from_the_player_rereads_the_page_so_play_resumes_where_the_stop_left_off: \
+                lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        let mut t = product_transition(&mut rig.app);
+        settle(&mut rig.app, &mut t);
+        super::super::bridge::open_detail(&mut rig.app.pages, &mut rig.app.bridge, rig.sid, "1", None, None);
+        settle(&mut rig.app, &mut t);
+        play_with_a_landing_inside_the_dip(&mut rig, &mut t);
+        let reads_before = plx_data::metadata::detail_generation_for_test(rig.app.bridge.metadata_mut().adapter_ref());
+        let back = back_key(t + 16);
+        step(&mut rig.app, &mut t, vec![back]);
+        settle(&mut rig.app, &mut t);
+        assert!(super::super::bridge::player(&rig.app.pages).is_none(), "premise: BACK left the player");
+        // The re-read waits for the stop report, which a worker thread posts. These frames take no
+        // wall time, so counting them races that thread (a loaded host lost the race and the page
+        // had re-read nothing "yet"). Wait for the report itself, then give the loop the one frame
+        // in which `refresh_after_playback` finds it settled.
+        plx_media::route::drain_scrobble();
+        step(&mut rig.app, &mut t, vec![]);
+        let reads_after = plx_data::metadata::detail_generation_for_test(rig.app.bridge.metadata_mut().adapter_ref());
+        assert!(
+            reads_after > reads_before,
+            "returning to the page re-read nothing: its resume point is still the one it opened with",
+        );
+        assert!(rig.app.refresh_detail.is_none(), "the re-read is asked for once, not left owed");
+    }
+
+    /// **Issue #680**: a show's Detail page, an episode played to its end, and the episode strip
+    /// must show what the server now holds (watched), not what the page read when it opened.
+    #[test]
+    fn issue_680_an_episode_played_to_its_end_is_watched_on_the_detail_page_it_returns_to() {
+        let _serial = plx_base::testlock::serial();
+        let played = Arc::new(AtomicBool::new(false));
+        let flag = played.clone();
+        let Some(mut rig) = Rig::serving_with(move |request: &str| {
+            let watched = flag.load(Ordering::SeqCst);
+            if request.contains("/decision?") {
+                return r#"{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"decision":"directplay"}]}]}]}}"#.into();
+            }
+            if request.contains("/library/metadata/200/children") {
+                return format!(r#"{{"MediaContainer":{{"size":2,"totalSize":2,"Metadata":[
+                  {{"ratingKey":"1","type":"episode","index":1,"parentIndex":1,"title":"First","duration":60000{}}},
+                  {{"ratingKey":"2","type":"episode","index":2,"parentIndex":1,"title":"Next","duration":60000}}]}}}}"#,
+                  if watched { r#","viewCount":1"# } else { "" });
+            }
+            if request.contains("/library/metadata/100/children") {
+                return r#"{"MediaContainer":{"Metadata":[{"ratingKey":"200","type":"season","index":1,"title":"Season 1","leafCount":2}]}}"#.into();
+            }
+            if request.contains("/related") || request.contains("/extras") || request.contains("/:/timeline") {
+                return r#"{"MediaContainer":{}}"#.into();
+            }
+            if request.contains("/library/metadata/100") {
+                return r#"{"MediaContainer":{"Metadata":[{"ratingKey":"100","type":"show","title":"Show","childCount":1,"leafCount":2}]}}"#.into();
+            }
+            // the play queue: one episode, nothing after it
+            if request.contains("playQueue") { flag.store(true, Ordering::SeqCst); }
+            r#"{"MediaContainer":{"machineIdentifier":"lifecycle-fixture","size":1,
+            "playQueueID":1,"playQueueSelectedItemID":11,"playQueueTotalCount":1,
+            "Metadata":[
+            {"ratingKey":"1","playQueueItemID":11,"type":"episode","title":"First",
+             "grandparentRatingKey":"100","parentIndex":1,"index":1,"duration":60000,
+             "Media":[{"videoCodec":"h264","audioCodec":"aac","width":1280,"height":720,
+             "Part":[{"id":1,"key":"/library/parts/1/file.mkv","Stream":[
+             {"id":1,"streamType":1,"codec":"h264"},
+             {"id":2,"streamType":2,"codec":"aac","selected":true}]}]}]}]}}"#.into()
+        }) else { return };
+        // Nothing parks: the first request (the page's own read) answers at once.
+        rig.release.send(()).unwrap();
+        let mut t = product_transition(&mut rig.app);
+        settle(&mut rig.app, &mut t);
+        super::super::bridge::open_detail(&mut rig.app.pages, &mut rig.app.bridge, rig.sid, "100", None, None);
+        settle(&mut rig.app, &mut t);
+        rig.app.bridge.metadata_mut().adapter_ref().run_held_detail_fetches_for_test();
+        rig.app.bridge.metadata_mut().pump_detail();
+        settle(&mut rig.app, &mut t);
+        let watched = |rig: &mut Rig| rig.app.bridge.metadata_view().current()
+            .filter(|d| d.rk == "100")
+            .and_then(|d| d.episodes.get(0).map(|e| (e.rk.clone(), e.watched)));
+        assert_eq!(watched(&mut rig), Some(("1".into(), false)), "premise: the page opened on an unwatched episode");
+        let origin = rig.app.pages.nav.top_page().unwrap().id;
+        assert!(matches!(rig.app.pages.nav.top_page().unwrap().arg,
+            AppArg::Content(plx_screens::registry::ContentArg::Detail { .. })));
+        rig.request();
+        rig.accept_start();
+        poll_until("the plan did not land through update", || {
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            fr.now = t;
+            unsafe { update(&mut rig.app, &mut fr); }
+            rig.app.adapters.player.is_live()
+        });
+        settle(&mut rig.app, &mut t);
+        assert!(super::super::bridge::player(&rig.app.pages).is_some(), "the player is on top");
+        assert!(played.load(Ordering::SeqCst), "premise: the server saw the play");
+        plx_media::player::SHARED.ended.store(true, std::sync::atomic::Ordering::Relaxed);
+        settle(&mut rig.app, &mut t);
+        assert_eq!(rig.app.pages.nav.top_page().map(|e| e.id), Some(origin), "EOS returned to the page");
+        plx_media::route::drain_scrobble();
+        step(&mut rig.app, &mut t, vec![]);
+        rig.app.bridge.metadata_mut().adapter_ref().run_held_detail_fetches_for_test();
+        rig.app.bridge.metadata_mut().pump_detail();
+        settle(&mut rig.app, &mut t);
+        assert_eq!(watched(&mut rig), Some(("1".into(), true)),
+            "the episode strip still shows the read the page opened with");
     }
 
     /// The same session drained to its end with nothing queued after it: `finish_playback` leaves

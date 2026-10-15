@@ -12,7 +12,7 @@ use plx_data::search::{Item, Shelf};
 use plx_ui::fixture::FixtureMeasure;
 use plx_ui::focus::{FocusEngine, Outcome};
 use plx_ui::hit::{HitMap, PointerKind};
-use plx_ui::screen::By;
+use plx_ui::screen::{By, Focusable, Step};
 use plx_machine::machine::{FocusRead, Host, InputEvent, PressRead, Source, Stamped, Tick};
 use plx_machine::present::Present;
 use plx_ui::screen::{Activate, Hover, ScreenArg, Stop};
@@ -57,7 +57,7 @@ fn movie(rk: &str) -> Item {
 
 /// A shelf of `n` synthetic items, addressed so two shelves never share a result identity.
 fn shelf(kind: Kind, tag: &str, n: usize) -> Shelf {
-    Shelf { kind, items: (0..n).map(|i| movie(&format!("{tag}-{i}"))).collect() }
+    Shelf { epoch: 0, window: Default::default(), kind, items: (0..n).map(|i| movie(&format!("{tag}-{i}"))).collect() }
 }
 
 struct Fixture {
@@ -276,7 +276,7 @@ fn a_vertical_step_between_shelves_keeps_the_visual_column() {
     fixture.query("column").shelves(vec![shelf(Kind::Movie, "a", 20), shelf(Kind::Show, "b", 20)]);
     let mut screen = fixture.screen();
     let style = layout::style(Kind::Movie);
-    screen.rows[0].motion.restore_scroll(4.0 * (style.w + style.gap), 20, &style);
+    scroll_row(&mut screen, &fixture, 0, 4.0 * (style.w + style.gap));
     let mut engine = FocusEngine::new();
     let sixth = screen.key(screen.rows[0].elems[6]);
     engine.set(OWNER, sixth, Some(screen.rows[0].group), By::Restore);
@@ -300,7 +300,7 @@ fn a_shelf_that_shrinks_under_the_cursor_re_seats_it() {
         shelf(Kind::Collection, "c", 5)]);
     let mut screen = fixture.screen();
     let mut engine = FocusEngine::new();
-    let index = |screen: &SearchScreen, key: FocusKey<u32>| screen.index(key.elem)
+    let index = |screen: &SearchScreen, key: FocusKey<u32>| index_of(&screen, key.elem)
         .and_then(|(group, i)| screen.rows.iter().position(|row| row.group == group).map(|row| (row, i)));
     engine.set(OWNER, screen.key(screen.rows[0].elems[6]), Some(screen.rows[0].group), By::Restore);
 
@@ -338,7 +338,7 @@ fn focus_is_clamped_when_the_shelves_shrink_under_it() {
     fixture.shelves(vec![shelf(Kind::Movie, "c", 4)]);
     deliver(&mut screen, &fixture, Some(deep), ScreenEvent::StoreChanged(StoreId::Search.ord(), 0));
     let seated = <SearchScreen as Focusable<HostFixture>>::reconcile(&screen, deep, &fixture.cx(Some(deep)));
-    assert_eq!(screen.index(seated.elem).map(|(g, i)| (g == screen.rows[0].group, i)), Some((true, 3)),
+    assert_eq!(index_of(&screen, seated.elem).map(|(g, i)| (g == screen.rows[0].group, i)), Some((true, 3)),
         "a cursor past the end of a shrunken shelf seats on its last item");
 
     // …and a set that empties entirely leaves focus on the field, never on a tile that is gone.
@@ -356,7 +356,7 @@ fn focus_is_clamped_when_the_shelves_shrink_under_it() {
         // moves a cursor off a region that has gone, and a direction key never sees the stale one.
         engine.reconcile(OWNER, &screen, &fixture.cx(Some(deep)));
         step_dir(&mut screen, &fixture, &mut engine, dir);
-        assert!(engine.current(OWNER).is_some_and(|key| screen.index(key.elem).is_some()),
+        assert!(engine.current(OWNER).is_some_and(|key| index_of(&screen, key.elem).is_some()),
             "{dir:?} inside an emptied result set must land on something drawn");
     }
 }
@@ -442,14 +442,14 @@ fn a_tile_scrolled_under_the_chrome_is_not_a_pointer_target() {
     let mut screen = fixture.screen();
     let elem = screen.rows[0].elems[0];
     let floor = plx_ui::widgets::TOP_BAR_BOTTOM;
-    let rest = screen.row_rect(0, 0, At::Drawn);
+    let rest = <SearchScreen as Focusable<HostFixture>>::place(&screen, &elem, &fixture.cx(None), At::Drawn).unwrap().rect;
 
     // Fully on screen: hit anywhere inside it.
     assert_eq!(hit(&screen, &fixture, &[elem], rest.cx(), rest.cy()), Some(elem));
 
     // Straddling the floor: the visible half answers, the covered half does not.
     let straddle = rest.y + rest.h - floor - 20.0;
-    screen.scroll.jump(straddle);
+    park(&mut screen, straddle);
     let part = <SearchScreen as Focusable<HostFixture>>::place(&screen, &elem, &fixture.cx(None), At::Drawn).unwrap();
     let visible = part.rect.intersect(part.clip);
     assert!((visible.h - 20.0).abs() < 0.001, "only the part below the track is taken: {visible:?}");
@@ -458,7 +458,7 @@ fn a_tile_scrolled_under_the_chrome_is_not_a_pointer_target() {
         "above the track is chrome the standing strip owns");
 
     // Fully underneath: no target at all, including on the floor line itself.
-    screen.scroll.jump(rest.y + rest.h - floor + 0.5);
+    park(&mut screen, rest.y + rest.h - floor + 0.5);
     assert_eq!(hit(&screen, &fixture, &[elem], rest.cx(), floor), None);
     assert_eq!(hit(&screen, &fixture, &[elem], rest.cx(), floor + 1.0), None);
 }
@@ -477,7 +477,7 @@ fn the_fields_hit_rect_rides_the_scroll_and_stops_at_the_track() {
         "an unscrolled screen must cost nothing: this is FIELD itself");
     assert_eq!(hit(&screen, &fixture, &[FIELD], layout::FIELD.cx(), layout::FIELD.cy()), Some(FIELD));
 
-    screen.scroll.jump(layout::FIELD.y - floor + 20.0);
+    park(&mut screen, layout::FIELD.y - floor + 20.0);
     let part = stop_of(&screen, &fixture, None, FIELD).unwrap();
     let visible = part.rect.intersect(part.clip);
     assert_eq!(visible.y, floor, "floored at the track, not dropped");
@@ -485,7 +485,7 @@ fn the_fields_hit_rect_rides_the_scroll_and_stops_at_the_track() {
         "only the part under the track is taken: y={} h={}", visible.y, visible.h);
     assert_eq!(hit(&screen, &fixture, &[FIELD], layout::FIELD.cx(), floor + 10.0), Some(FIELD));
 
-    screen.scroll.jump(layout::FIELD.y + layout::FIELD.h - floor + 0.5);
+    park(&mut screen, layout::FIELD.y + layout::FIELD.h - floor + 0.5);
     assert_eq!(hit(&screen, &fixture, &[FIELD], layout::FIELD.cx(), floor), None,
         "once the whole box is behind the track it is not a target at all");
 }
@@ -502,15 +502,15 @@ fn revealing_the_second_shelf_carries_the_query_field_under_the_track() {
     let mut engine = seated(&screen, &fixture);
 
     step_dir(&mut screen, &fixture, &mut engine, Dir::Down);
-    assert_eq!(screen.scroll_target, 0.0, "the first shelf is already on screen");
+    assert_eq!(screen.stack.target(), 0.0, "the first shelf is already on screen");
     assert_eq!(hit(&screen, &fixture, &[FIELD], layout::FIELD.cx(), layout::FIELD.cy()), Some(FIELD));
 
     step_dir(&mut screen, &fixture, &mut engine, Dir::Down);
-    assert!(screen.scroll_target > 0.0, "the second shelf is below the fold and must be revealed");
+    assert!(screen.stack.target() > 0.0, "the second shelf is below the fold and must be revealed");
     for i in 0..120 { frame(&mut screen, &fixture, &engine, i); }
     let floor = plx_ui::widgets::TOP_BAR_BOTTOM;
-    assert!(screen.scroll.pos > layout::FIELD.y + layout::FIELD.h - floor,
-        "the field must end up wholly under the track (scroll {})", screen.scroll.pos);
+    assert!(screen.stack.scroll() > layout::FIELD.y + layout::FIELD.h - floor,
+        "the field must end up wholly under the track (scroll {})", screen.stack.scroll());
     assert!(stop_of(&screen, &fixture, None, FIELD)
         .is_some_and(|stop| stop.rect.intersect(stop.clip).h <= 0.0));
     assert_eq!(hit(&screen, &fixture, &[FIELD], layout::FIELD.cx(), floor), None,
@@ -536,12 +536,12 @@ fn the_scroll_spring_reports_while_it_runs_and_goes_quiet_at_rest() {
         "a Search screen with nothing moving must stop repainting");
     assert!(!frame(&mut screen, &fixture, &engine, 101), "…and stays quiet frame after frame");
 
-    screen.scroll.jump(400.0);
+    park(&mut screen, 400.0);
     assert!(frame(&mut screen, &fixture, &engine, 102), "a scrolling shelf must keep the panel awake");
     let mut frames = 0;
     while frame(&mut screen, &fixture, &engine, 103 + frames) && frames < 600 { frames += 1; }
     assert!(frames < 600, "the scroll must arrive, not ring forever");
-    assert!(screen.scroll.pos.abs() < 0.25, "with focus off the shelves the flow rests at zero");
+    assert!(screen.stack.scroll().abs() < 0.25, "with focus off the shelves the flow rests at zero");
 }
 
 /// Legacy `the_fields_focus_fade_runs_when_focus_leaves_it_and_settles`: the field's two faces
@@ -625,7 +625,7 @@ fn a_mount_seats_the_field_and_parks_every_cursor_without_replacing_the_search()
     <SearchScreen as Screen<HostFixture>>::state(&screen).probe(&mut probe);
     assert_eq!(fixture.store.state(), plx_data::search::State::Idle);
     assert!(probe.contains("editing=false") && probe.contains("caret=0") && probe.contains("rows=0"));
-    assert_eq!(screen.scroll_target, 0.0);
+    assert_eq!(screen.stack.target(), 0.0);
     assert_eq!(screen.hot.pos, 1.0, "the field mounts focused and SEATED, or it reports motion on arrival");
 
     // A search in progress, with a cursor deep in its results: mounting again over it keeps the
@@ -633,8 +633,7 @@ fn a_mount_seats_the_field_and_parks_every_cursor_without_replacing_the_search()
     fixture.query("wallace").shelves(vec![shelf(Kind::Movie, "mount", 8)]);
     let generation = fixture.store.query_gen();
     let mut screen = fixture.screen();
-    screen.scroll.jump(400.0);
-    screen.scroll_target = 400.0;
+    screen.stack.jump_to(400.0);
     let (_, out, _) = deliver(&mut screen, &fixture, None, ScreenEvent::Mount);
     assert_eq!(fixture.store.query(), "wallace", "a mount must not wipe the term still on screen");
     assert_eq!(fixture.store.query_gen(), generation, "…nor supersede the answer under it");
@@ -650,7 +649,7 @@ fn a_mount_seats_the_field_and_parks_every_cursor_without_replacing_the_search()
     let mut probe = String::new();
     <SearchScreen as Screen<HostFixture>>::state(&screen).probe(&mut probe);
     assert!(probe.contains("caret=7"), "the caret is the LIVE string's end: {probe}");
-    assert!(screen.recents.is_empty() && screen.scroll_target == 0.0, "every cursor parks");
+    assert!(screen.recents.is_empty() && screen.stack.target() == 0.0, "every cursor parks");
     drop(session);
 }
 
@@ -745,31 +744,68 @@ fn the_shelf_flow_is_frozen_unless_the_shelves_hold_focus_with_the_keyboard_down
     // The one case that scrolls at all: the shelves hold focus with the keyboard down.
     deliver(&mut screen, &fixture, Some(deep), ScreenEvent::FocusMoved {
         from: Some(field), to: deep, by: By::Dir });
-    assert!(screen.scroll_target > 0.0);
+    assert!(screen.stack.target() > 0.0);
 
     // The keyboard goes up: the flow parks at zero under a user who is still typing, and stays
     // there for as long as the panel is up.
     deliver(&mut screen, &fixture, Some(field), ScreenEvent::Activate(FIELD));
     assert!(screen.editing);
-    assert_eq!(screen.scroll_target, 0.0, "the result set stays still while the panel is up");
+    assert_eq!(screen.stack.target(), 0.0, "the result set stays still while the panel is up");
     deliver(&mut screen, &fixture, Some(field), ScreenEvent::FocusMoved {
         from: Some(deep), to: field, by: By::Dir });
-    assert_eq!(screen.scroll_target, 0.0);
+    assert_eq!(screen.stack.target(), 0.0);
 
     // A step off the field DROPS the panel first — which is what makes "the flow moves only with
     // the keyboard down" true by construction rather than by a second frozen flag.
     deliver(&mut screen, &fixture, Some(deep), ScreenEvent::FocusMoved {
         from: Some(field), to: deep, by: By::Dir });
     assert!(!screen.editing, "leaving the field takes the television's keyboard with it");
-    assert!(screen.scroll_target > 0.0);
+    assert!(screen.stack.target() > 0.0);
 
     // …and whenever the shelves do not hold focus, the flow is back at zero.
     for elem in [FIELD, screen.rows[0].elems[0]] {
         let key = screen.key(elem);
         deliver(&mut screen, &fixture, Some(key), ScreenEvent::FocusMoved {
             from: Some(deep), to: key, by: By::Dir });
-        assert_eq!(screen.scroll_target, 0.0, "elem {elem} is not below the fold");
+        assert_eq!(screen.stack.target(), 0.0, "elem {elem} is not below the fold");
     }
+}
+
+/// The scroll that shows result row `k` of `kinds` focused, from scroll `cur`, worked from the
+/// layout: blocks measured at their destination (the focused row's caption band open, the others
+/// closed), the page's `CONTENT_TOP` as the margin.
+fn search_reveal_want(kinds: &[Kind], k: usize, cur: f32) -> f32 {
+    use plx_ui::cards::{reveal, under_band};
+    use plx_ui::consts::{MARGIN_Y, SCR_H};
+    let block = |n: usize, open: bool| layout::block_h(kinds[n], under_band(open as i32 as f32));
+    let top = layout::CONTENT_TOP + (0..k).map(|n| block(n, false)).sum::<f32>();
+    let end = layout::CONTENT_TOP + (0..kinds.len()).map(|n| block(n, n == k)).sum::<f32>();
+    reveal(cur, top + block(k, true) - (SCR_H - MARGIN_Y), top - layout::CONTENT_TOP, (end - (SCR_H - MARGIN_Y)).max(0.0))
+}
+
+/// Up to a row already revealed does not move the page when measured from where the page is
+/// headed (the target), which is not where it is (the live position) when keys outrun the glide.
+#[test]
+fn a_step_up_is_revealed_from_the_target_the_walk_down_left_not_from_the_lagging_position() {
+    let _serial = plx_base::testlock::serial();
+    let mut fixture = Fixture::new();
+    fixture.query("walk").shelves(vec![shelf(Kind::Movie, "w0", 6), shelf(Kind::Show, "w1", 6),
+        shelf(Kind::Episode, "w2", 6), shelf(Kind::Person, "w3", 6), shelf(Kind::Collection, "w4", 6)]);
+    let mut screen = fixture.screen();
+    let mut engine = seated(&screen, &fixture);
+    let kinds = [Kind::Movie, Kind::Show, Kind::Episode, Kind::Person, Kind::Collection];
+    let want = |k, cur| search_reveal_want(&kinds, k, cur);
+    let mut target = 0.0;
+    for k in 0..5 {
+        step_dir(&mut screen, &fixture, &mut engine, Dir::Down);
+        target = want(k, target);
+        assert_eq!(screen.stack.target(), target, "row {k}, from the previous target");
+    }
+    assert_eq!(screen.stack.scroll(), 0.0, "setup: no frame has run, the page has not left home");
+    step_dir(&mut screen, &fixture, &mut engine, Dir::Up);
+    let from_target = want(3, target);
+    assert_eq!(screen.stack.target(), from_target, "Up measures from the target");
+    assert_ne!(from_target, want(3, screen.stack.scroll()), "setup: from the live position it would differ");
 }
 
 // ---- the borrowed-source annotation -----------------------------------------------------------
@@ -786,8 +822,8 @@ fn shared_shelf(fixture: &mut Fixture) -> [plx_plex::plex::ServerId; 3] {
     let item = |sid| Item::Media(plx_data::pms::PmsMovie { sid, rk: format!("annotated-{sid:?}"),
         title: "Synthetic result".into(), ..Default::default() });
     fixture.query("annotated").shelves(vec![
-        Shelf { kind: Kind::Movie, items: vec![item(own), item(a), item(b)] },
-        Shelf { kind: Kind::Show, items: vec![item(own)] }]);
+        Shelf { epoch: 0, window: Default::default(), kind: Kind::Movie, items: vec![item(own), item(a), item(b)] },
+        Shelf { epoch: 0, window: Default::default(), kind: Kind::Show, items: vec![item(own)] }]);
     let handles: Vec<&str> = fixture.search.view().scope().sources().iter()
         .map(|source| source.handle.as_str()).collect();
     assert_eq!(handles, ["", "friend", "other"], "the fixture's own roster projection");
@@ -961,4 +997,597 @@ fn a_collection_shelf_counts_results_and_its_tiles_count_items() {
     assert_eq!(item_count(1), "1 item");
     // Cardinal rules apply to the absolute value, including negative wire counts.
     assert_eq!((item_count(0), item_count(-1)), ("0 items".to_owned(), "-1 item".to_owned()));
+}
+
+/// Put the page's scroll at `y` with its target left where it was, as a glide in progress.
+fn park(screen: &mut SearchScreen, y: f32) {
+    let target = screen.stack.target();
+    screen.stack.jump_to(y);
+    screen.stack.scroll_to(target);
+}
+
+/// The group `elem` is in and its place there, read off the page's model.
+fn index_of(screen: &SearchScreen, elem: u32) -> Option<(GroupId, usize)> {
+    if elem == FIELD { return Some((FIELD_GROUP, 0)); }
+    if elem == CLEAR && !screen.recents.is_empty() { return Some((CLEAR_GROUP, 0)); }
+    if let Some(i) = screen.recents.iter().position(|key| *key == elem) { return Some((RECENTS_GROUP, i)); }
+    screen.rows.iter().find_map(|row| row.elems.iter().position(|key| *key == elem).map(|i| (row.group, i)))
+}
+
+/// Result row `row`'s shelf in the page's stack.
+fn shelf_of(screen: &SearchScreen, row: usize) -> &plx_ui::cards::Shelf {
+    screen.stack.shelf(screen.section(row)).expect("the row has a shelf")
+}
+
+/// Put result row `row`'s tiles `x` px along their strip, as a Back to it would.
+fn scroll_row(screen: &mut SearchScreen, fixture: &Fixture, row: usize, x: f32) {
+    let sec = screen.section(row);
+    screen.stack.restore(&StackMemory { scroll: screen.stack.scroll(), shelves: vec![(sec, x)] });
+    deliver(screen, fixture, None, ScreenEvent::Resume);
+}
+
+// ---- result rows follow their kind, not their place in the list -------------------------------
+
+/// The pop of `elem` on result row `row`, as the row's shelf would draw it now.
+fn pop_of(screen: &SearchScreen, fixture: &Fixture, focus: Option<FocusKey<u32>>, row: usize, elem: u32) -> Option<f32> {
+    let src = screen.row_cards(fixture.search.view(), row)?;
+    shelf_of(screen, row).scale_of::<HostFixture, _>(&fixture.cx(focus), &src, &elem)
+}
+
+/// Sources answer one at a time, so a row can land above rows already on the page. Each row keeps
+/// its own shelf (its scroll and its lifted card), keyed by its kind; a row inserted above must
+/// not hand its neighbour's scroll or pop to itself.
+#[test]
+fn a_row_that_lands_above_keeps_the_neighbours_scroll_and_pop_with_the_neighbour() {
+    let _serial = plx_base::testlock::serial();
+    let mut fixture = Fixture::new();
+    fixture.query("landing").shelves(vec![shelf(Kind::Show, "s", 20)]);
+    let mut screen = fixture.screen();
+    let pitch = layout::style(Kind::Show).w + layout::style(Kind::Show).gap;
+    scroll_row(&mut screen, &fixture, 0, 3.0 * pitch);
+    let focus = Some(screen.key(screen.rows[0].elems[5]));
+    deliver(&mut screen, &fixture, focus, ScreenEvent::FocusMoved { from: None, to: focus.unwrap(), by: By::Restore });
+    for i in 0..60 { deliver(&mut screen, &fixture, focus, ScreenEvent::Tick(tick(i))); }
+    let scrolled = shelf_of(&screen, 0).scroll();
+    assert!(scrolled > 0.0);
+    let elem = focus.unwrap().elem;
+    assert_eq!(pop_of(&screen, &fixture, focus, 0, elem), Some(layout::style(Kind::Show).focus_scale));
+
+    fixture.shelves(vec![shelf(Kind::Movie, "m", 20), shelf(Kind::Show, "s", 20)]);
+    deliver(&mut screen, &fixture, focus, ScreenEvent::StoreChanged(StoreId::Search.ord(), 1));
+    deliver(&mut screen, &fixture, focus, ScreenEvent::Tick(tick(100)));
+    assert_eq!(screen.rows.iter().map(|row| row.kind).collect::<Vec<_>>(), [Kind::Movie, Kind::Show]);
+    let kinds = [Kind::Movie, Kind::Show];
+    let followed = search_reveal_want(&kinds, 1, 0.0);
+    assert!(followed > 0.0, "setup: the Show row now sits below the fold");
+    assert_eq!(screen.stack.target(), followed, "the page follows the focused row down to where it landed");
+    assert_eq!(shelf_of(&screen, 0).scroll(), 0.0, "the new row starts at its own beginning");
+    assert_eq!(shelf_of(&screen, 1).scroll(), scrolled, "the Show row keeps the Show row's scroll");
+    assert_eq!(pop_of(&screen, &fixture, focus, 1, elem), Some(layout::style(Kind::Show).focus_scale),
+        "and its lifted card stays lifted");
+    let first = screen.rows[0].elems[0];
+    assert_eq!(pop_of(&screen, &fixture, focus, 0, first), Some(1.0), "the new row lifts nothing");
+}
+
+/// Collection's `dismissing_a_hold_menu_and_moving_leaves_no_stale_lift`, on a result row: the
+/// opener a hold covers sits at full pop under the menu's focus (the opener redraw reads it), and
+/// once the menu is dismissed and focus moves on, the old card lets go and the new one grows from
+/// rest, so nothing stays lifted for a stale redraw to read.
+#[test]
+fn dismissing_a_hold_menu_and_moving_leaves_no_stale_lift() {
+    let _serial = plx_base::testlock::serial();
+    let mut fixture = Fixture::new();
+    fixture.query("opener").shelves(vec![shelf(Kind::Movie, "m", 6)]);
+    let mut screen = fixture.screen();
+    let mut engine = seated(&screen, &fixture);
+    let a = step_dir(&mut screen, &fixture, &mut engine, Dir::Down).unwrap();
+    for i in 0..60 { frame(&mut screen, &fixture, &engine, i); }
+    let full = layout::style(Kind::Movie).focus_scale;
+    let at_full = |screen: &SearchScreen| pop_of(screen, &fixture, Some(a), 0, a.elem).is_some_and(|pop| (pop - full).abs() < 0.001);
+    assert!(at_full(&screen), "the settled opener is at full pop");
+
+    // The menu opens over the page: the page keeps its focus and its pop.
+    deliver(&mut screen, &fixture, Some(a), ScreenEvent::Cover);
+    for i in 0..30 { frame(&mut screen, &fixture, &engine, 100 + i); }
+    assert!(at_full(&screen), "covered, the opener stays lifted");
+    let held = <SearchScreen as Focusable<HostFixture>>::place(&screen, &a.elem, &fixture.cx(Some(a)), At::Drawn).unwrap();
+    assert!((held.rect.w - held.rest_rect.w).abs() < 0.01, "the opener redraw paints the settled rect");
+    deliver(&mut screen, &fixture, Some(a), ScreenEvent::Uncover);
+
+    let b = step_dir(&mut screen, &fixture, &mut engine, Dir::Right).unwrap();
+    assert_ne!(a, b);
+    frame(&mut screen, &fixture, &engine, 200);
+    let (old, new) = (pop_of(&screen, &fixture, Some(b), 0, a.elem).unwrap(), pop_of(&screen, &fixture, Some(b), 0, b.elem).unwrap());
+    assert!(old < full - 0.001 && old >= 1.0, "the old opener is letting go, not held at full pop: {old}");
+    assert!(new < full - 0.001, "the new card grows from rest: {new}");
+}
+
+// ---- characterization: the page's focus model, pinned before it moves under `Stack` -----------
+
+/// What the hand-written page does today, as text: the focus groups and their policies, the
+/// neighbour of every element on every edge, the seats, where each element is placed at rest, the
+/// scroll after walking the shelves down and back, what a return from Detail restores and how a
+/// replaced result set reconciles. The expectations are the behaviour of the page before it was a
+/// `Stack` page; they change only when Search's behaviour is meant to.
+mod characterization {
+    use super::*;
+
+    /// The page's elements in document order, by whatever the page keeps them in.
+    fn content(screen: &SearchScreen) -> (Vec<u32>, Vec<Vec<u32>>) {
+        (screen.recents.clone(), screen.rows.iter().map(|row| row.elems.clone()).collect())
+    }
+
+    fn f(v: f32) -> String { format!("{:.1}", if v == 0.0 { 0.0 } else { v }) }
+    fn r(rect: Rect) -> String { format!("[{} {} {} {}]", f(rect.x), f(rect.y), f(rect.w), f(rect.h)) }
+
+    fn groups(screen: &SearchScreen, fixture: &Fixture, focus: Option<FocusKey<u32>>) -> String {
+        let mut out = Vec::new();
+        <SearchScreen as Focusable<HostFixture>>::groups(screen, &fixture.cx(focus), &mut out);
+        out.iter()
+            .map(|g| format!("{:#x} {:?} seat={:?} edge={:?} len={} elem={:?} extent={}", g.id.0, g.kind, g.seat, g.edge, g.len, g.elem, r(g.extent)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn name(elem: u32, screen: &SearchScreen) -> String {
+        let (recents, rows) = content(screen);
+        if elem == FIELD { return "field".into(); }
+        if elem == CLEAR { return "clear".into(); }
+        if let Some(i) = recents.iter().position(|e| *e == elem) { return format!("recent{i}"); }
+        for (row, elems) in rows.iter().enumerate() {
+            if let Some(i) = elems.iter().position(|e| *e == elem) { return format!("r{row}c{i}"); }
+        }
+        format!("?{elem}")
+    }
+
+    fn neighbours(screen: &SearchScreen, fixture: &Fixture, elems: &[u32]) -> String {
+        let mut lines = Vec::new();
+        for &elem in elems {
+            let key = screen.key(elem);
+            let cx = fixture.cx(Some(key));
+            let at = |dir| match <SearchScreen as Focusable<HostFixture>>::neighbour(screen, key, dir, &cx) {
+                Step::Move(k) => name(k.elem, screen),
+                Step::Edge => "-".into(),
+                #[allow(unreachable_patterns)]
+                _ => "other".into(),
+            };
+            lines.push(format!("{}: up={} down={} left={} right={}", name(elem, screen),
+                at(Dir::Up), at(Dir::Down), at(Dir::Left), at(Dir::Right)));
+        }
+        lines.join("\n")
+    }
+
+    fn all_elems(screen: &SearchScreen) -> Vec<u32> {
+        let (recents, rows) = content(screen);
+        let mut v = vec![FIELD];
+        v.extend(recents.iter().copied());
+        if !recents.is_empty() { v.push(CLEAR); }
+        v.extend(rows.into_iter().flatten());
+        v
+    }
+
+    fn placed(screen: &SearchScreen, fixture: &Fixture, focus: Option<FocusKey<u32>>, elems: &[u32], at: At) -> String {
+        elems.iter().map(|&e| {
+            match <SearchScreen as Focusable<HostFixture>>::place(screen, &e, &fixture.cx(focus), at) {
+                Some(p) => format!("{}: rect={} rest={} clip={} index={:?}", name(e, screen), r(p.rect), r(p.rest_rect), r(p.clip), p.index),
+                None => format!("{}: none", name(e, screen)),
+            }
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    fn seats(screen: &SearchScreen, fixture: &Fixture, focus: Option<FocusKey<u32>>, gs: &[GroupId], from: Placed) -> String {
+        gs.iter().map(|&g| {
+            let k = <SearchScreen as Focusable<HostFixture>>::seat(screen, g, from, &fixture.cx(focus));
+            format!("{:#x} -> {}", g.0, name(k.elem, screen))
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    fn settle(screen: &mut SearchScreen, fixture: &Fixture, engine: &FocusEngine<u32>) {
+        for i in 0..180 { frame(screen, fixture, engine, 1000 + i); }
+    }
+
+    fn recents_fixture() -> (plx_plex::plex::session::TempSession, Fixture) {
+        (remembering("characterization-recents", &["gromit", "wallace", "preston", "feathers"]), Fixture::new())
+    }
+
+    fn shelves_fixture() -> Fixture {
+        let mut fixture = Fixture::new();
+        fixture.query("many").shelves(vec![shelf(Kind::Movie, "m", 9), shelf(Kind::Show, "s", 3),
+            shelf(Kind::Episode, "e", 7), shelf(Kind::Person, "p", 12), shelf(Kind::Collection, "c", 4)]);
+        fixture
+    }
+
+    #[test]
+    fn the_recents_page_groups_neighbours_and_places() {
+        let _serial = plx_base::testlock::serial();
+        let (_session, fixture) = recents_fixture();
+        let screen = fixture.screen();
+        let field = Some(screen.key(FIELD));
+        let elems = all_elems(&screen);
+        let from = <SearchScreen as Focusable<HostFixture>>::place(&screen, &FIELD, &fixture.cx(field), At::Drawn).unwrap();
+        let got = [groups(&screen, &fixture, field), neighbours(&screen, &fixture, &elems),
+            placed(&screen, &fixture, field, &elems, At::Drawn), placed(&screen, &fixture, field, &elems, At::SpringTarget),
+            seats(&screen, &fixture, field, &[FIELD_GROUP, RECENTS_GROUP, CLEAR_GROUP], from)].join("\n--\n");
+        assert_eq!(got, include_str!("characterization/recents.txt").trim_end());
+        let mut links = links(&screen).iter().map(|l| format!("{:#x} {:?} {:#x}", l.from.0, l.dir, l.to.0)).collect::<Vec<_>>();
+        links.sort();
+        assert_eq!(links.join("\n"), include_str!("characterization/recents_links.txt").trim_end());
+        // a seat from a card-less place (anywhere but the field) enters at the first element
+        let down = <SearchScreen as Focusable<HostFixture>>::seat(&screen, RECENTS_GROUP, from, &fixture.cx(Some(screen.key(CLEAR))));
+        assert_eq!(name(down.elem, &screen), "recent0");
+    }
+
+    #[test]
+    fn the_results_page_groups_neighbours_and_places() {
+        let _serial = plx_base::testlock::serial();
+        let fixture = shelves_fixture();
+        let screen = fixture.screen();
+        let field = Some(screen.key(FIELD));
+        let elems = all_elems(&screen);
+        let from = <SearchScreen as Focusable<HostFixture>>::place(&screen, &FIELD, &fixture.cx(field), At::Drawn).unwrap();
+        let gids: Vec<GroupId> = [FIELD_GROUP].into_iter().chain((0..5).map(|i| GroupId(0x5345_4200 + i))).collect();
+        let got = [groups(&screen, &fixture, field), neighbours(&screen, &fixture, &elems),
+            placed(&screen, &fixture, field, &elems, At::Drawn), seats(&screen, &fixture, field, &gids, from)].join("\n--\n");
+        assert_eq!(got, include_str!("characterization/results.txt").trim_end());
+        let mut links = links(&screen).iter().map(|l| format!("{:#x} {:?} {:#x}", l.from.0, l.dir, l.to.0)).collect::<Vec<_>>();
+        links.sort();
+        assert_eq!(links.join("\n"), include_str!("characterization/results_links.txt").trim_end());
+    }
+
+    /// Walk ▼ through every shelf (settling each stop) and back ▲: the scroll at rest, where the
+    /// focused tile is placed, and that the field and the first shelf come back where they were.
+    #[test]
+    fn walking_down_through_every_shelf_and_back_scrolls_and_places_as_it_did() {
+        let _serial = plx_base::testlock::serial();
+        let fixture = shelves_fixture();
+        let mut screen = fixture.screen();
+        let mut engine = seated(&screen, &fixture);
+        let mut lines = Vec::new();
+        let mut record = |screen: &mut SearchScreen, engine: &FocusEngine<u32>, what: &str| {
+            settle(screen, &fixture, engine);
+            let focus = engine.current(OWNER);
+            let elem = focus.unwrap().elem;
+            let p = <SearchScreen as Focusable<HostFixture>>::place(screen, &elem, &fixture.cx(focus), At::Drawn).unwrap();
+            let field = <SearchScreen as Focusable<HostFixture>>::place(screen, &FIELD, &fixture.cx(focus), At::Drawn).unwrap();
+            lines.push(format!("{what}: {} scroll={} rect={} rest={} field_y={}", name(elem, screen), f(screen.stack.scroll()), r(p.rect), r(p.rest_rect), f(field.rect.y)));
+        };
+        record(&mut screen, &engine, "start");
+        for _ in 0..5 {
+            step_dir(&mut screen, &fixture, &mut engine, Dir::Down);
+            record(&mut screen, &engine, "down");
+        }
+        step_dir(&mut screen, &fixture, &mut engine, Dir::Right);
+        record(&mut screen, &engine, "right");
+        for _ in 0..5 {
+            step_dir(&mut screen, &fixture, &mut engine, Dir::Up);
+            record(&mut screen, &engine, "up");
+        }
+        assert_eq!(lines.join("\n"), include_str!("characterization/walk.txt").trim_end());
+    }
+
+    #[test]
+    fn a_return_from_detail_restores_the_scroll_the_shelves_and_the_focus() {
+        let _serial = plx_base::testlock::serial();
+        let fixture = shelves_fixture();
+        let mut screen = fixture.screen();
+        let mut engine = seated(&screen, &fixture);
+        for _ in 0..3 { step_dir(&mut screen, &fixture, &mut engine, Dir::Down); }
+        let deep = engine.current(OWNER).unwrap();
+        for _ in 0..3 { step_dir(&mut screen, &fixture, &mut engine, Dir::Right); }
+        let focus = engine.current(OWNER).unwrap();
+        settle(&mut screen, &fixture, &engine);
+        let before = placed(&screen, &fixture, Some(focus), &[focus.elem], At::Drawn);
+        let memory = Screen::<HostFixture>::memory_at(&screen, Some(focus));
+
+        let mut fresh = SearchScreen::new(ENTRY, INSTANCE);
+        deliver(&mut fresh, &fixture, None, ScreenEvent::RestoreMemory(memory));
+        deliver(&mut fresh, &fixture, Some(focus), ScreenEvent::Mount);
+        let reconciled = <SearchScreen as Focusable<HostFixture>>::reconcile(&fresh, focus, &fixture.cx(Some(focus)));
+        assert_eq!(reconciled, focus, "the tile that was focused is the tile that comes back");
+        let mut engine = FocusEngine::new();
+        engine.set(OWNER, focus, None, By::Restore);
+        for i in 0..4 { frame(&mut fresh, &fixture, &engine, i); }
+        assert_eq!(name(deep.elem, &fresh), name(deep.elem, &screen));
+        let got = format!("scroll={} target={}\n{}", f(fresh.stack.scroll()), f(fresh.stack.target()),
+            placed(&fresh, &fixture, Some(focus), &[focus.elem], At::Drawn));
+        assert_eq!(got.lines().last().unwrap(), before, "the restored page puts the tile where it stood");
+        assert_eq!(got.lines().next().unwrap(), include_str!("characterization/restore.txt").trim_end());
+    }
+
+    #[test]
+    fn replacing_the_results_under_focus_reconciles_to_the_same_slot_else_the_field() {
+        let _serial = plx_base::testlock::serial();
+        let mut fixture = shelves_fixture();
+        let mut screen = fixture.screen();
+        let mut out = Vec::new();
+        for (elem_of, label) in [((1usize, 2usize), "r1c2"), ((3, 11), "r3c11"), ((0, 8), "r0c8")] {
+            let want = screen.key(content(&screen).1[elem_of.0][elem_of.1]);
+            // the same query with fewer items in every shelf, then with a shelf gone
+            fixture.shelves(vec![shelf(Kind::Movie, "m", 5), shelf(Kind::Show, "s", 1),
+                shelf(Kind::Episode, "e", 7), shelf(Kind::Person, "p", 4), shelf(Kind::Collection, "c", 4)]);
+            deliver(&mut screen, &fixture, Some(want), ScreenEvent::StoreChanged(StoreId::Search.ord(), 0));
+            let shrunk = <SearchScreen as Focusable<HostFixture>>::reconcile(&screen, want, &fixture.cx(Some(want)));
+            out.push(format!("{label} shrunk -> {}", name(shrunk.elem, &screen)));
+            fixture.shelves(vec![shelf(Kind::Show, "s", 3), shelf(Kind::Episode, "e", 7)]);
+            deliver(&mut screen, &fixture, Some(want), ScreenEvent::StoreChanged(StoreId::Search.ord(), 0));
+            let gone = <SearchScreen as Focusable<HostFixture>>::reconcile(&screen, want, &fixture.cx(Some(want)));
+            out.push(format!("{label} dropped -> {}", name(gone.elem, &screen)));
+            fixture.shelves(vec![shelf(Kind::Movie, "m", 9), shelf(Kind::Show, "s", 3),
+                shelf(Kind::Episode, "e", 7), shelf(Kind::Person, "p", 12), shelf(Kind::Collection, "c", 4)]);
+            deliver(&mut screen, &fixture, None, ScreenEvent::StoreChanged(StoreId::Search.ord(), 0));
+        }
+        assert_eq!(out.join("\n"), include_str!("characterization/reconcile.txt").trim_end());
+    }
+}
+
+/// A collection hit opens its page on a hold, never an item menu, so it never gets the hint and
+/// never spends the kind's one showing.
+#[test]
+fn the_hold_hint_does_not_stand_on_a_collection_hit() {
+    let _serial = plx_base::testlock::serial();
+    plx_ui::hold_hint::reset_learned_for_test();
+    plx_ui::hold_hint::reset_shown_for_test();
+    let mut fixture = Fixture::new();
+    let hits = (0..5).map(|i| Item::Collection(plx_data::search::CollectionHit {
+        item: plx_data::pms::PmsMovie { rk: format!("c-{i}"), title: format!("Collection {i}"),
+            kind: plx_data::pms::KIND_COLLECTION, ..Default::default() },
+        tag: i,
+    })).collect();
+    fixture.query("hint").shelves(vec![Shelf { epoch: 0, window: Default::default(), kind: Kind::Collection, items: hits }]);
+    let mut screen = fixture.screen();
+    let card = Some(screen.key(screen.rows[0].elems[1]));
+    deliver(&mut screen, &fixture, card, ScreenEvent::FocusMoved { from: None, to: card.unwrap(), by: By::Dir });
+    for at in 100..100 + 6 * 60 {
+        deliver(&mut screen, &fixture, card, ScreenEvent::Tick(tick(at)));
+    }
+    assert!(!screen.stack.hint_visible(), "a hold on a collection hit opens its page, not a menu");
+    assert!(!plx_ui::hold_hint::shown_this_run(plx_ui::hold_hint::Kind::Search), "and nothing is spent");
+}
+
+/// The hold hint (`ui::hold_hint`) on a result card: it stands after the dwell on a settled card,
+/// not on the field (not a card), not while a menu owns focus, and not a second time this run.
+#[test]
+fn the_hold_hint_stands_on_a_resting_result_card_once_per_run() {
+    let _serial = plx_base::testlock::serial();
+    plx_ui::hold_hint::reset_learned_for_test();
+    plx_ui::hold_hint::reset_shown_for_test();
+    let mut fixture = Fixture::new();
+    fixture.query("hint").shelves(vec![shelf(Kind::Movie, "m", 8)]);
+    let mut screen = fixture.screen();
+    let card = Some(screen.key(screen.rows[0].elems[1]));
+    let mut at = 100;
+    let mut rest = |screen: &mut SearchScreen, focus: Option<FocusKey<u32>>, secs: f32| {
+        for _ in 0..(secs * 60.0) as u32 {
+            at += 1;
+            deliver(screen, &fixture, focus, ScreenEvent::Tick(tick(at)));
+        }
+    };
+    deliver(&mut screen, &fixture, card, ScreenEvent::FocusMoved { from: None, to: card.unwrap(), by: By::Dir });
+    rest(&mut screen, card, 1.2);
+    assert!(!screen.stack.hint_visible(), "not before the dwell");
+    // negatives first: a stand spends the kind's latch and would make them vacuous
+    rest(&mut screen, Some(FocusKey { entry: EntryId(900), elem: 0 }), 4.0);
+    assert!(!screen.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(plx_ui::hold_hint::Kind::Search), "never while a menu owns focus");
+    let field = Some(screen.key(FIELD));
+    rest(&mut screen, field, 4.0);
+    assert!(!screen.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(plx_ui::hold_hint::Kind::Search), "never on the field");
+    rest(&mut screen, card, 3.6);
+    assert!(screen.stack.hint_visible(), "after the dwell, on a settled card");
+    rest(&mut screen, Some(FocusKey { entry: EntryId(900), elem: 0 }), 1.0);
+    assert!(!screen.stack.hint_visible(), "a menu taking focus hides it");
+    rest(&mut screen, card, 4.0);
+    assert!(!screen.stack.hint_visible(), "and not a second time on Search this run");
+}
+
+/// A row whose window has hits past it asks for the next window once focus nears its trailing
+/// edge, and when the window then slides the focused card is still the same element.
+#[test]
+fn a_row_with_hits_past_its_window_asks_for_the_next_one_and_keeps_the_focused_card_as_it_slides() {
+    let _serial = plx_base::testlock::serial();
+    let window = |start, before, after| plx_data::search::Window { start, before, after };
+    let mut fixture = Fixture::new();
+    let mut first = shelf(Kind::Movie, "m", 24);
+    first.window = window(0, false, true);
+    fixture.query("slide").shelves(vec![first]);
+    let mut screen = fixture.screen();
+    let pages = |out: &[Stamped<HostFixture>]| out.iter().filter(|e| matches!(&e.fx, Fx::App(AppFx::Store(
+        StoreId::Search, StoreCmd::Search(SearchCmd::Page { kind: Kind::Movie, before: false, .. }))))).count();
+    // mid-row: nothing is asked
+    let mid = screen.key(screen.rows[0].elems[3]);
+    deliver(&mut screen, &fixture, Some(mid), ScreenEvent::FocusMoved { from: None, to: mid, by: By::Dir });
+    let asked: usize = (100..160).map(|at| pages(&deliver(&mut screen, &fixture, Some(mid), ScreenEvent::Tick(tick(at))).1)).sum();
+    assert_eq!(asked, 0, "far from the trailing edge");
+    // near the edge: asked, once
+    let focus = screen.key(screen.rows[0].elems[22]);
+    deliver(&mut screen, &fixture, Some(focus), ScreenEvent::FocusMoved { from: Some(mid), to: focus, by: By::Dir });
+    let asked: usize = (200..210).map(|at| pages(&deliver(&mut screen, &fixture, Some(focus), ScreenEvent::Tick(tick(at))).1)).sum();
+    assert_eq!(asked, 1, "the trailing edge asks once, and repeats only when the ladder says so");
+    // the store slides half a window on: the focused card is the same element, seated earlier
+    let mut next = Shelf { epoch: 1, window: window(12, true, true), kind: Kind::Movie,
+        items: (12..36).map(|i| movie(&format!("m-{i}"))).collect() };
+    next.window.after = false;
+    fixture.shelves(vec![next]);
+    deliver(&mut screen, &fixture, Some(focus), ScreenEvent::Tick(tick(400)));
+    assert_eq!(screen.rows[0].elems.get(10).copied(), Some(focus.elem), "m-22 keeps its identity at its new place");
+    assert_eq!(screen.rows[0].elems.len(), 24);
+}
+
+/// The shelf repeats an ask nobody answered, and the page passes the repeat on to the store (which
+/// takes an identical ask idempotently): an ask the store refused for a reason that passes is
+/// taken by a later one. A slide that committed and left the window as the page saw it still
+/// answers the ask: the next goes out at once, without waiting out a rung.
+#[test]
+fn a_search_row_repeats_an_unanswered_ask_and_asks_again_at_once_after_a_landing() {
+    let _serial = plx_base::testlock::serial();
+    let mut fixture = Fixture::new();
+    let mut first = shelf(Kind::Movie, "m", 24);
+    first.window = plx_data::search::Window { start: 0, before: false, after: true };
+    fixture.query("slide").shelves(vec![first.clone()]);
+    let mut screen = fixture.screen();
+    let pages = |out: &[Stamped<HostFixture>]| out.iter().filter(|e| matches!(&e.fx, Fx::App(AppFx::Store(
+        StoreId::Search, StoreCmd::Search(SearchCmd::Page { kind: Kind::Movie, before: false, .. }))))).count();
+    let mid = screen.key(screen.rows[0].elems[3]);
+    deliver(&mut screen, &fixture, Some(mid), ScreenEvent::FocusMoved { from: None, to: mid, by: By::Dir });
+    let focus = screen.key(screen.rows[0].elems[22]);
+    deliver(&mut screen, &fixture, Some(focus), ScreenEvent::FocusMoved { from: Some(mid), to: focus, by: By::Dir });
+    let ask = |screen: &mut SearchScreen, fixture: &Fixture, from: u32, to: u32|
+        (from..to).map(|at| pages(&deliver(screen, fixture, Some(focus), ScreenEvent::Tick(tick(at))).1)).sum::<usize>();
+    assert_eq!(ask(&mut screen, &fixture, 200, 210), 1, "asked once, then the first rung is not yet due");
+    assert!(ask(&mut screen, &fixture, 210, 300) >= 2, "an ask nobody answered goes out again on the ladder");
+    // a slide committed that left the window where the page saw it: only the epoch moved
+    first.epoch = 1;
+    fixture.shelves(vec![first]);
+    assert_eq!(ask(&mut screen, &fixture, 300, 302), 1, "answered: the next ask goes out at once");
+}
+
+/// The slide a row asked for is withdrawn once focus has left the trailing edge's zone, so the
+/// sources answering afterwards cannot commit a window that takes the focused card out of the row.
+#[test]
+fn a_row_withdraws_its_slide_when_focus_walks_back_from_the_edge() {
+    let _serial = plx_base::testlock::serial();
+    let mut fixture = Fixture::new();
+    let mut first = shelf(Kind::Movie, "m", 24);
+    first.window = plx_data::search::Window { start: 0, before: false, after: true };
+    fixture.query("slide").shelves(vec![first]);
+    let mut screen = fixture.screen();
+    let count = |out: &[Stamped<HostFixture>], cancel: bool| out.iter().filter(|e| match &e.fx {
+        Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(SearchCmd::PageCancel { kind: Kind::Movie, .. }))) => cancel,
+        Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(SearchCmd::Page { kind: Kind::Movie, .. }))) => !cancel,
+        _ => false,
+    }).count();
+    let mut at = 100;
+    let mut walk = |screen: &mut SearchScreen, col: usize, from: Option<FocusKey<u32>>| {
+        let focus = screen.key(screen.rows[0].elems[col]);
+        deliver(screen, &fixture, Some(focus), ScreenEvent::FocusMoved { from, to: focus, by: By::Dir });
+        let mut totals = (0, 0);
+        for _ in 0..4 {
+            at += 1;
+            let out = deliver(screen, &fixture, Some(focus), ScreenEvent::Tick(tick(at))).1;
+            totals = (totals.0 + count(&out, false), totals.1 + count(&out, true));
+        }
+        (focus, totals)
+    };
+    let (edge, totals) = walk(&mut screen, 22, None);
+    assert_eq!(totals, (1, 0), "asked once at the edge");
+    let (inside, totals) = walk(&mut screen, 18, Some(edge));
+    assert_eq!(totals.1, 0, "the zone still holds focus: nothing is withdrawn");
+    let (_, totals) = walk(&mut screen, 17, Some(inside));
+    assert_eq!(totals, (0, 1), "the first card out of the zone withdraws the slide");
+}
+
+/// The invariant behind "focus never moves under the user" on a Search row, driven over the real
+/// screen and focus engine and a stand-in store that applies the commands it is sent the way the
+/// search store does: a `Page` ask is refused when it names a window the store has since replaced
+/// (`seen`, the start and the cards held) or one is already out; it lands after a random delay,
+/// filling the twelve-card preview to a window where it stands and after that sliding the 24-card
+/// window twelve places; a `PageCancel` drops the one out. Random walks of presses (runs, bursts,
+/// reversals, 100 ms repeats) meet random landing delays (one frame to five seconds), and the
+/// frame a landing arrives in is stepped on the view captured before it. On EVERY frame the
+/// focused card changes only by a press and by exactly one place and is inside the window the
+/// store holds. A held key then reaches the last hit and walks back to the first.
+#[test]
+fn no_landing_on_a_search_row_ever_moves_the_card_under_the_focus() {
+    let _serial = plx_base::testlock::serial();
+    const TOTAL: usize = 24 + 12 * 8;
+    let publication = |lo: usize, held: usize| Shelf {
+        epoch: 0,
+        window: plx_data::search::Window { start: lo, before: lo > 0, after: lo + held < TOTAL },
+        kind: Kind::Movie,
+        items: (lo..lo + held).map(|i| movie(&format!("m-{i}"))).collect(),
+    };
+    for seed in 1..=8u64 {
+        let mut rng = plx_ui::fixture::Walk(seed);
+        let mut fixture = Fixture::new();
+        // what the store holds: the preview, before any page was asked
+        let (mut lo, mut held) = (0usize, 12usize);
+        fixture.query("walk").shelves(vec![publication(lo, held)]);
+        let mut screen = fixture.screen();
+        let mut engine = seated(&screen, &fixture);
+        let start = screen.key(screen.rows[0].elems[0]);
+        engine.enter(OWNER, &screen, FocusTarget::Elem(start), None, &fixture.cx(None));
+        deliver(&mut screen, &fixture, Some(start), ScreenEvent::FocusMoved { from: None, to: start, by: By::Dir });
+        // the hit under the focus, read from the view a frame draws
+        let hit_now = |screen: &SearchScreen, fixture: &Fixture, key: FocusKey<u32>| -> Option<usize> {
+            let col = screen.rows[0].elems.iter().position(|e| *e == key.elem)?;
+            match fixture.search.view().shelves().first()?.items.get(col)? {
+                Item::Media(m) => m.rk.strip_prefix("m-")?.parse().ok(),
+                _ => None,
+            }
+        };
+        // (frame the page lands on, whether it slides toward the start)
+        let mut pending: Option<(u32, bool)> = None;
+        let (mut dir_right, mut run_left, mut cadence) = (true, 40u64, 6u32);
+        let mut expected = 0usize;
+        let mut reached = (false, false);
+        let mut landings = 0u32;
+        let frames = 24_000u32;
+        for frame in 1..frames + 6000 {
+            let at = format!("seed {seed}, frame {frame}, window {lo}+{held}");
+            let tail = frame >= frames;
+            if !tail && run_left == 0 {
+                dir_right = rng.below(3) != 0 && expected + 4 < TOTAL;
+                let longest = if rng.below(4) == 0 { 40 } else { 14 };
+                run_left = 1 + rng.below(longest);
+                cadence = [1, 2, 6, 6, 6, 12, 30][rng.below(7) as usize];
+            }
+            let (right, due) = if tail { (!reached.0, frame % 6 == 0) } else { (dir_right, frame % cadence == 0) };
+            // the app's frame: the captured view predates this frame's landing
+            let mut landed = None;
+            if pending.is_some_and(|(due, _)| frame >= due) {
+                let (_, before) = pending.take().unwrap();
+                let next = if before { (lo.saturating_sub(12), 24) }
+                    else if held < 24 { (lo, 24.min(TOTAL - lo)) }
+                    else { ((lo + 12).min(TOTAL - 24), 24) };
+                if next != (lo, held) {
+                    (lo, held) = next;
+                    landed = Some(publication(lo, held));
+                    landings += 1;
+                }
+            }
+            if due {
+                let from = engine.current(OWNER);
+                let to = step_dir(&mut screen, &fixture, &mut engine, if right { Dir::Right } else { Dir::Left });
+                if to != from { expected = if right { expected + 1 } else { expected - 1 }; }
+                run_left = run_left.saturating_sub(1);
+            }
+            let key = engine.current(OWNER).expect("focus is on the row");
+            let (_, out, _) = deliver(&mut screen, &fixture, Some(key), ScreenEvent::Tick(tick(frame)));
+            for fx in &out {
+                match &fx.fx {
+                    Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(SearchCmd::Page { before, seen, .. }))) => {
+                        if *seen == (lo, held) && pending.is_none() {
+                            pending = Some((frame + 1 + rng.below(300) as u32, *before));
+                        }
+                    }
+                    Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(SearchCmd::PageCancel { seen, .. }))) => {
+                        if *seen == lo { pending = None; }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(next) = landed {
+                fixture.shelves(vec![next]);
+                deliver(&mut screen, &fixture, Some(key), ScreenEvent::StoreChanged(StoreId::Search.ord(), frame));
+                assert!(screen.rows[0].elems.contains(&key.elem), "{at}: the landing took the focused card out of the row");
+            }
+            assert_eq!(hit_now(&screen, &fixture, key), Some(expected), "{at}: the focused card is the one the keys walked to");
+            assert!((lo..lo + held).contains(&expected), "{at}: focus {expected} outside the window");
+            if expected == TOTAL - 1 { reached.0 = true; }
+            if reached.0 && expected == 0 { reached.1 = true; }
+        }
+        assert!(reached.0, "seed {seed}: the last hit is reachable");
+        assert!(reached.1, "seed {seed}: and so is the first");
+        assert!(landings > 20, "seed {seed}: the windows slid under the walk: {landings}");
+    }
+}
+
+/// The focus read-out (`cdg`) names a card by its place in the row's hits: a window that starts at
+/// twelve puts its slot 11 at hit 23.
+#[test]
+fn a_slid_row_names_its_cards_by_listing_position() {
+    let window = plx_data::search::Window { start: 12, before: true, after: true };
+    let slid = cards::RowCards { kind: Kind::Movie, elems: &[], items: &[], sources: &[], window, epoch: 1 };
+    assert_eq!(plx_ui::cards::CardSource::<HostFixture>::global(&slid, 11), 23);
+    let opening = cards::RowCards { window: Default::default(), ..slid };
+    assert_eq!(plx_ui::cards::CardSource::<HostFixture>::global(&opening, 11), 11);
 }

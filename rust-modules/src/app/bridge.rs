@@ -56,7 +56,7 @@ use plx_machine::machine::{
 };
 use plx_machine::present::Present;
 use plx_ui::screen::{
-    At, DrawFrame, FocusSource, Focusable, ReturnState, Screen, ScreenEvent,
+    At, DrawFrame, FocusSource, ReturnState, Screen, ScreenEvent,
 };
 
 
@@ -166,6 +166,10 @@ impl Host for AppHost {
     // of Detail, Person and Filmography across eviction. The opaque payload belongs to the
     // screen bundle; current focus and group cursors remain the input engine's state.
     type Memory = PageMemory;
+
+    fn shed_memory(memory: &mut PageMemory, focus: Option<u32>) {
+        memory.shed_to_identity(focus);
+    }
 
     fn app_fx_needs_return(fx: &AppFx) -> bool {
         !matches!(fx, AppFx::Store(..) | AppFx::StoreWork(_)
@@ -299,8 +303,59 @@ impl ConsentMachine {
     fn current(&self) -> &plx_telemetry::telemetry::consent::Consent { &self.current }
 }
 
+/// **The one trigger of the per-profile player cells**: the seat they were last restored for.
+///
+/// A seat changes only by a profile publication, so the bridge's `SessionFx::PublishProfile` arm
+/// shows every new seat to [`SeatWatch::arrive`], which restores the ten cells
+/// (`route::restore_profile_rows`) when the seat is not the one already restored. That covers every
+/// path (a stored boot, the boot picker's pick, a change of profile, a fresh sign-in, a sign-out) and
+/// puts the restore before the `Ready` of the same step, which is why `follow_auth_landing` no longer
+/// has one. A republication of the SAME seat (a roster refresh) restores nothing, so a pick in flight
+/// is not clobbered.
+///
+/// Process start is the first seat, `Unseated`: boot restores the cells for it itself
+/// (`boot::restore_player_preferences`), so a watch starts there too.
+///
+/// It also carries the boot writers, the dev audio-enhancement arm and the dev track-memory `clear`
+/// (`dev::scenarios::arm_track_memory`): they run once, right after the restore of the first
+/// `Unseated` to `Seated` change, so they force the SEATED profile's record. That
+/// is a stored or picker boot's. A harness boot that injects a token (`--guest` included: both
+/// `tools/tv-session.sh` and `tests/run.py` write `plxnative-token`) is a dev-token boot, which never
+/// seats, so the audio-enhancement arm run at boot is the only one there and sets the live cell alone
+/// (a dev-token boot remembers no track and has nothing to clear).
+struct SeatWatch {
+    restored: plx_plex::plex::session::Seat,
+    arm_pending: bool,
+}
+
+impl SeatWatch {
+    fn new() -> Self {
+        Self { restored: plx_plex::plex::session::Seat::Unseated, arm_pending: true }
+    }
+
+    /// The process now occupies `seat`. Restore for it if that is a change; say whether it was.
+    fn arrive(&mut self, seat: plx_plex::plex::session::Seat) -> bool {
+        if self.restored == seat {
+            return false;
+        }
+        plx_media::route::restore_profile_rows(&plx_plex::plex::session::peek(), &seat,
+            plx_media::route::Overrides { quality: crate::dev::playback_quality_override() });
+        let seated = seat.user().is_some();
+        self.restored = seat;
+        if seated && std::mem::take(&mut self.arm_pending) {
+            crate::dev::scenarios::arm_audio_enhancements();
+            if let Some(user) = self.restored.user() {
+                crate::dev::scenarios::arm_track_memory(user);
+            }
+        }
+        true
+    }
+}
+
 /// What the bridge lends the dispatcher, and what it collects for the loop.
 pub(crate) struct Bridge {
+    /// Endpoint refreshes a store step had no room to emit (`EndpointRefreshSet::emit`).
+    endpoint_carry: plx_data::stores::EndpointRefreshSet,
     session_cache_generation: u64,
     home_io: Option<super::bootstrap::HomeIo>,
     recorded_clients: std::collections::BTreeMap<u32, &'static plx_plex::plex::Client>,
@@ -308,6 +363,8 @@ pub(crate) struct Bridge {
     session: plx_session::auth::SessionMachine,
     session_adapter: super::adapters::session::SessionAdapter,
     session_ready: Option<(u64, plx_session::auth::owner::ProfileScope, plx_plex::plex::session::ServerRef, String, plx_session::auth::owner::ReadyInstall)>,
+    /// The seat the ten per-profile cells (the player settings and trailer autoplay) were last restored for ([`SeatWatch`]).
+    seat_watch: SeatWatch,
     consent_adapter: super::adapters::consent::ConsentAdapter,
     stores: plx_data::stores::Stores,
     mounter: AppMounter,
@@ -531,12 +588,14 @@ impl Bridge {
         reads: StorePublications, stores: plx_data::stores::Stores) -> Self {
         Self {
             session_cache_generation: plx_plex::plex::session::visible_generation(),
+            endpoint_carry: Default::default(),
             home_io: None,
             recorded_clients: std::collections::BTreeMap::new(),
             initial_subhash: 0,
             session: plx_session::auth::SessionMachine::from_init(init),
             session_adapter,
             session_ready: None,
+            seat_watch: SeatWatch::new(),
             consent_adapter,
             stores,
             mounter: AppMounter::default(),
@@ -631,13 +690,14 @@ impl Bridge {
 
     pub(crate) fn search_selection(&self, d: &Dispatcher<AppHost>, entry: EntryId, focus: Option<FocusKey<u32>>)
         -> Option<(plx_data::search::Item, plx_ui::popover::Opener)> {
-        let page = d.nav.entry(entry)?.inst.as_ref()?.screen.as_any()?.downcast_ref::<plx_screens::search::SearchScreen>()?;
+        let e = d.nav.entry(entry).filter(|e| e.arg == AppArg::Search)?;
+        let screen = &e.inst.as_ref()?.screen;
         let parts = CxParts { tick: Tick::default(), press: Default::default(),
             focus: plx_machine::machine::FocusRead { current: focus, ..Default::default() }, owner: InputOwner::Entry(entry) };
         let cx = parts.cx::<AppHost>(self.views(), &self.measure);
-        let item = page.selected_item(focus, &cx)?.clone();
-        let rect = page.place(&focus?.elem, &cx, At::Drawn)?.rest_rect;
-        Some((item, plx_ui::popover::Opener { rect: Some(rect), ..plx_ui::popover::Opener::NONE }))
+        let card = screen.focused_card(&cx, focus, Some(At::Drawn))?;
+        let item = card.item.downcast_ref::<plx_data::search::Item>()?.clone();
+        Some((item, plx_ui::popover::Opener { rect: Some(card.rest_rect?), ..plx_ui::popover::Opener::NONE }))
     }
 
     pub(crate) fn search_tab_available(&self, tab: HomeTab) -> bool {
@@ -650,13 +710,14 @@ impl Bridge {
 
     pub(crate) fn library_selection(&self, d: &Dispatcher<AppHost>, entry: EntryId, focus: Option<FocusKey<u32>>)
         -> Option<(plx_data::pms::PmsMovie, plx_ui::popover::Opener)> {
-        let page = d.nav.entry(entry)?.inst.as_ref()?.screen.as_any()?.downcast_ref::<plx_screens::library::LibraryScreen>()?;
+        let e = d.nav.entry(entry).filter(|e| e.arg == AppArg::Library)?;
+        let screen = &e.inst.as_ref()?.screen;
         let parts = CxParts { tick: Tick::default(), press: Default::default(),
             focus: plx_machine::machine::FocusRead { current: focus , ..Default::default() }, owner: InputOwner::Entry(entry) };
         let cx = parts.cx::<AppHost>(self.views(), &self.measure);
-        let item = page.focused_item(focus, &cx)?.clone();
-        let rect = page.place(&focus?.elem, &cx, At::Drawn)?.rest_rect;
-        Some((item, plx_ui::popover::Opener { rect: Some(rect), ..plx_ui::popover::Opener::NONE }))
+        let card = screen.focused_card(&cx, focus, Some(At::Drawn))?;
+        let item = card.item.downcast_ref::<plx_data::pms::PmsMovie>()?.clone();
+        Some((item, plx_ui::popover::Opener { rect: Some(card.rest_rect?), ..plx_ui::popover::Opener::NONE }))
     }
 
     pub(crate) fn library_command(d: &mut Dispatcher<AppHost>, command: plx_screens::registry::LibraryCmd) {
@@ -724,6 +785,28 @@ impl Bridge {
         self.library_commands.push_back(plx_screens::registry::LibraryCmd::Enter(kind));
     }
 
+    /// **Aim the store at the PRESS, a dip-out ahead of a Library that is not on screen yet.** The
+    /// page is shown as the one image captured on the frame it mounts (`PageImage`), and a Library
+    /// that mounts over a store still pointing at another kind has nothing to draw there but its
+    /// spinner: the select it would send from its first tick lands a frame after the capture, so
+    /// the dip brings up an empty page and the grid appears in one frame when the image is
+    /// replaced. The target is the page's own (`DirectoryView::kind_address`, which its first tick
+    /// sends too, so the second select is the same command on a store already there). A store
+    /// already on a library of this kind stays on it (the reader's last pick), as
+    /// `LibraryScreen::sync` keeps it. Not for a Library already on top: its `LibraryCmd::Enter` saves the outgoing
+    /// section's cursor from the listing it is still showing, before it switches.
+    pub(crate) fn aim_library(&mut self, kind: plx_data::browse::SecKind) {
+        let target = {
+            let directory = self.directory.view();
+            let current = directory.current().map(|i| directory.sections()[i].kind);
+            directory.kind_address(kind).filter(|_| current != Some(kind))
+        };
+        if let Some(target) = target {
+            self.browse_run(plx_data::stores::browse::BrowseCmd::Addressed { target,
+                work: plx_data::stores::browse::LibraryWork::Commit { select: true, choice: false, query: None } });
+        }
+    }
+
     fn deliver_library_commands(&mut self, d: &mut Dispatcher<AppHost>) {
         if d.nav.top_page().is_none_or(|page| page.arg != AppArg::Library || page.inst.is_none()) { return; }
         while let Some(command) = self.library_commands.pop_front() { Self::library_command(d, command); }
@@ -732,12 +815,11 @@ impl Bridge {
     pub(crate) fn home_opener(&self, d: &Dispatcher<AppHost>, entry: EntryId,
         focus: Option<FocusKey<u32>>) -> plx_ui::popover::Opener {
         let rect = focus.filter(|key| key.entry == entry).and_then(|key| {
-            let screen = &d.nav.entry(entry)?.inst.as_ref()?.screen;
+            let screen = &d.nav.entry(entry).filter(|e| e.arg == AppArg::Home)?.inst.as_ref()?.screen;
             let parts = CxParts { tick: Tick { ms: 0, dt_us: 0 }, press: Default::default(),
                 focus: plx_machine::machine::FocusRead { current: Some(key) , ..Default::default() }, owner: InputOwner::Entry(entry) };
             let cx = parts.cx::<AppHost>(self.views(), &self.measure);
-            screen.as_any()?.downcast_ref::<plx_screens::home::HomeScreen>()?
-                .focused_rect::<AppHost>(Some(key), &cx, At::Drawn)
+            screen.focused_card_rect(&cx, Some(key), At::Drawn)
         });
         plx_ui::popover::Opener { rect, ..plx_ui::popover::Opener::NONE }
     }
@@ -773,6 +855,19 @@ impl Bridge {
             focus: plx_machine::machine::FocusRead { current: focus , ..Default::default() }, owner: InputOwner::Entry(entry.id) };
         let cx = parts.cx::<AppHost>(self.views(), &self.measure);
         Some(f(home, &cx, focus))
+    }
+
+    /// Is a MEMBER CARD focused on the mounted Collection page (not its header)? The press bench's
+    /// precondition on a `cards::Stack` page.
+    pub(crate) fn collection_card_focused(&self, d: &Dispatcher<AppHost>) -> bool {
+        let Some(entry) = d.nav.top_page() else { return false };
+        let Some(page) = entry.inst.as_ref().and_then(|i| i.screen.as_any())
+            .and_then(|s| s.downcast_ref::<plx_screens::collection::CollectionScreen>()) else { return false };
+        let focus = d.input.engine.current(InputOwner::Entry(entry.id));
+        let parts = CxParts { tick: Tick { ms: 0, dt_us: 0 }, press: Default::default(),
+            focus: plx_machine::machine::FocusRead { current: focus, ..Default::default() }, owner: InputOwner::Entry(entry.id) };
+        let cx = parts.cx::<AppHost>(self.views(), &self.measure);
+        page.focused_item::<AppHost>(focus, &cx).is_some()
     }
 
     pub(crate) fn home_grid_focused(&self, d: &Dispatcher<AppHost>) -> bool {
@@ -919,9 +1014,10 @@ impl Bridge {
     pub(crate) fn content_menu_arg(&self, d: &Dispatcher<AppHost>, entry: EntryId, ret: &ReturnState<u32, PageMemory>)
         -> Option<plx_screens::registry::ItemMenuArg> {
         let e = d.nav.entry(entry)?;
-        let screen = e.inst.as_ref()?.screen.as_any()?;
+        let real = &e.inst.as_ref()?.screen;
+        let screen = real.as_any()?;
         let mut parts = CxParts { tick: Tick { ms: 0, dt_us: 0 },
-            press: plx_machine::machine::PressRead { scale: 1.0, is_long: false, held_ms: None },
+            press: plx_machine::machine::PressRead { scale: 1.0, is_long: false, held_ms: None, owner: None },
             focus: plx_machine::machine::FocusRead { current: None , ..Default::default() },
             owner: plx_machine::machine::InputOwner::Entry(entry) };
         parts.owner = plx_machine::machine::InputOwner::Entry(entry);
@@ -932,27 +1028,22 @@ impl Bridge {
             let rect = page.focused_rect::<AppHost>(ret.focus, &cx, At::Drawn);
             let meta = <AppHost as plx_screens::registry::MetadataLike>::metadata(&cx);
             if let Some((rk, mark)) = page.focused_season(ret.focus, meta) {
-                Some(strip_menu_arg(sid, &rk, ItemMenuKind::Season { mark }, entry, ret.focus, rect))
-            } else if let Some((rk, mark)) = page.focused_episode(ret.focus, meta) {
-                // the ONE entry point whose item is a leaf of the season this page has loaded
-                Some(strip_menu_arg(sid, &rk, ItemMenuKind::Episode { mark }, entry, ret.focus, rect))
-            } else {
-                // …a RELATED tile is a DIFFERENT item standing on the same page: an ordinary card
-                // row, which is exactly what `MenuHost::Related` existed to say.
-                let item = page.focused_related(ret.focus, meta).filter(|m| plx_screens::item_menu::has_actions(m))?;
-                Some(card_menu_arg(item, false, false, entry, ret.focus, rect))
+                return Some(strip_menu_arg(sid, &rk, ItemMenuKind::Season { mark }, entry, ret.focus, rect));
             }
-        } else {
-            // A card page — Person or Collection — answers its focused card and where it sits.
-            let (item, rect) = if let Some(page) = screen.downcast_ref::<plx_screens::person::PersonScreen>() {
-                (page.focused_item(ret.focus, &cx), page.focused_rect::<AppHost>(ret.focus, &cx, At::Drawn))
-            } else {
-                let page = screen.downcast_ref::<plx_screens::collection::CollectionScreen>()?;
-                (page.focused_item(ret.focus, &cx), page.focused_rect::<AppHost>(ret.focus, &cx, At::Drawn))
-            };
-            let item = item.filter(|m| plx_screens::item_menu::has_actions(m))?;
-            Some(card_menu_arg(item, false, false, entry, ret.focus, rect))
+            if let Some((rk, mark)) = page.focused_episode(ret.focus, meta) {
+                // the ONE entry point whose item is a leaf of the season this page has loaded
+                return Some(strip_menu_arg(sid, &rk, ItemMenuKind::Episode { mark }, entry, ret.focus, rect));
+            }
         }
+        // A card page answers its focused card and where it sits: Person, Collection, and Detail's
+        // Related shelf — a RELATED tile is a DIFFERENT item standing on the same page, an
+        // ordinary card row, which is exactly what `MenuHost::Related` existed to say. Only a
+        // content page's route: Home, Library and Search cards open their menus through their own
+        // requests, which carry the `from_deck` / `from_home` bits this arm would drop.
+        if !matches!(e.arg, AppArg::Content(_)) { return None; }
+        let card = real.focused_card(&cx, ret.focus, Some(At::Drawn))?;
+        let item = card.item.downcast_ref::<plx_data::pms::PmsMovie>().filter(|m| plx_screens::item_menu::has_actions(m))?;
+        Some(card_menu_arg(item, false, false, entry, ret.focus, card.rect))
     }
 
     /// **The opener LIFT: the focused tile repainted above the modal dim.** Render-only, and the
@@ -965,9 +1056,11 @@ impl Bridge {
     /// that the card stays visible behind it. The dim is the CONTAINER's now (`Screen::scrim`), so
     /// what is left here is the half only the page that drew the element can answer — a `fn()` lift
     /// has nothing to borrow a `&Dispatcher` through.
+    ///
+    /// Whether it runs at all is [`opener_lift`]'s answer, made once for every page: it stands down
+    /// once the menu is dismissed and focus has moved off the opener element.
     pub(crate) fn redraw_opener(&self, d: &Dispatcher<AppHost>) {
-        let Some((entry, focus)) = item_menu(d).map(|menu| menu.opener()) else { return };
-        if d.nav.top_page().map(|e| e.id) != Some(entry) { return; }
+        let Some((entry, focus)) = opener_lift(d) else { return };
         let Some(screen) = d.nav.entry(entry).and_then(|e| e.inst.as_ref()).map(|i| &i.screen) else { return };
         // The page pass may be submitting a cached host quad. Opener lifts are live paint
         // above that quad, like Popover::scrim_lifting's legacy callback scope.
@@ -1145,6 +1238,25 @@ impl Bridge {
 
     pub(crate) fn landgate(&self) -> &plx_machine::landgate::Gate { &self.stores.landgate }
 
+    /// **Landing claims still open**, by store name: a request this owner spawned whose answer no
+    /// take has moved out yet. The frame-dump driver (`dev::framedump`) holds the picture while any
+    /// is open. It is the subset the owner can read without a take: Home's hubs
+    /// (`HubsStore::owed`) and the controlled-Home Browse discovery. The `Fetch`-based stores
+    /// (metadata, person, collection, search, view state) keep their claim inside the store and
+    /// answer through `take_owed` alone, so a request spawned this iteration is seen by NEXT
+    /// iteration's take, which waits for it (`plx_machine::landgate`'s module doc).
+    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    pub(crate) fn open_claims(&self) -> Vec<&'static str> {
+        let mut open = Vec::new();
+        if self.stores.hubs.owed() {
+            open.push(StoreId::Hubs.name());
+        }
+        if self.stores.browse.borrow().discovery_owed() {
+            open.push(StoreId::Browse.name());
+        }
+        open
+    }
+
     /// The `MetadataStore`'s own async detail landing — `app/run.rs`'s route-unconditional pump.
     pub(crate) fn metadata_pump_detail(&mut self) -> bool {
         self.stores.metadata.pump_detail_with_gate(&self.stores.landgate)
@@ -1290,53 +1402,17 @@ impl Bridge {
     }
 }
 
-impl Rig<AppHost> for Bridge {
-    fn draw_chrome(&mut self, arg: &AppArg, _parts: &CxParts<u32>,
-        nav: plx_ui::screen::NavPresentation,
-        glass: Option<&mut plx_ui::frame::glass::GlassPlan>) {
-        if !Self::draws_chrome_for(arg) { return; }
-        let Some(glass) = glass else { return };
-        let p = plx_ui::Painter::root().alpha(nav.chrome_alpha);
-        let chrome = self.chrome.read(self.strip.chip_expand_pos());
-        self.strip.draw(chrome.labels, p, glass.tab_band_mut());
-        plx_ui::widgets::profile_chip_with(
-            p,
-            chrome.profile,
-            chrome.chip_expand,
-            glass.tab_face(),
-        );
+impl Bridge {
+    /// Carry a store step's due endpoint refreshes to the end of the dispatcher turn, where
+    /// `deliver_inner`'s caller emits them; every store-step arm ends here so none can forget.
+    ///
+    /// An associated function over the field (not `&mut self`) so an arm holding `home_io` can call it.
+    fn carry(carried: &mut plx_data::stores::EndpointRefreshSet, due: plx_data::stores::EndpointRefreshSet) -> Handled {
+        carried.merge(due);
+        Handled::Yes
     }
-    /// See [`plx_ui::dispatch::Rig::scrim_chrome_read`] — the account menu's chip lift borrows
-    /// the SAME captured profile, labels and unfurl [`Bridge::draw_chrome`] used. The dispatcher
-    /// adds this frame's material from `GlassPlan`; neither value crosses through a static.
-    fn scrim_chrome_read(&self) -> Option<plx_ui::widgets::ChromeRead<'_>> {
-        Some(self.chrome.read(self.strip.chip_expand_pos()))
-    }
-    fn page_alpha(&self) -> f32 { plx_ui::nav::page_alpha() }
-    fn navigation_presentation(&self) -> plx_ui::screen::NavPresentation {
-        plx_ui::screen::NavPresentation {
-            page_alpha: plx_ui::nav::page_alpha(),
-            chrome_alpha: plx_ui::nav::chrome_alpha(),
-            view_tab: u32::try_from(plx_ui::nav::view_tab(-1)).ok(),
-            blur_amount: plx_ui::nav::blur_amount(),
-        }
-    }
-    fn surface_scope(&mut self) -> Option<plx_ui::popover::host::Live> {
-        Some(plx_ui::popover::host::live())
-    }
-    fn split(&mut self) -> Split<'_, AppHost> {
-        Split {
-            mounter: &mut self.mounter,
-            views: AppViews { auth: self.session.read(),
-                hubs: self.hubs.view(),
-                listing: self.listing.view(),
-                directory: self.directory.view(),
-                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback,
-            },
-            measure: &self.measure,
-        }
-    }
-    fn deliver(&mut self, to: MachineId, msg: &AppMsg, parts: &CxParts<u32>, fx: &mut Effects<'_, AppHost>) -> Handled {
+
+    fn deliver_inner(&mut self, to: MachineId, msg: &AppMsg, parts: &CxParts<u32>, fx: &mut Effects<'_, AppHost>) -> Handled {
         if let AppMsg::Consent(command) = msg {
             if to != MachineId::Consent { return Handled::No; }
             match command {
@@ -1393,9 +1469,8 @@ impl Rig<AppHost> for Bridge {
             match msg {
                 AppMsg::Store(StoreCmd::Hubs(cmd)) => {
                     let directory = self.directory.view();
-                    io.hubs_with_directory(&mut self.stores.hubs, Some(cmd.clone()), 0.0, directory)
-                        .endpoints.emit(fx);
-                    return Handled::Yes;
+                    let due = io.hubs_with_directory(&mut self.stores.hubs, Some(cmd.clone()), 0.0, directory).endpoints;
+                    return Self::carry(&mut self.endpoint_carry, due);
                 }
                 AppMsg::Store(StoreCmd::Browse(plx_data::stores::browse::BrowseCmd::Discovery(result))) => {
                     let mut endpoints = plx_data::stores::EndpointRefreshSet::default();
@@ -1408,14 +1483,12 @@ impl Rig<AppHost> for Bridge {
                     if outcome.changed {
                         self.stores.browse.borrow_mut().capture_directory(&mut self.directory);
                     }
-                    endpoints.emit(fx);
-                    return Handled::Yes;
+                    return Self::carry(&mut self.endpoint_carry, endpoints);
                 }
                 AppMsg::StoreWork(plx_data::stores::StoreWork::Hubs) => {
                     let directory = self.directory.view();
-                    io.hubs_with_directory(&mut self.stores.hubs, None, parts.tick.dt(), directory)
-                        .endpoints.emit(fx);
-                    return Handled::Yes;
+                    let due = io.hubs_with_directory(&mut self.stores.hubs, None, parts.tick.dt(), directory).endpoints;
+                    return Self::carry(&mut self.endpoint_carry, due);
                 }
                 AppMsg::StoreWork(plx_data::stores::StoreWork::BrowseDiscovery) => {
                     io.discovery_owned(&self.stores);
@@ -1458,30 +1531,27 @@ impl Rig<AppHost> for Bridge {
             }
             AppMsg::Store(StoreCmd::Hubs(c)) => {
                 let directory = self.directory.view();
-                self.stores.hubs.run_with_directory(c.clone(), directory)
-                    .endpoints.emit(fx);
-                Handled::Yes
+                let due = self.stores.hubs.run_with_directory(c.clone(), directory).endpoints;
+                Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::Store(cmd) => step_store(cmd, &cx, fx),
             AppMsg::HubsResult(result) => {
                 let directory = self.directory.view();
-                self.stores.hubs.land_with_directory(result, directory)
-                    .endpoints.emit(fx);
-                Handled::Yes
+                let due = self.stores.hubs.land_with_directory(result, directory).endpoints;
+                Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::Hubs) => {
                 let directory = self.directory.view();
-                self.stores.hubs.tick_with_directory(parts.tick.dt(), directory)
-                    .endpoints.emit(fx);
-                Handled::Yes
+                let due = self.stores.hubs.tick_with_directory(parts.tick.dt(), directory).endpoints;
+                Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::BrowseDiscovery) => {
-                self.stores.browse.borrow_mut().discover_pump_with_gate(&self.stores.landgate).endpoints.emit(fx);
-                Handled::Yes
+                let due = self.stores.browse.borrow_mut().discover_pump_with_gate(&self.stores.landgate).endpoints;
+                Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::Browse) => {
-                self.stores.browse.borrow_mut().pump_with_gate(&self.stores.landgate).endpoints.emit(fx);
-                Handled::Yes
+                let due = self.stores.browse.borrow_mut().pump_with_gate(&self.stores.landgate).endpoints;
+                Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::Search { dt_us }) => {
                 self.stores.search_pump(*dt_us as f32 / 1_000_000.0, self.directory.view());
@@ -1494,6 +1564,65 @@ impl Rig<AppHost> for Bridge {
             _ => Handled::No,
         }
     }
+}
+
+impl Rig<AppHost> for Bridge {
+    fn draw_chrome(&mut self, arg: &AppArg, _parts: &CxParts<u32>,
+        nav: plx_ui::screen::NavPresentation,
+        glass: Option<&mut plx_ui::frame::glass::GlassPlan>) {
+        if !Self::draws_chrome_for(arg) { return; }
+        let Some(glass) = glass else { return };
+        let p = plx_ui::Painter::root().alpha(nav.chrome_alpha);
+        let chrome = self.chrome.read(self.strip.chip_expand_pos());
+        self.strip.draw(chrome.labels, p, glass.tab_band_mut());
+        plx_ui::widgets::profile_chip_with(
+            p,
+            chrome.profile,
+            chrome.chip_expand,
+            glass.tab_face(),
+        );
+    }
+    /// See [`plx_ui::dispatch::Rig::scrim_chrome_read`] — the account menu's chip lift borrows
+    /// the SAME captured profile, labels and unfurl [`Bridge::draw_chrome`] used. The dispatcher
+    /// adds this frame's material from `GlassPlan`; neither value crosses through a static.
+    fn scrim_chrome_read(&self) -> Option<plx_ui::widgets::ChromeRead<'_>> {
+        Some(self.chrome.read(self.strip.chip_expand_pos()))
+    }
+    fn page_alpha(&self) -> f32 { plx_ui::nav::page_alpha() }
+    fn navigation_presentation(&self) -> plx_ui::screen::NavPresentation {
+        plx_ui::screen::NavPresentation {
+            page_alpha: plx_ui::nav::page_alpha(),
+            chrome_alpha: plx_ui::nav::chrome_alpha(),
+            view_tab: u32::try_from(plx_ui::nav::view_tab(-1)).ok(),
+            blur_amount: plx_ui::nav::blur_amount(),
+        }
+    }
+    fn surface_scope(&mut self) -> Option<plx_ui::popover::host::Live> {
+        Some(plx_ui::popover::host::live())
+    }
+    fn split(&mut self) -> Split<'_, AppHost> {
+        Split {
+            mounter: &mut self.mounter,
+            views: AppViews { auth: self.session.read(),
+                hubs: self.hubs.view(),
+                listing: self.listing.view(),
+                directory: self.directory.view(),
+                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback,
+            },
+            measure: &self.measure,
+        }
+    }
+    fn deliver(&mut self, to: MachineId, msg: &AppMsg, parts: &CxParts<u32>, fx: &mut Effects<'_, AppHost>) -> Handled {
+        let handled = self.deliver_inner(to, msg, parts, fx);
+        // A store step queues the endpoint refreshes it owes; they leave here, as many as the step
+        // has room for, and the rest wait for the next store step (the sixteen-server table is gone,
+        // so a roster can owe more than one step may emit).
+        if matches!(to, MachineId::Store(_)) && !self.endpoint_carry.is_empty() {
+            self.endpoint_carry = std::mem::take(&mut self.endpoint_carry).emit(fx);
+        }
+        handled
+    }
+
     fn timer(&mut self, _owner: MachineId, _id: TimerId, _parts: &CxParts<u32>, _fx: &mut Effects<'_, AppHost>) {}
     fn app_return(&mut self, _from: MachineId, ret: ReturnState<u32, PageMemory>) {
         self.effect_return = ret;
@@ -1635,7 +1764,9 @@ impl Bridge {
             }
             SessionFx::PublishProfile(publication) => {
                 if self.session.publication_is_current(&publication) {
-                    self.session_adapter.publish_profile(publication);
+                    if let Some(seat) = self.session_adapter.publish_profile(publication) {
+                        self.seat_watch.arrive(seat);
+                    }
                     if let Some(io) = &mut self.home_io {
                         io.profile = self.session_adapter.profile_resource_view().expect("controlled publisher");
                     }
@@ -1745,8 +1876,11 @@ impl Bridge {
     /// arrival waits for the frame the recording delivered it on (§3.3 step 3). Off a replay, one
     /// relaxed atomic load and the same call.
     fn take_hubs_results(&self) -> AppResults {
-        let mut results =
-            self.stores.landgate.take_all(StoreId::Hubs.ord(), || self.stores.hubs.take_results());
+        // Dump mode waits here for every hub request the previous execution of this site (or the
+        // frame's own work) spawned, so a request issued in iteration k lands in k+1 whatever the
+        // worker's timing. The claim is the adapter's own count (`HubsStore::owed`).
+        let mut results = self.stores.landgate.take_all_owed(StoreId::Hubs.ord(), StoreId::Hubs.name(),
+            |_| self.stores.hubs.owed(), || self.stores.hubs.take_results());
         results.sort_by_key(|result| result.request_id());
         results.into_iter().map(|result| (
             plx_machine::machine::Addr {
@@ -1806,7 +1940,8 @@ impl Bridge {
         }
         results.extend(self.take_hubs_results());
         if self.home_io.is_some() {
-            if let Some(result) = self.stores.landgate.take(StoreId::Browse.ord(),
+            if let Some(result) = self.stores.landgate.take_owed(StoreId::Browse.ord(), StoreId::Browse.name(),
+                || self.stores.browse.borrow().discovery_owed(),
                 || self.stores.browse.borrow_mut().take_discovery()) {
                 results.push((plx_machine::machine::Addr {
                     to: MachineId::Store(StoreId::Browse.ord()),
@@ -1865,6 +2000,9 @@ fn frame_ingest(
         let outcome = rig.stores.browse_discover_pump();
         execute_endpoint_outcomes(d, outcome.endpoints);
     }
+    // A Related window that landed is installed here, ahead of the notices below, so the Detail
+    // page is told of it in the frame that first draws it (`MetadataStore::pump_related`).
+    rig.stores.metadata.pump_related();
     let (browse_changed, hubs_changed, search_changed) = rig.capture_views(d);
     rig.capture_chrome(d);
     rig.deliver_home_commands(d);
@@ -1981,7 +2119,37 @@ pub(crate) fn content_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
             out.push('-');
         }
     }
+    #[cfg(feature = "devtriggers")]
+    push_card_probe(&mut out);
     out
+}
+
+/// `plxnative-focusx` for every card section (`plx_ui::card_probe`): the focused card of the frame
+/// just drawn, on whichever page drew it. `cdk` is the ratingKey inside the card's artwork path
+/// (`push_rk`'s filter, so a path or a token cannot reach the log), `cdx`/`cdy`/`cdw` its drawn
+/// screen rect, `cdi`/`cdn` its slot in the run of cards the section holds (a shelf's source, a grid's painted
+/// window) and that run's length, `cdg` its index in the section's source,
+/// `cda` whether its texture was resident, `cdc`/`cdcw` its caption's left edge and width, `cdr`
+/// how many posters so far went back to their placeholder while on screen and `cdb` how many cards
+/// came back on screen without a texture they once had (running totals over every card drawn).
+/// Off by default, so the fingerprint grammar the replay recordings pin does not change.
+#[cfg(feature = "devtriggers")]
+fn push_card_probe(out: &mut String) {
+    use std::fmt::Write;
+    if !plx_ui::card_probe::armed() { return; }
+    let Some(c) = plx_ui::card_probe::peek() else { return };
+    let rk = ["/library/metadata/", "/library/collections/"].iter()
+        .find_map(|root| c.key.strip_prefix(root))
+        .and_then(|rest| rest.split('/').next())
+        .filter(|rk| rk.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("");
+    let _ = write!(out, " cdx={} cdy={} cdw={} cdi={} cdn={} cdg={} cda={} cdr={} cdb={} cdk=", c.x.round() as i64,
+        c.y.round() as i64, c.w.round() as i64, c.index, c.len, c.global,
+        c.ready.map_or(-1, i64::from), plx_ui::card_probe::regressions(), plx_ui::card_probe::returned_bare());
+    crate::focusprobe::push_rk(out, rk);
+    if let Some((x, w)) = c.caption {
+        let _ = write!(out, " cdc={} cdcw={}", x.round() as i64, w.round() as i64);
+    }
 }
 
 fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
@@ -2046,6 +2214,17 @@ fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
         let mut out = format!(" snapt={} snapp={} hf={hf} row={row} col={col}", grid as u8,
             (!<plx_screens::home::HomeScreen as Screen<AppHost>>::strip_reachable(home)) as u8);
         crate::focusprobe::push_item(&mut out, if grid { home.focused_item::<AppHost>(focus, &cx) } else { home.hero_item::<AppHost>(&cx) });
+        // `plxnative-focusx`: where the focused card is DRAWN, in whole canvas pixels. It moves
+        // every frame a row scrolls, so an armed run logs a line per frame: that is the point.
+        // `tests/paging_link.py` reads a row that jumps under the focus (the trailing-edge to
+        // leading-edge teleport a window slide once caused) from it. Off by default, so the
+        // fingerprint grammar the replay recordings pin does not change.
+        #[cfg(feature = "devtriggers")]
+        if plx_base::devtrig::flag("focusx") {
+            let at = At::Drawn;
+            let _ = write!(out, " fx={}", home.focused_rect::<AppHost>(focus, &cx, at)
+                .map_or(-99999, |r| r.x.round() as i64));
+        }
         return out;
     }
     if matches!(page.arg, AppArg::Library) {
@@ -2090,7 +2269,7 @@ fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
     let Some(instance) = d.nav.entry(owner).and_then(|e| e.inst.as_ref()) else { return String::new() };
     let focus = d.focus();
     let parts = CxParts { tick: Tick { ms: 0, dt_us: 0 },
-        press: plx_machine::machine::PressRead { scale: 1.0, is_long: false, held_ms: None },
+        press: plx_machine::machine::PressRead { scale: 1.0, is_long: false, held_ms: None, owner: None },
         focus: plx_machine::machine::FocusRead { current: focus , ..Default::default() }, owner: InputOwner::Entry(owner) };
     let cx = parts.cx::<AppHost>(rig.views(), &rig.measure);
     let mut groups = Vec::new();
@@ -2101,13 +2280,20 @@ fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
     let mut out = String::new();
     match &page.arg {
         AppArg::Content(ContentArg::Detail { sid, rk }) => {
+            // The probe's `col=` is the card's index in the Related row; a restore names a card of
+            // the tail window by its listing position instead (`Spot::tail_col`).
+            let listed = cx.views.metadata.current();
+            let col_of = |spot: &plx_data::metadata::Spot| spot.tail_position().zip(listed)
+                .and_then(|(at, d)| d.related_tail.positions.iter().position(|&p| p == at).map(|k| (d.related_tail.head + k) as i32))
+                .unwrap_or(spot.col);
             let mut sp = match instance.screen.memory_at(focus) {
                 PageMemory::Detail(s) => s.spot, _ => Default::default(),
             };
+            sp.col = col_of(&sp);
             for (_, elem) in d.return_state().remembered {
                 if let PageMemory::Detail(saved) = instance.screen.memory_at(Some(FocusKey { entry: owner, elem })) {
                     let saved = saved.spot;
-                    if let Some(col) = sp.saved_col.get_mut(saved.section.max(0) as usize) { *col = saved.col; }
+                    if let Some(col) = sp.saved_col.get_mut(saved.section.max(0) as usize) { *col = col_of(&saved); }
                 }
             }
             let _ = write!(out, " sec={} col={} eptext={}", sp.section, sp.col, sp.ep_text as u8);
@@ -2149,18 +2335,16 @@ fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
             let filmography = d.nav.is_surface(owner)
                 && d.nav.entry(owner).is_some_and(|e| matches!(e.arg, AppArg::Content(ContentArg::Filmography { .. })));
             let _ = write!(out, " card={} filmography={}", card as u8, filmography as u8);
-            let item = instance.screen.as_any()
-                .and_then(|s| s.downcast_ref::<plx_screens::person::PersonScreen>())
-                .and_then(|s| s.focused_item(focus, &cx));
+            let item = instance.screen.focused_card(&cx, focus, None)
+                .and_then(|card| card.item.downcast_ref::<plx_data::pms::PmsMovie>());
             if let Some(item) = item {
                 let _ = write!(out, " sid={} rk=", item.sid.raw());
                 crate::focusprobe::push_rk(&mut out, &item.rk);
             } else { out.push_str(" sid=- rk=-"); }
         }
         AppArg::Content(ContentArg::Collection(plx_plex::plex::collections::CollectionRef { rk, sec, tag, .. })) => {
-            let item = instance.screen.as_any()
-                .and_then(|screen| screen.downcast_ref::<plx_screens::collection::CollectionScreen>())
-                .and_then(|screen| screen.focused_item(focus, &cx));
+            let item = instance.screen.focused_card(&cx, focus, None)
+                .and_then(|card| card.item.downcast_ref::<plx_data::pms::PmsMovie>());
             let _ = write!(out, " card={} collection_rk=", card as u8);
             crate::focusprobe::push_rk(&mut out, rk);
             let _ = write!(out, " sec={sec} tag={tag}");
@@ -2400,16 +2584,35 @@ fn strip_menu_arg(
 }
 
 /// **What the opener lift reads of the press: the dispatcher's own, live.** The lift is the page's
-/// focused card drawn a second time above the dim, and the page draws it at the press scale
-/// (`DrawFrame.press`, from `Dispatcher::parts`), so the lift must be handed the SAME number or the
-/// two disagree on every frame the press is moving. They did, while this was a constant `1.0`: a
-/// taken hold's card was drawn at its pop by the lift and at its dip by the page and the host
-/// snapshot, and the owner saw a poster that popped in one frame with its title doubled.
+/// focused card drawn a second time above the dim. A card a card section left out of the page pass
+/// (`DrawFrame::lifted`) is drawn by the lift ALONE, at this scale. An opener no card section draws
+/// (the Detail episode strip, season tabs, hero buttons, the Home hero) is still drawn by the page
+/// at the press scale (`DrawFrame.press`, from `Dispatcher::parts`), so there the lift must be
+/// handed the SAME number or the two disagree on every frame the press is moving. They did, while
+/// this was a constant `1.0`: a taken hold's card was drawn at its pop by the lift and at its dip
+/// by the page and the host snapshot, and the owner saw a poster that popped in one frame with its
+/// title doubled.
 ///
 /// Only the scale is the lift's business; a hold in flight or the hint's elapsed time is not (the
 /// lift draws one card, not the page's hold hint).
-pub(crate) fn opener_press(d: &Dispatcher<AppHost>) -> plx_machine::machine::PressRead {
-    plx_machine::machine::PressRead { scale: d.input.press.scale(), is_long: false, held_ms: None }
+pub(crate) fn opener_press(d: &Dispatcher<AppHost>) -> plx_machine::machine::PressRead<u32> {
+    plx_machine::machine::PressRead { scale: d.input.press.scale(), is_long: false, held_ms: None, owner: d.input.dip_owner }
+}
+
+/// **Which element, if any, the opener lift repaints this frame** — the ONE decision every page
+/// inherits, so no screen's `redraw_focused` has to defend against a stale key.
+///
+/// The lift is the opener tile drawn again above the dim, *because it is the focused one*. That
+/// stops being true the moment the menu is dismissed: `ModalStack::dismiss` hands input back to the
+/// page on the same frame, but the surface stays in the stack until its fade settles, so a D-pad
+/// press during the fade moves the page's focus to a neighbour while this lift would still paint
+/// the OLD tile fully popped and captioned (two tiles look focused at once; the new one's pop
+/// reads late). So while the surface is `Closing`, the lift is painted only if the engine's focus
+/// on the host page is still the opener element (or there is none to compare); once focus has
+/// moved, the page draws the tiles itself and the lift stands down. While the menu is open the
+/// engine's focus is on the menu's own rows, so the lift always paints then.
+pub(crate) fn opener_lift(d: &Dispatcher<AppHost>) -> Option<(EntryId, Option<FocusKey<u32>>)> {
+    d.lifted_opener()
 }
 
 /// **The context the opener lift draws with**: the page's own pieces for `entry`'s focused element,
@@ -2434,10 +2637,12 @@ pub(crate) fn opener_parts(
 ///
 /// **It does not touch the press.** A hold the screen answered was already abandoned onto its
 /// release spring by the dispatcher (`InputMachine::cancel_press`), so the card springs from its dip
-/// up to its pop as the menu opens, and the press is the ONE owner of that motion: the page and
-/// the opener lift ([`opener_press`]) both draw its scale, and `Press::tick` reports the frames a
-/// cancelled long hold visibly moves the card as page damage (a tap's spring is not) so the host snapshot below is re-taken until the card rests (see
-/// the style paragraph). Ending the press at rest here instead (`Press::settle`, rc.3) made the
+/// up to its pop as the menu opens, and the press is the ONE owner of that motion: the opener
+/// lift ([`opener_press`]) draws it live above the frozen page (and, for an opener no card section
+/// draws, the page draws it too). The page pass leaves
+/// the lifted card out (`DrawFrame::lifted`), so the snapshot holds no copy of it to go stale and
+/// the spring is not page damage (`Press::tick`); only an opener no card section draws keeps the
+/// per-frame re-take. Ending the press at rest here instead (`Press::settle`, rc.3) made the
 /// card jump to its pop in one frame, the lost animation the owner reported.
 ///
 /// The style is `Compact`, whose host policy is `(Frozen, Cached)`: the page under the panel is
@@ -2592,20 +2797,11 @@ pub(crate) fn follow_auth_landing(pages: &mut Dispatcher<AppHost>, bridge: &mut 
     if let Some(c) = bridge.take_session_ready() {
         // A sign-out followed by a fresh sign-in can replace the session without restarting the
         // process. Re-read only at this one credentials handoff so the old account's in-memory
-        // preference cannot leak into the new session.
+        // lists (the memory mirrors and the profiles' own player values) cannot leak into the new
+        // session. The profile's player and trailer cells are not restored here: the seat is
+        // (`SeatWatch`, at the `PublishProfile` that precedes this `Ready`).
         let saved = plx_plex::plex::session::peek();
-        plx_media::route::restore_quality(
-            crate::dev::playback_quality_override().unwrap_or_else(|| saved.playback_quality()),
-        );
-        plx_media::route::restore_direct_play_mode(saved.direct_play_mode());
-        plx_media::route::restore_subtitle_size(saved.subtitle_size());
-        plx_media::route::restore_subtitle_position(saved.subtitle_position());
-        plx_media::route::restore_next_episode_mode(saved.next_episode_mode());
-        plx_media::route::restore_skip_interval(saved.skip_interval());
-        plx_media::route::restore_deck_press(saved.deck_press());
-        plx_media::route::restore_marker_skip(saved.skip_intro(), saved.skip_credits());
-        plx_media::player::restore_subtitle_tone(saved.subtitle_tone());
-        plx_media::player::restore_audio_enhancements(saved.audio_enhancements());
+        plx_media::route::restore_install_rows(&saved);
         let endpoints = super::boot::install_pms_owned(bridge, &c.origin,
             &c.address, &c.token, c.tier, c.pin.as_ref(), &c.install);
         execute_endpoint_outcomes(pages, endpoints);
@@ -2787,8 +2983,12 @@ pub(crate) fn nav_tab(
             }
             AppArg::Home
         }
-        HomeTab::Movies => { rig.enter_library(plx_data::browse::SecKind::Movie); AppArg::Library }
-        HomeTab::Shows => { rig.enter_library(plx_data::browse::SecKind::Show); AppArg::Library }
+        HomeTab::Movies | HomeTab::Shows => {
+            let kind = if tab == HomeTab::Movies { plx_data::browse::SecKind::Movie } else { plx_data::browse::SecKind::Show };
+            rig.enter_library(kind);
+            if d.top_arg() != Some(&AppArg::Library) { rig.aim_library(kind); }
+            AppArg::Library
+        }
         HomeTab::Search => AppArg::Search,
     };
     nav_peer(d, arg, ret);
@@ -3334,14 +3534,17 @@ pub(crate) fn release_input(now: Tick) -> InputEvent<u32> {
 
 /// A scripted direction (the dev oscillators), both edges.
 pub(crate) fn script_key(key: Key, now: Tick) -> Vec<InputEvent<u32>> {
-    [Edge::Down, Edge::Up]
-        .into_iter()
-        .map(|edge| InputEvent {
-            at: now,
-            source: Source::Script,
-            kind: InputKind::Key { key, sym: 0, wcode: 0, edge, at_edge: false },
-        })
-        .collect()
+    [Edge::Down, Edge::Up].into_iter().map(|edge| script_edge(key, edge, now)).collect()
+}
+
+/// One scripted key edge. The frame dump presses a key as a person does, the down edge and then
+/// the up edge some frames later (`dev::framedump`).
+pub(crate) fn script_edge(key: Key, edge: Edge, now: Tick) -> InputEvent<u32> {
+    InputEvent {
+        at: now,
+        source: Source::Script,
+        kind: InputKind::Key { key, sym: 0, wcode: 0, edge, at_edge: false },
+    }
 }
 
 #[allow(dead_code)]
@@ -3400,6 +3603,10 @@ mod session_endpoint_policy_tests;
 #[path = "session_stored_home_tests.rs"]
 mod session_stored_home_tests;
 
+#[cfg(all(test, feature = "hostsim"))]
+#[path = "restore_characterisation_tests.rs"]
+mod restore_characterisation_tests;
+
 #[cfg(test)]
 #[path = "bridge_test_support.rs"]
 mod test_support;
@@ -3417,8 +3624,16 @@ mod session_dispatch_tests;
 mod home_retention_tests;
 
 #[cfg(test)]
+#[path = "hubs_dump_tests.rs"]
+mod hubs_dump_tests;
+
+#[cfg(test)]
 #[path = "library_bookmark_tests.rs"]
 mod library_bookmark_tests;
+
+#[cfg(test)]
+#[path = "library_push_capture_tests.rs"]
+mod library_push_capture_tests;
 
 #[cfg(test)]
 #[path = "library_diagnostic_tests.rs"]
@@ -3445,6 +3660,10 @@ mod library_host_freeze_tests;
 mod library_shelf_action_tests;
 
 #[cfg(test)]
+#[path = "opener_route_tests.rs"]
+mod opener_route_tests;
+
+#[cfg(test)]
 #[path = "library_tab_arrival_tests.rs"]
 mod library_tab_arrival_tests;
 
@@ -3463,6 +3682,10 @@ mod search_owned_tests;
 #[cfg(test)]
 #[path = "detail_panel_tests.rs"]
 mod detail_panel_tests;
+
+#[cfg(test)]
+#[path = "detail_related_landing_tests.rs"]
+mod detail_related_landing_tests;
 
 #[cfg(test)]
 #[path = "surface_navigation_tests.rs"]
@@ -3516,11 +3739,12 @@ mod preference_effect_tests {
                 "controlled account load must drop the reply without capturing a live profile");
             for save_quality in [false, true] {
                 let (reply, receipt) = mpsc::channel();
-                let command = if save_quality {
-                    PreferenceCmd::Quality { quality: plx_media::route::Quality::P480, reply }
+                let choice = if save_quality {
+                    plx_media::route::Choice::Quality(plx_media::route::Quality::P480)
                 } else {
-                    PreferenceCmd::DirectPlay { mode: plx_media::route::DirectPlayMode::Forced, reply }
+                    plx_media::route::Choice::DirectPlay(plx_media::route::DirectPlayMode::Forced)
                 };
+                let command = PreferenceCmd::Choose(choice, reply);
                 bridge.app_effect(MachineId::Instance(InstanceId(1)), AppFx::Preferences(command), &mut out);
                 assert!(matches!(receipt.try_recv(), Err(TryRecvError::Disconnected)),
                     "controlled local preference must not enqueue persistence");

@@ -18,6 +18,12 @@ The declaration is conditional on one boot-time configd answer. Only an exact bo
 `tv.config.supportDolbyHDRContents` is support; a refusal, timeout, malformed answer or an answer
 still pending is `Unknown` and follows the unsupported column.
 
+**On webOS 3 a configd `true` is overridden to unsupported** (`webos::caps::platform_gate`, logged
+as `webos-caps: … answer=unsupported source=webos3`). Device-measured 2026-10-14 on an LG OLED C7
+(webOS 3.9.3, m16p) with a P8.1 film: configd answers `true`, the declared Load accepts every
+access unit and never starts its clock (0:00 forever), and the same build with the declaration
+removed plays. One set measured; webOS 4+ and an unreadable version keep configd's answer.
+
 | Source | Confirmed supported | Unsupported / unknown |
 |---|---|---|
 | **P8 single-layer, CCID 1/2/4** | declare + direct play | no node; direct-play the HDR10/SDR/HLG base |
@@ -44,7 +50,8 @@ the `_single` we do use) can be fed from a single appsrc is unexamined.
 Profiles not present here: **4** is dual-layer and deprecated (P&L §1.1 p. 6); **9** is single-layer
 **AVC**, and now falls back without a node because codec eligibility is part of
 `Dovi::presentation` itself (the old gate/payload disagreement has a host regression); **10** and
-**20** are AV1 and MV-HEVC, and this panel has no decoder for either.
+**20** are AV1 and MV-HEVC, and this panel has no Dolby Vision decoder for either. (A set whose
+codec table lists an AV1 decoder can direct-play plain AV1, but that is not a Dolby Vision path.)
 
 ---
 
@@ -436,7 +443,9 @@ human at the panel, check whether the platform already publishes it.
 - **Cross-firmware reply behavior.** The libplayerAPIs mechanism exists in the symbol/decompile
   census from 3.9.2 through 11.2.0, but the key, ACL and reply semantics have not been exercised
   across that range. Older or refusing firmware remains Unknown rather than being inferred from a
-  version or from unrelated `updateConfig` symbols.
+  version or from unrelated `updateConfig` symbols. The one version rule is `platform_gate`: a
+  configd `true` on webOS 1..=3 is reported Unsupported, because that answer was measured wrong
+  on a C7 (webOS 3.9.3).
 - **Profile 9's gate/payload disagreement is closed in code.** `presentation` now takes the output
   codec and an AVC stream cannot produce `Declare`; the regression covers the SDR-compatible
   fallback and an unusable-base non-HEVC refusal. No Profile 9 asset has been measured on device.

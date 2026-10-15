@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver};
 use plx_plex::plex::account::{AudioPreferences, PreferenceError, PreferenceRequest, PreferenceSnapshot, PreferenceUpdate};
-use plx_media::route::{DeckPress, DirectPlayMode, MarkerSkip, NextEpisodeMode, Quality, SkipInterval, SubtitlePosition, SubtitleSize};
+use plx_media::route::{Choice, DeckPress, DirectPlayMode, MarkerSkip, NextEpisodeMode, Quality, SkipInterval, SubtitlePosition, SubtitleSize};
 use plx_ui::form::{Form, FormId, FormSection, FormTable, RowKey, RowKind};
 use plx_ui::frame::Budget;
 use plx_machine::machine::{Canon, Cx, Delivery, Edge, Effects, EntryId, FocusKey, Fx, GroupId,
@@ -110,20 +110,57 @@ impl Subject {
     }
 }
 
+/// **Whose settings the Playback page shows.** Its rows are the seated profile's own picks
+/// (`session::Seat`), so the page names that profile; while nobody is seated (a normal session always has one, because
+/// Settings is opened through a profile; `Seat` lists the unseated states, among them a dev-token run and a controlled
+/// replay) the rows show the legacy fallback values and the data layer refuses
+/// a write, so the page shows them read-only instead of offering a pick that cannot land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Whose { Nobody, Profile(String) }
+impl Whose {
+    /// The seated profile as the profile chip names it (`chrome.rs`): the active profile's title,
+    /// else the roster's owner, else the Account label of a signed-in owner with no name. It reads
+    /// the chip's own session accessors; `account_menu::chip_label` is that rule, but a screen never
+    /// names a sibling. A seat implies a signed-in account, so the chip's signed-out arm (the Sign
+    /// in label) cannot be this page's. Returns the publication generation it read, to notice a change.
+    fn now() -> (u32, Self) {
+        let profile = plx_plex::plex::session::current_snapshot();
+        if profile.seat() == plx_plex::plex::session::Seat::Unseated { return (profile.generation, Self::Nobody); }
+        let account = plx_plex::plex::session::peek().account(profile.user.as_ref());
+        let name = account.name.unwrap_or_else(|| plx_platform::i18n::msg::settings_account_title().to_string());
+        (profile.generation, Self::Profile(name))
+    }
+    /// The Playback list's Profile rows cannot be changed.
+    fn read_only(&self, kind: Kind) -> bool { kind == Kind::Playback && *self == Self::Nobody }
+}
+
 /// The copy under the title: the failure / progress status (with the Force note while Forced is
-/// on and matters here), else the Force note itself, else the subject's own explanation — a
-/// picker explains its own setting, never its page's.
-fn copy_text<'a>(subject: Subject, status: &'a str, direct_play: DirectPlayMode) -> Cow<'a, str> {
+/// on and matters here), else the subject's own explanation, with the Force note replacing it on
+/// the two pickers Force overrides — a picker explains its own setting, never its page's. The
+/// Playback page's own explanation names the profile whose settings these are (`whose`), or says
+/// to choose one; under Force it keeps a shorter profile sentence, followed by the Force note in
+/// the same paragraph (the text view draws no line break); nobody seated: the rows are
+/// read-only, so only the line.
+fn copy_text<'a>(subject: Subject, status: &'a str, direct_play: DirectPlayMode, whose: &Whose) -> Cow<'a, str> {
     let forced = direct_play == DirectPlayMode::Forced && subject.overridden_by_force();
     if !status.is_empty() {
         return if forced {
             Cow::Owned(format!("{}\n\n{}", status, plx_platform::i18n::msg::settings_playback_force_note()))
         } else { Cow::Borrowed(status) };
     }
+    if subject == Subject::Page(Kind::Playback) {
+        // The page's own line wins over the bare Force note: Settings has no other place that names
+        // the profile, and with nobody seated the Force advice cannot be acted on from read-only rows.
+        return match whose {
+            Whose::Nobody => Cow::Borrowed(plx_platform::i18n::msg::settings_playback_unseated()),
+            Whose::Profile(name) if forced => Cow::Owned(format!("{} {}", plx_platform::i18n::msg::settings_playback_copy_profile_forced(name),
+                plx_platform::i18n::msg::settings_playback_force_note())),
+            Whose::Profile(name) => Cow::Owned(plx_platform::i18n::msg::settings_playback_copy_profile(name)),
+        };
+    }
     if forced { return Cow::Borrowed(plx_platform::i18n::msg::settings_playback_force_note()); }
     Cow::Borrowed(match subject {
-        Subject::Page(Kind::AudioSubtitles) => plx_platform::i18n::msg::settings_audio_account_note(),
-        Subject::Page(Kind::Playback) => plx_platform::i18n::msg::settings_playback_copy(),
+        Subject::Page(_) => plx_platform::i18n::msg::settings_audio_account_note(),
         Subject::Picker(field) => field.copy(),
     })
 }
@@ -206,6 +243,7 @@ impl Txn {
             _ => PreferenceCmd::Load { reply },
         };
         self.saving = matches!(&command, PreferenceCmd::Save { .. });
+        // placeholder-exempt: SCOPE decision, not a non-placeholder: this is a real wait caption, left uncounted because the demo storyboard never shows Settings (a driver that does must count it)
         io.status = if self.saving {
             plx_platform::i18n::msg::settings_audio_saving()
         } else { plx_platform::i18n::msg::settings_audio_loading() }.into();
@@ -213,22 +251,22 @@ impl Txn {
         fx.push(Fx::App(AppFx::Preferences(command)));
     }
     fn save_local(&mut self, io: &mut Io, value: Value, fx: &mut Effects<'_, InnerHost>) {
-        let (reply, rx) = mpsc::channel();
-        let command = match value {
-            Value::Quality(quality) => PreferenceCmd::Quality { quality, reply },
-            Value::DirectPlay(mode) => PreferenceCmd::DirectPlay { mode, reply },
-            Value::SubtitleSize(size) => PreferenceCmd::SubtitleSize { size, reply },
-            Value::SubtitlePosition(position) => PreferenceCmd::SubtitlePosition { position, reply },
-            Value::NextEpisode(mode) => PreferenceCmd::NextEpisode { mode, reply },
-            Value::DeckPress(mode) => PreferenceCmd::DeckPress { mode, reply },
-            Value::SkipIntro(mode) => PreferenceCmd::SkipIntro { mode, reply },
-            Value::SkipCredits(mode) => PreferenceCmd::SkipCredits { mode, reply },
-            Value::SkipInterval(interval) => PreferenceCmd::SkipInterval { interval, reply },
+        let choice = match value {
+            Value::Quality(quality) => Choice::Quality(quality),
+            Value::DirectPlay(mode) => Choice::DirectPlay(mode),
+            Value::SubtitleSize(size) => Choice::SubtitleSize(size),
+            Value::SubtitlePosition(position) => Choice::SubtitlePosition(position),
+            Value::NextEpisode(mode) => Choice::NextEpisode(mode),
+            Value::DeckPress(mode) => Choice::DeckPress(mode),
+            Value::SkipIntro(mode) => Choice::SkipIntro(mode),
+            Value::SkipCredits(mode) => Choice::SkipCredits(mode),
+            Value::SkipInterval(interval) => Choice::SkipInterval(interval),
             _ => return,
         };
+        let (reply, rx) = mpsc::channel();
         self.pending = Some(Pending::Local(rx)); io.busy = true; self.saving = true;
         io.status = plx_platform::i18n::msg::settings_playback_saving().into();
-        fx.push(Fx::App(AppFx::Preferences(command)));
+        fx.push(Fx::App(AppFx::Preferences(PreferenceCmd::Choose(choice, reply))));
     }
     /// The request no longer names the active profile: drop the snapshot and any in-flight
     /// receipt and load again.
@@ -336,6 +374,9 @@ pub struct PreferencesPage {
     next_episode: NextEpisodeMode,
     deck_press: DeckPress,
     skip_interval: SkipInterval,
+    /// Whose settings the list was last built for, with the profile publication it read that from
+    /// (not canonical state, like `look`: the copy and the rows' dimming are not hashed either).
+    whose: (u32, Whose),
 }
 impl PreferencesPage {
     pub fn new(entry: EntryId, kind: Kind) -> Self {
@@ -345,7 +386,7 @@ impl PreferencesPage {
             copy: String::new(), txn: Txn::new(false),
             look: (plx_media::route::subtitle_size(), plx_media::route::subtitle_position()),
             next_episode: plx_media::route::next_episode_mode(), deck_press: plx_media::route::deck_press(),
-            skip_interval: plx_media::route::skip_interval() };
+            skip_interval: plx_media::route::skip_interval(), whose: Whose::now() };
         s.rebuild(None);
         s
     }
@@ -373,10 +414,12 @@ impl PreferencesPage {
         self.next_episode = plx_media::route::next_episode_mode();
         self.deck_press = plx_media::route::deck_press();
         self.skip_interval = plx_media::route::skip_interval();
-        self.copy = copy_text(Subject::Page(self.state.kind), &self.state.io.status, self.state.direct_play).into_owned();
+        self.whose = Whose::now();
+        self.copy = copy_text(Subject::Page(self.state.kind), &self.state.io.status, self.state.direct_play, &self.whose.1).into_owned();
         let inputs = FieldListInputs {
             kind: self.state.kind, quality: self.state.quality, direct_play: self.state.direct_play,
             prefs: self.txn.prefs(), busy: self.state.io.busy, show_retry: !self.state.io.status.is_empty(),
+            read_only: self.whose.1.read_only(self.state.kind),
         };
         self.state.values = fields_of(&inputs).iter()
             .map(|&f| field_readout(f, inputs.quality, inputs.direct_play, inputs.prefs)).collect();
@@ -498,6 +541,8 @@ struct FieldListInputs<'a> {
     busy: bool,
     /// Show the Retry row: the account kind has a non-empty status message and nothing is in flight.
     show_retry: bool,
+    /// The field rows are shown but cannot be opened: no profile is seated to own a pick.
+    read_only: bool,
 }
 /// The page's field list as a [`Form`]: each field a `Nav` item onto its picker page, plus the
 /// Audio & Subtitles Retry button, built from [`FieldListInputs`] alone.
@@ -512,7 +557,8 @@ fn field_form(inputs: &FieldListInputs<'_>) -> Form<RowId, Action, SettingsPage>
         if field == PickerKind::AudioLanguage && inputs.prefs.is_some_and(|p| p.auto_select_audio == Some(false)) {
             row = row.detail(plx_platform::i18n::msg::settings_audio_selection_off());
         }
-        section = section.item(RowId::Field(field), RowKind::Nav(SettingsPage::Picker(field)), Action::Open, row);
+        section = section.item(RowId::Field(field), RowKind::Nav(SettingsPage::Picker(field)), Action::Open, row)
+            .disabled(inputs.read_only);
     }
     section = section.item_if(inputs.kind == Kind::AudioSubtitles && !inputs.busy && inputs.show_retry,
         RowId::Retry, RowKind::Button, Action::Retry,
@@ -588,7 +634,8 @@ impl Machine<InnerHost> for PreferencesPage {
                     || self.look != (plx_media::route::subtitle_size(), plx_media::route::subtitle_position())
                     || self.next_episode != plx_media::route::next_episode_mode()
                     || self.deck_press != plx_media::route::deck_press()
-                    || self.skip_interval != plx_media::route::skip_interval() {
+                    || self.skip_interval != plx_media::route::skip_interval()
+                    || self.whose.0 != plx_plex::plex::session::current_gen() {
                     self.rebuild_keeping();
                     // An empty loading table had no engine seat. Give its first landing (or
                     // Retry row) one so OK works immediately, without moving an existing
@@ -649,7 +696,7 @@ impl Screen<InnerHost> for PreferencesPage {
 pub fn nav_items_for_test(kind: Kind, prefs: Option<&AudioPreferences>) -> Vec<(u32, SettingsPage)> {
     let mut form: FormTable<RowId, Action, SettingsPage> = FormTable::new(BAND);
     form.set(field_form(&FieldListInputs { kind, quality: Quality::Original, direct_play: DirectPlayMode::Auto,
-        prefs, busy: false, show_retry: false }), None);
+        prefs, busy: false, show_retry: false, read_only: false }), None);
     (0..form.table.n_rows() as usize).filter_map(|i| match form.binding_at(i)?.kind.clone() {
         RowKind::Nav(dest) => Some((form.key_at(i)?.0, dest)),
         _ => None,

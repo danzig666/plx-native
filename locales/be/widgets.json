@@ -13,6 +13,7 @@
   "widgets.tracks.subtitles": "Субцітры",
   "widgets.tracks.unknown": "Невядома",
   "widgets.tracks.off": "Выкл.",
+  "widgets.tracks.forced_only": "Толькі прымусовыя",
   "widgets.tracks.mono": "Мона",
   "widgets.tracks.stereo": "Стэрэа",
   "widgets.tracks.original": "Арыгінал: {language}",
@@ -117,7 +118,7 @@
     "many": "{heading} · {count} ДАРОЖАК",
     "other": "{heading} · {count} ДАРОЖКІ"
   },
-  "widgets.reason.jail_help": "Для выпраўлення патрэбны тэлевізар з root-доступам і доступ да Homebrew Channel. Даведка: github.com/GLinnik21/plx-native/issues/74.",
+  "widgets.reason.jail_help": "Для выпраўлення патрэбны тэлевізар з root-доступам і Homebrew Channel. Даведка: plxnative.com/troubleshooting/#playback-reports-jail_missing_rtkmem.",
   "widgets.tracks.empty": "Няма дарожак",
   "widgets.tracks.bytes": {
     "one": "{count} байт",
@@ -172,6 +173,7 @@
   "widgets.tracks.enh_reason_refused": "Ваш сервер Plex не змог уключыць гэта для гэтага відэа.",
   "widgets.tracks.sub_burn_audio": "Іх малюе ваш сервер Plex, пакуль канвертуе гук.",
   "widgets.tracks.sub_burn_quality": "Іх малюе ваш сервер Plex пры гэтай якасці.",
+  "widgets.tracks.sub_remembered_note": "Субцітры, якія вы абралі для гэтага серыяла, нельга паказаць з гэтым відэа.",
   "widgets.tracks.style": "Стыль",
   "widgets.tracks.style_size": "Памер",
   "widgets.tracks.style_position": "Пазіцыя",
@@ -200,8 +202,6 @@
   "widgets.ass.invalid_track": "Гэтая дарожка стылізаваных субцітраў пашкоджана або завялікая",
   "widgets.ass.invalid_events": "Гэтая дарожка стылізаваных субцітраў змяшчае няправільныя падзеі",
   "widgets.ass.track_too_large": "Гэтая дарожка стылізаваных субцітраў завялікая",
-  "widgets.ass.too_many_fonts": "Гэтая дарожка стылізаваных субцітраў змяшчае зашмат шрыфтоў",
-  "widgets.ass.invalid_fonts": "Гэтая дарожка стылізаваных субцітраў змяшчае пашкоджаныя шрыфты",
   "widgets.ass.render_failed": "Не ўдалося паказаць гэтыя стылізаваныя субцітры",
   "widgets.ass.unavailable": "Стылізаваныя субцітры недаступныя ў гэтай усталёўцы",
   "widgets.ass.fonts_unavailable": "Не ўдалося загрузіць шрыфты субцітраў",

@@ -65,11 +65,11 @@ fn episode_navigation_and_page_jumps_follow_four_columns() {
     page.initial = false;
     assert_eq!(page.layout.cols(), 4);
     let mut engine = FocusEngine::new();
-    let first = page.key(page.pair.detail.elems[0]);
+    let first = page.key(page.pair.detail.elem_at(0).unwrap());
     engine.set(OWNER, first, Some(page.pair.groups_config().detail), By::Restore);
     direction(&mut page, &mut engine, &fixture, Dir::Down);
     assert_eq!(page.grid_position(engine.current(OWNER)), Some((1, 0)));
-    assert_eq!(engine.current(OWNER).unwrap().elem, page.pair.detail.elems[4]);
+    assert_eq!(engine.current(OWNER).unwrap().elem, page.pair.detail.elem_at(4).unwrap());
     let focused = engine.current(OWNER).unwrap();
     let rect = <LibraryScreen as Focusable<HostFixture>>::place(&page, &focused.elem, &fixture.cx(Some(focused)), At::SpringTarget).unwrap().rect;
     assert!((rect.w / rect.h - 16.0 / 9.0).abs() < 0.01);
@@ -79,7 +79,7 @@ fn episode_navigation_and_page_jumps_follow_four_columns() {
         &mut Effects::new(&mut output, MachineId::Instance(InstanceId(19)), &mut present));
     assert!(output.iter().any(|effect| matches!(&effect.fx,
         Fx::Deliver(_, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { focus: FocusTarget::Elem(key) })))
-            if key.elem == page.pair.detail.elems[12])));
+            if key.elem == page.pair.detail.elem_at(12).unwrap())));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn ok_on_a_collection_card_requests_its_page() {
     let fixture = collections_fixture(36);
     let mut page = fixture.screen();
     page.initial = false;
-    let elem = page.pair.detail.elems[1];
+    let elem = page.pair.detail.elem_at(1).unwrap();
     let mut output = Vec::new();
     let mut present = plx_machine::present::Present::new();
     assert_eq!(page.activate(elem, false, &fixture.cx(Some(page.key(elem))),
@@ -178,6 +178,34 @@ fn ok_on_a_collection_card_requests_its_page() {
     assert!(output.iter().any(|effect| matches!(&effect.fx,
         Fx::App(AppFx::Library(LibraryReq::Detail { rk, .. })) if rk == "50002")),
         "OK on a collection opens it, never plays it");
+}
+
+/// The hold hint teaches a hold that opens an item menu; a hold on a collection card opens
+/// nothing (`app/content.rs` drops the menu unless `item_menu::has_actions`), so the hint must not
+/// stand there and must not spend the kind's one showing.
+#[test]
+fn the_hold_hint_does_not_stand_on_a_collection_card() {
+    let _guard = plx_base::testlock::serial();
+    plx_ui::hold_hint::reset_learned_for_test();
+    plx_ui::hold_hint::reset_shown_for_test();
+    let fixture = collections_fixture(36);
+    let mut page = fixture.screen();
+    page.initial = false;
+    page.live = true;
+    page.page_fade.mount();
+    let key = page.key(page.pair.detail.elem_at(1).unwrap());
+    let mut ms = 0;
+    for _ in 0..(6.0 * 60.0) as u32 {
+        ms += 17;
+        let mut out = Vec::new();
+        let mut present = plx_machine::present::Present::new();
+        let mut cx = fixture.cx(Some(key));
+        cx.tick = Tick { ms, dt_us: 16_667 };
+        page.step(&ScreenEvent::Tick(cx.tick), &cx,
+            &mut Effects::new(&mut out, MachineId::Instance(InstanceId(19)), &mut present));
+    }
+    assert!(!page.hold_hint.visible(), "a hold on a collection opens no menu, so no hint");
+    assert!(!plx_ui::hold_hint::shown_this_run(plx_ui::hold_hint::Kind::Library), "and nothing is spent");
 }
 
 /// The dev/scenario path to a listing type: `SetType` is the menu row's own edit, addressed to the

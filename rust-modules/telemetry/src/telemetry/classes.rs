@@ -1,6 +1,9 @@
 //! **The closed vocabulary of a handled playback-error report.**
 //!
-//! Every value [`super::playback`] serialises is a member of one of these enums, and every
+//! Every value [`super::playback`] serialises is a member of one of these enums, a bool
+//! (`attempt_started`), a bounded ordinal (`attempt_ordinal`, `1`..`9` else `9+`), or one of two
+//! bounded integers (`http_status`, 100-599 else 0, and `pipeline_error`, the firmware's `i32`
+//! error number); there is no free-text slot. Every
 //! enum's `code` is the wire string, written out and never derived from a variant name, because a
 //! rename is a refactor and must not silently re-partition a year of dashboards. The telemetry
 //! layer owns the schema; `player::report` is the producer that classifies a live playback into
@@ -315,15 +318,122 @@ pub enum DeliveryReason {
     LinkFallback,
     OriginalRecovery,
     OriginalOpenRollback,
+    /// The viewer picked a quality the current stream cannot satisfy, so the playback is
+    /// re-encoded: a fixed rung re-encodes at that rung (a transcode), and Auto, when it cannot
+    /// keep the bytes on screen, rebuilds the adaptive HLS ladder at its re-entry rung.
+    QualityPick,
 }
 
 impl DeliveryReason {
+    pub const ALL: [Self; 4] = [
+        Self::LinkFallback,
+        Self::OriginalRecovery,
+        Self::OriginalOpenRollback,
+        Self::QualityPick,
+    ];
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::LinkFallback => "link_fallback",
             Self::OriginalRecovery => "original_recovery",
             Self::OriginalOpenRollback => "original_open_rollback",
+            Self::QualityPick => "quality_pick",
         }
+    }
+}
+
+/// **Why an engine open was made.** An attempt that fails reads differently by cause: a fresh Play
+/// that never opened is a different bug from an Original open the viewer asked for mid-film or a
+/// recovery the app started on its own. The producer (`player::report`) names the cause where the
+/// open is decided; a value is never inferred from a failure.
+///
+/// Adding a cause is ONE place here: a variant, its `code`, and a slot in [`Self::ALL`], which the
+/// consent legend, the tests and the sample all read (the compiler checks `code` is exhaustive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOrigin {
+    /// The first open after the viewer pressed Play.
+    Fresh,
+    /// The viewer pressed Retry (or the failure screen's *Switch to Auto and play*) on a failure.
+    UserRetry,
+    /// The viewer chose a quality, from the menu or from the failure screen, and the open follows
+    /// from that choice (including an Original they asked for).
+    QualityChange,
+    /// The app changed the delivery on its own: a link fallback or an automatic Original attempt.
+    AutoHandoff,
+    /// The app reopened a route after a failed open: the rollback from Original, or the HLS that
+    /// replaces an Original source that never opened.
+    Recovery,
+    /// The session was reopened at its position after the app returned to the foreground.
+    Resume,
+    /// A detail-page trailer preview, which is not a playback the viewer asked for: it opens in the
+    /// background on a dwell, direct play only, and writes no watch state. A failure of it is its
+    /// own issue group (see `playback::event_body`), not a playback failure.
+    Preview,
+}
+
+impl AttemptOrigin {
+    pub const ALL: [Self; 7] = [
+        Self::Fresh,
+        Self::UserRetry,
+        Self::QualityChange,
+        Self::AutoHandoff,
+        Self::Recovery,
+        Self::Resume,
+        Self::Preview,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::UserRetry => "user_retry",
+            Self::QualityChange => "quality_change",
+            Self::AutoHandoff => "auto_handoff",
+            Self::Recovery => "recovery",
+            Self::Resume => "resume",
+            Self::Preview => "preview",
+        }
+    }
+}
+
+/// **Which engine open of the playback session this was**, counting the first, every Retry and
+/// every handoff or recovery: `1`..`9`, then `9+`. Bounded on purpose, so a session that flaps for
+/// an hour is one value rather than a free number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptOrdinal(u8);
+
+impl AttemptOrdinal {
+    /// The count that reads `9+`; anything above saturates to it.
+    const SATURATED: u8 = 10;
+    pub const FIRST: Self = Self(1);
+
+    /// `n` opens, clamped into `1..=10`; 0 (nothing was counted) reads as the first.
+    pub fn new(n: u32) -> Self {
+        Self(n.clamp(1, u32::from(Self::SATURATED)) as u8)
+    }
+
+    /// The ordinal after one more open.
+    pub fn next(self) -> Self {
+        Self::new(u32::from(self.0) + 1)
+    }
+
+    pub const fn code(self) -> &'static str {
+        match self.0 {
+            0 | 1 => "1",
+            2 => "2",
+            3 => "3",
+            4 => "4",
+            5 => "5",
+            6 => "6",
+            7 => "7",
+            8 => "8",
+            9 => "9",
+            _ => "9+",
+        }
+    }
+
+    /// Every value `code` can produce, in order, for the consent legend.
+    pub fn all() -> impl Iterator<Item = Self> {
+        (1..=u32::from(Self::SATURATED)).map(Self::new)
     }
 }
 
@@ -517,6 +627,16 @@ impl HttpClass {
             _ => Self::Other,
         }
     }
+
+    /// The status itself when it is a real HTTP status (100-599), else 0 for "none recorded". A
+    /// latch that was never set, a transport code or any other stray number is not a status and
+    /// is never reported as one.
+    pub fn exact_status(status: i32) -> u16 {
+        match u16::try_from(status) {
+            Ok(s @ 100..=599) => s,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,6 +673,123 @@ impl BufferClass {
     }
 }
 
+/// **Why the media transfer died, as a class — never the libcurl number.** Issue #504: a direct
+/// play over https that stopped exactly a minute in reached Sentry as a bare `playback_interrupted`
+/// and the event log said only that the demuxer's read failed; the `CURLcode` that explains it was
+/// kept and never reported. The classes are the codes a mid-body death actually produces; a code
+/// outside them is `other`, which cannot carry the number it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportClass {
+    /// No transport failure was recorded (the failure was not a curl transfer's).
+    None,
+    /// `CURLE_PARTIAL_FILE` (18): the connection closed before the whole body arrived.
+    Partial,
+    /// `CURLE_RECV_ERROR` (56): the connection was reset or dropped while receiving.
+    RecvError,
+    /// `CURLE_SEND_ERROR` (55).
+    SendError,
+    /// `CURLE_GOT_NOTHING` (52): the server closed without answering.
+    GotNothing,
+    /// `CURLE_OPERATION_TIMEDOUT` (28), the 30 s low-speed floor included.
+    Timeout,
+    /// `CURLE_HTTP2` (16) or `CURLE_HTTP2_STREAM` (92).
+    Http2,
+    /// The transfer died and the reopen that follows a failed read (libavformat's `seek_cb` heal)
+    /// was refused too: the cause of the first death is in the event log, not here.
+    ReopenFailed,
+    /// Any other `CURLcode`.
+    Other,
+}
+
+impl TransportClass {
+    pub const ALL: [Self; 9] = [
+        Self::None,
+        Self::Partial,
+        Self::RecvError,
+        Self::SendError,
+        Self::GotNothing,
+        Self::Timeout,
+        Self::Http2,
+        Self::ReopenFailed,
+        Self::Other,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Partial => "partial",
+            Self::RecvError => "recv_error",
+            Self::SendError => "send_error",
+            Self::GotNothing => "got_nothing",
+            Self::Timeout => "timeout",
+            Self::Http2 => "http2",
+            Self::ReopenFailed => "reopen_failed",
+            Self::Other => "other",
+        }
+    }
+
+    /// The class of a `CURLcode`; `0` is no failure.
+    pub const fn from_curl_rc(rc: i32) -> Self {
+        match rc {
+            0 => Self::None,
+            18 => Self::Partial,
+            56 => Self::RecvError,
+            55 => Self::SendError,
+            52 => Self::GotNothing,
+            28 => Self::Timeout,
+            16 | 92 => Self::Http2,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// **How long the failed transfer had lived, as a bucket — never the millisecond count.** A proxy
+/// or middlebox that cuts every transfer at a fixed time shows up as one bucket on every report
+/// (30-90 s for a minute), which is the pattern that names it. `Unknown` is "no transport failure
+/// was recorded", so the bucket never claims an age nobody measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferAgeClass {
+    Unknown,
+    Under5s,
+    S5To30,
+    S30To90,
+    S90To300,
+    Over300s,
+}
+
+impl TransferAgeClass {
+    pub const ALL: [Self; 6] = [
+        Self::Unknown,
+        Self::Under5s,
+        Self::S5To30,
+        Self::S30To90,
+        Self::S90To300,
+        Self::Over300s,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Under5s => "<5s",
+            Self::S5To30 => "5-30s",
+            Self::S30To90 => "30-90s",
+            Self::S90To300 => "90-300s",
+            Self::Over300s => "300s+",
+        }
+    }
+
+    pub const fn from_ms(ms: i64) -> Self {
+        match ms {
+            m if m < 0 => Self::Unknown,
+            0..=4_999 => Self::Under5s,
+            5_000..=29_999 => Self::S5To30,
+            30_000..=89_999 => Self::S30To90,
+            90_000..=299_999 => Self::S90To300,
+            _ => Self::Over300s,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaybackErrorContext {
     pub delivery: DeliveryClass,
@@ -564,7 +801,31 @@ pub struct PlaybackErrorContext {
     pub pipeline: PipelineClass,
     pub http: HttpClass,
     pub buffer: BufferClass,
+    /// Why the media transfer died, when a curl transfer's death was recorded.
+    pub transport: TransportClass,
+    /// How long that transfer had lived.
+    pub transfer_age: TransferAgeClass,
+    /// Whether the PLAYBACK ever put a picture on the panel (the session's own latch).
     pub started: bool,
+    /// The route the failed attempt was opening, as against `delivery`, which is the route the
+    /// session had installed. They differ after a mid-play switch whose new route never opened.
+    pub attempted_delivery: DeliveryClass,
+    /// Whether THIS attempt (the engine open that failed) put a picture on the panel, as against
+    /// `started`, which is true for a session that played before the switch that failed.
+    pub attempt_started: bool,
+    /// Why THAT open was made, and which open of the playback session it was (the first, a Retry,
+    /// a handoff...). `delivery` and `attempted_delivery` say what was opened; these say why and
+    /// how many times.
+    pub attempt_origin: AttemptOrigin,
+    pub attempt_ordinal: AttemptOrdinal,
+    /// The exact HTTP status the media source answered with, 100-599, or 0 when none was recorded
+    /// or the number is not a valid status. Beside [`HttpClass`], never instead of it.
+    pub http_status: u16,
+    /// The TV firmware's own error number for the pipeline's first `type=18` error callback (601 =
+    /// resource allocation), or 0 when none was recorded. An integer in the `i32` range and
+    /// nothing else: the callback's string is free text that can carry a URI or a path and has no
+    /// field here.
+    pub pipeline_error: i32,
     /// Only for a refusal the server made at `/decision` — see [`RefusalContext`].
     pub refusal: Option<RefusalContext>,
 }

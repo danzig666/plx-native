@@ -26,8 +26,8 @@
 #              9: `route/` (both halves of the split — `plan.rs`, the pure selection half, and
 #              `decision.rs`, the network/adapter half) and `player/` are scanned the same as
 #              `screens/`/`app/` (zero hits at the split, so green on day one; the `wall` rule below
-#              is the one that distinguishes the halves: it gates `route/plan.rs` and exempts
-#              `route/decision.rs`). Phase 10 adds `dev/`: the dev-trigger arms that used to live
+#              is the one that distinguishes the halves: it gates `route/plan.rs` (and its child
+#              `route/plan_memory.rs`) and exempts `route/decision.rs`). Phase 10 adds `dev/`: the dev-trigger arms that used to live
 #              in `app/{boot,run,content,mod}.rs` moved to `dev/scenarios.rs`, and a mutator call
 #              that moved with them must not launder itself out of this gate's scan. **This was a
 #              CALL-SITE gate alone through phase 10, and D3's census (2026-09-10/11) found the
@@ -93,6 +93,10 @@
 #              `navcommit` when the flash was slow (`fps:modal-ramp`, device-measured 2026-09-09).
 #              Nothing failed: both doors return a `Session` and the difference is invisible at the
 #              call site, which is exactly what a grep gate is for. Count is zero.
+# Plex paging rule:
+#   paging   — `X-Plex-Container-` is spelled in production Rust ONLY by `paged_path`'s file,
+#              rust-modules/plex/src/plex/paging.rs. Every other window is built through it. Zero,
+#              no allowlist; test code and comments are not counted (see the rule's own comment).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 SRC=rust-modules/src
@@ -588,7 +592,7 @@ gate ticks 'SDL_GetTicks\(' "$SRC" "$SRC_BASE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_
 #              screens/ and stores/ (screens/player/ is a subdirectory of screens/ and so already
 #              included) — every screen migrated out of ui/ carries the same "instrument only"
 #              rule its old home had. Re-verified clean on 2026-09-10 with no new violation.
-gate wall '(Instant::now|SystemTime::now|\.elapsed\(\))' "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT" "$SRC/app" "$SRC_MEDIA/route/plan.rs" "$SRC_SCREENS" "$SRC_DATA/stores"
+gate wall '(Instant::now|SystemTime::now|\.elapsed\(\))' "$SRC_UI" "$SRC_MACHINE" "$SRC_APPKIT" "$SRC/app" "$SRC_MEDIA/route/plan.rs" "$SRC_MEDIA/route/plan_memory.rs" "$SRC_SCREENS" "$SRC_DATA/stores"
 
 if grep -rnE 'fp-contract|fast-math|\+fma' rust-modules/Cargo.toml rust-modules/build.rs rust-modules/net/Cargo.toml rust-modules/plex/Cargo.toml rust-modules/telemetry/Cargo.toml rust-modules/data/Cargo.toml rust-modules/session/Cargo.toml rust-modules/media/Cargo.toml rust-modules/appkit/Cargo.toml rust-modules/screens/Cargo.toml rust-modules/platform/Cargo.toml rust-modules/platform/build.rs rust-modules/gfx/Cargo.toml rust-modules/gfx/build.rs rust-modules/ui/Cargo.toml rust-modules/ui/build.rs rust-modules/appkit/build.rs rust-modules/screens/build.rs rust-modules/storage/Cargo.toml rust-modules/storage/build.rs rust-modules/.cargo Makefile 2>/dev/null | grep -v '^[[:space:]]*#'; then
   fail "fpflags: a floating-point contraction flag is set (spec §4.2 assumes none)"
@@ -701,6 +705,37 @@ done
 if [ "$vis_bad" -eq 0 ]; then ok "mutators-visibility"; else fail "mutators-visibility: $vis_bad fn(s) still crate-visible"; fi
 
 gate nav '(crate::ui|plx_ui)::nav::' "$SRC_SCREENS"
+
+# cards: a screen's card shelves and grids come from `plx_ui::cards::{Shelf, Grid}` (the
+# shared-card-sections plan, layer L1), which own the pop, press, stops, restore and paging a
+# hand-assembled strip forgets. The L0 modules `card_row` and `poster_grid` are `pub(crate)`, so a
+# screen cannot NAME them at all; what it can reach is what `plx_ui::cards` re-exports, and this
+# gate is the backstop on that surface. `screens/` may not use, in non-test code: the tile
+# painters `cards::{paint_visible, draw_tile, draw_focused}` (qualified through any alias, or
+# imported by name from `cards::{..}`) should one be re-exported or added there, the L0 types
+# `CardRow`, `GridPop` and `GridBands` (a screen can name one only through such a re-export), or the
+# thread-local `press::scale()`; and `AvatarRow`, the circular-avatar row painter, is the profile
+# picker's alone (`profiles.rs`) — the scoping is in the gate, not an allowlist row, because it is
+# a permanent fact about one screen and not a migration. The geometry and label helpers
+# `plx_ui::cards` also re-exports (`tile_rect`, `under_band`, `poster_label`, ...) are what a
+# screen's own layout reads and are deliberately not gated. Whole test files are skipped; the
+# allowlist (empty) is the screens that still assemble their own, one line per file, and only
+# SHRINKS.
+cards_pat='cards::(paint_visible|draw_tile|draw_focused)\b|use [^;]*cards::\{[^}]*\b(paint_visible|draw_tile|draw_focused)\b|\bCardRow\b|\bGridPop\b|\bGridBands\b|press::scale\(\)'
+cards_bad=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  p="${line%%:*}"
+  if is_wholly_test "$p"; then continue; fi
+  if ! allowed cards "$p"; then echo "    $line"; cards_bad=$((cards_bad+1)); fi
+done < <(grep_code "$cards_pat" "$SRC_SCREENS")
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  p="${line%%:*}"
+  if is_wholly_test "$p" || [ "$p" = "$SRC_SCREENS/profiles.rs" ]; then continue; fi
+  echo "    $line"; cards_bad=$((cards_bad+1))
+done < <(grep_code '\bAvatarRow\b' "$SRC_SCREENS")
+if [ "$cards_bad" -eq 0 ]; then ok "cards"; else fail "cards: $cards_bad line(s) outside ci/allow/cards.txt (or AvatarRow outside profiles.rs) — draw card sections with plx_ui::cards::Shelf / Grid"; fi
 
 # layer: a SCREEN never names the application. §2.1's table says `screens/` may name `ui/`,
 # `stores/`, `plex/` and `player/` and never `app/`, and until phase 10 that half of the rule was
@@ -1147,6 +1182,78 @@ else
   fail "tmppath: $(echo "$tmp_hits" | grep -c . ) line(s) of a literal /tmp/plxnative- path outside dev.rs, not comment or log-message text"
 fi
 
+
+# paging: the two Plex paging parameter names are spelled in ONE non-test file, the `paged_path`
+# primitive (rust-modules/plex/src/plex/paging.rs). Any other production string that spells one is a
+# window built by hand, which skips the `?`/`&` rule and the always-together pairing. Comments are
+# not counted (they cannot build a request), and test code is: whole test files (the `wholly_test`
+# classification above) and `#[cfg(test)]` items, found from tokens so a literal inside a string is
+# never mistaken for a comment. Zero, no allowlist. Scans every crate root, not only plex's.
+paging_hits=$(WHOLLY_TEST="$wholly_test" python3 - "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_PLATFORM" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_APPKIT" "$SRC_SCREENS" <<'PY'
+import os, sys
+sys.path.insert(0, "ci")
+from rust_test_modules import close, lex
+
+needle = "X-Plex-Container-"
+owner = os.path.relpath(os.path.realpath("rust-modules/plex/src/plex/paging.rs"))
+test_files = {os.path.relpath(os.path.realpath(p)) for p in os.environ.get("WHOLLY_TEST", "").split("\n") if p}
+
+def skip_item(tokens, j):
+    """Index just past the item that starts at `j`: its `{…}` body, or up to a `;` at depth 0."""
+    while j < len(tokens):
+        kind, text = tokens[j]
+        if kind == "code":
+            if text == ";":
+                return j + 1
+            if text == "{":
+                return close(tokens, j) + 1
+            if text in ("(", "["):
+                j = close(tokens, j) + 1
+                continue
+        j += 1
+    return j
+
+def production_literals(tokens):
+    found, i = [], 0
+    while i < len(tokens):
+        kind, text = tokens[i]
+        if kind == "code" and text == "#" and i + 1 < len(tokens) and tokens[i + 1] == ("code", "["):
+            end = close(tokens, i + 1)
+            # Exactly `#[cfg(test)]`: a compound predicate counts as production, so it fails closed.
+            if [t[1] for t in tokens[i + 2:end]] == ["cfg", "(", "test", ")"]:
+                i = skip_item(tokens, end + 1)
+                continue
+        if kind == "string" and needle in text:
+            found.append(text)
+        i += 1
+    return found
+
+bad = 0
+for root in sys.argv[1:]:
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith("target")]
+        for fn in sorted(files):
+            if not fn.endswith(".rs"):
+                continue
+            path = os.path.relpath(os.path.realpath(os.path.join(dirpath, fn)))
+            if path == owner or path in test_files:
+                continue
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            if needle not in text:
+                continue
+            for literal in production_literals(lex(text)):
+                print(f"{path}: {literal!r}")
+                bad += 1
+sys.exit(1 if bad else 0)
+PY
+)
+paging_status=$?
+if [ "$paging_status" -eq 0 ] && [ -z "$paging_hits" ]; then ok "paging"
+else
+  echo "$paging_hits" | sed 's/^/    /'
+  fail "paging: $(echo "$paging_hits" | grep -c . ) production literal(s) spell X-Plex-Container- outside rust-modules/plex/src/plex/paging.rs (use paged_path)"
+fi
 
 # every allowlist's declared count equals its entries
 for f in ci/allow/*.txt; do
