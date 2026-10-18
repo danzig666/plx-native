@@ -343,7 +343,7 @@ library you care about — which is what `test_user` is for.
 ## Prerequisites
 
 - The same toolchain the main dev loop needs: the webOS NDK (`make setup-env`), `sshpass`
-  (only when the TV refuses your ssh key), and (for `--build`) the Rust nightly + `rust-src` (see the repo `Makefile` / `docs/agent-reference.md`).
+  (only when the TV refuses your ssh key), and (for `--build`) the pinned stable Rust toolchain with its armv7 rust-std (`make setup-rust`; see the repo `Makefile` / `docs/agent-reference.md`).
 - `tests/manifest.local.json` present — `cp tests/manifest.local.json.example` and fill in the
   PMS host/port, the TV address, `test_user`, and **as many `item` ratingKeys as your library can
   actually supply**; leave the rest bracketed and the cases that need them are skipped (below).
@@ -462,6 +462,17 @@ library); everything else needs real library content and is skipped with that re
 true` marks a scene that runs ONLY under `--mock` (it is skipped, with a reason, on a plain
 `--fps`). An exact scene name as `--filter` selects that scene alone (`home-grid` does not pull in
 `home-grid-deep`).
+
+A **player** scene can also grade what the app declared, not how fast it drew: `fixed-480p-reencode-declaration`
+(#665) is a `--fps-player --mock` scene whose `mock` block hands the mock `extra_media` (a real, ffprobed
+3840x2160 H.264 file, rk 990001) and a `transcode_fixture` (the 854x480 clip `start.mkv` returns), both
+named relative to `$FIXTURES_OUT` (default `~/plxnative-fixtures`; a scene whose files are not built is
+skipped with the ffmpeg commands' location), and whose `expect` block reuses a playback case's keys
+(`load_max`, `sink_echo`, `decision`, `codec`/`video_size`, `min_timeline_climb_s`; `no_error` always).
+`quality` pins the rung (`480p_720_kbps`). Run it: `tools/tv-lock.sh with --why "fixed 480p declaration" --
+./tests/run.py --fps-player --mock --filter fixed-480p-reencode-declaration`.
+
+`boost-remux-declares-source-rate` (#832) is the second such scene: `plxnative-audioenh=boost` turns a direct-playable 4K H.264 24p file into an enhanced remux, and it grades `load_fps: 24.0`, `load_max: 3840x2160@24`, the set's echo, and (`presented_rate: true`, optionally `presented_rate_tol_pct`) the sink's presented rate against the declared one. Fixtures live in `boost-remux/` under the same root; the ffmpeg commands are in the scene's `comment`. Run it: `tools/tv-lock.sh with --why "boost remux declaration" -- ./tests/run.py --fps-player --mock --filter boost-remux-declares-source-rate`.
 
 `home-grid-deep` is the Home-with-many-rows scene (#395): `--home-hubs 170`. `plxnative-homeosc`
 only sweeps about nine rows either side of the top, so it instead presses **Down once per landed
@@ -817,10 +828,11 @@ Operation cases (each also re-checks not-stuck / no-error afterward):
 
 ## Subtitle soft-render
 
-The **demuxer (`ff.rs`) demuxes embedded plain-text subtitles** (SRT/subrip and mov_text)
-and emits `sub cue [..] len=<n>` lines. It pushes cues for **all** plain-text tracks (tagged by
-index), and the renderer filters by the selected `desired_sub_idx`, so a mid-play track switch is
-instant (no ~10-20s buffer-gap wait). ASS/SSA preserves headers, complete timed events and fonts
+The **demuxer (`ff.rs`) demuxes embedded text subtitles** (SRT/subrip, WebVTT, mov_text, ...)
+and `ass_source::push_text` emits `sub cue [..] len=<n>` lines for the selected track when a cue is
+new (a cue the demuxer re-reads after a seek is not logged again). It pushes cues for **all** text
+tracks (tagged by index), converted to ASS events and rendered by libass; the renderer filters by the
+selected `desired_sub_idx`, so a mid-play track switch is instant (no ~10-20s buffer-gap wait). ASS/SSA preserves headers, complete timed events and fonts
 for native libass rendering; plain-cue log assertions cannot verify that output. See
 [`ass-subtitles.md`](../docs/ass-subtitles.md) for its native pixel and device checks. Image subs (PGS/VobSub/DVB) are now client-rendered too:
 `ff.rs` software-decodes the selected bitmap track (`avcodec_decode_subtitle2`), converts each

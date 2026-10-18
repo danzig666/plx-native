@@ -92,10 +92,11 @@ impl PickerPage {
     /// falls back to; reading the legacy key alone would call a profile's own pick "not saved" and
     /// write it again on every OK.
     fn durable(&self, value: &Value) -> bool {
-        use plx_plex::plex::session::{current_seat, peek, stored_effective, SubtitlePositionPref, SubtitleSizePref};
+        use plx_plex::plex::session::{current_seat, peek, stored_effective, SubtitlePositionPref, SubtitleSizePref, HdrOverlayBrightnessPref};
         match value {
             Value::SubtitleSize(v) => stored_effective::<SubtitleSizePref>(&peek(), &current_seat()) == *v,
             Value::SubtitlePosition(v) => stored_effective::<SubtitlePositionPref>(&peek(), &current_seat()) == *v,
+            Value::HdrOverlay(v) => stored_effective::<HdrOverlayBrightnessPref>(&peek(), &current_seat()) == *v,
             _ => true,
         }
     }

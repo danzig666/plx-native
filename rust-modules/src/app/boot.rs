@@ -425,6 +425,20 @@ pub(crate) unsafe fn hide_cursor() {
     }
 }
 
+/// True where the pointer is hidden by swapping in a transparent cursor rather than by LG's call,
+/// so the system's pointer stays up and the remote's OK arrives as a click (`input::click_is_ok`).
+/// False on the host simulator, where a click is always a real one.
+pub(crate) unsafe fn cursor_is_transparent() -> bool {
+    #[cfg(not(feature = "hostsim"))]
+    {
+        matches!(cursor_door(), CursorDoor::Sdl { .. })
+    }
+    #[cfg(feature = "hostsim")]
+    {
+        false
+    }
+}
+
 /// Bring the pointer back after [`hide_cursor`] swapped in the transparent cursor. Call on pointer
 /// motion while the cursor is hidden. A no-op wherever LG's extension exists: there the
 /// compositor shows its own pointer on motion, as it always has.
@@ -853,6 +867,8 @@ pub(super) fn activate_server_owned(
     let _ = bridge.hubs_run(plx_data::stores::hubs::HubsCmd::Reset).changed;
     bridge.person_run(plx_data::stores::person::PersonCmd::Reset);
     bridge.collection_run(plx_data::stores::collection::CollectionCmd::Reset);
+    // before the stores reset: a stop the previous identity left in flight must not land on this one
+    plx_media::route::retire_pending_stops();
     bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset);
     bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::Reset);
     let mut endpoints = bridge.hubs_run(plx_data::stores::hubs::HubsCmd::RefetchHubs).endpoints;
@@ -1842,10 +1858,11 @@ pub(crate) unsafe fn construct(
     let pause_script: Option<(u32, Option<u32>, Option<u32>)> = None;
     let pause_resume_at: Option<u32> = None;
     let prev = 0u32;
-    // Home data refresh, armed on every player exit (Stop/BACK/EOS): the hubs are refetched a
-    // beat later so the final timeline PUT lands first — Continue Watching then shows the new
-    // resume point / next episode instead of the state from boot.
-    let refresh_hubs_at = 0u32;
+    // Home data refresh, armed on every player exit (Stop/BACK/EOS): the hubs are refetched once
+    // the stop report has settled (`route::timeline_stop_landed`), so the `stopped` timeline POST
+    // lands first — Continue Watching then shows the new resume point / next episode instead of
+    // the state from boot.
+    let refresh_hubs = false;
 
     let ev = [0u8; 128];
     // dev/testing remote: drain any tokens written to /tmp/plxnative-remote and push
@@ -1874,14 +1891,16 @@ pub(crate) unsafe fn construct(
         player,
         adapters,
         repause_at,
+        decoder_parked: false,
         ok_armed,
         last_route_reported,
         ptr,
         menu_play_await: None,
         prev,
-        refresh_hubs_at,
-        refresh_detail: None,
+        refresh_hubs,
+        return_hold: Default::default(),
         plaintext_upgrade: Default::default(),
+        reread: Default::default(),
         ev,
         remote,
         win,
@@ -2002,6 +2021,9 @@ pub(crate) unsafe fn construct(
         #[cfg(feature = "devtriggers")]
         plx_base::eventlog::log("budget: pre-phase-11 admission (quota only) by /tmp/plxnative-nobudget");
     }
+    // dev: /tmp/plxnative-watchlist-live — the owner's switch that lets a debug build write to the
+    // real plex.tv Watchlist; latched here, and logged once when it is on.
+    plx_plex::plex::watchlist::announce_live_writes();
     if controlled {
         let initial = app.snapshot_init().expect("controlled constructor retains initial inputs");
         initial.validate().map_err(|reason| { log(&format!("rec: REFUSED — {reason}")); 1 })?;

@@ -295,14 +295,15 @@ impl AutoOriginalCandidate {
     /// is `None` for Off and `Some(render ordinal)` for a pick; an external sidecar pick has no
     /// demuxer ordinal (`-1`), which is stored as `None` because `player::sidecar` draws it once
     /// the route is direct and `request_subtitle(-1)` never touches that renderer. A pick the
-    /// client cannot draw would need a burn, which the Original route by definition does not do:
-    /// `false`, and the caller drops the candidate.
-    pub(super) fn retarget_subtitle(&mut self, ordinal: Option<i32>, client_renderable: bool) -> bool {
-        if ordinal.is_some() && !client_renderable {
-            return false;
-        }
+    /// client cannot draw (an image sidecar, a pick with no ordinal and no sidecar key) is KEPT
+    /// with `None` too: the Original route never shows it client-side, and the server burns it
+    /// wherever the route is enhanced (M7's Burn). That is a deliberate mid-play behaviour, not
+    /// parity with a cold start (an image sidecar selected at cold start plays with the subtitle
+    /// off). Releasing or recovering to a route that would silently drop it is prevented by
+    /// `candidate_shows_selected_subtitle`, not here. Unlike the audio sibling this cannot fail,
+    /// so the candidate is never dropped by a subtitle pick.
+    pub(super) fn retarget_subtitle(&mut self, ordinal: Option<i32>) {
         self.subtitle_ordinal = ordinal.filter(|o| *o >= 0);
-        true
     }
 }
 
@@ -423,7 +424,7 @@ pub(super) fn transcode_spec_carrying_burn<'a>(
 }
 
 
-pub use plx_plex::plex::session::{PlaybackQuality as Quality, DeckPress, DirectPlayMode, MarkerSkip, NextEpisodeMode, SkipInterval, SubtitleSize, SubtitlePosition};
+pub use plx_plex::plex::session::{PlaybackQuality as Quality, DeckPress, DirectPlayMode, HdrOverlayBrightness, MarkerSkip, NextEpisodeMode, SkipInterval, SubtitleSize, SubtitlePosition};
 
 
 /// The ladder IN ORDER, best first. The ONE place row order lives, so the picker's index mapping
@@ -600,6 +601,44 @@ pub(super) struct EnhancementFacts<'a> {
     pub(super) subtitle_effect: SubtitleEffect,
     /// This playback's server already refused or ignored the params once.
     pub(super) refused: bool,
+    /// The quality in force: the picker's value (what the HUD's Quality row reads) on the live
+    /// session, the resolve's own copy at resolve time. Only a quality that is NOT Original may
+    /// be blamed with [`DisabledReason::NotOriginalQuality`].
+    pub(super) quality: Quality,
+    /// Why `base` is `None` when the resolve (or a mid-play pick) is the reason; `None` for a
+    /// fixed rung, which never asks for an Original candidate.
+    pub(super) declined: Option<OriginalDeclined>,
+}
+
+/// **Why no [`AutoOriginalCandidate`] exists** — recorded where it is not built or is dropped, so
+/// the menu can say the true reason instead of blaming the quality picker. Behaviour never reads
+/// it; only [`enhancement_availability`] and the decline log line do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OriginalDeclined {
+    /// Settings > Force Direct Play is on: the server never gets to copy the video.
+    ForcedDirectPlay,
+    /// The link is a Plex relay, which never carries an Original candidate.
+    Relay,
+    /// The video cannot be copied as it is (the television cannot decode it, or the server must
+    /// convert it).
+    VideoNeedsConverting,
+    /// No file path or no measured link to build the candidate from.
+    NoSource,
+    /// A mid-play audio or subtitle pick the candidate could not follow dropped it.
+    TrackPickDropped,
+}
+
+impl OriginalDeclined {
+    /// One short word-phrase for the decline log line.
+    pub fn log_name(self) -> &'static str {
+        match self {
+            Self::ForcedDirectPlay => "forced direct play",
+            Self::Relay => "relay link",
+            Self::VideoNeedsConverting => "video needs converting",
+            Self::NoSource => "no part or link",
+            Self::TrackPickDropped => "track pick dropped it",
+        }
+    }
 }
 
 /// What the enhancement, once offered, actually asks the server for — the one fork the menu, the
@@ -634,10 +673,20 @@ pub enum DisabledReason {
     /// the DV video regardless of a burn request and silently dropping the subtitle — neither half
     /// of the ask is honoured, so it is never sent.
     DolbyVisionSubtitle,
-    /// The live route is not Direct or Remux (a fixed quality rung, HLS, a relay…), or no Original
-    /// candidate was ever computed for it (I5's exclusion list) — the enhanced route is always an
-    /// uncapped Original.
+    /// The quality in force is not Original (a fixed rung, or Auto currently on HLS) — picking
+    /// Original is the way in. Never used while Original is the quality in force.
     NotOriginalQuality,
+    /// Settings > Force Direct Play is on, so the server cannot add the enhancement.
+    ForcedDirectPlay,
+    /// Original is picked but the route does not copy the video (the live session's
+    /// `original_is_converted`): the Quality row reads "Original · Converted" and this note says the
+    /// same fact. A burn route is also `Converted` (its picture is re-encoded) yet the Audio tab
+    /// explains its own state there (the burn note): the row states the picture fact, the tab its own.
+    ServerConverting,
+    /// Original is in force and the route copies the video, but no Original candidate exists to
+    /// decorate (a relay link, a video that had to be converted, a track pick the Original route
+    /// could not follow). The viewer cannot act on the differences, so one reason.
+    NotCopyable,
     /// This playback's server already refused or ignored the params once.
     ServerRefused,
 }
@@ -661,15 +710,32 @@ pub(super) fn enhancement_availability(f: &EnhancementFacts, target: RouteFamily
     if f.refused {
         return Disabled(DisabledReason::ServerRefused);
     }
-    // I5: Direct or Remux only, and only when an Original candidate was actually computed for it
-    // (forced direct play, a fixed rung, relay, a non-Original MDE… all read the same to a viewer:
-    // "only at Original quality").
-    if !matches!(target, RouteFamily::Direct | RouteFamily::Remux) {
-        return Disabled(DisabledReason::NotOriginalQuality);
-    }
-    let Some(base) = f.base else {
-        return Disabled(DisabledReason::NotOriginalQuality);
+    // I5: Direct or Remux only, and only when an Original candidate was actually computed for it.
+    // The reason is the true one: "only at Original quality" is said ONLY when the quality in
+    // force is not Original (a fixed rung, Auto on HLS) — saying it under "Quality: Original"
+    // contradicts the Quality row. A missing candidate names why it is missing.
+    let converting = f.quality == Quality::Original && !matches!(target, RouteFamily::Direct | RouteFamily::Remux);
+    let not_original = f.quality != Quality::Original;
+    let unreachable = || {
+        Disabled(match f.declined {
+            Some(OriginalDeclined::ForcedDirectPlay) => DisabledReason::ForcedDirectPlay,
+            _ if converting => DisabledReason::ServerConverting,
+            // A pick the Original route could not follow dropped the candidate; under Auto or a
+            // rung the quality in force is the honest thing to name.
+            Some(OriginalDeclined::TrackPickDropped) | None if not_original => DisabledReason::NotOriginalQuality,
+            _ => DisabledReason::NotCopyable,
+        })
     };
+    let Some(base) = f.base else {
+        return unreachable();
+    };
+    if !matches!(target, RouteFamily::Direct | RouteFamily::Remux) {
+        return Disabled(if converting {
+            DisabledReason::ServerConverting
+        } else {
+            DisabledReason::NotOriginalQuality
+        });
+    }
     // I7: an unusable Dolby Vision base layer is never copied at all — nothing to decorate.
     if base.dovi.base_layer_unusable() {
         return Disabled(DisabledReason::DolbyVisionUnusable);
@@ -1245,6 +1311,11 @@ pub struct Plan {
     /// only one half is recorded. Equal to `vcodec`/`acodec` for a direct play and for a remux.
     pub src_vcodec: String,
     pub src_acodec: String,
+    /// The SOURCE file's video frame rate (0 = unknown), whichever route carries it. Beside
+    /// `src_*` and not beside `fps`: `fps` is what the Load declares for THIS stream (direct play
+    /// and remux, whose video is the source's own elementary stream; 0 on a re-encode), while this
+    /// stays the file's, so a later rebuild of the route ([`video_copy_fps`]) can decide again.
+    pub src_fps: f64,
     pub fps: f64,
     /// The direct-played file's Dolby Vision layering, for the Load payload's `DolbyHdrInfo`
     /// node. Set on the DIRECT-PLAY branch only, beside `fps` and for the same reason: the
@@ -1299,6 +1370,9 @@ pub struct Plan {
     /// A measured Remote can begin on HLS and later recover. Preserve the exact no-video-encode
     /// source declaration even when this plan's immediate output is H264/AAC HLS.
     pub(super) auto_original: Option<AutoOriginalCandidate>,
+    /// Why `auto_original` is `None` (see [`OriginalDeclined`]); `None` while a candidate exists
+    /// and for a fixed rung, which never asks for one.
+    pub(super) original_declined: Option<OriginalDeclined>,
     /// demuxer stream ordinal to feed (direct-play, non-default track). None = leave as-is.
     pub feed_audio_ordinal: Option<i32>,
     /// the subtitle selected for this part or by the show preference (0 = none/off), so the
@@ -1445,6 +1519,7 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
         .cached_item
         .clone()
         .or_else(|| plx_data::metadata::fetch_playing_item(env.sid, rk));
+    plan.src_fps = plan.playing.as_ref().map_or(0.0, |p| p.video_fps);
     plan.playing_fresh = env.cached_item.is_none() && plan.playing.is_some();
     if let (Some(id), Some(item)) = (env.subtitle_override, plan.playing.as_mut()) {
         // The retry's explicit selection owns both embedded and sidecar restoration; a stale
@@ -1935,6 +2010,20 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
             audio_converted: false,
             subtitle_ordinal,
         });
+    } else if matches!(playback_quality, Quality::Auto | Quality::Original) {
+        // Record WHY Original is unreachable, so the audio-enhancement note can say the true
+        // reason; behaviour never reads this. A fixed rung is not a decline: it never asks.
+        let why = if forced {
+            OriginalDeclined::ForcedDirectPlay
+        } else if location == Some(plx_plex::plex::probe::Location::Relay) {
+            OriginalDeclined::Relay
+        } else if !(directplay || remux_candidate) {
+            OriginalDeclined::VideoNeedsConverting
+        } else {
+            OriginalDeclined::NoSource
+        };
+        plan.original_declined = Some(why);
+        crate::player::log(&format!("original: no candidate ({})", why.log_name()));
     }
     // Issue #266: the audio enhancement decorates the Original route only (I5), so it is judged
     // against the candidate captured above — its DV facts (I7), its carried track, and the family
@@ -1960,6 +2049,8 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
                 carried: $candidate.and_then(|c| c.audio.as_ref()),
                 subtitle_effect,
                 refused: false,
+                quality: env.quality,
+                declined: plan.original_declined,
             }
         };
     }
@@ -2335,6 +2426,9 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     // to our own server, which answers 200 and changes nothing on theirs.
     plan.contract.remux = remux;
     plan.contract.no_video_copy = no_video_copy;
+    // A remux's video is the source's own elementary stream, so the Load declares the source's rate
+    // (a 4K H.264 24p stream declared at the 60 an unknown rate keeps is presented at ~13 fps).
+    plan.fps = video_copy_fps(&plan.contract, plan.src_fps);
     // `plan.contract.ceiling` is NOT set here — it was set for every flavour up at the decision,
     // which is what the direct-play branch needed too. Spending it below is the third reader of
     // the same reasoning `remux` and `no_video_copy` carry: a seek and an audio switch rebuild
@@ -2452,6 +2546,15 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     plan
 }
 
+
+/// The video frame rate the Load may declare for a route with this contract: the SOURCE's own when
+/// the server copies the video stream (a remux, so direct play's rule holds there too), 0 (unknown)
+/// when it re-encodes it (an HLS rung, `no_video_copy`, a burned subtitle) — the encoder owns that
+/// rate and nothing here knows it. The one place the rule lives: the plan, the recovery install and
+/// the retranscode landing all ask it.
+pub(super) fn video_copy_fps(contract: &plx_plex::plex::EncodeContract, src_fps: f64) -> f64 {
+    if contract.remux && !contract.no_video_copy { src_fps } else { 0.0 }
+}
 
 /// The direct-play plan: the pipeline decodes the SOURCE codecs natively, so the Load payload uses
 /// them (h264/hevc + the chosen audio track's codec). If a specific track was picked (aidx >= 0),

@@ -5199,8 +5199,8 @@ def do_build(tv, timing=False):
     Functional runs keep the fast default. The profile that actually landed is checked afterwards by
     `require_release_binary`, which also covers a binary deployed without this flag.
     """
-    # The Makefile owns the whole build (it drives cargo +nightly with the load-bearing
-    # cortex-a9 flags itself) — shelling out to it keeps run.py from drifting a second
+    # The Makefile owns the whole build (it drives cargo on the pinned stable toolchain with the
+    # load-bearing cortex-a9 flags itself) — shelling out to it keeps run.py from drifting a second
     # copy of the toolchain invocation (the old hand-rolled zigbuild here did exactly that).
     profile_args = ["ARM_PROFILE=release"] if timing else []
     print("=== BUILD: make -> make deploy" + (" (ARM_PROFILE=release: timing run)" if timing else "") + " ===")
@@ -5890,6 +5890,49 @@ def grade_required_log(scene, lines):
     return True, " | required log line(s) present: " + ", ".join(repr(w) for w in want)
 
 
+def grade_scene_expect(scene, lines):
+    """`expect`: a scene's own log assertions, the playback cases' functions on the playback cases'
+    keys. For a player scene that exists to say what the app DECLARED or ROUTED (issue #665: a fixed
+    480p re-encode of a 4K file must declare the 1080p envelope, not the source's 4K60), where the
+    frame-rate gates above grade nothing it cares about. `no_error` is always checked. Returns
+    (ok, detail_suffix); a scene without `expect` passes untouched.
+
+    Keys: decision, codec (+ min_video_width / video_size), load_video, load_audio, load_fps,
+    load_max, sink_echo (all `a_load_decl`'s), min_timeline_climb_s, presented_rate (+
+    presented_rate_tol_pct; `a_presented_rate`). Anything else is a typo and
+    FAILS rather than being ignored: an assertion that silently does not run is the false pass this
+    function exists to prevent.
+    """
+    exp = scene.get("expect")
+    if not exp:
+        return True, ""
+    known = {"decision", "codec", "min_video_width", "video_size", "min_timeline_climb_s",
+             "presented_rate", "presented_rate_tol_pct"}
+    load_keys = {"load_video", "load_audio", "load_fps", "load_max", "sink_echo"}
+    unknown = sorted(set(exp) - known - load_keys)
+    if unknown:
+        return False, f" | unknown expect key(s): {', '.join(unknown)}"
+    results = []
+    if "decision" in exp:
+        results.append(("decision", *a_decision(lines, exp["decision"])))
+    if "codec" in exp:
+        results.append(("codec", *a_codec(
+            lines, exp["codec"], exp.get("min_video_width", 0), exp.get("video_size"))))
+    if load_keys & set(exp):
+        results.append(("load", *a_load_decl(lines, exp)))
+    if "min_timeline_climb_s" in exp:
+        results.append(("timeline_climb", *a_timeline_climb(lines, exp["min_timeline_climb_s"])))
+    if exp.get("presented_rate"):
+        # the sink's presented rate against the declared one (#832): `presented_rate: true` opts a
+        # scene IN; `presented_rate_tol_pct` widens the band exactly as on a playback case
+        results.append(("presented_rate", *a_presented_rate(lines, exp)))
+    results.append(("no_error", *a_no_error(lines)))
+    ok = all(r[1] for r in results)
+    detail = " | expect: " + "; ".join(
+        f"{'ok' if good else 'FAIL'} {label}: {why}" for label, good, why in results)
+    return ok, detail
+
+
 def fps_scene_needs_token(scene, has_shared_server=False):
     """Whether this scene must cross the signed-in boot gate.
 
@@ -6151,6 +6194,9 @@ def run_fps_scene(scene, cfg, token, *, extra_triggers=(), capture=None,
     ok_r, detail_r = grade_required_log(scene, lines)
     ok = ok and ok_r
     detail += detail_r
+    ok_e, detail_e = grade_scene_expect(scene, lines)
+    ok = ok and ok_e
+    detail += detail_e
     detail += walk_detail
     print(f"    [{'PASS' if ok else 'FAIL'}] {detail}")
     return ok, detail
@@ -6753,6 +6799,8 @@ def main():
                 gates = f"loop_floor={s['loop_floor']}"
             elif s.get("bench"):
                 gates = f"bench_missed_max={s.get('bench_missed_max', 0)}"
+            elif s.get("expect"):
+                gates = f"expect={','.join(s['expect'])}"
             else:
                 gates = "gate=?"
             if s.get("fps_floor") is not None:
@@ -6769,6 +6817,8 @@ def main():
             if mock_fps.scene_mock(s) is not None:
                 mark += "  [mock-only]" if s["mock"].get("only") else "  [mock ok]"
             mark += f"  [SKIP: {s['skip']}]" if s.get("skip") else ""
+            if mock_fps.scene_mock(s) is not None and mock_fps.missing_mock_fixtures(s):
+                mark += f"  [mock SKIP: {mock_fps.missing_mock_fixtures(s)}]"
             print(f"fps:{s['name']:28s} tier={s.get('tier','ui'):6s} {tag:16s} {gates}{mark}")
         print(f"\ninstall: {APPID} [{FLAVOUR}] — runtime root {RUNDIR}")
         # Offline, so this reports what the OVERLAY says — nothing is resolved and plex.tv is not

@@ -50,7 +50,8 @@
 use super::origin::Origin;
 use super::probe::Location;
 pub use prefs::{effective, own_prefs, persist_profile_pref, put_own, stored_effective, tenure, AudioEnhancementsPref,
-    DeckPressPref, DirectPlayModePref, SkipCreditsPref, SkipIntroPref, NextEpisodeModePref, Preferences, ProfilePrefs, ProfilePrefsPref,
+    DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, Preferences, ProfilePrefs, ProfilePrefsPref,
+    SkipCreditsPref, SkipIntroPref,
     ProfilePrefsRecord, ProfileSetting, ProfileWrite, QualityPref, Row, Setting, SkipIntervalPref,
     SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref};
 use prefs::ProfileMemory;
@@ -611,7 +612,7 @@ pub struct Session {
     /// Soft-parsed like every list in this struct: an entry costs itself, never the credentials.
     #[serde(default, deserialize_with = "de_profile_cache")]
     pub profiles: Vec<ProfileCreds>,
-    /// Every preference key but `language` (`profile_prefs`, the per-profile home of the nine player
+    /// Every preference key but `language` (`profile_prefs`, the per-profile home of the ten player
     /// settings and of hero trailer autoplay, and those settings' frozen top-level keys every profile
     /// falls back to (`trailer_autoplay` among them), `auto_sign_in`,
     /// `last_hero_blur`, `plaintext_consent`, `server_key_pins`, `last_library`,
@@ -646,7 +647,7 @@ struct CanonicalSessionAuth {
 struct CanonicalSessionPreferences {
     #[serde(default)]
     language: plx_platform::i18n::Preference,
-    /// Every flattened preference key (the nine player settings, hero trailer autoplay, the A5 rows and the two memory-door
+    /// Every flattened preference key (the ten player settings, hero trailer autoplay, the A5 rows and the two memory-door
     /// lists), flattened ahead of `extensions` so a flattened struct takes its keys first and
     /// `extensions` still sees only unknown ones.
     #[serde(flatten)]
@@ -843,34 +844,6 @@ fn valid_profiles(profiles: Vec<ProfileCreds>) -> Vec<ProfileCreds> {
     }).collect()
 }
 
-/// Remember the hero envelope Home is showing right now, best-effort, for [`Preferences::last_hero_blur`].
-///
-/// Cheap to call on every route-ground latch: [`update`] is a single read-modify-write, and this
-/// skips the write entirely when the stored envelope already matches, so parking on the same hero
-/// for minutes costs nothing beyond the initial read. A session with no `client_id` yet (nothing
-/// signed in) is a deliberate no-op — see [`update`]'s doc — which is fine here: there is no
-/// pre-Home route to seed before an account exists.
-///
-/// Returns whether the file was actually rewritten — `false` both when nothing is signed in yet
-/// ([`update`]'s own no-op rule) and when the stored envelope already matches, which is how a test
-/// can grade the skip without inspecting file bytes.
-pub fn record_last_hero(blur: [[f32; 3]; 4]) -> bool {
-    update(|cur| {
-        if cur.prefs.last_hero_blur == Some(blur) {
-            return None;
-        }
-        let mut next = cur.clone();
-        next.prefs.last_hero_blur = Some(blur);
-        Some(next)
-    })
-}
-
-/// The last hero envelope recorded by [`record_last_hero`], or `None` on a fresh device that has
-/// never rendered one.
-pub fn last_hero() -> Option<[[f32; 3]; 4]> {
-    peek().prefs.last_hero_blur
-}
-
 /// Persist Automatically Sign In through [`update`], so a concurrent roster/recents write cannot
 /// lose the switch. Returns whether the file was rewritten.
 #[cfg(any(test, feature = "test-support"))]
@@ -965,6 +938,18 @@ impl PlaybackQuality {
         format!("{lines}p \u{b7} {rate}")
     }
 
+    /// The rung's SHORT name for a row that has another part to read beside it ("720p"): the
+    /// picture height alone, which is the format's own conventional name in every shipped language.
+    /// Auto and Original name themselves ([`Self::label`]).
+    pub fn short_label(self) -> String {
+        match self {
+            PlaybackQuality::Auto | PlaybackQuality::Original => self.label(),
+            PlaybackQuality::P1080High | PlaybackQuality::P1080 => "1080p".to_owned(),
+            PlaybackQuality::P720 | PlaybackQuality::P720Low => "720p".to_owned(),
+            PlaybackQuality::P480 => "480p".to_owned(),
+        }
+    }
+
     /// A missing field in an OLD file is handled by [`Session::playback_quality`] and is always
     /// Original. This is only for a genuinely NEW file, where Auto is allowed to become the
     /// default after (and only after) its whole playback path declares itself ready.
@@ -1053,15 +1038,22 @@ pub enum SubtitleSize {
     Large,
     #[serde(rename = "extra_large")]
     ExtraLarge,
+    /// Added on top of the ladder rather than by moving the other rungs up, so no saved pick
+    /// changes size. A build from before it reads `"huge"` as a value it cannot parse: the
+    /// per-profile field falls back to the install's older value and the install key to `Medium`
+    /// (both are parsed softly), never a failed load.
+    #[serde(rename = "huge")]
+    Huge,
 }
 
 impl SubtitleSize {
     /// Every rung, smallest first — the order the picker lists them in.
-    pub const LADDER: [SubtitleSize; 4] = [
+    pub const LADDER: [SubtitleSize; 5] = [
         SubtitleSize::Small,
         SubtitleSize::Medium,
         SubtitleSize::Large,
         SubtitleSize::ExtraLarge,
+        SubtitleSize::Huge,
     ];
 
     /// An in-memory index back to a rung — out of range is `Medium`, never a neighbouring rung,
@@ -1077,7 +1069,7 @@ impl SubtitleSize {
 
 /// The persisted subtitle vertical placements, lowest first — one per profile, like [`SubtitleTone`].
 /// Absence is `Low`, which is where every build before this preference drew the caption
-/// (`appkit::player_hud`'s fixed `SUB_BASE_Y`/`SUB_CEIL_Y` baseline). Only the plain-text caption draw
+/// (`media::player::text_style`'s fixed `SUB_BASE_Y`/`SUB_CEIL_Y` baseline). Only the plain-text caption draw
 /// moves with this; image (PGS/VobSub) captions and native ASS/SSA keep their own placement
 /// (`docs/ass-subtitles.md`).
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1233,6 +1225,58 @@ impl DeckPress {
     /// triangle, its press and its menu's Play row are all derived from.
     pub fn press_plays(self) -> bool {
         self == DeckPress::Play
+    }
+}
+
+/// **How bright the player's overlay and captions are drawn while the picture is HDR** — one per
+/// profile, like [`SubtitleTone`]. A television maps graphics white in an HDR picture to a far
+/// brighter level than the same white in SDR (the HUD and the captions are graphics; the panel
+/// treats them as part of the HDR scene), so a viewer in a dark room is dazzled by the transport
+/// and the subtitles. This is how far RGB is scaled down then; it never applies to an SDR picture.
+/// Absence is `ThreeQuarters`: the overlay is dimmed to 75% in an HDR picture unless the viewer
+/// chose otherwise (`Full` turns the dim off). The factor is a plain linear multiplier on the sRGB-encoded values (alpha is untouched), which is
+/// the same multiply the painter's `rgb` cascade already is.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdrOverlayBrightness {
+    #[serde(rename = "full")]
+    Full,
+    #[default]
+    #[serde(rename = "three_quarters")]
+    ThreeQuarters,
+    #[serde(rename = "half")]
+    Half,
+}
+
+impl HdrOverlayBrightness {
+    /// Every rung, brightest first — the order the picker lists them in.
+    pub const LADDER: [HdrOverlayBrightness; 3] = [
+        HdrOverlayBrightness::Full,
+        HdrOverlayBrightness::ThreeQuarters,
+        HdrOverlayBrightness::Half,
+    ];
+
+    /// An in-memory index back to a rung — out of range is the default, never a neighbouring rung, for
+    /// the reason [`SubtitleTone::from_index`] gives: the ladder can grow or shrink.
+    pub fn from_index(i: u8) -> HdrOverlayBrightness {
+        Self::LADDER.get(i as usize).copied().unwrap_or_default()
+    }
+
+    pub fn index(self) -> u8 {
+        Self::LADDER.iter().position(|&b| b == self).unwrap_or(0) as u8
+    }
+
+    /// The RGB multiplier this rung applies to an HDR picture's overlay, `1.0` for `Full`.
+    pub fn factor(self) -> f32 {
+        match self {
+            HdrOverlayBrightness::Full => 1.0,
+            HdrOverlayBrightness::ThreeQuarters => 0.75,
+            HdrOverlayBrightness::Half => 0.5,
+        }
+    }
+
+    /// The rung's percentage, for its label.
+    pub fn percent(self) -> i64 {
+        (self.factor() * 100.0).round() as i64
     }
 }
 
@@ -2258,6 +2302,10 @@ impl Session {
 
     pub fn skip_credits(&self) -> MarkerSkip {
         self.prefs.skip_credits
+    }
+
+    pub fn hdr_overlay_brightness(&self) -> HdrOverlayBrightness {
+        self.prefs.hdr_overlay_brightness
     }
 
     pub fn audio_enhancements(&self) -> crate::plex::AudioEnhancements {
@@ -4014,13 +4062,38 @@ pub fn replace_after_reauthentication_guarded_with_outcome(
     }
     // The one login that is not a sign-out: the stored session is still on disk, so no `ClearTenure`
     // ran. A different account must not open on the previous one's library views, which carry no
-    // account stamp to read as nothing under (`ACCOUNT_BOUND_PREFERENCES` is what sign-out clears).
-    if !cur.account_token.is_empty() && cur.account_token != next.account_token {
+    // account stamp to read as nothing under (`ACCOUNT_BOUND_PREFERENCES` is what sign-out clears),
+    // nor on its Home pins and search history: those are keyed by profile `uuid` with `""` for the
+    // owner of EVERY account, and sign-out drops them with the file.
+    //
+    // "Different account" is the OWNER'S IDENTITY (`owner_identity` of the roster each side holds),
+    // never the token: a fresh QR sign-in always mints a new plex.tv token, so the same person
+    // signing in again differs by token and must keep their pins, searches and library memory.
+    // Unknown on either side (a roster not yet fetched, or one without a nameable admin) clears.
+    if !cur.account_token.is_empty() && !same_owner(&cur.home_users, &next.home_users) {
         next.prefs.last_library.clear();
         next.prefs.library_views.clear();
+        next.home_pins.clear();
+        next.recent_searches.clear();
     }
     if !may_write() { return Err(()); }
     Ok(Some(save_locked_with_authority(&next, SaveAuthority::FreshReauthentication)))
+}
+
+/// The stable identity of the account a roster belongs to: its admin entry's plex.tv account id
+/// (the same id space as `account::Resource::owner_id`), else that entry's uuid when an old file
+/// carries no id. `None` when the roster is empty ("unknown", not "nobody"), has no admin, or the
+/// admin names neither. A token is NOT an identity: every sign-in mints a new one.
+pub fn owner_identity(roster: &[HomeUserRef]) -> Option<String> {
+    let admin = roster.iter().find(|u| u.admin)?;
+    if admin.id != 0 { Some(format!("id:{}", admin.id)) }
+    else if !admin.uuid.is_empty() { Some(format!("uuid:{}", admin.uuid)) }
+    else { None }
+}
+
+/// Do two rosters name the SAME account? Fails safe: an identity either side cannot name is "no".
+pub fn same_owner(a: &[HomeUserRef], b: &[HomeUserRef]) -> bool {
+    matches!((owner_identity(a), owner_identity(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// What the routine-authority write actually did — the canonical verdict beside the

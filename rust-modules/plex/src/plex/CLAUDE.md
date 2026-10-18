@@ -152,7 +152,7 @@ into it (`session::project_server_keys`: each machine's key bound to the hosts o
 machine registered at runtime; a key `session::learn_server_key` learns reaches the table only when its
 queued write is applied and projected (the projection is the only production source of a key; `register_lazy` only binds hosts);
 sign-out empties it (revoked/missing/cleared sessions project nothing). Both stacks share
-the decision and the option code: the control plane in `net::request_tls_evidence`, the media plane
+the decision and the option code: the control plane in `net::request_tls_sink` (wrapped by `request_tls_evidence`), the media plane
 in `curlio::CurlSource::start_range_until`, which every open, reopen and seek goes through. After a
 key-mode success the host is LATCHED for 10 minutes on the monotonic clock (later requests skip the
 doomed strict handshake; the timer does not slide; a strict success or a changed pin clears it; rc 90
@@ -192,7 +192,7 @@ three attempts. A name mismatch, a self-signed leaf (18/19), plex.tv or any othe
 mode. After a success the host is latched in the same `keypin` state for 10 minutes on the monotonic
 clock (later requests skip the doomed strict handshake, the timer does not slide, a strict success or
 a refusal by the bundle clears it); both stacks share the decision, the control plane in
-`net::request_tls_evidence` and the media plane in `curlio::CurlSource::start_range_until`. Unlike key
+`net::request_tls_sink` (wrapped by `request_tls_evidence`) and the media plane in `curlio::CurlSource::start_range_until`. Unlike key
 mode a roots-mode answer IS strictly verified, so it may teach `peer_pin`. The log carries one line when
 the fallback engages, one when it first succeeds and one when the bundle refuses too, naming only the
 verify result.
@@ -376,6 +376,18 @@ a dead source is **absent** from Home and states itself in its own library secti
 
 ## Gotchas that bite (all verified in code)
 
+- **`notify.rs` is the PMS server-sent-event feed, and it is not a playback signal.** It parses
+  `/:/eventsource/notifications?filters=playing%2Ctimeline` (`docs/pms-api.md` §9: the parameter is
+  `filters`, the spec's `filter` is wrong; the encoded comma list was measured to deliver `timeline`) into
+  lenient `Notification`s (`Play`, `Library` for finished movie/show timeline entries, `Ping`,
+  `Ignored`; a `timeline` frame is `event: timeline` + one `{"TimelineEntry":{...}}` object, state 5 both opens
+  and closes a sequence so "created" is state 5 with no `metadataState`, and state 9 for a delete is UNVERIFIED,
+  never captured) over `http::stream`, dropping this
+  device's own sessions at the source, and never mints a client id (`client_id` is the persisted
+  one; a new id raises a new-device alert). Its policy lives in `plx_data::stores::notify`: shipped
+  ON (`NOTIFY_ENABLED`), owned servers only. Nothing here may call a stop, an end-of-stream candidate or an Offset
+  publish: a stranger's `stopped` session would otherwise scrobble our other servers.
+
 - **A hub's `title` is PMS's own localized text — except for the standard hubs, which this app
   now overrides client-side at BOTH scopes it draws hubs on.** `hubs.rs`/`models.rs`'s
   `Hub::title` still carries whatever PMS sent, but neither `screens/home/mod.rs` nor a library's
@@ -477,12 +489,12 @@ a dead source is **absent** from Home and states itself in its own library secti
   reader may now call `session::peek()`, because `peek()` is backed by a live in-memory read
   cache, not a per-call file transaction.
 - **Every preference key but `language` lives in ONE struct, `session/prefs.rs`'s `Preferences`**
-  (the nine player settings' and `trailer_autoplay`'s FROZEN top-level keys, `profile_prefs` (their per-profile home, below), `auto_sign_in`, `last_hero_blur`, the account-bound
+  (the ten player settings' and `trailer_autoplay`'s FROZEN top-level keys, `profile_prefs` (their per-profile home, below), `auto_sign_in`, `last_hero_blur`, the account-bound
   `plaintext_consent` and `server_key_pins`, the per-profile `last_library` and `library_sorts` (cleared
   at sign-out like every `ACCOUNT_BOUND = true` row in `prefs::DESCRIPTORS`, but their records carry no
   account stamp, so the one login that is not a sign-out, a stored session that could not be activated
   in `app/boot.rs`, would leave them to the next account: `replace_after_reauthentication_guarded_with_outcome`
-  clears both when the login's account token differs from the stored one), and the two memory-door lists `track_memory` and `subtitle_offsets`), flattened (`#[serde(flatten)] prefs`) into BOTH on-disk
+  clears both, and the Home pins and recent searches, when the login's owner identity (`owner_identity`, the roster admin's plex.tv id; never the token, which every sign-in mints anew) differs from the stored one or either is unknown), and the two memory-door lists `track_memory` and `subtitle_offsets`), flattened (`#[serde(flatten)] prefs`) into BOTH on-disk
   forms — the legacy file's `Session` and the canonical preference record — declared before each
   form's own `extensions`, so the flatten takes its keys first and the unknown-key map still sees
   only keys nobody models. A new key of that kind is a `Preferences` field (its serde attributes
@@ -492,7 +504,7 @@ a dead source is **absent** from Home and states itself in its own library secti
   Callers read `session.prefs.<field>` or the hand-written getter, and change a value with
   `session.with_pref::<Marker>(v)` (a `Copy` row; it writes the TOP-LEVEL key, so for the ten
   per-profile settings it is a fixture builder for the legacy fallback, never what a pick does).
-  **The nine player settings and hero trailer autoplay are per profile** (`prefs/profile_prefs.rs`): a profile's own picks sit
+  **The ten player settings and hero trailer autoplay are per profile** (`prefs/profile_prefs.rs`): a profile's own picks sit
   in `profile_prefs` (`[{user, account, prefs}]`, `account` the `grant::account_key` stamp, the owner
   `user: ""`), and what a profile reads is `stored_effective` = its own value, else the frozen
   top-level key (`Setting::get`, a garbage own value included), else the default. The top-level keys
