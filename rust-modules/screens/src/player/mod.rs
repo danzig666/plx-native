@@ -2143,13 +2143,13 @@ mod step_ladder_tests {
         let mut page = PlayerScreen::new(ENTRY);
         fresh(&mut page);
         page.hud.nav.focus = 1;
-        page.scrub.ns = 5_000_000_000;
+        // No scrub in progress: a live scrub's BACK cancels the scrub first (upstream's
+        // `key_back_scrub`), and that is not this test's subject.
         let (handled, reqs) = press(&mut page, 0, WCODE_BACK, Edge::Down);
         assert_eq!(handled, Handled::Yes);
         assert!(reqs.is_empty(), "the first BACK hides, it does not leave: {reqs:?}");
         assert!(page.hud.dismissed, "the transport is taken down");
         assert_eq!(page.hud.nav.focus, 0, "…with the ring re-parked on the scrubber");
-        assert_eq!(page.scrub.ns, -1, "…and the scrub preview abandoned with it");
         assert!(page.hud.back_hidden.is_some(), "…and the jitter gate armed");
 
         page.hud.visible_at_press = false; // what `note_fresh_press` samples for the next press

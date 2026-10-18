@@ -36,10 +36,6 @@ concurrency:
   group: sideload-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Pinned, like the release build (build-package.yml): a fork release should be reproducible.
-  RUST_NIGHTLY: nightly-2026-07-02
-
 jobs:
   # A release run (a `v*-fork.*` tag, or a dispatch with `release_tag`) of a commit this workflow
   # has already run green does not run the host checks a second time: the packages are rebuilt
@@ -94,7 +90,7 @@ jobs:
           - stage: release features
             rust: true
             sdl: "false"
-            run: cd rust-modules && cargo "+$RUST_NIGHTLY" check --lib --no-default-features
+            run: cd rust-modules && cargo "+$RUST_TOOLCHAIN" check --lib --no-default-features
           - stage: python
             rust: false
             sdl: "false"
@@ -138,11 +134,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install nightly Rust
-        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
+      - name: Install the pinned Rust and the armv7 target
+        # rust-modules/rust-toolchain.toml's release with the prebuilt ARMv7 std, as ci.yml's
+        # cross-build installs it. No nightly, no rust-src, no `-Z build-std`.
+        uses: ./.github/actions/rust-toolchain
 
-      # The crate's dependencies cache; `-Z build-std` recompiles std every run regardless (see
-      # ci.yml's cross-build job, Swatinem/rust-cache#161).
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: rust-modules
