@@ -297,5 +297,11 @@
   "settings.consent.placeholder.random_id": "véletlenszerű azonosító",
   "settings.consent.placeholder.project_key": "projektkulcs",
   "settings.consent.placeholder.app_version": "alkalmazásverzió",
-  "settings.consent.placeholder.webos_codename_short": "webOS-kódnév"
+  "settings.consent.placeholder.webos_codename_short": "webOS-kódnév",
+  "settings.playback.skip_intro": "Főcím kihagyása",
+  "settings.playback.skip_credits": "Stáblista kihagyása",
+  "settings.playback.marker_skip.button": "Gomb megjelenítése",
+  "settings.playback.marker_skip.auto": "Automatikus kihagyás",
+  "settings.playback.skip_intro.copy": "Az Automatikus kihagyás a sorozat főcímét rögtön az elején átugorja, és ezt a képernyőn jelzi. A Gomb megjelenítése helyette a Főcím kihagyása gombot kínálja.",
+  "settings.playback.skip_credits.copy": "Az Automatikus kihagyás a stáblistát rögtön az elején átugorja; az epizód végén azonnal indul a következő. A Gomb megjelenítése helyette a Stáblista kihagyása vagy a Következő epizód gombot kínálja."
 }

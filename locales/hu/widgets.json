@@ -246,5 +246,7 @@
   "widgets.region.nl": "Hollandia",
   "widgets.region.latin_america": "Latin-Amerika",
   "widgets.failure.play_auto": "Automatikusra váltás és lejátszás",
-  "widgets.failure.change_quality": "Minőség módosítása"
+  "widgets.failure.change_quality": "Minőség módosítása",
+  "widgets.skip.intro_skipped": "Főcím kihagyva",
+  "widgets.skip.credits_skipped": "Stáblista kihagyva"
 }
