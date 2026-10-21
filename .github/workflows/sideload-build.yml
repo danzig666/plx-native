@@ -10,8 +10,11 @@ name: Sideload build
 #
 # A tag `v<upstream version>-fork.<n>`, or a manual run with `release_tag`, also PUBLISHES: the two
 # packages and their checksums as a GitHub Release of this fork, with `docs/fork-releases/<tag>.md`
-# as its body. Nothing here signs, uploads symbols or touches the Homebrew Channel manifest; that
-# is release.yml's job and it needs the upstream repository's credentials. A stable package cut
+# as its body. A release run stamps the packages `<major>.<minor>.<fork number>` (v0.8.0-fork.5 ->
+# 0.8.5, `ci/fork-homebrew-repo.py`) so the Homebrew Channel sees each fork release as newer, and
+# rewrites the fork's own Channel repository, `repo.json` on the `homebrew` branch. Nothing here
+# signs, uploads symbols or touches upstream's webosbrew listing; that is release.yml's job and it
+# needs the upstream repository's credentials. A stable package cut
 # here carries no telemetry endpoint. (release.yml also wakes on a pushed `v*` tag and stops at its
 # tag/version guard, because `-fork.<n>` is not the version in pkg/appinfo.json — that red run is
 # expected and harmless.)
@@ -134,6 +137,25 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # A release run only: the four version files (ci/bump-version.py) say <major>.<minor>.<fork n>,
+      # so the .ipk name, its control file and the app's reported version all agree with it. The
+      # stable package's check-package.py grades the release note and audit OF THAT VERSION; a fork
+      # release's own notes are docs/fork-releases/<tag>.md, so the stamped version's are the
+      # upstream release's it is built on, renamed.
+      - name: Stamp the fork release version
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        env:
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          ver=$(python3 ci/fork-homebrew-repo.py version "$TAG")
+          base="${TAG#v}"; base="${base%%-fork.*}"
+          python3 ci/bump-version.py "$ver"
+          if [ "$ver" != "$base" ]; then
+            for d in release-notes release-audits; do
+              sed "s/${base//./\\.}/$ver/g" "docs/$d/v$base.md" > "docs/$d/v$ver.md"
+            done
+          fi
+
       - name: Install the pinned Rust and the armv7 target
         # rust-modules/rust-toolchain.toml's release with the prebuilt ARMv7 std, as ci.yml's
         # cross-build installs it. No nightly, no rust-src, no `-Z build-std`.
@@ -218,3 +240,25 @@ jobs:
           gh release create "$TAG" dist/*.ipk dist/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$title" --notes-file "$RUNNER_TEMP/body.md"
+      # The fork's Homebrew Channel repository: one file a viewer adds once in the Channel
+      # (raw.githubusercontent.com/<fork>/homebrew/repo.json), rewritten from scratch for every
+      # release and force-pushed, so the branch holds the latest release's listing and nothing else.
+      - name: Update the Homebrew Channel repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          ipk=$(ls dist/com.beb.plxnative_*_arm.ipk)
+          dir="$RUNNER_TEMP/homebrew"
+          mkdir -p "$dir"
+          cp pkg/largeIcon.png "$dir/largeIcon.png"
+          raw="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/homebrew"
+          python3 ci/fork-homebrew-repo.py repo "$TAG" "$ipk" "$GITHUB_REPOSITORY" "$raw/largeIcon.png" > "$dir/repo.json"
+          cat "$dir/repo.json"
+          printf '# PlxNative fork: Homebrew Channel repository\n\nAdd `%s/repo.json` in Homebrew Channel, Settings, Repositories. Rewritten by the Sideload build workflow for every fork release (now %s).\n' "$raw" "$TAG" > "$dir/README.md"
+          cd "$dir"
+          git init -q -b homebrew
+          git add repo.json largeIcon.png README.md
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "Homebrew Channel repository for $TAG"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" homebrew
