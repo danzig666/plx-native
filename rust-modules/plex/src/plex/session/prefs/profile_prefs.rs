@@ -70,6 +70,7 @@ pub struct ProfilePrefs {
     pub skip_intro: Option<MarkerSkip>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub skip_credits: Option<MarkerSkip>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub under_posters: Option<UnderPosters>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub audio_enhancements: Option<AudioEnhancements>,

@@ -248,13 +248,16 @@ struct PlaybackCells {
     next_episode: plx_media::route::NextEpisodeMode,
     deck_press: plx_media::route::DeckPress,
     skip: plx_media::route::SkipInterval,
+    skip_intro: plx_media::route::MarkerSkip,
+    skip_credits: plx_media::route::MarkerSkip,
 }
 impl PlaybackCells {
     fn capture() -> Self {
         use plx_media::route as r;
         PlaybackCells { quality: r::quality(), direct_play: r::direct_play_mode(), size: r::subtitle_size(),
             position: r::subtitle_position(), hdr: r::hdr_overlay_brightness(), next_episode: r::next_episode_mode(),
-            deck_press: r::deck_press(), skip: r::skip_interval() }
+            deck_press: r::deck_press(), skip: r::skip_interval(), skip_intro: r::skip_intro(),
+            skip_credits: r::skip_credits() }
     }
 }
 impl Drop for PlaybackCells {
@@ -264,6 +267,7 @@ impl Drop for PlaybackCells {
         r::restore_subtitle_size(self.size); r::restore_subtitle_position(self.position);
         r::restore_hdr_overlay_brightness(self.hdr); r::restore_next_episode_mode(self.next_episode);
         r::restore_deck_press(self.deck_press); r::restore_skip_interval(self.skip);
+        r::restore_skip_intro(self.skip_intro); r::restore_skip_credits(self.skip_credits);
     }
 }
 
@@ -313,6 +317,8 @@ fn every_pushed_picker_opens_on_its_checked_line_and_pops_to_its_row() {
     r::restore_next_episode_mode(*ses::NextEpisodeMode::LADDER.last().unwrap());
     r::restore_deck_press(*ses::DeckPress::LADDER.last().unwrap());
     r::restore_skip_interval(*ses::SkipInterval::LADDER.last().unwrap());
+    r::restore_skip_intro(*ses::MarkerSkip::LADDER.last().unwrap());
+    r::restore_skip_credits(*ses::MarkerSkip::LADDER.last().unwrap());
     let lines = |kind: PickerKind| match kind {
         PickerKind::Quality => ladder_last(r::available_quality_ladder().len()),
         PickerKind::DirectPlay => 2,
@@ -321,11 +327,12 @@ fn every_pushed_picker_opens_on_its_checked_line_and_pops_to_its_row() {
         PickerKind::HdrOverlay => ladder_last(ses::HdrOverlayBrightness::LADDER.len()),
         PickerKind::NextEpisode => ladder_last(ses::NextEpisodeMode::LADDER.len()),
         PickerKind::DeckPress => ladder_last(ses::DeckPress::LADDER.len()),
+        PickerKind::SkipIntro | PickerKind::SkipCredits => ladder_last(ses::MarkerSkip::LADDER.len()),
         PickerKind::SkipInterval => ladder_last(ses::SkipInterval::LADDER.len()),
         other => panic!("{other:?} is not a Playback picker"),
     };
     let playback = super::super::preferences::nav_items_for_test(super::super::preferences::Kind::Playback, None);
-    assert_eq!(playback.len(), 8, "every Playback picker is in the table: {playback:?}");
+    assert_eq!(playback.len(), 10, "every Playback picker (upstream's eight and this fork's two marker-skip rows) is in the table: {playback:?}");
     for &(row, dest) in &playback {
         let SettingsPage::Picker(kind) = dest else { panic!("a Playback row pushes a picker: {dest:?}") };
         assert_a_pushed_picker_opens_on_its_checked_line_and_pops_to_its_row(
