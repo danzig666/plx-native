@@ -25,6 +25,10 @@ pub enum SettingsPage {
     Root,
     /// Install-wide language choice, applied next launch.
     Language,
+    /// Settings > Libraries > Under posters: what the focused poster's caption band shows.
+    UnderPosters,
+    /// Settings > Libraries > Under posters > Details: the picker of the one details line.
+    UnderPostersDetails,
     /// Translation contribution guide with an offline QR link.
     Contribute,
     /// Playback settings: each profile's own picks (a profile that has not chosen reads the install's older value). The page names the seated profile; while nobody is seated its rows are read-only.
@@ -69,14 +73,17 @@ pub enum PickerKind {
     SubtitleMode,
     SubtitleLanguage,
     ForcedSubtitles,
+    /// Settings > System > Interface resolution (install-wide; pushed from the Settings root).
+    UiResolution,
 }
 
 impl SettingsPage {
     /// The pages a boot target opens the surface over, root first: `plxnative-settings=picker-…`
-    /// is reached as root → Playback → the picker, so BACK from it lands where an interactive
-    /// visit would. Every other page is booted as the surface's root.
+    /// is reached as root → Playback → the picker (root → the picker for a root row's), so BACK from it
+    /// lands where an interactive visit would. Every other page is booted as the surface's root.
     pub fn boot_trail(self) -> Vec<SettingsPage> {
         match self {
+            SettingsPage::Picker(kind) if kind.parent() == SettingsPage::Root => vec![SettingsPage::Root, self],
             SettingsPage::Picker(kind) => vec![SettingsPage::Root, kind.parent(), self],
             page => vec![page],
         }
@@ -89,6 +96,7 @@ impl PickerKind {
         match self {
             PickerKind::Quality | PickerKind::DirectPlay | PickerKind::SubtitleSize | PickerKind::SubtitlePosition | PickerKind::HdrOverlay | PickerKind::NextEpisode | PickerKind::SkipIntro | PickerKind::SkipCredits | PickerKind::DeckPress | PickerKind::SkipInterval => SettingsPage::Playback,
             PickerKind::AudioLanguage | PickerKind::SubtitleMode | PickerKind::SubtitleLanguage | PickerKind::ForcedSubtitles => SettingsPage::AudioSubtitles,
+            PickerKind::UiResolution => SettingsPage::Root,
         }
     }
 }
@@ -104,6 +112,8 @@ impl ScreenArg for SettingsPage {
             SettingsPage::AudioSubtitles => 109,
             SettingsPage::Language => 110,
             SettingsPage::Contribute => 111,
+            SettingsPage::UnderPosters => 113,
+            SettingsPage::UnderPostersDetails => 114,
             SettingsPage::Favourites => 101,
             SettingsPage::Privacy => 102,
             SettingsPage::Legal => 103,
@@ -141,6 +151,8 @@ impl LogicalState for SettingsPage {
         w.u8(match self {
             SettingsPage::Root
             | SettingsPage::Language
+            | SettingsPage::UnderPosters
+            | SettingsPage::UnderPostersDetails
             | SettingsPage::Contribute
             | SettingsPage::Playback
             | SettingsPage::AudioSubtitles
@@ -157,6 +169,8 @@ impl LogicalState for SettingsPage {
             SettingsPage::Root => "root",
             SettingsPage::Language => "language",
             SettingsPage::Contribute => "contribute",
+            SettingsPage::UnderPosters => "under-posters",
+            SettingsPage::UnderPostersDetails => "under-posters-details",
             SettingsPage::Playback => "playback",
             SettingsPage::AudioSubtitles => "audio-subtitles",
             SettingsPage::Favourites => "favourites",
@@ -314,6 +328,8 @@ mod tests {
         let pages = [
             SettingsPage::Root,
             SettingsPage::Language,
+            SettingsPage::UnderPosters,
+            SettingsPage::UnderPostersDetails,
             SettingsPage::Contribute,
             SettingsPage::Playback,
             SettingsPage::AudioSubtitles,

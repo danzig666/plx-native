@@ -108,7 +108,7 @@ impl PickerPage {
             .iter().position(|(_, v)| *v == current).map_or(u32::MAX, |i| i as u32)
     }
     fn view(&self) -> TableScreen<'_> {
-        TableScreen::new(Header::new(RouteLayout::screen(), Some(self.state.field.kind().title()),
+        TableScreen::new(Header::new(RouteLayout::screen(), Some(self.state.field.parent_title()),
             self.state.field.title(), &self.copy), &self.form.table, GroupId(0), self.entry).keyed(&self.form)
     }
     fn focus(&self, fx: &mut Effects<'_, InnerHost>, group: GroupId) {
@@ -117,7 +117,7 @@ impl PickerPage {
                 FocusTarget::Elem(FocusKey { entry: self.entry, elem: self.state.selected })
             } else { FocusTarget::ContainerGroup(group) } }))));
     }
-    fn account(&self) -> bool { self.state.field.kind() == Kind::AudioSubtitles }
+    fn account(&self) -> bool { self.state.field.kind() == Some(Kind::AudioSubtitles) }
     fn start_initial_load(&mut self, fx: &mut Effects<'_, InnerHost>) -> bool {
         if self.account() && self.txn.request.is_none() && self.txn.snapshot.is_none()
             && self.txn.pending.is_none() && self.state.io.status.is_empty() {

@@ -113,8 +113,10 @@ pub(crate) use bootstrap::HomeIo;
 /// and `devcaps` — application facts — and because its state is now an `App` field.
 pub(crate) mod diagnostics;
 pub(crate) mod words;
+pub(crate) mod page_title;
 pub(crate) mod clock;
 mod clock_notice;
+mod hint_taught;
 mod recorder;
 mod window_activity;
 pub(crate) mod events;
@@ -124,6 +126,7 @@ mod preferences;
 pub(crate) mod input;
 pub(crate) mod bridge;
 pub(crate) mod chrome;
+mod collections_probe;
 pub(crate) mod content;
 pub(crate) mod reread;
 pub(crate) mod run;
@@ -148,6 +151,7 @@ extern "C" {
         h: c_int,
         flags: u32,
     ) -> *mut c_void;
+    fn SDL_DestroyWindow(win: *mut c_void);
     fn SDL_GL_CreateContext(win: *mut c_void) -> *mut c_void;
     fn SDL_GL_SetSwapInterval(interval: c_int) -> c_int;
     fn SDL_Delay(ms: u32);

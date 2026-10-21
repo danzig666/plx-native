@@ -4,7 +4,7 @@
 use plx_media::route::{choose, Choice, How};
 use plx_plex::plex::account::{PreferenceError, PreferenceRequest};
 use plx_plex::plex::session::{DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, QualityPref,
-    SkipCreditsPref, SkipIntervalPref, SkipIntroPref, SubtitlePositionPref, SubtitleSizePref, TrailerAutoplayPref};
+    SkipCreditsPref, SkipIntervalPref, SkipIntroPref, SubtitlePositionPref, SubtitleSizePref, TrailerAutoplayPref, UnderPostersPref};
 use plx_screens::registry::{AccountPreferenceReply, PreferenceCmd};
 use std::sync::mpsc::Sender;
 
@@ -19,6 +19,7 @@ fn choose_setting(choice: Choice, reply: Sender<bool>) {
         Choice::DeckPress(v) => choose::<DeckPressPref>(v, How::settings::<DeckPressPref>(reply)),
         Choice::SkipIntro(v) => choose::<SkipIntroPref>(v, How::settings::<SkipIntroPref>(reply)),
         Choice::SkipCredits(v) => choose::<SkipCreditsPref>(v, How::settings::<SkipCreditsPref>(reply)),
+        Choice::UnderPosters(v) => choose::<UnderPostersPref>(v, How::settings::<UnderPostersPref>(reply)),
         Choice::TrailerAutoplay(v) => choose::<TrailerAutoplayPref>(v, How::settings::<TrailerAutoplayPref>(reply)),
         Choice::SubtitleSize(v) => choose::<SubtitleSizePref>(v, How::settings::<SubtitleSizePref>(reply)),
         Choice::SubtitlePosition(v) => choose::<SubtitlePositionPref>(v, How::settings::<SubtitlePositionPref>(reply)),
@@ -53,6 +54,12 @@ pub(super) fn execute(command: PreferenceCmd) {
         }
         // Every live setting saves through the one write door, in `choose_setting`.
         PreferenceCmd::Choose(choice, reply) => choose_setting(choice, reply),
+        PreferenceCmd::UiResolution { mode, reply } => {
+            let _ = plx_base::storage_worker::submit_retained(move || {
+                let _ = reply.send(plx_plex::plex::session::set_ui_resolution(mode));
+                plx_machine::idle::invalidate();
+            });
+        }
         PreferenceCmd::Language { language, reply } => {
             let _ = plx_base::storage_worker::submit_retained(move || {
                 let _ = reply.send(plx_plex::plex::session::set_language(language));

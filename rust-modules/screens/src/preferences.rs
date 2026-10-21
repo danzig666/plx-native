@@ -18,6 +18,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver};
+use plx_plex::plex::session::UiResolution;
 use plx_plex::plex::account::{AudioPreferences, PreferenceError, PreferenceRequest, PreferenceSnapshot, PreferenceUpdate};
 use plx_media::route::{Choice, DeckPress, DirectPlayMode, MarkerSkip, NextEpisodeMode, Quality, SkipInterval, SubtitlePosition, SubtitleSize, HdrOverlayBrightness};
 use plx_ui::form::{Form, FormId, FormSection, FormTable, RowKey, RowKind};
@@ -50,6 +51,7 @@ impl PickerKind {
         Self::SkipIntro => plx_platform::i18n::msg::settings_playback_skip_intro(),
         Self::SkipCredits => plx_platform::i18n::msg::settings_playback_skip_credits(),
         Self::SkipInterval => plx_platform::i18n::msg::settings_playback_skip_interval(),
+        Self::UiResolution => plx_platform::i18n::msg::settings_resolution_title(),
         Self::AudioLanguage => plx_platform::i18n::msg::settings_audio_language(), Self::SubtitleMode => plx_platform::i18n::msg::settings_audio_subtitles(),
         Self::SubtitleLanguage => plx_platform::i18n::msg::settings_audio_subtitle_language(), Self::ForcedSubtitles => plx_platform::i18n::msg::settings_audio_forced_subtitles(),
     }}
@@ -66,14 +68,20 @@ impl PickerKind {
         Self::SkipIntro => plx_platform::i18n::msg::settings_playback_skip_intro_copy(),
         Self::SkipCredits => plx_platform::i18n::msg::settings_playback_skip_credits_copy(),
         Self::SkipInterval => plx_platform::i18n::msg::settings_playback_skip_interval_copy(),
+        Self::UiResolution => plx_platform::i18n::msg::settings_resolution_detail(),
         Self::AudioLanguage | Self::SubtitleMode | Self::SubtitleLanguage | Self::ForcedSubtitles => plx_platform::i18n::msg::settings_audio_account_note(),
     }}
-    /// The field-list page this field belongs to.
-    fn kind(self) -> Kind {
+    /// The field-list page this field belongs to; `None` for a field the Settings root lists itself.
+    fn kind(self) -> Option<Kind> {
         match self {
-            Self::Quality | Self::DirectPlay | Self::SubtitleSize | Self::SubtitlePosition | Self::HdrOverlay | Self::NextEpisode | Self::SkipIntro | Self::SkipCredits | Self::DeckPress | Self::SkipInterval => Kind::Playback,
-            Self::AudioLanguage | Self::SubtitleMode | Self::SubtitleLanguage | Self::ForcedSubtitles => Kind::AudioSubtitles,
+            Self::Quality | Self::DirectPlay | Self::SubtitleSize | Self::SubtitlePosition | Self::HdrOverlay | Self::NextEpisode | Self::SkipIntro | Self::SkipCredits | Self::DeckPress | Self::SkipInterval => Some(Kind::Playback),
+            Self::AudioLanguage | Self::SubtitleMode | Self::SubtitleLanguage | Self::ForcedSubtitles => Some(Kind::AudioSubtitles),
+            Self::UiResolution => None,
         }
+    }
+    /// The crumb over this field's picker: the title of the page it was opened from.
+    fn parent_title(self) -> &'static str {
+        self.kind().map_or(plx_platform::i18n::msg::settings_title(), Kind::title)
     }
 }
 impl Kind {
@@ -87,14 +95,14 @@ impl Kind {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Value { Quality(Quality), DirectPlay(DirectPlayMode), SubtitleSize(SubtitleSize), SubtitlePosition(SubtitlePosition), HdrOverlay(HdrOverlayBrightness), NextEpisode(NextEpisodeMode), SkipIntro(MarkerSkip), SkipCredits(MarkerSkip), DeckPress(DeckPress), SkipInterval(SkipInterval), Language(String), Mode(i64), Forced(i64) }
+enum Value { Quality(Quality), DirectPlay(DirectPlayMode), SubtitleSize(SubtitleSize), SubtitlePosition(SubtitlePosition), HdrOverlay(HdrOverlayBrightness), NextEpisode(NextEpisodeMode), SkipIntro(MarkerSkip), SkipCredits(MarkerSkip), DeckPress(DeckPress), SkipInterval(SkipInterval), UiResolution(UiResolution), Language(String), Mode(i64), Forced(i64) }
 impl Value {
     /// Saved on this television ([`Txn::save_local`]) rather than to the account. The picker
     /// routes on this, so a new local setting is saved by adding it here and to `save_local`.
     fn is_local(&self) -> bool {
         matches!(self, Value::Quality(_) | Value::DirectPlay(_) | Value::SubtitleSize(_) | Value::SubtitlePosition(_)
             | Value::HdrOverlay(_) | Value::NextEpisode(_) | Value::SkipIntro(_) | Value::SkipCredits(_) | Value::DeckPress(_)
-            | Value::SkipInterval(_))
+            | Value::SkipInterval(_) | Value::UiResolution(_))
     }
 }
 
@@ -254,23 +262,25 @@ impl Txn {
         fx.push(Fx::App(AppFx::Preferences(command)));
     }
     fn save_local(&mut self, io: &mut Io, value: Value, fx: &mut Effects<'_, InnerHost>) {
-        let choice = match value {
-            Value::Quality(quality) => Choice::Quality(quality),
-            Value::DirectPlay(mode) => Choice::DirectPlay(mode),
-            Value::SubtitleSize(size) => Choice::SubtitleSize(size),
-            Value::SubtitlePosition(position) => Choice::SubtitlePosition(position),
-            Value::HdrOverlay(brightness) => Choice::HdrOverlayBrightness(brightness),
-            Value::NextEpisode(mode) => Choice::NextEpisode(mode),
-            Value::DeckPress(mode) => Choice::DeckPress(mode),
-            Value::SkipIntro(mode) => Choice::SkipIntro(mode),
-            Value::SkipCredits(mode) => Choice::SkipCredits(mode),
-            Value::SkipInterval(interval) => Choice::SkipInterval(interval),
+        let (reply, rx) = mpsc::channel();
+        let command = match value {
+            Value::Quality(quality) => PreferenceCmd::Choose(Choice::Quality(quality), reply),
+            Value::DirectPlay(mode) => PreferenceCmd::Choose(Choice::DirectPlay(mode), reply),
+            Value::SubtitleSize(size) => PreferenceCmd::Choose(Choice::SubtitleSize(size), reply),
+            Value::SubtitlePosition(position) => PreferenceCmd::Choose(Choice::SubtitlePosition(position), reply),
+            Value::HdrOverlay(brightness) => PreferenceCmd::Choose(Choice::HdrOverlayBrightness(brightness), reply),
+            Value::NextEpisode(mode) => PreferenceCmd::Choose(Choice::NextEpisode(mode), reply),
+            Value::DeckPress(mode) => PreferenceCmd::Choose(Choice::DeckPress(mode), reply),
+            Value::SkipIntro(mode) => PreferenceCmd::Choose(Choice::SkipIntro(mode), reply),
+            Value::SkipCredits(mode) => PreferenceCmd::Choose(Choice::SkipCredits(mode), reply),
+            Value::SkipInterval(interval) => PreferenceCmd::Choose(Choice::SkipInterval(interval), reply),
+            // Install-wide, not a seated profile's live setting, so it has no `Choice`.
+            Value::UiResolution(mode) => PreferenceCmd::UiResolution { mode, reply },
             _ => return,
         };
-        let (reply, rx) = mpsc::channel();
         self.pending = Some(Pending::Local(rx)); io.busy = true; self.saving = true;
         io.status = plx_platform::i18n::msg::settings_playback_saving().into();
-        fx.push(Fx::App(AppFx::Preferences(PreferenceCmd::Choose(choice, reply))));
+        fx.push(Fx::App(AppFx::Preferences(command)));
     }
     /// The request no longer names the active profile: drop the snapshot and any in-flight
     /// receipt and load again.
@@ -340,8 +350,10 @@ impl FormId for RowId {
             Self::Field(PickerKind::SkipInterval) => 5,
             Self::Field(PickerKind::DeckPress) => 7,
             Self::Field(PickerKind::HdrOverlay) => 8,
-            Self::Field(PickerKind::SkipIntro) => 9,
-            Self::Field(PickerKind::SkipCredits) => 10,
+            Self::Field(PickerKind::SkipIntro) => 10,
+            Self::Field(PickerKind::SkipCredits) => 11,
+            // Listed on the Settings root, never on a field list; the number only keeps the match total.
+            Self::Field(PickerKind::UiResolution) => 9,
             Self::Retry => 6,
         })
     }
@@ -472,6 +484,7 @@ fn resolve_value(field: PickerKind, quality: Quality, direct_play: DirectPlayMod
         PickerKind::SkipIntro => Value::SkipIntro(plx_media::route::skip_intro()),
         PickerKind::SkipCredits => Value::SkipCredits(plx_media::route::skip_credits()),
         PickerKind::SkipInterval => Value::SkipInterval(plx_media::route::skip_interval()),
+        PickerKind::UiResolution => Value::UiResolution(plx_plex::plex::session::peek().ui_resolution()),
         // A deprecated code (`pb`) resolves to its replacement so the picker checks that entry.
         PickerKind::AudioLanguage => Value::Language(prefs.and_then(|p| p.stated_language.as_deref()).map(plx_plex::plex::languages::canonical).unwrap_or_default().to_string()),
         PickerKind::SubtitleLanguage => Value::Language(prefs.and_then(|p| p.subtitle_language.as_deref()).map(plx_plex::plex::languages::canonical).unwrap_or_default().to_string()),
@@ -502,6 +515,8 @@ fn field_options(field: PickerKind, quality: Quality, direct_play: DirectPlayMod
             .map(|m| (marker_skip_label(m).into(), Value::SkipCredits(m))).collect(),
         PickerKind::SkipInterval => SkipInterval::LADDER.into_iter()
             .map(|i| (skip_interval_label(i), Value::SkipInterval(i))).collect(),
+        PickerKind::UiResolution => UiResolution::LADDER.into_iter()
+            .map(|m| (resolution_label(m), Value::UiResolution(m))).collect(),
         PickerKind::SubtitleMode => [(plx_platform::i18n::msg::settings_audio_manual(), 0), (plx_platform::i18n::msg::settings_audio_foreign(), 1), (plx_platform::i18n::msg::settings_audio_always(), 2)]
             .into_iter().map(|(label, mode)| (label.into(), Value::Mode(mode))).collect(),
         PickerKind::ForcedSubtitles => [plx_platform::i18n::msg::settings_audio_prefer_regular(), plx_platform::i18n::msg::settings_audio_prefer_forced(), plx_platform::i18n::msg::settings_audio_only_forced(), plx_platform::i18n::msg::settings_audio_only_regular()]
@@ -602,6 +617,14 @@ fn marker_skip_label(mode: MarkerSkip) -> &'static str {
     match mode {
         MarkerSkip::Button => plx_platform::i18n::msg::settings_playback_marker_skip_button(),
         MarkerSkip::Automatic => plx_platform::i18n::msg::settings_playback_marker_skip_auto(),
+    }
+}
+/// What the Interface resolution reads, on the Settings root and in its picker. The sizes are
+/// numbers, not words, so only Automatic (the native 1920x1080 canvas on every set) is translated.
+pub(crate) fn resolution_label(mode: UiResolution) -> String {
+    match mode.size() {
+        None => plx_platform::i18n::msg::settings_resolution_auto().to_string(),
+        Some((w, h)) => format!("{w}x{h}"),
     }
 }
 fn skip_interval_label(interval: SkipInterval) -> String {

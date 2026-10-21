@@ -35,9 +35,10 @@ simulator, browsing a demo library of openly licensed films
 
 ![Library](docs/screenshots/library.jpg)
 
-**Library** — a library opens on its own shelves: what you're partway through, with the time
-left under the focused card, and what just landed. Further down is the full grid, with sort,
-filter (including unwatched-only) and an A–Z rail down the side
+**Library** — a library opens on its full poster grid, with an A–Z rail down the side and one
+header row for sort & filter (including unwatched-only), a Collections page and a Recommended
+page. The shelves live on Recommended: what you're partway through, with the time left under
+the focused card, and what just landed
 ([pictured here](docs/screenshots/ux-library-grid.jpg)).
 
 ![Search](docs/screenshots/search.jpg)
@@ -77,13 +78,15 @@ likely will. I develop and test on a 2019 set, and opt-in usage reports show
 video playing on sets from 2018 through the newest, on webOS 11 — both direct play and server
 transcodes, Developer Mode installs included.
 
+Owners' reports, set by set, are in the [compatibility list](docs/compatibility.md).
+
 ### Known issues
 
 | Where | What happens |
 |---|---|
 | **Some 2019 sets on LG's k5lp or k3lp chip**, installed through Developer Mode | Video won't play. On these sets LG's Developer Mode sandbox can withhold a device the video path needs — Kodi and Moonlight hit the same wall. The app checks for it and says so instead of crashing; other sets on the same chip play normally. On a rooted TV with Homebrew Channel, the failure screen offers **Repair**, which applies the Homebrew Channel fix to the sandbox (one owner fixed it this way from a root shell; the button itself hasn't been run on an affected set yet). Without root there is no fix. |
 | **2018 sets on firmware that reports platform release 3.9.3** | Sign-in and browsing work. The prebuilt **v0.8.0** holds a strong ELF reference to the cxx11 `StarfishMediaAPIs::Feed` symbol, which 3.x `libplayerAPIs` does not export, so on the prebuilt video never starts and no error is reported: [#249](https://github.com/GLinnik21/plx-native/issues/249). A source build at or after [`60f99c7`](https://github.com/GLinnik21/plx-native/commit/60f99c7) resolves Feed with a dual-ABI `dlsym` and plays direct play on a 2018 C7 (W17H chassis, 3.9.3). |
-| **webOS 3.x** | Seeking restarts the stream at the new position instead of jumping in place, so each seek takes a moment longer. In-place seek depends on the internal layout of LG's 4.x media player, and on 3.4 that layout differs. |
+| **webOS 3.x** | Seeking restarts the stream at the new position instead of jumping in place, so each seek takes a moment longer. In-place seek depends on the internal layout of LG's 4.x media player, and on 3.4 that layout differs. Menus can drop frames at 1920x1080 on these sets; **Settings → System → Interface resolution** trades sharper text for smoother menus. |
 | **Sets on LG's k6hp chip** | A crash seen in opt-in crash reports and not reproduced here, because I have no such set: [#174](https://github.com/GLinnik21/plx-native/issues/174). |
 
 ### Rooted or not
@@ -95,7 +98,8 @@ A rooted TV with Homebrew Channel has no expiry.
 
 If something goes wrong, check [Troubleshooting](docs/troubleshooting.md) first, then
 [tell me what happened](https://github.com/GLinnik21/plx-native/issues/new/choose) — and if you own one of the
-sets above, it working is as useful a report as it failing.
+sets above, it working is as useful a report as it failing: post it under
+[Discussions > Compatibility](https://github.com/GLinnik21/plx-native/discussions/categories/compatibility).
 
 ## Installing
 

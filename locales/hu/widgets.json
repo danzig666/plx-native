@@ -25,6 +25,7 @@
   "widgets.source.relay": "Közvetített",
   "widgets.source.needs_library": "Legalább egy könyvtár kell",
   "widgets.source.new_shares": "Megosztott könyvtárak keresése",
+  "widgets.source.shared_with_you": "Megosztva veled",
   "widgets.source.unauthorized": "Nincs jogosultság",
   "widgets.source.unreachable": "Nem érhető el",
   "widgets.source.insecure": "Nem biztonságos",
@@ -38,6 +39,8 @@
   "widgets.chapters.number": "{number}. fejezet",
   "widgets.skip.intro": "Főcím kihagyása",
   "widgets.skip.credits": "Stáblista kihagyása",
+  "widgets.skip.intro_skipped": "Főcím kihagyva",
+  "widgets.skip.credits_skipped": "Stáblista kihagyva",
   "widgets.next.episode": "Következő epizód",
   "widgets.next.credits": "Stáblista megtekintése",
   "widgets.next.caption": "Következik · {episode}",
@@ -51,8 +54,6 @@
   "widgets.player.chapters": "Fejezetek",
   "widgets.card.new_episode": "Új epizód",
   "widgets.card.show_new_episode": "{show} · Új epizód",
-  "widgets.card.season_episode": "É{season} • E{episode}",
-  "widgets.card.episode": "E{episode}",
   "widgets.failure.jail": "Sikertelen lejátszás – a TV sandboxa tiltja a natív videót",
   "widgets.failure.refused": "Sikertelen lejátszás – a szerver nem tudja lejátszani vagy konvertálni a fájlt",
   "widgets.failure.audio_only": "Sikertelen lejátszás – a szerver csak hangot küldött",
@@ -143,7 +144,6 @@
   "widgets.tracks.normalize_loudness": "Hangerő kiegyenlítése",
   "widgets.tracks.enh_note_sidecar": "A feliratok nem változnak.",
   "widgets.tracks.enh_note_burn": "A feliratok bekapcsolva maradnak. A Plex-szerver ehhez újrafeldolgozza a videót, ezért a kép kissé életlenebb lehet.",
-  "widgets.tracks.enh_note_dv_off": "Amíg ez be van kapcsolva, a Dolby Vision kikapcsol. A videó továbbra is HDR-ben játszódik le.",
   "widgets.tracks.enh_reason_not_analyzed": "Ehhez a videóhoz még nem érhető el. A Plex-szervernek előbb elemeznie kell a hangját.",
   "widgets.tracks.enh_reason_dv_unusable": "Ennél a Dolby Vision-videónál nem érhető el.",
   "widgets.tracks.enh_reason_dv_subtitle": "Ennél a Dolby Vision-videónál feliratokkal nem használható. Kapcsolja ki a feliratokat.",
@@ -246,7 +246,5 @@
   "widgets.region.nl": "Hollandia",
   "widgets.region.latin_america": "Latin-Amerika",
   "widgets.failure.play_auto": "Automatikusra váltás és lejátszás",
-  "widgets.failure.change_quality": "Minőség módosítása",
-  "widgets.skip.intro_skipped": "Főcím kihagyva",
-  "widgets.skip.credits_skipped": "Stáblista kihagyva"
+  "widgets.failure.change_quality": "Minőség módosítása"
 }
