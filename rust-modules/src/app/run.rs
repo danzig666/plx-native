@@ -1998,8 +1998,9 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         if advance {
             log("marker: Credits skipped automatically");
             super::playback::activate_ctrl_row(
-                &mut app.player.session,
+                &mut app.player,
                 &mut app.adapters.player,
+                &mut app.repause_at,
                 fr.ctrl,
                 &mut app.refresh_hubs,
                 plx_appkit::up_next::BTN_NEXT,
