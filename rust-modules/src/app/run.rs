@@ -2072,7 +2072,7 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
             let on_bar = app.ptr.edge.at().is_some_and(|(x, y)| {
                 app.pages.input.hit.top_at(x, y).is_some_and(|stop| Some(stop.key.entry) != page)
             });
-            if let Some(dy) = app.ptr.edge.step(on_bar, fr.now, fr.dt) {
+            if let Some(dy) = app.ptr.edge.step(on_bar, fr.now) {
                 // a fractional wheel: the pages that scroll freely glide by it
                 app.inputs.push(plx_machine::machine::InputEvent {
                     at: plx_machine::machine::Tick { ms: fr.now, dt_us: 0 },
@@ -4149,6 +4149,38 @@ mod lifecycle_regression_tests {
         super::super::bridge::frame(&mut app.pages, &mut app.bridge,
             Tick { ms: 4_000, dt_us: 16_000 }, std::mem::take(&mut app.inputs));
         assert!(app.bridge.take_player_reqs().is_empty());
+    }
+
+    /// **The pointer resting at Home's top edge glides the page, through the real loop.** fork.3
+    /// to fork.5 never glided on the television: the glide ran in `playback_tick`, before the
+    /// loop has worked out `Frame::dt`, and it took that 0 as the frame's length, so every frame's
+    /// wheel was 0 and none was sent. The host rigs set `dt` by hand and hid it. Here the frame is
+    /// begun as the loop begins it (`dt` 0) and only the clock moves.
+    #[test]
+    fn a_pointer_resting_at_the_top_edge_sends_the_page_a_glide_through_the_real_loop() {
+        let _serial=plx_base::testlock::serial();
+        let mut app=app();
+        super::super::bridge::nav_root(&mut app.pages, AppArg::Home);
+        frame(&mut app,0);
+        assert!(super::super::bridge::page_glides(&app.pages), "premise: Home glides");
+        let mut fr=Frame::begin(&app.player.session, app.bridge.metadata_view());
+        app.ev=[0;128];
+        app.ev[20..24].copy_from_slice(&960i32.to_ne_bytes());
+        app.ev[24..28].copy_from_slice(&40i32.to_ne_bytes());
+        event(&mut app,&mut fr,SDL_MOUSEMOTION);
+        app.inputs.clear();
+        let mut wheels=Vec::new();
+        for i in 1..=60u32 {
+            let mut fr=Frame::begin(&app.player.session, app.bridge.metadata_view());
+            fr.now=1_000+i*16;
+            assert_eq!(fr.dt,0.0, "premise: the loop has not worked out the frame's dt yet");
+            unsafe { playback_tick(&mut app,&mut fr); }
+            for e in app.inputs.drain(..) {
+                if let plx_machine::machine::InputKind::Wheel { dy } = e.kind { wheels.push(dy); }
+            }
+        }
+        assert!(wheels.len() > 40 && wheels.iter().all(|&dy| dy > 0.0),
+            "the resting pointer glides the page up on every frame after the dwell: {wheels:?}");
     }
 
     #[test]

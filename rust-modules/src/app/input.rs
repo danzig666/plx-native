@@ -102,10 +102,15 @@ pub(crate) struct EdgeScroll {
     at: Option<(f32, f32)>,
     /// The glide under way: its direction (+1 up, -1 down) and when the pointer came to the band.
     glide: Option<(i32, u32)>,
+    /// The last frame [`step`](Self::step) ran on: the glide times its own frames. It runs in
+    /// `run::playback_tick`, before the loop has worked out `Frame::dt` (still 0 there), and a
+    /// glide that took the frame's dt moved the page by nothing on every frame (fork.3 to fork.5
+    /// never glided on the television; the host rigs set `dt` by hand and hid it).
+    last: Option<u32>,
 }
 
 impl EdgeScroll {
-    pub(crate) const IDLE: EdgeScroll = EdgeScroll { at: None, glide: None };
+    pub(crate) const IDLE: EdgeScroll = EdgeScroll { at: None, glide: None, last: None };
 
     fn band(y: f32) -> Option<i32> {
         if y < EDGE_BAND {
@@ -136,9 +141,12 @@ impl EdgeScroll {
         self.at
     }
 
-    /// One frame at `now`, `dt` seconds long: the wheel `dy` to hand the page, if any. `on_bar` is
-    /// whether the pointer is over the navigation bar; it is read only while no glide runs.
-    pub(crate) fn step(&mut self, on_bar: bool, now: u32, dt: f32) -> Option<f32> {
+    /// One frame at `now` (ms): the wheel `dy` to hand the page, if any, for the time since the
+    /// last frame this ran on. `on_bar` is whether the pointer is over the navigation bar; it is
+    /// read only while no glide runs.
+    pub(crate) fn step(&mut self, on_bar: bool, now: u32) -> Option<f32> {
+        let dt = self.last.map_or(0.0, |last| now.wrapping_sub(last).min(100) as f32 / 1000.0);
+        self.last = Some(now);
         let Some((_, y)) = self.at else {
             self.glide = None;
             return None;
@@ -167,7 +175,7 @@ impl EdgeScroll {
         let from_edge = if dir > 0 { y } else { plx_ui::consts::SCR_H - y };
         let depth = (1.0 - from_edge / EDGE_BAND).clamp(0.0, 1.0);
         let share = EDGE_MIN_SHARE + (1.0 - EDGE_MIN_SHARE) * depth;
-        let dy = dir as f32 * EDGE_ROWS_PER_S * share * ramp * dt.clamp(0.0, 0.1);
+        let dy = dir as f32 * EDGE_ROWS_PER_S * share * ramp * dt;
         (dy != 0.0).then_some(dy)
     }
 }
@@ -1835,11 +1843,9 @@ mod edge_scroll_tests {
     use super::{EdgeScroll, EDGE_BAND, EDGE_DWELL_MS, EDGE_RAMP_MS};
     use plx_ui::consts::SCR_H;
 
-    const DT: f32 = 1.0 / 60.0;
-
     /// The `dy` an `EdgeScroll` hands out on every 16 ms frame of `ms` from `t0`.
     fn run(e: &mut EdgeScroll, on_control: bool, t0: u32, ms: u32) -> Vec<(u32, f32)> {
-        (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16, DT).map(|d| (t0 + i * 16, d))).collect()
+        (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16).map(|d| (t0 + i * 16, d))).collect()
     }
 
     /// The reported bug: the pointer near the TOP of a scrolled page moved nothing. Resting in the
@@ -1851,6 +1857,11 @@ mod edge_scroll_tests {
         e.moved(960.0, 40.0);
         let out = run(&mut e, false, 1000, 2000);
         assert!(out[0].0 >= 1000 + EDGE_DWELL_MS && out[0].0 < 1000 + EDGE_DWELL_MS + 32, "{out:?}");
+        // it times its own frames (the loop's `Frame::dt` is still 0 where it runs): 16 ms at
+        // y 40, two thirds into the band, is that share of the edge's speed
+        let share = super::EDGE_MIN_SHARE + (1.0 - super::EDGE_MIN_SHARE) * (1.0 - 40.0 / EDGE_BAND);
+        let last = out.last().unwrap().1;
+        assert!((last - super::EDGE_ROWS_PER_S * share * 0.016).abs() < 1e-5, "a 16 ms frame's glide: {last}");
         assert!(out.iter().all(|&(_, d)| d > 0.0), "up is the wheel's +");
         assert!(out.windows(2).all(|w| w[1].0 - w[0].0 == 16), "no frame without motion: {out:?}");
         let steady: Vec<f32> = out.iter().filter(|(t, _)| *t > 1000 + EDGE_DWELL_MS + EDGE_RAMP_MS).map(|p| p.1).collect();
@@ -1891,10 +1902,10 @@ mod edge_scroll_tests {
         let mut e = EdgeScroll::IDLE;
         e.moved(960.0, 40.0);
         assert!(!run(&mut e, false, 0, 600).is_empty());
-        assert!(e.step(true, 616, DT).is_some(), "a card sliding under the pointer does not stop it");
+        assert!(e.step(true, 616).is_some(), "a card sliding under the pointer does not stop it");
         assert!(e.moved(900.0, 60.0), "a move inside the band while gliding is not hover");
         assert!(!e.moved(900.0, 400.0), "leaving the band ends the glide");
-        assert!(e.step(false, 632, DT).is_none());
+        assert!(e.step(false, 632).is_none());
         e.moved(900.0, 60.0);
         assert!(run(&mut e, false, 648, EDGE_DWELL_MS - 20).is_empty(), "coming back starts the dwell again");
     }
