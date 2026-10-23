@@ -706,12 +706,18 @@ unsafe fn audio_stream_matching(fmt: *mut AVFormatContext, want: &str) -> Option
         let cp = stream_codecpar(*streams.add(i as usize));
         if (*cp).codec_type == AVMEDIA_TYPE_AUDIO {
             let name = std::ffi::CStr::from_ptr(avcodec_get_name((*cp).codec_id)).to_string_lossy();
-            if name.eq_ignore_ascii_case(want) {
+            if audio_name_matches(&name, want) {
                 return Some(i as c_int);
             }
         }
     }
     None
+}
+
+/// FFmpeg's codec name against the payload codec, through the shared canonicaliser: FFmpeg says
+/// `dts` where PMS (and so the payload codec) says `dca`.
+fn audio_name_matches(ffmpeg_name: &str, want: &str) -> bool {
+    plx_platform::devcaps::audio_codec_id(ffmpeg_name) == plx_platform::devcaps::audio_codec_id(want)
 }
 
 /// The ffmpeg stream index of the `n`-th audio stream in file order (for native audio-track
@@ -6654,7 +6660,22 @@ fn hls_demux(
                     control.catalog,
                 )
             })
-            .flatten();
+            .flatten()
+            // An automatic Original recovery was already refused on this HLS encoder (or admitted
+            // and rolled back onto it after its Load failed): this worker is the pump's reopen of
+            // the retained route, and a fresh gate would probe, ask and be refused again, a
+            // visible reload each round. Held until an HLS commit changes the
+            // route (`OriginalRecovery::on_hls_commit`).
+            .map(|gate| {
+                if control.original_refused_on_this_route() {
+                    crate::player::log(
+                        "abr: Original was refused on this HLS route; not asked again until the route changes",
+                    );
+                    gate.after_route_refusal()
+                } else {
+                    gate
+                }
+            });
         // **Observation only (plan I0-G).** A seek builds a FRESH controller here, so the live
         // link estimate does not survive it — the only thing that does is `prior`, whose writer on
         // the fallback path is the rate measured at the moment Original failed. One line, printed
@@ -8395,6 +8416,22 @@ struct AudioStep {
     first: bool,
     /// The audio lead-in is in: release the headroom now.
     release: bool,
+}
+
+#[cfg(test)]
+mod audio_codec_name_tests {
+    use super::*;
+
+    /// FFmpeg names DTS `dts`; PMS (and so the payload codec reaching the matcher) says `dca`.
+    #[test]
+    fn the_payload_codec_matches_ffmpegs_name_across_spellings() {
+        assert!(audio_name_matches("dts", "dca"));
+        assert!(audio_name_matches("dts", "DTS"));
+        assert!(audio_name_matches("eac3", "ec-3"));
+        assert!(audio_name_matches("ac3", "ac3"));
+        assert!(!audio_name_matches("truehd", "dca"));
+        assert!(!audio_name_matches("ac3", "eac3"));
+    }
 }
 
 #[cfg(test)]

@@ -878,6 +878,142 @@ class TeardownProcessTable(unittest.TestCase):
         fake.assert_called_once_with(["ps", "-Ao", "pid,command"], capture_output=True)
 
 
+class CrashGate(unittest.TestCase):
+    """`crash_gate`: a case whose app died keeps `plxnative-stderr.log` (the next launch truncates
+    it) and FAILS, unless the case declares `expect_crash`."""
+
+    SIGLINE = "*** SIGNAL 6 (SIGABRT) addr=0x0 pc=0x76a1b2c4 lr=0x76a1b2c8"
+
+    def _gate(self, case, lines, crash_log, baseline, save=None):
+        files = {run.CRASH_LOG: crash_log, run.STDERR_LOG: "abort: assertion failed\n"}
+        out = tempfile.mkdtemp()
+        cfg = {"tv": "192.0.2.20", "save_logs": save or None}
+        with mock.patch.object(run, "pull_runtime_file", side_effect=lambda tv, n: files[n]), \
+             mock.patch.object(run.tempfile, "gettempdir", return_value=out), \
+             mock.patch.object(run, "_CRASH_BASELINE", baseline), \
+             mock.patch("builtins.print") as shown:
+            res = run.crash_gate(cfg, case, "case_a", lines, True, [("x", True, "ok")])
+        return res, out, shown
+
+    def test_new_crash_record_fails_the_case_and_keeps_stderr(self):
+        (passed, results), out, shown = self._gate({}, ["loop=60"], f"old\n{self.SIGLINE}\n", 0)
+        self.assertFalse(passed)
+        self.assertEqual(results[-1][0], "app_alive")
+        kept = os.path.join(out, "plxnative-crash-evidence", "case_a.stderr.log")
+        with open(kept) as f:
+            self.assertEqual(f.read(), "abort: assertion failed\n")
+        self.assertIn(kept, " ".join(str(c) for c in shown.call_args_list))
+
+    def test_signal_line_in_the_case_log_alone_fails_it(self):
+        (passed, results), _out, _shown = self._gate({}, ["loop=60", self.SIGLINE], "", None)
+        self.assertFalse(passed)
+        self.assertFalse(results[-1][1])
+
+    def test_a_crash_before_the_case_is_not_this_cases(self):
+        (passed, results), out, _shown = self._gate({}, ["loop=60"], f"{self.SIGLINE}\n", 1)
+        self.assertTrue(passed)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(os.path.exists(os.path.join(out, "plxnative-crash-evidence")))
+
+    def test_expect_crash_keeps_evidence_without_failing(self):
+        (passed, results), out, _shown = self._gate(
+            {"expect_crash": True}, ["loop=60"], f"{self.SIGLINE}\n", 0)
+        self.assertTrue(passed)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(os.path.exists(
+            os.path.join(out, "plxnative-crash-evidence", "case_a.crash.log")))
+
+    def test_save_logs_keeps_stderr_even_for_a_clean_case(self):
+        save = tempfile.mkdtemp()
+        (passed, _results), _out, _shown = self._gate({}, ["loop=60"], "", 0, save=save)
+        self.assertTrue(passed)
+        self.assertTrue(os.path.exists(os.path.join(save, "case_a.stderr.log")))
+
+    def test_apply_triggers_records_the_crash_baseline(self):
+        saved = run.RUNDIR
+        run.RUNDIR = "/tmp/com.beb.plxnative.debug"
+        try:
+            done = subprocess.CompletedProcess([], 0, stdout="3\n", stderr="")
+            with mock.patch.object(run, "ssh", return_value=done) as ssh:
+                run.apply_triggers("192.0.2.20", [])
+            self.assertIn("plxnative-crash.log", ssh.call_args.args[1])
+            self.assertEqual(run._CRASH_BASELINE, 3)
+        finally:
+            run.RUNDIR = saved
+            run._CRASH_BASELINE = None
+
+    def test_parse_crash_count(self):
+        self.assertEqual(run.parse_crash_count("0\n"), 0)
+        self.assertEqual(run.parse_crash_count(""), None)
+        self.assertEqual(run.parse_crash_count("noise\n4\n"), 4)
+
+
+class TestUserTokenFile(unittest.TestCase):
+    """`test_user.token_file` supplies an already-resolved managed-user token: no plex.tv call."""
+
+    def _file(self, text):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_token_file_is_read_and_skips_the_owner_lookup(self):
+        path = self._file("synthetic-token-value\n")
+        with mock.patch.object(run, "fetch_managed_user_token") as fetch, \
+                mock.patch.object(run, "read_token") as owner:
+            tok = run.resolve_test_user_token({"id": "1", "token_file": path}, "h", 32400)
+        self.assertEqual(tok, "synthetic-token-value")
+        fetch.assert_not_called()
+        owner.assert_not_called()
+
+    def test_without_token_file_the_shared_servers_lookup_is_unchanged(self):
+        with mock.patch.object(run, "fetch_managed_user_token", return_value="t") as fetch, \
+                mock.patch.object(run, "read_token", return_value="owner"):
+            self.assertEqual(run.resolve_test_user_token({"id": "7"}, "h", 1), "t")
+        fetch.assert_called_once_with("owner", "h", 1, "7")
+
+    def test_empty_multiline_or_missing_file_is_refused(self):
+        for path in (self._file(""), self._file("a\nb\n"), "/nonexistent/plx-token"):
+            with self.assertRaises(SystemExit):
+                run.resolve_test_user_token({"id": "1", "token_file": path}, "h", 1)
+
+
+class QuietTv(unittest.TestCase):
+    """`quiet_tv` is what `--fps --mock` uses to set the panel and sound. The panel stays ON for
+    smoothness runs (a dark one makes the frame times meaningless); only `--panel off` blanks it."""
+
+    def _steps(self, **kw):
+        calls = []
+
+        def fake(cmd, **_):
+            calls.append(tuple(cmd[1:]))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(run.subprocess, "run", fake):
+            run.quiet_tv("tv.invalid", **kw)
+        return calls
+
+    def test_default_keeps_the_panel_on_and_mutes_once(self):
+        self.assertEqual(self._steps(), [("screen", "on")])
+        self.assertEqual(self._steps(sound=True), [("screen", "on"), ("sound", "off")])
+
+    def test_panel_off_is_the_opt_in(self):
+        self.assertEqual(self._steps(sound=True, panel="off"),
+                         [("screen", "off"), ("sound", "off")])
+
+    def test_a_bad_panel_value_is_refused_and_a_failed_step_stops_the_run(self):
+        with self.assertRaises(ValueError):
+            run.quiet_tv("tv.invalid", panel="dim")
+        fail = lambda cmd, **_: subprocess.CompletedProcess(cmd, 1, "", "no")
+        with mock.patch.object(run.subprocess, "run", fail), self.assertRaises(SystemExit):
+            run.quiet_tv("tv.invalid")
+
+    def test_the_cli_exposes_panel_with_on_as_default(self):
+        src = inspect.getsource(run.main)
+        self.assertIn('"--panel", choices=("on", "off"), default="on"', src)
+        self.assertIn('cfg["panel"] = args.panel', src)
+
+
 class StoredSessionGate(unittest.TestCase):
     """A `session: stored` case with no stored sign-in on the install used to call
     `require_stored_session()` -> `sys.exit()` from inside `run_case`, and `SystemExit` is not an
@@ -2184,20 +2320,59 @@ class CompletionCase(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("froze", why)
 
-    def test_only_a_case_that_asks_to_reach_the_end_may_name_the_short_clip(self):
-        """The rule is not "exactly one case", which is what it said while there was one — it is
-        that a case graded through a TEARDOWN has to have asked for one. The short clip ends inside
-        every window, so any case naming it without `reaches_eos` would have its assertions cut off
-        by a finish it never declared."""
+    def test_a_finish_with_the_playhead_short_of_the_duration_is_still_a_finish(self):
+        """Since #865 the pump ends the film on the pipeline's own end-of-stream as well as on
+        `pos >= dur - 1s`, and the clip whose audio outlasts its picture (`pipe_finish_audio_tail`)
+        reads `playpos=19s/23s`: four seconds short, by construction. The assertion is the line and
+        the teardown behind it; a check of the playhead against the duration added here would fail
+        the one clip built to end the other way."""
+        eos = "EOS reached: playpos=19s/23s -> ended\n"
+        ok, why = run.a_finished([self.POS, eos, self.TORN])
+        self.assertTrue(ok, why)
+
+    def test_only_a_case_that_asks_to_reach_the_end_may_name_a_clip_that_runs_out(self):
+        """The rule is not "exactly one case", which is what it said while there was one, and not
+        "exactly one clip" either, which it said until a clip whose audio outlasts its picture
+        joined (#865) — it is that a case graded through a TEARDOWN has to have asked for one.
+        Every clip a `reaches_eos` case names ENDS inside its window, so any case naming it
+        without `reaches_eos` would have its assertions cut off by a finish it never declared."""
         cases = _manifest()["pipeline_cases"]
         eos = [c for c in cases if c["expect"].get("reaches_eos")]
         self.assertTrue(eos, "no case reaches EOS — LG #46 has nothing behind it")
-        short = {c["fixture"] for c in eos}
-        self.assertEqual(len(short), 1, f"the completion cases disagree on which clip ends: {short}")
+        runs_out = {c["fixture"] for c in eos}
         strays = [c["name"] for c in cases
-                  if c["fixture"] in short and not c["expect"].get("reaches_eos")]
-        self.assertFalse(strays, f"the short clip ENDS mid-window; {strays} would be graded "
+                  if c["fixture"] in runs_out and not c["expect"].get("reaches_eos")]
+        self.assertFalse(strays, f"{sorted(runs_out)} END mid-window; {strays} would be graded "
                                  f"through a teardown they never asked for")
+
+    def test_every_clip_a_finish_case_names_ends_inside_the_cap_it_is_given(self):
+        """The bound `_resolve_fixtures` skips on, pinned statically against the generator's own
+        table: a clip that must be played out `1 + replays` times inside 0.6 of the case's cap. The
+        runtime check only fires on a pack someone regenerated; this one fires on the edit that
+        made the manifest and the generator disagree, before any pack exists."""
+        shapes = fixturegen.PIPE_SHAPES
+        for c in _manifest()["pipeline_cases"]:
+            exp = c["expect"]
+            if not exp.get("reaches_eos"):
+                continue
+            key, _, ext = c["fixture"].rpartition(".")
+            self.assertIn(key, shapes, f"{c['name']} names a clip the generator does not build")
+            self.assertEqual(ext, shapes[key]["ext"], c["name"])
+            views = 1 + exp.get("replays", 0)
+            self.assertLessEqual(
+                shapes[key]["duration"] * views, 0.6 * c["run_secs"],
+                f"{c['name']}: {shapes[key]['duration']}s x {views} viewing(s) does not fit "
+                f"0.6 x {c['run_secs']}s, so `_resolve_fixtures` would skip it on a pack built "
+                f"at the declared length")
+
+    def test_a_clip_whose_audio_outlasts_its_picture_is_named_by_a_finish_case(self):
+        """`audio_tail_s` exists to make a clip that only the pipeline's own end-of-stream can end,
+        so a shape carrying it that no `reaches_eos` case names is media nothing grades."""
+        named = {c["fixture"] for c in _manifest()["pipeline_cases"]
+                 if c["expect"].get("reaches_eos")}
+        for key, spec in fixturegen.PIPE_SHAPES.items():
+            if spec.get("audio_tail_s"):
+                self.assertIn(f"{key}.{spec['ext']}", named, key)
 
     def test_the_replay_case_grades_both_halves_of_46(self):
         """#46 is "replay AFTER completion", so the case that grades the replay must also be the
@@ -3555,6 +3730,91 @@ class AbrTraceMetrics(unittest.TestCase):
         ok, why = run.op_audio_enhancement_burn(lines)
         self.assertTrue(ok, why)
 
+    # The side-reader shape (#474): on a local link with a moderate Part bitrate the app reads an
+    # embedded subtitle beside the enhanced remux and draws it itself, so nothing is burned. Lines
+    # are the v0.9.0 TV run's, reduced; ids and the host are placeholders.
+    _CLIENT_REMUX = ("stream: <addr> path=/video/:/transcode/universal/start.mkv?directPlay=0&"
+                     "directStream=1&directStreamAudio=1&audioStreamID=11&normalizeLoudness=1&"
+                     "subtitleStreamID=0&subtitles=none")
+
+    def _cold_client(self):
+        return ["enhancement: boost_dialog=false normalize_loudness=true — direct play becomes "
+                "an enhanced remux", "decision output: v=h264 a=aac",
+                "enhancement: applied boost=0 loudness=1",
+                "server-selected subtitle: sid=21 render_idx=0", self._CLIENT_REMUX,
+                "subside: open tracks=4 ordinal=0 kbps=10000",
+                "subside: anchor match=exact part_kf_ms=0 remux_kf_ms=44",
+                "sub cue [4296..7049ms] len=50"]
+
+    def _live_client(self):
+        remux = self._CLIENT_REMUX.replace("&subtitleStreamID=0&subtitles=none", "")
+        return ["enhancement: applied boost=0 loudness=1", remux,
+                "loop=60 route=player overlay=menu pos=5s play=1000pm",
+                "select streams: part=31 audio=11 sub=24 -> HTTP 200",
+                "subside: open tracks=6 ordinal=3 kbps=26000",
+                "sub cue [4296..7049ms] len=50"]
+
+    def test_enhancement_subtitle_client_presenter_passes_the_v090_shapes(self):
+        """The two v0.9.0 TV failures were this product behaviour graded as a missing burn."""
+        ok, why = run.op_audio_enhancement_subtitle(self._cold_client(), "client", live=False)
+        self.assertTrue(ok, why)
+        ok, why = run.op_audio_enhancement_subtitle(self._live_client(), "client", live=True)
+        self.assertTrue(ok, why)
+
+    def test_enhancement_subtitle_client_presenter_rejects_a_burn_or_a_lost_subtitle(self):
+        burned = [ln.replace("directStreamAudio=1&", "").replace("subtitles=none", "subtitles=burn")
+                  for ln in self._cold_client()]
+        ok, why = run.op_audio_enhancement_subtitle(burned, "client", live=False)
+        self.assertFalse(ok, why)
+        no_reader = [ln for ln in self._cold_client() if not ln.startswith("subside:")]
+        ok, why = run.op_audio_enhancement_subtitle(no_reader, "client", live=False)
+        self.assertFalse(ok, why)
+        self.assertIn("subside: open", why)
+        other_track = [ln.replace("ordinal=0", "ordinal=2") for ln in self._cold_client()]
+        ok, why = run.op_audio_enhancement_subtitle(other_track, "client", live=False)
+        self.assertFalse(ok, why)
+        no_cue = [ln for ln in self._cold_client() if not ln.startswith("sub cue")]
+        ok, why = run.op_audio_enhancement_subtitle(no_cue, "client", live=False)
+        self.assertFalse(ok, why)
+        failed = self._cold_client() + ["subside: failed"]
+        ok, why = run.op_audio_enhancement_subtitle(failed, "client", live=False)
+        self.assertFalse(ok, why)
+
+    def test_enhancement_subtitle_live_pick_must_not_rebuild_the_stream(self):
+        """`embedded_pick_on_a_live_remux_queues_no_retranscode`'s device half: the pick starts
+        the reader and leaves the enhanced remux alone."""
+        lines = self._live_client()
+        rebuilt = lines[:4] + ["enhancement: applied boost=0 loudness=1", lines[1]] + lines[4:]
+        ok, why = run.op_audio_enhancement_subtitle(rebuilt, "client", live=True)
+        self.assertFalse(ok, why)
+        no_pick = [ln for ln in lines if not ln.startswith("select streams:")]
+        ok, why = run.op_audio_enhancement_subtitle(no_pick, "client", live=True)
+        self.assertFalse(ok, why)
+
+    def test_enhancement_subtitle_burn_presenter_is_the_burn_grader(self):
+        applied = "enhancement: applied boost=0 loudness=1"
+        burn = ("stream: 1.2.3.4 path=/video/:/transcode/universal/start.mkv?directStream=1&"
+                "videoResolution=3840x2160&maxVideoBitrate=60000&normalizeLoudness=1&"
+                "subtitleStreamID=24&subtitles=burn")
+        self.assertTrue(run.op_audio_enhancement_subtitle([applied, burn], "burn", live=False)[0])
+        self.assertFalse(run.op_audio_enhancement_subtitle(self._cold_client(), "burn", live=False)[0])
+
+    def test_enhancement_subtitle_cases_name_their_presenter(self):
+        """Each case STATES which presenter its item gets (`side_reader_inputs_admit`: a local link
+        and a Part of at most 30000 kbps admit the app's reader), and evaluate() grades it."""
+        cases = {c["name"]: c for c in _manifest()["cases"]}
+        cold = cases["audio_enhancement_draws_server_selected_subtitle"]
+        live = cases["audio_enhancement_draws_embedded_subtitle"]
+        self.assertIn({"op": "audio_enhancement_subtitle", "presenter": "client"}, cold["operations"])
+        self.assertTrue(any(o.get("op") == "subtitle" and o.get("enhanced") == "client"
+                            for o in live["operations"]))
+        _, results = run.evaluate({"rk": "1", **cold}, self._cold_client())
+        self.assertIn(("audio_enhancement_subtitle", True),
+                      [(label, ok) for label, ok, _ in results])
+        _, results = run.evaluate({"rk": "1", **live}, self._live_client())
+        self.assertIn(("audio_enhancement_subtitle", True),
+                      [(label, ok) for label, ok, _ in results])
+
     def test_audio_enhancement_dispatch_picks_release_by_settle(self):
         """`evaluate()`'s per-operation dispatch: `settle: "released"` grades the cleanup leg, and
         its absence grades the ordinary apply leg."""
@@ -4533,6 +4793,131 @@ class LateAudioFixture(unittest.TestCase):
         self.assertFalse(run.a_audio_feed_ready(["feed v#1 sz=9 fed=0 reply=O qbytes=1"])[0])
 
 
+class AudioTailFixture(unittest.TestCase):
+    """The clip whose audio outlasts its picture and its case (#865): 20 s of video, 23 s of audio.
+
+    Static only. The clip is only worth anything if its audio really runs past the pump's
+    one-second tolerance, and the case is only worth anything if it names that clip and ends it.
+    """
+
+    KEY = "pipe_h264_ac3_audio_tail"
+
+    def _packets(self, video_end=20.0, audio_end=23.0):
+        v = [{"stream_index": 0, "pts_time": f"{i / 24.0:.3f}", "duration_time": "0.041667"}
+             for i in range(int(video_end * 24))]
+        a = [{"stream_index": 1, "pts_time": f"{i * 0.032:.3f}", "duration_time": "0.032000"}
+             for i in range(int(audio_end / 0.032))]
+        return v + a
+
+    def _argv(self, spec, dur):
+        captured = []
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(fixturegen, "run",
+                                  side_effect=lambda argv, quiet=True: captured.append(list(argv)) or ""):
+            work = fixturegen.Path(d)
+            fixturegen.build_generic(mock.Mock(markers=False), self.KEY, spec, dur, None,
+                                     work / "out.mkv", work)
+        return captured[0]
+
+    def test_the_streams_ends_are_the_last_packet_plus_its_duration(self):
+        video_end, audio_end = fixturegen.stream_ends(self._packets(), 0, 1)
+        self.assertAlmostEqual(video_end, 20.0, delta=0.05)
+        self.assertAlmostEqual(audio_end, 23.0, delta=0.05)
+
+    def test_a_missing_stream_or_timestamp_is_refused_not_zeroed(self):
+        with self.assertRaises(ValueError):
+            fixturegen.stream_ends([p for p in self._packets() if p["stream_index"] == 0], 0, 1)
+        broken = self._packets()
+        broken[-1] = {"stream_index": 1, "duration_time": "0.032"}
+        with self.assertRaises(ValueError):
+            fixturegen.stream_ends(broken, 0, 1)
+
+    def _verify(self, packets, spec=None):
+        spec = spec or fixturegen.PIPE_SHAPES[self.KEY]
+        streams = [{"codec_type": "video", "index": 0}, {"codec_type": "audio", "index": 1}]
+        rec, problems = {}, []
+        with mock.patch.object(fixturegen, "run",
+                               return_value=json.dumps({"packets": packets})):
+            fixturegen.verify_audio_tail("x.mkv", spec, streams, rec, problems)
+        return rec, problems
+
+    def test_a_clip_with_its_tail_verifies_and_records_both_ends(self):
+        rec, problems = self._verify(self._packets())
+        self.assertEqual(problems, [])
+        self.assertAlmostEqual(rec["audio_tail"]["tail_s"], 3.0, delta=0.1)
+
+    def test_a_clip_that_lost_its_tail_fails_the_build(self):
+        """The audio cut at the picture's end verifies clean on every other axis, and a player
+        without the #865 fix then ends it on the old arithmetic, so the case grades nothing."""
+        _, problems = self._verify(self._packets(audio_end=20.0))
+        self.assertTrue(any("wanted at least 2.0s" in p for p in problems), problems)
+
+    def test_a_tail_inside_the_pumps_tolerance_fails_even_if_declared(self):
+        """1.5 s past the picture is under the 2 s floor, whatever the shape asked for."""
+        spec = dict(fixturegen.PIPE_SHAPES[self.KEY], audio_tail_s=1.5)
+        _, problems = self._verify(self._packets(audio_end=21.5), spec)
+        self.assertTrue(any("wanted at least 2.0s" in p for p in problems), problems)
+
+    def test_a_tail_other_than_the_declared_one_fails_the_build(self):
+        _, problems = self._verify(self._packets(audio_end=25.0))
+        self.assertTrue(any("declares 3s" in p for p in problems), problems)
+
+    def test_the_picture_is_the_file_less_the_tail_and_no_other_shape_has_one(self):
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        self.assertEqual((spec["duration"], spec["audio_tail_s"]), (23, 3))
+        self.assertEqual(fixturegen.picture_secs(spec, spec["duration"]), 20)
+        others = [k for k, s in fixturegen.PIPE_SHAPES.items()
+                  if s.get("audio_tail_s") and k != self.KEY]
+        self.assertEqual(others, [], "a second audio-tail shape wants its own case")
+        short = fixturegen.PIPE_SHAPES["pipe_h264_ac3_short"]
+        self.assertEqual(fixturegen.picture_secs(short, short["duration"]), short["duration"])
+
+    def test_the_picture_input_ends_at_the_picture_and_everything_else_at_the_file(self):
+        """Video `-t` 20, audio `-t` 23 and the audio graph's own duration, output `-t` 23: the mux
+        has to run on to the audio's end, and the picture must not be padded to meet it."""
+        argv = self._argv(fixturegen.PIPE_SHAPES[self.KEY], 23)
+        v = next(i for i, a in enumerate(argv) if a.startswith("testsrc2="))
+        self.assertEqual(argv[v - 5:v - 1], ["-t", "20", "-f", "lavfi"])
+        a = next(i for i, a in enumerate(argv) if a.startswith("sine="))
+        self.assertEqual(argv[a - 5:a - 1], ["-t", "23", "-f", "lavfi"])
+        self.assertIn("duration=23", argv[a])
+        self.assertEqual(argv[-3:-1], ["-t", "23"], "the output cap must not cut the tail")
+
+    def test_a_shape_without_a_tail_builds_exactly_as_before(self):
+        short = fixturegen.PIPE_SHAPES["pipe_h264_ac3_short"]
+        argv = self._argv(short, short["duration"])
+        v = next(i for i, a in enumerate(argv) if a.startswith("testsrc2="))
+        self.assertEqual(argv[v - 5:v - 1], ["-t", "20", "-f", "lavfi"])
+        self.assertEqual(argv[-3:-1], ["-t", "20"])
+
+    def test_a_build_shorter_than_its_tail_has_no_picture_and_is_refused(self):
+        with self.assertRaises(fixturegen.Fail):
+            self._argv(fixturegen.PIPE_SHAPES[self.KEY], 3)
+
+    def test_the_burned_in_layout_states_the_pictures_length(self):
+        """verify() rebuilds this from the MEASURED file length, so the V0 line must come out the
+        same from the build's 23 and from the measured 23.005 rounded."""
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        line = fixturegen.layout_lines(self.KEY, spec, 23)[1]
+        self.assertTrue(line.endswith(" 20s"), line)
+        self.assertEqual(fixturegen.layout_lines(self.KEY, spec, round(23.005)),
+                         fixturegen.layout_lines(self.KEY, spec, 23))
+
+    def test_the_case_names_the_clip_and_declares_what_it_carries(self):
+        case = next(c for c in _manifest()["pipeline_cases"] if c["name"] == "pipe_finish_audio_tail")
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        self.assertEqual(case["fixture"], self.KEY + ".mkv")
+        for k in ("vcodec", "acodec", "fps"):
+            self.assertEqual(case["declare"][k], spec["declare"][k], f"declare.{k} drifted from the shape")
+        self.assertTrue(case["expect"]["reaches_eos"])
+        self.assertEqual(case["expect"]["video_size"], spec["video"]["size"])
+        finish = next(c for c in _manifest()["pipeline_cases"] if c["name"] == "pipe_finish_eos")
+        self.assertEqual(case["expect"], finish["expect"],
+                         "same grading as pipe_finish_eos: the clip is the only thing that differs")
+        self.assertEqual(case["run_secs"], finish["run_secs"])
+        self.assertEqual(case["operations"], finish["operations"])
+
+
 class AbrResponseProfile(unittest.TestCase):
     """One request actuator may produce different completed renditions in fresh PMS sessions."""
 
@@ -5148,7 +5533,7 @@ class PostSeekSurvival(unittest.TestCase):
     """
 
     def _log(self, positions, tail=(), retired=True):
-        out = ["reload_transcode: fresh Load at offset 300s"]
+        out = ["autoseek: step → 300s (0 left)", "reload_transcode: fresh Load at offset 300s"]
         if retired:
             out.append("seek: retired previous encoder ok=1")
         out += [f"loop=60 fps=60 pos={t}s play=1000pm" for t in positions]
@@ -5165,7 +5550,7 @@ class PostSeekSurvival(unittest.TestCase):
 
     def test_a_stop_that_the_server_rejected_is_not_a_successful_retirement(self):
         lines = self._log(range(300, 480), retired=False)
-        lines.insert(1, "seek: retired previous encoder ok=0")
+        lines.insert(2, "seek: retired previous encoder ok=0")
         ok, why = run.op_seek_transcode(lines, 300, min_climb_after_s=45)
         self.assertFalse(ok, why)
         self.assertIn("ok=0", why)
@@ -5191,6 +5576,68 @@ class PostSeekSurvival(unittest.TestCase):
         """A short seek case may omit post-climb, never physical-session retirement."""
         ok, _ = run.op_seek_transcode(self._log(range(300, 315)), 300)
         self.assertTrue(ok)
+
+    def _pin_then_original_then_inplace_seek(self):
+        """`auto_pin_then_original_and_seek` on the v0.9.0 TV run, reduced: the 720p PIN rebuilt
+        the stream (`reload_transcode: fresh Load at offset 12s`), Original then restored direct
+        play and retired the pin's encoder, and the scheduled seek ~45 s later was an in-place
+        `av_seek` on the source file."""
+        pos = lambda t: f"loop=60 route=player overlay=none pos={t}s play=1000pm fps=60"
+        return ([pos(t) for t in range(0, 12)]
+                + ["quality: switch → 720p_4_mbps (1 left)",
+                   "route transition: user retranscode at 12s",
+                   "reload_transcode: fresh Load at offset 12s"]
+                + [pos(t) for t in range(12, 50)]
+                + ["quality: switch → original (0 left)", "reload_at: fresh Load at 50s",
+                   "abr: retired superseded encoder after Original handoff ok=1"]
+                + [pos(t) for t in range(50, 95)]
+                + ["autoseek: step → 300s (0 left)",
+                   "seek(in-place): av_seek t=300000000000 coalesced=0",
+                   "in-place seek: setTimeToDecode(296917000000) rv=0 setContentInfo=1 sendSegment=1"]
+                + [pos(t) for t in range(300, 339)])
+
+    def test_a_quality_switch_reload_before_the_seek_is_not_the_seeks_signal(self):
+        """The v0.9.0 failure: the grader grepped the WHOLE log, took the pin's own reload for the
+        seek's, and then failed it for not retiring an encoder the pin never replaced. Only the
+        lines after the seek was requested (`autoseek: step`) can be the seek's evidence."""
+        ok, why = run.op_seek_transcode(self._pin_then_original_then_inplace_seek(), 300,
+                                        min_climb_after_s=25)
+        self.assertFalse(ok, why)
+        self.assertIn("no transcode-seek signal", why)
+
+    def test_a_look_alike_before_the_seek_cannot_pass_it(self):
+        """The same trap in the passing direction: a switch's rebuild that DID retire its
+        predecessor must not grade a seek that never rebuilt anything."""
+        lines = self._pin_then_original_then_inplace_seek()
+        lines.insert(lines.index("reload_transcode: fresh Load at offset 12s") + 1,
+                     "seek: retired previous encoder ok=1")
+        ok, why = run.op_seek_transcode(lines, 300, min_climb_after_s=25)
+        self.assertFalse(ok, why)
+
+    def test_a_seek_that_was_never_requested_is_not_graded_from_other_reloads(self):
+        lines = [ln for ln in self._log(range(300, 480)) if not ln.startswith("autoseek:")]
+        ok, why = run.op_seek_transcode(lines, 300, min_climb_after_s=45)
+        self.assertFalse(ok, why)
+        self.assertIn("never requested", why)
+
+    def test_the_inplace_arm_grades_the_restored_source_and_its_survival(self):
+        lines = self._pin_then_original_then_inplace_seek()
+        ok, why = run.op_seek_inplace(lines, 300, min_climb_after_s=25)
+        self.assertTrue(ok, why)
+        ok, why = run.op_seek_inplace(lines[:-30], 300, min_climb_after_s=25)
+        self.assertFalse(ok, why)
+        self.assertIn("did not survive", why)
+
+    def test_the_case_states_its_inplace_assumption(self):
+        """After Original restores direct play the seek is an `av_seek`; the case says so (as its
+        sibling `original_then_auto_and_seek` does) instead of leaving the transcode arm to find a
+        reload that a direct play cannot emit."""
+        with open(run.MANIFEST) as f:
+            cases = json.load(f)["cases"]
+        case = next(c for c in cases if c["name"] == "auto_pin_then_original_and_seek")
+        seek = next(o for o in case["operations"] if o["op"] == "seek")
+        self.assertEqual(seek.get("mode"), "inplace")
+        self.assertTrue(seek.get("min_climb_after_s"))
 
 
 class DemuxFailureAssertion(unittest.TestCase):
@@ -6616,18 +7063,18 @@ class StreamSelectionReset(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_server_selected_subtitle_case_seeds_its_own_subtitle_after_the_reset(self):
-        """audio_enhancement_burns_server_selected_subtitle reads a SERVER-selected subtitle, and
+        """audio_enhancement_draws_server_selected_subtitle reads a SERVER-selected subtitle, and
         `subtitle_text_srt` plays the same part -- its reset/pick leaves an explicit selection,
         so relying on stream_reset: false made the case order-dependent. The case now declares
         `setup.seed_subtitle`; `apply_stream_setup` must reset, THEN PUT a non-zero
         subtitleStreamID resolved from live metadata (no id in the manifest)."""
         case = {c["name"]: c for c in _manifest()["cases"]}[
-            "audio_enhancement_burns_server_selected_subtitle"]
+            "audio_enhancement_draws_server_selected_subtitle"]
         case = {"rk": "72", **case}
         self.assertTrue(case.get("stream_reset", True))
         self.assertNotIn("stream_reset", case)
         self.assertIn("seed_subtitle", case["setup"])
-        self.assertNotRegex(json.dumps(case["setup"]), r"\d{4}")
+        self.assertNotRegex(json.dumps(case["setup"]["seed_subtitle"]), r"\d{4}")
         streams = [
             {"id": 2694, "streamType": 1},
             {"id": 2695, "streamType": 2, "selected": 1},
