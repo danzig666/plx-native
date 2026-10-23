@@ -88,8 +88,8 @@ const EDGE_MIN_SHARE: f32 = 0.35;
 /// it clicked, and keys move by whole rows. So a pointer that comes to rest in an edge band glides
 /// the page, over cards or not: after [`EDGE_DWELL_MS`] every frame hands the page a fractional
 /// `InputKind::Wheel` (+ up, - down, the wheel's sign), easing in over [`EDGE_RAMP_MS`] to a speed
-/// that grows toward the edge. Only the navigation bar is the bar's own pointer: a pointer that
-/// enters a band over it does not glide. Stepping FOCUS a row at a time (fork.2) could not glide:
+/// that grows toward the edge. Only the navigation bar's buttons are the bar's own pointer: over
+/// one the glide stops (it starts again, easing in, once the pointer is off it). Stepping FOCUS a row at a time (fork.2) could not glide:
 /// the critically damped scroll spring settles between steps, so the page pulsed (a simulation of
 /// `gfx::spring` at `K_SCROLL`: still a 2:1 speed swing at a step every 160 ms).
 ///
@@ -122,10 +122,12 @@ impl EdgeScroll {
         }
     }
 
-    /// The pointer moved to `(x, y)`. `true` while a glide holds it, so the move is not hover.
-    pub(crate) fn moved(&mut self, x: f32, y: f32) -> bool {
+    /// The pointer moved to `(x, y)`, over a button of the navigation bar when `on_bar`. `true`
+    /// while a glide holds it, so the move is not hover; a move onto the bar stops the glide and
+    /// is the bar's hover.
+    pub(crate) fn moved(&mut self, x: f32, y: f32, on_bar: bool) -> bool {
         self.at = Some((x, y));
-        if self.glide.is_some_and(|(dir, _)| Self::band(y) != Some(dir)) {
+        if on_bar || self.glide.is_some_and(|(dir, _)| Self::band(y) != Some(dir)) {
             self.glide = None;
         }
         self.glide.is_some()
@@ -142,8 +144,9 @@ impl EdgeScroll {
     }
 
     /// One frame at `now` (ms): the wheel `dy` to hand the page, if any, for the time since the
-    /// last frame this ran on. `on_bar` is whether the pointer is over the navigation bar; it is
-    /// read only while no glide runs.
+    /// last frame this ran on. `on_bar` is whether the pointer is over a button of the navigation
+    /// bar (the profile chip, the tabs, Search): the glide stops there, whether it was running or
+    /// not, and starts again (dwell and ease-in) once the pointer is off the buttons.
     pub(crate) fn step(&mut self, on_bar: bool, now: u32) -> Option<f32> {
         let dt = self.last.map_or(0.0, |last| now.wrapping_sub(last).min(100) as f32 / 1000.0);
         self.last = Some(now);
@@ -155,12 +158,12 @@ impl EdgeScroll {
             self.glide = None;
             return None;
         };
+        if on_bar {
+            self.glide = None;
+            return None;
+        }
         let since = match self.glide {
             Some((d, since)) if d == dir => since,
-            _ if on_bar => {
-                self.glide = None;
-                return None;
-            }
             _ => {
                 self.glide = Some((dir, now));
                 now
@@ -1854,7 +1857,7 @@ mod edge_scroll_tests {
     #[test]
     fn the_pointer_resting_at_the_top_edge_glides_up_every_frame() {
         let mut e = EdgeScroll::IDLE;
-        e.moved(960.0, 40.0);
+        e.moved(960.0, 40.0, false);
         let out = run(&mut e, false, 1000, 2000);
         assert!(out[0].0 >= 1000 + EDGE_DWELL_MS && out[0].0 < 1000 + EDGE_DWELL_MS + 32, "{out:?}");
         // it times its own frames (the loop's `Frame::dt` is still 0 where it runs): 16 ms at
@@ -1873,7 +1876,7 @@ mod edge_scroll_tests {
     fn the_bottom_edge_glides_down_faster_nearer_the_edge_and_the_middle_not_at_all() {
         let speed = |y: f32| {
             let mut e = EdgeScroll::IDLE;
-            e.moved(960.0, y);
+            e.moved(960.0, y, false);
             run(&mut e, false, 0, 1500).last().map(|p| p.1)
         };
         let (deep, shallow) = (speed(SCR_H - 5.0).unwrap(), speed(SCR_H - EDGE_BAND + 5.0).unwrap());
@@ -1882,17 +1885,32 @@ mod edge_scroll_tests {
         assert_eq!(speed(SCR_H / 2.0), None);
     }
 
-    /// Over the navigation bar the bar's hover rules; a hidden pointer glides nothing.
+    /// Over a button of the navigation bar the bar's hover rules; a hidden pointer glides nothing.
     #[test]
     fn the_navigation_bar_under_a_resting_pointer_or_a_hidden_pointer_glides_nothing() {
         let mut e = EdgeScroll::IDLE;
-        e.moved(960.0, 40.0);
+        e.moved(960.0, 40.0, true);
         assert!(run(&mut e, true, 0, 2000).is_empty());
-        assert!(!e.moved(960.0, 41.0), "no glide, so the move is hover");
+        assert!(!e.moved(960.0, 41.0, true), "no glide, so the move is hover");
         e.stop();
         assert!(run(&mut e, false, 0, 2000).is_empty(), "a pointer LG hid, or the D-pad took over, is gone");
         let mut fresh = EdgeScroll::IDLE;
         assert!(run(&mut fresh, false, 0, 2000).is_empty(), "no pointer yet");
+    }
+
+    /// The owner's ask: the glide stops while the pointer is on the top bar's buttons (the profile
+    /// chip, Home / Movies / Watchlist / Search), even mid-glide, and goes on once it is off them.
+    #[test]
+    fn the_glide_stops_on_the_bar_buttons_and_goes_on_off_them() {
+        let mut e = EdgeScroll::IDLE;
+        e.moved(700.0, 40.0, false);
+        assert!(!run(&mut e, false, 0, 600).is_empty(), "gliding up between the buttons");
+        assert!(!e.moved(960.0, 40.0, true), "a move onto a button is the bar's hover");
+        assert!(run(&mut e, true, 616, 1000).is_empty(), "no glide while on the button");
+        e.moved(700.0, 40.0, false);
+        let again = run(&mut e, false, 1632, 1000);
+        assert!(!again.is_empty() && again.iter().all(|&(_, d)| d > 0.0), "off the button the glide goes on");
+        assert!(again[0].0 >= 1632 + EDGE_DWELL_MS, "easing back in after the dwell: {again:?}");
     }
 
     /// A glide that has started holds the pointer: cards sliding under it neither stop it nor take
@@ -1900,13 +1918,13 @@ mod edge_scroll_tests {
     #[test]
     fn a_running_glide_holds_the_band_until_the_pointer_leaves_it() {
         let mut e = EdgeScroll::IDLE;
-        e.moved(960.0, 40.0);
+        e.moved(960.0, 40.0, false);
         assert!(!run(&mut e, false, 0, 600).is_empty());
-        assert!(e.step(true, 616).is_some(), "a card sliding under the pointer does not stop it");
-        assert!(e.moved(900.0, 60.0), "a move inside the band while gliding is not hover");
-        assert!(!e.moved(900.0, 400.0), "leaving the band ends the glide");
+        assert!(e.moved(900.0, 60.0, false), "a move inside the band while gliding is not hover");
+        assert!(e.step(false, 616).is_some(), "a card sliding under the pointer does not stop it");
+        assert!(!e.moved(900.0, 400.0, false), "leaving the band ends the glide");
         assert!(e.step(false, 632).is_none());
-        e.moved(900.0, 60.0);
+        e.moved(900.0, 60.0, false);
         assert!(run(&mut e, false, 648, EDGE_DWELL_MS - 20).is_empty(), "coming back starts the dwell again");
     }
 }

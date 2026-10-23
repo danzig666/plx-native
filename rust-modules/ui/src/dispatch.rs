@@ -547,11 +547,6 @@ where
 
     /// The entry whose page answers focus and hits: the tree's owner (the keyboard consumes
     /// text, the page beneath it still owns the groups).
-    /// The entry that owns input now (the top page's, or a surface's), `None` for a system owner.
-    pub fn input_entry(&self) -> Option<EntryId> {
-        self.owner_entry()
-    }
-
     fn owner_entry(&self) -> Option<EntryId> {
         match self.nav.input_owner() {
             Some(InputOwner::Entry(e)) => Some(e),

@@ -1335,8 +1335,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         // drove HOME's focus underneath instead. The press-cancel each of them paid for
         // by hand — a pointer sliding off the control it armed must abandon that press —
         // is `dispatch`'s ingest, which cancels an arm whose hit no longer resolves to it.
-        // a running edge glide holds the pointer: its moves in the band are not hover
-        if app.ptr.edge.moved(mx, my) {
+        // a running edge glide holds the pointer: its moves in the band are not hover (a move onto
+        // a button of the top bar stops it and is the bar's)
+        if app.ptr.edge.moved(mx, my, pointer_on_bar(app, mx, my)) {
             return;
         }
         if super::bridge::owns_input(&app.pages) {
@@ -1752,6 +1753,13 @@ fn playback_may_run(app: &App) -> bool {
 /// The playback side of an iteration before the tick: the engine pump, the foreground load
 /// poll, the reporter, EOS / Up Next, the hub refresh, the held key, the scrubber and the paused
 /// seek — everything that reads `fr.now` and no `dt`.
+/// **Is the pointer on a button of the top bar?** The profile chip and the tabs (Home, Movies, the
+/// Watchlist, Search) are the container strip's members, `elem >= STRIP_BASE` whatever entry the
+/// bar registers them under (the page's own), and the bar has stops only while it is drawn.
+fn pointer_on_bar(app: &App, x: f32, y: f32) -> bool {
+    app.pages.input.hit.top_at(x, y).is_some_and(|stop| stop.key.elem >= plx_ui::dispatch::STRIP_BASE)
+}
+
 pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         park_on_decoder_release(app);
         if playback_may_run(app) {
@@ -2066,12 +2074,9 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
             && !app.ptr.button_down
             && super::bridge::page_glides(&app.pages)
         {
-            // over the page's own cards the edge glides all the same; over the navigation bar (a
-            // stop that is not the page's) it is the bar's pointer
-            let page = app.pages.input_entry();
-            let on_bar = app.ptr.edge.at().is_some_and(|(x, y)| {
-                app.pages.input.hit.top_at(x, y).is_some_and(|stop| Some(stop.key.entry) != page)
-            });
+            // over the page's own cards the edge glides all the same; over a button of the top bar
+            // it stops, and goes on once the pointer is off it
+            let on_bar = app.ptr.edge.at().is_some_and(|(x, y)| pointer_on_bar(app, x, y));
             if let Some(dy) = app.ptr.edge.step(on_bar, fr.now) {
                 // a fractional wheel: the pages that scroll freely glide by it
                 app.inputs.push(plx_machine::machine::InputEvent {
@@ -4181,6 +4186,44 @@ mod lifecycle_regression_tests {
         }
         assert!(wheels.len() > 40 && wheels.iter().all(|&dy| dy > 0.0),
             "the resting pointer glides the page up on every frame after the dwell: {wheels:?}");
+    }
+
+    /// **The glide stops on the top bar's buttons and goes on off them, through the real loop**
+    /// (the owner's ask after fork.7): with Home's bar presented in the hit map, a pointer resting
+    /// on a tab sends no glide, and moved off it, still at the edge, the page glides again.
+    #[test]
+    fn the_edge_glide_stops_on_a_bar_button_and_goes_on_off_it_through_the_real_loop() {
+        let _serial=plx_base::testlock::serial();
+        let mut app=app();
+        super::super::bridge::nav_root(&mut app.pages, AppArg::Home);
+        frame(&mut app,0);
+        app.pages.present_bar_stops(&app.bridge);
+        let tab=app.pages.input.hit.front().iter()
+            .find(|stop| stop.key.elem >= plx_ui::dispatch::STRIP_BASE && stop.rect.y + stop.rect.h / 2.0 < 120.0)
+            .map(|stop| stop.rect).expect("premise: the bar has a button in the top band");
+        let off=(5..1900).step_by(5).map(|x| x as f32)
+            .find(|&x| app.pages.input.hit.top_at(x, tab.cy()).is_none()).expect("premise: the band has room off the buttons");
+        let mut t=1_000u32;
+        let mut glide=|app: &mut App, x: f32, y: f32| {
+            app.ev=[0;128];
+            app.ev[20..24].copy_from_slice(&(x as i32).to_ne_bytes());
+            app.ev[24..28].copy_from_slice(&(y as i32).to_ne_bytes());
+            let mut fr=Frame::begin(&app.player.session, app.bridge.metadata_view());
+            event(app,&mut fr,SDL_MOUSEMOTION);
+            app.inputs.retain(|e| matches!(e.kind, plx_machine::machine::InputKind::Wheel { .. }));
+            let mut wheels=0;
+            for _ in 0..60 {
+                t+=16;
+                let mut fr=Frame::begin(&app.player.session, app.bridge.metadata_view());
+                fr.now=t;
+                unsafe { playback_tick(app,&mut fr); }
+                wheels+=app.inputs.drain(..).filter(|e| matches!(e.kind, plx_machine::machine::InputKind::Wheel { .. })).count();
+            }
+            wheels
+        };
+        assert!(glide(&mut app, off, tab.cy()) > 30, "off the buttons, at the edge, the page glides");
+        assert_eq!(glide(&mut app, tab.cx(), tab.cy()), 0, "on a bar button the glide stops");
+        assert!(glide(&mut app, off, tab.cy()) > 30, "off it again the glide goes on");
     }
 
     #[test]
