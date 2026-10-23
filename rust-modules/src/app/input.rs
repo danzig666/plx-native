@@ -49,6 +49,8 @@ pub(crate) struct Pointer {
     /// The button now held went DOWN as an OK key, not a click ([`click_is_ok`]), so its up must
     /// be an OK key-up too.
     pub(crate) ok_from_click: bool,
+    /// The pointer resting in the top or bottom edge band scrolls the page ([`EdgeScroll`]).
+    pub(crate) edge: EdgeScroll,
 }
 impl Pointer {
     /// Pointer mode, cursor shown, nothing held or dragging — where the loop starts.
@@ -62,7 +64,80 @@ impl Pointer {
         button_down: false,
         last_wheel: 0,
         ok_from_click: false,
+        edge: EdgeScroll::IDLE,
     };
+}
+
+/// How far from the top or bottom of the screen the pointer scrolls the page ([`EdgeScroll`]).
+pub(crate) const EDGE_BAND: f32 = 120.0;
+/// How long the pointer rests in an edge band before the first step.
+pub(crate) const EDGE_DWELL_MS: u32 = 300;
+/// The pace of the steps while it stays there.
+pub(crate) const EDGE_REPEAT_MS: u32 = 450;
+
+/// **The pointer at the top or bottom edge scrolls the page**, the way the Magic Remote scrolls
+/// LG's own lists.
+///
+/// Hover alone moves a page only where it parks focus on a card, and a page rests its focused
+/// row or section at the TOP of the screen: below it the next row stands nearly whole, so the
+/// pointer near the bottom scrolls on, but above it at most a sliver of the previous row is left
+/// (the Library clips its grid's stops at the content top, so with the chrome tucked the band
+/// over the hidden row is ~56 px; Detail leaves 0..80 px of the section above, often nothing but
+/// the focused section's heading and air). So a pointer resting in an edge band over NO control
+/// steps focus the way the wheel does (`bridge::wheel_input`: one Up or Down), first after
+/// [`EDGE_DWELL_MS`] and then every [`EDGE_REPEAT_MS`]. Over a control the pointer's hover rules,
+/// unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeScroll {
+    /// The pointer's last position, `None` once it is hidden (LG's auto-hide or a D-pad press).
+    at: Option<(f32, f32)>,
+    /// The band the pointer rests in (+1 top, -1 bottom: the wheel's sign) and when it steps next.
+    dwell: Option<(i32, u32)>,
+}
+
+impl EdgeScroll {
+    pub(crate) const IDLE: EdgeScroll = EdgeScroll { at: None, dwell: None };
+
+    /// The pointer moved to `(x, y)`.
+    pub(crate) fn moved(&mut self, x: f32, y: f32) {
+        self.at = Some((x, y));
+    }
+
+    /// The pointer is gone (hidden, or the D-pad took over): no step until it moves again.
+    pub(crate) fn stop(&mut self) {
+        *self = Self::IDLE;
+    }
+
+    /// Where the pointer rests now, for the caller's hit test.
+    pub(crate) fn at(&self) -> Option<(f32, f32)> {
+        self.at
+    }
+
+    /// One frame at `now`: the wheel step (+1 Up, -1 Down) to take now, if any. `on_control` is
+    /// whether the pointer is over a stop of the hit map.
+    pub(crate) fn step(&mut self, on_control: bool, now: u32) -> Option<i32> {
+        let band = self.at.and_then(|(_, y)| {
+            if y < EDGE_BAND { Some(1) } else if y >= plx_ui::consts::SCR_H - EDGE_BAND { Some(-1) } else { None }
+        });
+        let Some(dir) = band.filter(|_| !on_control) else {
+            self.dwell = None;
+            return None;
+        };
+        match self.dwell {
+            Some((d, next)) if d == dir => {
+                if now.wrapping_sub(next) as i32 >= 0 {
+                    self.dwell = Some((dir, now.wrapping_add(EDGE_REPEAT_MS)));
+                    Some(dir)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.dwell = Some((dir, now.wrapping_add(EDGE_DWELL_MS)));
+                None
+            }
+        }
+    }
 }
 
 /// **Is this pointer click really the remote's OK button?**
@@ -1024,6 +1099,7 @@ pub(crate) unsafe fn begin_fresh_press(
         ptr.dpad_mode = true;
         ptr.cur_hidden = true;
         ptr.mot_accum = 0.0;
+        ptr.edge.stop();
     }
 }
 
@@ -1719,5 +1795,63 @@ mod click_is_ok_tests {
         ] {
             assert!(!click_is_ok(dpad, motion, on_control, transparent), "{dpad} {motion} {on_control} {transparent}");
         }
+    }
+}
+
+#[cfg(test)]
+mod edge_scroll_tests {
+    use super::{EdgeScroll, EDGE_BAND, EDGE_DWELL_MS, EDGE_REPEAT_MS};
+    use plx_ui::consts::SCR_H;
+
+    /// The steps one `EdgeScroll` takes over `ms` frames of 16 ms from `t0`.
+    fn run(e: &mut EdgeScroll, on_control: bool, t0: u32, ms: u32) -> Vec<(u32, i32)> {
+        (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16).map(|d| (t0 + i * 16, d))).collect()
+    }
+
+    /// The reported bug: the pointer near the TOP of a scrolled page moved nothing, because the
+    /// row above the focused one leaves no hoverable card there. Resting in the top band over no
+    /// control steps Up (the wheel's +1) after the dwell, then at the repeat pace.
+    #[test]
+    fn the_pointer_resting_at_the_top_edge_over_nothing_scrolls_up() {
+        let mut e = EdgeScroll::IDLE;
+        e.moved(960.0, 40.0);
+        let steps = run(&mut e, false, 1000, 1000);
+        assert_eq!(steps.first().map(|s| s.1), Some(1), "{steps:?}");
+        assert!(steps[0].0 >= 1000 + EDGE_DWELL_MS, "no step before the dwell: {steps:?}");
+        assert!(steps.len() >= 2 && steps[1].0 - steps[0].0 >= EDGE_REPEAT_MS, "{steps:?}");
+    }
+
+    #[test]
+    fn the_bottom_edge_scrolls_down_and_the_middle_scrolls_nothing() {
+        let mut e = EdgeScroll::IDLE;
+        e.moved(960.0, SCR_H - 10.0);
+        assert_eq!(run(&mut e, false, 0, 1000).first().map(|s| s.1), Some(-1));
+        let mut e = EdgeScroll::IDLE;
+        e.moved(960.0, EDGE_BAND + 1.0);
+        assert!(run(&mut e, false, 0, 2000).is_empty());
+    }
+
+    /// Over a control the pointer's hover is what moves focus: the edge stays out of it.
+    #[test]
+    fn a_control_under_the_pointer_or_a_hidden_pointer_takes_no_step() {
+        let mut e = EdgeScroll::IDLE;
+        e.moved(960.0, 40.0);
+        assert!(run(&mut e, true, 0, 2000).is_empty());
+        e.stop();
+        assert!(run(&mut e, false, 0, 2000).is_empty(), "a pointer LG hid, or the D-pad took over, is gone");
+        let mut fresh = EdgeScroll::IDLE;
+        assert!(run(&mut fresh, false, 0, 2000).is_empty(), "no pointer yet");
+    }
+
+    /// Leaving the band and coming back starts the dwell again, so a pass through it is not a step.
+    #[test]
+    fn crossing_the_band_restarts_the_dwell() {
+        let mut e = EdgeScroll::IDLE;
+        e.moved(960.0, 40.0);
+        assert!(run(&mut e, false, 0, EDGE_DWELL_MS - 20).is_empty());
+        e.moved(960.0, 500.0);
+        assert!(e.step(false, EDGE_DWELL_MS).is_none());
+        e.moved(960.0, 40.0);
+        assert!(run(&mut e, false, EDGE_DWELL_MS + 16, EDGE_DWELL_MS - 40).is_empty());
     }
 }

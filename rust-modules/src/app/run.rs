@@ -1199,7 +1199,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             // below for the documented direction+wcode-hidden combination noted there; removing
             // the branch instead of its body would let that combination fall through to it.
         } else if wcode == WCODE_POINTER_HIDDEN {
-            // LG pointer auto-hidden; ignore.
+            // LG pointer auto-hidden: nothing else to do, but a hidden pointer resting at an
+            // edge no longer scrolls the page (`input::EdgeScroll`).
+            app.ptr.edge.stop();
             //
             // THE RAW `wcode`, not `Key::PointerHidden`, and this is the one arm in the
             // ladder that cannot use the classified value. Its precedence here is
@@ -1333,6 +1335,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         // drove HOME's focus underneath instead. The press-cancel each of them paid for
         // by hand — a pointer sliding off the control it armed must abandon that press —
         // is `dispatch`'s ingest, which cancels an arm whose hit no longer resolves to it.
+        app.ptr.edge.moved(mx, my);
         if super::bridge::owns_input(&app.pages) {
             // `app.last_input`, stamped from the clock at the top of this arm: `fr.now`
             // is not written until after ingest (`tree_tick` above says why).
@@ -2053,6 +2056,21 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
                 }
                 player.publish();
             }
+        }
+        // the pointer resting at the top or bottom edge scrolls the page (`input::EdgeScroll`)
+        if !matches!(app.route(), AppArg::Player)
+            && !app.ptr.dpad_mode
+            && !app.ptr.button_down
+            && !app.pages.surface_up()
+            && !super::bridge::search_owns_input(&app.pages)
+            && super::bridge::owns_input(&app.pages)
+        {
+            let on_control = app.ptr.edge.at().is_some_and(|(x, y)| app.pages.input.hit.top_at(x, y).is_some());
+            if let Some(dy) = app.ptr.edge.step(on_control, fr.now) {
+                app.inputs.extend(super::bridge::wheel_input(dy, plx_machine::machine::Tick { ms: fr.now, dt_us: 0 }));
+            }
+        } else {
+            app.ptr.edge.stop();
         }
         // hide the idle pointer during playback
         if matches!(app.route(), AppArg::Player)
