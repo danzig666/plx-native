@@ -5801,3 +5801,50 @@ fn a_caption_input_that_changes_under_a_kept_row_reaches_the_drawn_block() {
     assert_eq!(block(&remounted, &state, row, col), video);
     TEST_UNDER_POSTERS.with(|cell| cell.set(None));
 }
+
+/// **The pointer moves Home by its edges, never by a hover.** The reported bug: Home did not
+/// scroll under the Magic Remote at all once the edge glide held hover back, and before that every
+/// hover pulled the page to the shelf it touched. Now a wheel (the edge glide, fractional, every
+/// frame) slides the page out of the hero into the shelves and through them and back, a hover
+/// moves focus and nothing else, a click brings the page to its card, and a key rests its row.
+#[test]
+fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
+    let _guard = plx_base::testlock::serial();
+    let mut state = plx_data::pms::PmsState::default();
+    let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
+    let snapshot = collection_home(&mut state, &adapter);
+    let view = snapshot.view();
+    let mut s = screen(view);
+    let rows = s.rows.len();
+    assert!(rows >= 3 && rest_scroll(rows - 1, rows, band_open_of(false)) > 0.0, "premise: the shelves scroll");
+    let hero = FocusKey { entry: s.entry, elem: HERO_PLAY_ELEM };
+    let card = |s: &HomeScreen, row: usize| FocusKey { entry: s.entry, elem: s.rows[row].elems[0] };
+    let tick = |s: &mut HomeScreen, focus: FocusKey<u32>| {
+        for _ in 0..3 { step(s, view, Some(focus), &ScreenEvent::Tick(Tick { ms: 16, dt_us: 16_667 })); }
+    };
+    let input = |kind| ScreenEvent::Input(InputEvent { at: Tick::default(), source: plx_machine::machine::Source::Script, kind });
+    // the glide down leaves the hero for the shelves, then scrolls through them, focus staying put
+    step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 }));
+    assert_eq!(s.snap_target, 1.0, "down from the hero goes to the shelves");
+    for _ in 0..60 { step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 })); }
+    tick(&mut s, hero);
+    let glided = s.grid.scroll_target;
+    assert!(glided > 100.0, "the shelves glide by the wheel: {glided}");
+    // a hover on a shelf card moves focus, not the page
+    let near = card(&s, 1);
+    step(&mut s, view, Some(near), &ScreenEvent::FocusMoved { from: Some(hero), to: near, by: By::Pointer });
+    tick(&mut s, near);
+    assert_eq!(s.grid.scroll_target, glided, "a hover moves focus, not the page");
+    // a click brings the page to its card
+    step(&mut s, view, Some(near), &input(InputKind::Click { x: 0.0, y: 0.0, hit: Some(near.elem) }));
+    tick(&mut s, near);
+    assert_eq!(s.grid.scroll_target, rest_scroll(1, rows, band_open_of(false)), "a click rests its card's row");
+    // the glide up goes back through the shelves to the hero
+    for _ in 0..400 { step(&mut s, view, Some(near), &input(InputKind::Wheel { dy: 0.05 })); }
+    assert_eq!((s.grid.scroll_target, s.snap_target), (0.0, 0.0), "up through the shelves to the hero");
+    // a key rests its row again
+    let deep = card(&s, rows - 1);
+    step(&mut s, view, Some(deep), &ScreenEvent::FocusMoved { from: Some(near), to: deep, by: By::Dir });
+    tick(&mut s, deep);
+    assert_eq!((s.grid.scroll_target, s.snap_target), (rest_scroll(rows - 1, rows, band_open_of(false)), 1.0));
+}

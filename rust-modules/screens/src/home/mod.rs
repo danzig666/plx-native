@@ -612,6 +612,11 @@ pub struct HomeScreen {
     covered: bool,
 
     snap_target: f32,
+    /// **The page is where the pointer put it, not where focus would rest it.** Set by a wheel (the
+    /// pointer's edge glide, `app::input::EdgeScroll`) and by a hover, which moves focus but never
+    /// the page; cleared by a key's move and by a click, which bring the page back to the focused
+    /// shelf. While set, the tick does not pull `grid.scroll_target` to the focused row.
+    free: bool,
     /// Stable element still visible while the engine has already crossed the hero/grid door.
     /// This is a press landing policy, not current focus, and retires at the visual midpoint.
     visible_activation: Option<u32>,
@@ -672,6 +677,7 @@ impl HomeScreen {
             hero_pinned: false,
             covered: false,
             snap_target: 0.0,
+            free: false,
             visible_activation: None,
             cta_available: false,
             strip_chosen: false,
@@ -1589,7 +1595,7 @@ impl HomeScreen {
                 fx.push(Fx::App(AppFx::Store(StoreId::Hubs, StoreCmd::Hubs(HubsCmd::Hold { lo: hold.0, hi: hold.1 }))));
             }
         }
-        if let Some(row) = self.rest_row(engine).filter(|row| *row < self.rows.len()) {
+        if let Some(row) = self.rest_row(engine).filter(|row| *row < self.rows.len() && !self.free) {
             self.grid.scroll_target = rest_scroll(row, self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)));
         }
         self.grid
@@ -2492,6 +2498,10 @@ impl LogicalState for HomeScreen {
             rows: _, elem_at: _, item_index: _, group_index: _, projected_generation: _, cw_cards: _, cw_offset: _, carousel_anchor: _, rebound: _, ghost_cards: _, restored_scroll: _, restore_reveal: _, hold: _, since_prune: _, #[cfg(test)] cost: _, carousel: _,
             outgoing: _, hero_flip_cd: _, hero_slide: _, hero_dir: _, hero_auto: _, hero_pinned: _, covered: _,
             snap_target: _,
+            // Whether the tick pulls the scroll to the focused shelf. What it decides is
+            // `grid.scroll_target`, encoded below, and it is a hand-off from the pointer's events
+            // (a wheel, a hover, a click) to the next `Tick`, like a shelf's `seen`.
+            free: _,
             visible_activation: _, cta_available: _, strip_chosen: _, snap: _, status_ms: _,
             hero_pop: _, backdrop: _, grid: _,
             // The disc's membership is the Watchlist store's (the application feeds it); the flip
@@ -2997,7 +3007,39 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
         if let ScreenEvent::Input(InputEvent { at, kind: InputKind::Key { key, edge, .. }, .. }) = ev {
             self.backdrop.note_key(*key, *edge, at.ms);
         }
+        // A click brings the page to what it clicked, the way a key's move does.
+        if let ScreenEvent::Input(InputEvent { kind: InputKind::Click { hit: Some(elem), .. }, .. }) = ev {
+            if let Some(loc) = self.locate(*elem) {
+                self.free = false;
+                self.snap_target = if loc.on_grid() { 1.0 } else { 0.0 };
+                fx.invalidate(Provenance::Input);
+            }
+        }
         match ev {
+            // A wheel (the pointer's edge glide, a fractional one every frame) moves the page
+            // itself, focus staying where it is: down from the hero into the shelves, then through
+            // them by `ROW_PITCH` a row; up through the shelves, then back to the hero.
+            ScreenEvent::Input(InputEvent { kind: InputKind::Wheel { dy }, .. }) => {
+                if !dy.is_finite() || self.rows.is_empty() {
+                    return Handled::Yes;
+                }
+                self.free = true;
+                let max = grid_max_scroll(self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)));
+                let to = self.grid.scroll_target - dy * ROW_PITCH;
+                if *dy > 0.0 {
+                    if self.snap_target >= 0.5 && self.grid.scroll_target > 0.0 {
+                        self.grid.scroll_target = to.max(0.0);
+                    } else {
+                        self.snap_target = 0.0;
+                    }
+                } else if self.snap_target < 0.5 {
+                    self.snap_target = 1.0;
+                } else {
+                    self.grid.scroll_target = to.min(max.max(self.grid.scroll_target));
+                }
+                fx.invalidate(Provenance::Input);
+                Handled::Yes
+            }
             ScreenEvent::Mount => {
                 self.sync_catalog(cx);
                 Handled::Yes
@@ -3057,10 +3099,17 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                         self.visible_activation = from.map(|key| key.elem);
                     }
                 }
-                match to_loc {
-                    Some(Located::Hero(_)) => self.snap_target = 0.0,
-                    Some(Located::Item(_, _) | Located::Heading(_)) => self.snap_target = 1.0,
-                    None => {}
+                // A hover moves focus, never the page: the pointer scrolls by the screen's edges
+                // (and a click by what it clicked). Every other move brings the page to the focus.
+                if *by == By::Pointer {
+                    self.free = true;
+                } else {
+                    self.free = false;
+                    match to_loc {
+                        Some(Located::Hero(_)) => self.snap_target = 0.0,
+                        Some(Located::Item(_, _) | Located::Heading(_)) => self.snap_target = 1.0,
+                        None => {}
+                    }
                 }
                 if matches!(by, By::Restore) && self.restore_reveal {
                     // A restored page opens at its saved region, rather than replaying the
@@ -3185,6 +3234,7 @@ impl<H: HomeLike> Screen<H> for HomeScreen {
     fn redraw_focused(&self, f: &mut DrawFrame<'_, '_, H>, focus: Option<plx_machine::machine::FocusKey<u32>>) {
         HomeScreen::redraw_focused::<H>(self, f, focus)
     }
+    fn glides(&self) -> bool { true }
     fn name(&self) -> &'static str {
         super::registry::word::HOME
     }

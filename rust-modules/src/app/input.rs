@@ -83,22 +83,19 @@ const EDGE_MIN_SHARE: f32 = 0.35;
 /// **The pointer at the top or bottom edge glides the page**, the way the Magic Remote scrolls
 /// LG's own lists (and Glasshouse's home rows): continuously, not a row at a time.
 ///
-/// Hover alone moves a page only where it parks focus on a card, and a page rests its focused
-/// row or section at the TOP of the screen: below it the next row stands nearly whole, so the
-/// pointer near the bottom scrolls on, but above it at most a sliver of the previous row is left
-/// (the Library clips its grid's stops at the content top, so with the chrome tucked the band
-/// over the hidden row is ~56 px; Detail leaves 0..80 px of the section above, often nothing but
-/// the focused section's heading and air). So a pointer that comes to rest in an edge band over
-/// NO control glides the page: after [`EDGE_DWELL_MS`] every frame hands the page a fractional
-/// `InputKind::Wheel` (+ up, - down, the wheel's sign), easing in over [`EDGE_RAMP_MS`] to a
-/// speed that grows toward the edge. Stepping FOCUS a row at a time could not do this: the
-/// critically damped scroll spring settles between steps, so the page pulsed (measured in a
-/// simulation of `gfx::spring` at `K_SCROLL`: still a 2:1 speed swing at a step every 160 ms).
+/// The pointer scrolls a page by its edges and nothing else: a hover moves focus but never the
+/// page (`Screen::glides` pages: Home, the Library and the rest), a click brings the page to what
+/// it clicked, and keys move by whole rows. So a pointer that comes to rest in an edge band glides
+/// the page, over cards or not: after [`EDGE_DWELL_MS`] every frame hands the page a fractional
+/// `InputKind::Wheel` (+ up, - down, the wheel's sign), easing in over [`EDGE_RAMP_MS`] to a speed
+/// that grows toward the edge. Only the navigation bar is the bar's own pointer: a pointer that
+/// enters a band over it does not glide. Stepping FOCUS a row at a time (fork.2) could not glide:
+/// the critically damped scroll spring settles between steps, so the page pulsed (a simulation of
+/// `gfx::spring` at `K_SCROLL`: still a 2:1 speed swing at a step every 160 ms).
 ///
 /// While a glide runs, the pointer's moves inside the band are not hover ([`moved`](Self::moved)
-/// says so): cards sliding under it would park focus and their reveal would pull the page back.
-/// Leaving the band ends the glide and hands the pointer back to hover. A pointer that enters a
-/// band over a control (the shown tab bar) does not glide; hover rules there, unchanged.
+/// says so), so the card under it does not take focus as the page slides; leaving the band ends
+/// the glide and hands the pointer back to hover.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EdgeScroll {
     /// The pointer's last position, `None` once it is hidden (LG's auto-hide or a D-pad press).
@@ -139,9 +136,9 @@ impl EdgeScroll {
         self.at
     }
 
-    /// One frame at `now`, `dt` seconds long: the wheel `dy` to hand the page, if any. `on_control`
-    /// is whether the pointer is over a stop of the hit map; it is read only while no glide runs.
-    pub(crate) fn step(&mut self, on_control: bool, now: u32, dt: f32) -> Option<f32> {
+    /// One frame at `now`, `dt` seconds long: the wheel `dy` to hand the page, if any. `on_bar` is
+    /// whether the pointer is over the navigation bar; it is read only while no glide runs.
+    pub(crate) fn step(&mut self, on_bar: bool, now: u32, dt: f32) -> Option<f32> {
         let Some((_, y)) = self.at else {
             self.glide = None;
             return None;
@@ -152,7 +149,7 @@ impl EdgeScroll {
         };
         let since = match self.glide {
             Some((d, since)) if d == dir => since,
-            _ if on_control => {
+            _ if on_bar => {
                 self.glide = None;
                 return None;
             }
@@ -1874,9 +1871,9 @@ mod edge_scroll_tests {
         assert_eq!(speed(SCR_H / 2.0), None);
     }
 
-    /// Over a control the pointer's hover rules; a hidden pointer glides nothing.
+    /// Over the navigation bar the bar's hover rules; a hidden pointer glides nothing.
     #[test]
-    fn a_control_under_a_resting_pointer_or_a_hidden_pointer_glides_nothing() {
+    fn the_navigation_bar_under_a_resting_pointer_or_a_hidden_pointer_glides_nothing() {
         let mut e = EdgeScroll::IDLE;
         e.moved(960.0, 40.0);
         assert!(run(&mut e, true, 0, 2000).is_empty());

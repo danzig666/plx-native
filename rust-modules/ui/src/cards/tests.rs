@@ -2441,7 +2441,7 @@ mod stack {
 
     /// The pointer's edge glide (a fractional wheel every frame) moves a stack page itself: the
     /// page follows the wheel and stays where it put it instead of the tick pulling it back to the
-    /// focused row, until focus moves again.
+    /// focused row; a hover moves focus and not the page, and a key's move brings it back.
     #[test]
     fn a_wheel_glides_the_page_and_it_stays_until_focus_moves() {
         let wheel = |dy: f32| ScreenEvent::Input(plx_machine::machine::InputEvent {
@@ -2466,9 +2466,12 @@ mod stack {
         r.run(120);
         let glided = r.stack.scroll();
         assert!((glided - (deep - 1.2 * crate::consts::ROW_PITCH)).abs() < 1.0, "1.2 rows up: {deep} -> {glided}");
-        r.go(1043, By::Dir);
+        r.go(1043, By::Pointer);
         r.run(120);
-        assert!((r.stack.scroll() - deep).abs() < 1.0, "a focus move reveals the focused row again: {}", r.stack.scroll());
+        assert!((r.stack.scroll() - glided).abs() < 0.5, "a hover moves focus, not the page: {}", r.stack.scroll());
+        r.go(1042, By::Dir);
+        r.run(120);
+        assert!((r.stack.scroll() - deep).abs() < 1.0, "a key's move reveals the focused row again: {}", r.stack.scroll());
     }
 
     #[test]

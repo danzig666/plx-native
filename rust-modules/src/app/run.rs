@@ -2066,8 +2066,13 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
             && !app.ptr.button_down
             && super::bridge::page_glides(&app.pages)
         {
-            let on_control = app.ptr.edge.at().is_some_and(|(x, y)| app.pages.input.hit.top_at(x, y).is_some());
-            if let Some(dy) = app.ptr.edge.step(on_control, fr.now, fr.dt) {
+            // over the page's own cards the edge glides all the same; over the navigation bar (a
+            // stop that is not the page's) it is the bar's pointer
+            let page = app.pages.input_entry();
+            let on_bar = app.ptr.edge.at().is_some_and(|(x, y)| {
+                app.pages.input.hit.top_at(x, y).is_some_and(|stop| Some(stop.key.entry) != page)
+            });
+            if let Some(dy) = app.ptr.edge.step(on_bar, fr.now, fr.dt) {
                 // a fractional wheel: the pages that scroll freely glide by it
                 app.inputs.push(plx_machine::machine::InputEvent {
                     at: plx_machine::machine::Tick { ms: fr.now, dt_us: 0 },

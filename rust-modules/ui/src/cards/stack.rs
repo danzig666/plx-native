@@ -743,8 +743,19 @@ impl<K: Copy + Eq> Stack<K> {
                     reported = Some(StackEvent::Card(k, CardEvent::Want(r)));
                 }
             }
+            // A hover moves focus, never the page: the pointer scrolls by the screen's edges (and
+            // a click by what it clicked, below). Every other move brings the page to the focus.
+            ScreenEvent::FocusMoved { by: plx_machine::machine::By::Pointer, .. } => self.wheeled = true,
             ScreenEvent::FocusMoved { to, .. } if self.on_move => self.reveal_on(p, cx, *to),
             ScreenEvent::FocusMoved { .. } => self.wheeled = false,
+            ScreenEvent::Input(input) if matches!(input.kind, plx_machine::machine::InputKind::Click { hit: Some(_), .. }) => {
+                if let plx_machine::machine::InputKind::Click { hit: Some(elem), .. } = input.kind {
+                    self.wheeled = false;
+                    if self.on_move {
+                        self.reveal_on(p, cx, FocusKey { entry: self.entry, elem });
+                    }
+                }
+            }
             // A wheel moves the page itself, focus staying where it is: `dy` rows of `ROW_PITCH`
             // (fractional for the pointer's edge glide). A `reveal_on_move` page answers its own
             // wheel (Search scrolls by its table rows), so it is left alone here.

@@ -5331,11 +5331,11 @@ fn a_wheel_glides_the_detail_page_within_its_range() {
     clear();
 }
 
-/// **A pointed element scrolls the detail page only as much as shows it**; a key still brings its
-/// section into reading position. Before, a Magic Remote hover yanked the section it touched up
-/// to the title band, so every hover moved the page and a hover after an edge glide undid it.
+/// **A hover moves focus, never the detail page; a click brings the page to what it clicked**; a
+/// key still brings its section into reading position. Before, a Magic Remote hover yanked the
+/// section it touched up to the title band, so every hover moved the page and undid a glide.
 #[test]
-fn a_pointed_element_scrolls_the_detail_page_only_as_much_as_shows_it() {
+fn a_hover_moves_no_detail_page_and_a_click_brings_it_to_its_element() {
     let sid = ServerId::UNSET;
     let mut page = detail(sid, "show");
     page.related = (1..=12).map(|i| collection_member(sid, &format!("r{i}"))).collect();
@@ -5343,24 +5343,23 @@ fn a_pointed_element_scrolls_the_detail_page_only_as_much_as_shows_it() {
     let _guard = install(page);
     let mut screen = bare(&_guard, sid, "show");
     let related = screen.engine_key(related::elem(0).unwrap()).unwrap();
-    let related_next = screen.engine_key(related::elem(1).unwrap()).unwrap();
     let moved = |screen: &mut DetailScreen, from: u32, to: u32, by: By| {
         let ev = ScreenEvent::FocusMoved { from: Some(FocusKey { entry: screen.entry, elem: from }),
             to: FocusKey { entry: screen.entry, elem: to }, by };
         step(screen, &ev, Some(to));
     };
-    // a key brings Related into reading position
     moved(&mut screen, hero::ELEM_PLAY, related, By::Dir);
     let seated = screen.scroll_target;
-    assert!(seated > 0.0);
-    // the pointer on the next card of that shelf, wholly on screen, moves nothing
-    moved(&mut screen, related, related_next, By::Pointer);
-    assert_eq!(screen.scroll_target, seated);
-    // scrolled up by a glide so the shelf stands low on the screen but whole, a hover keeps the glide
-    let glided = (seated - 150.0).max(0.0);
-    screen.scroll_target = glided;
-    screen.scroll.jump(glided);
-    moved(&mut screen, related_next, related, By::Pointer);
-    assert_eq!(screen.scroll_target, glided, "a hover after a glide does not pull the page back");
+    assert!(seated > 0.0, "a key brings Related into reading position");
+    moved(&mut screen, related, hero::ELEM_PLAY, By::Pointer);
+    assert_eq!(screen.scroll_target, seated, "a hover moves focus, not the page");
+    screen.scroll_target = 0.0;
+    screen.scroll.jump(0.0);
+    moved(&mut screen, hero::ELEM_PLAY, related, By::Pointer);
+    assert_eq!(screen.scroll_target, 0.0, "nor after a glide");
+    let click = ScreenEvent::Input(InputEvent { at: Default::default(), source: plx_machine::machine::Source::Script,
+        kind: InputKind::Click { x: 0.0, y: 0.0, hit: Some(related) } });
+    step(&mut screen, &click, Some(related));
+    assert_eq!(screen.scroll_target, seated, "a click brings the page to what it clicked");
     clear();
 }

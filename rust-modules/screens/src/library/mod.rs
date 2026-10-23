@@ -726,11 +726,13 @@ impl LibraryScreen {
             }
         }
         self.relayout(Some(key));
-        let want = if let Some(index) = self.pair.detail.index_of(key.elem) {
+        // A hover moves focus, never the page: the pointer scrolls by the screen's edges (and a
+        // click by what it clicked, `Input`'s `Click` arm).
+        let want = if by == By::Pointer {
+            None
+        } else if let Some(index) = self.pair.detail.index_of(key.elem) {
             // held in the coordinates `scroll` is in until the grid's tick rebases both by a landing
-            let row = index / self.layout.cols();
-            let rest = self.target_layout.row_reveal(row) - self.pair.detail.pending_shift(cx);
-            Some(if by == By::Pointer { self.pointer_reveal(row, rest) } else { rest })
+            Some(self.target_layout.row_reveal(index / self.layout.cols()) - self.pair.detail.pending_shift(cx))
         } else if let Some(top) = self.header_focus().and_then(|focus| focus.reveal(key.elem)) {
             Some(top)
         } else if key.elem == RETRY {
@@ -752,24 +754,6 @@ impl LibraryScreen {
         }
         self.relayout(Some(key));
         self.pair.master.refresh(cx, &mut self.keys);
-    }
-
-    /// **The scroll a POINTED card's row asks for: only as much as shows it** (the way Glasshouse's
-    /// home rows and LG's own lists answer a pointer). A key seats the focused row where the first
-    /// row rests (`rest`, `Layout::row_reveal`); a pointer that did that yanked the row it touched
-    /// to the top of the screen, so every hover moved the page a screenful, and a hover after an
-    /// edge glide threw away the glide. Here a row already wholly on screen keeps the scroll, a row
-    /// running off the bottom scrolls up just enough to show it (never past `rest`), and a row
-    /// standing above its resting line (under the header) settles to `rest`.
-    fn pointer_reveal(&self, row: usize, rest: f32) -> f32 {
-        let at = self.scroll_target;
-        let top = self.target_layout.row_y(row, at);
-        if top < self.target_layout.row_y(row, rest) - 0.5 {
-            return rest;
-        }
-        let bottom = self.target_layout.row_y(row + 1, at) - plx_ui::consts::UNDER_LABEL_AIR;
-        let over = bottom - SCR_H;
-        if over > 0.0 { (at + over).min(rest).max(0.0) } else { at }
     }
 
     fn follow<H: LibraryLike>(&mut self, elem: u32, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
@@ -1455,6 +1439,14 @@ impl LibraryScreen {
                     && cx.focus.current.is_some_and(|key| key.entry == self.entry && region_of_elem(key.elem) == Some(KeyRegion::Rail)) {
                     self.reseat(FocusTarget::ContainerGroup(self.pair.groups_config().detail), fx);
                     return Handled::Yes;
+                }
+                // A click brings the page to the card it clicked, the way a key's move does.
+                if let InputKind::Click { hit: Some(hit), .. } = input.kind {
+                    if let Some(index) = self.pair.detail.index_of(hit) {
+                        self.scroll_target = self.target_layout.row_reveal(index / self.layout.cols())
+                            - self.pair.detail.pending_shift(cx);
+                        fx.invalidate(Provenance::Input);
+                    }
                 }
                 if let InputKind::Wheel { dy } = input.kind {
                     self.scroll_target = (self.scroll_target - dy * self.layout.grid_pitch())
