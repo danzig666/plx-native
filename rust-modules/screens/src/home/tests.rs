@@ -5848,3 +5848,47 @@ fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
     tick(&mut s, deep);
     assert_eq!((s.grid.scroll_target, s.snap_target), (rest_scroll(rows - 1, rows, band_open_of(false)), 1.0));
 }
+
+/// **The shelf peeking under the hero is clickable, and its click brings it into view.** The
+/// reported gripe: on the top of Home the first shelf's posters show at the bottom of the screen,
+/// but nothing could be clicked there until the page was scrolled (the shelves registered no stops
+/// while the hero was up). Now its cards are stops (hovering them takes no focus from the hero), a
+/// click on one scrolls the page down to it, and that click does not open it; once in view, a click
+/// opens it as usual.
+#[test]
+fn a_card_peeking_under_the_hero_is_clickable_and_its_click_brings_it_into_view() {
+    let _guard = plx_base::testlock::serial();
+    let mut state = plx_data::pms::PmsState::default();
+    let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
+    plx_data::pms::seed_for_test(&mut state, &adapter, 2, plx_data::pms::HubState::Ready);
+    let snapshot = plx_data::pms::hubs_snapshot(&state);
+    let view = snapshot.view();
+    let mut s = screen(view);
+    s.layout_grid();
+    assert!(s.snap.pos < 0.5, "premise: the hero is up");
+    let hero = FocusKey { entry: s.entry, elem: HERO_PLAY_ELEM };
+    let card = first_card(&s);
+    let context = cx(view, Some(hero));
+    let mut frame = DrawFrame::new(&context, Painter::root());
+    s.record_stops(&mut frame, view);
+    let stops = frame.into_stops();
+    let stop = *stops.iter().find(|stop| stop.key == card).expect("the peeking card is a stop");
+    assert!(stop.rect.y < SCR_H && stop.rect.y + stop.rect.h > SCR_H, "premise: the card peeks, cut by the bottom: {:?}", stop.rect);
+    assert_eq!(stop.hover, Hover::OnlyIfFocused, "a hover there takes no focus from the hero");
+    let mut map = HitMap::new();
+    map.fill(stops);
+    map.swap();
+    let (x, y) = (stop.rect.cx(), (stop.rect.y + SCR_H) / 2.0);
+    let hit = map.resolve(Some(card.entry), PointerKind::Click, x, y, Some(hero));
+    assert_eq!((hit.focus, hit.activate), (Some(card), Some((card, Activate::Press))), "its visible part takes the click");
+    // the click as the dispatcher delivers it: focus by the pointer, then the click itself
+    step(&mut s, view, Some(card), &ScreenEvent::FocusMoved { from: Some(hero), to: card, by: By::Pointer });
+    step(&mut s, view, Some(card), &ScreenEvent::Input(InputEvent { at: Tick::default(),
+        source: plx_machine::machine::Source::Script, kind: InputKind::Click { x, y, hit: Some(card.elem) } }));
+    assert_eq!(s.snap_target, 1.0, "the click brings the page down to the shelf");
+    let commit = |s: &mut HomeScreen, id| step(s, view, Some(card), &ScreenEvent::PressCommit(plx_machine::machine::PressId(id))).1;
+    assert!(!has_home(&commit(&mut s, 1), |r| matches!(r, HomeReq::Detail { .. })), "that click does not open the card");
+    for i in 1..=90 { step(&mut s, view, Some(card), &ScreenEvent::Tick(Tick { ms: i * 16, dt_us: 16_667 })); }
+    assert!(s.snap.pos > 0.99, "the page has come down to the shelf: {}", s.snap.pos);
+    assert!(has_home(&commit(&mut s, 2), |r| matches!(r, HomeReq::Detail { .. })), "a click once it is in view opens it");
+}
