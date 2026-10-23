@@ -138,6 +138,7 @@ pub(super) fn bare_held(sid: ServerId, rk: &str) -> DetailScreen {
         withdrawn: false,
         scroll: Spring::at(0.0),
         scroll_target: 0.0,
+        free: false,
         episode_scroll: Spring::at(0.0),
         tab_scroll: Spring::at(0.0),
         episode_cells: episodes::Cells::new(),
@@ -5361,5 +5362,40 @@ fn a_hover_moves_no_detail_page_and_a_click_brings_it_to_its_element() {
         kind: InputKind::Click { x: 0.0, y: 0.0, hit: Some(related) } });
     step(&mut screen, &click, Some(related));
     assert_eq!(screen.scroll_target, seated, "a click brings the page to what it clicked");
+    clear();
+}
+
+/// **A landing does not pull a glided detail page back.** The reported bug: a series page jumped
+/// around while the pointer's edge glide scrolled it, because every landing (a season's episodes,
+/// the next page of a shelf as the glide reached it, the cast, the ratings) brought the page back
+/// to the focused section. Now a page the pointer moved stays where it is; a key's move still
+/// brings it to the focus, and a landing after that follows the focus again.
+#[test]
+fn a_landing_does_not_pull_a_glided_detail_page_back() {
+    let sid = ServerId::UNSET;
+    let mut page = detail(sid, "show");
+    page.related = (1..=12).map(|i| collection_member(sid, &format!("r{i}"))).collect();
+    page.extras = (1..=12).map(|i| plx_data::metadata::Extra { rk: format!("x{i}"), ..Default::default() }).collect();
+    let _guard = install(page);
+    let mut screen = bare(&_guard, sid, "show");
+    let wheel = |dy: f32| ScreenEvent::Input(InputEvent { at: Default::default(),
+        source: plx_machine::machine::Source::Script, kind: InputKind::Wheel { dy } });
+    let landing = ScreenEvent::StoreChanged(StoreId::Metadata.ord(), 1);
+    let play = hero::ELEM_PLAY;
+    // focus on the hero, glided well down the page
+    for _ in 0..40 { step(&mut screen, &wheel(-0.05), Some(play)); }
+    let glided = screen.scroll_target;
+    assert!(glided > 300.0, "premise: the glide moved the page: {glided}");
+    step(&mut screen, &landing, Some(play));
+    assert_eq!(screen.scroll_target, glided, "a landing leaves the glided page where it is");
+    // a key's move brings the page to the focus, and a landing then follows the focus again
+    let related = screen.engine_key(related::elem(0).unwrap()).unwrap();
+    let entry = screen.entry;
+    step(&mut screen, &ScreenEvent::FocusMoved { from: Some(FocusKey { entry, elem: play }),
+        to: FocusKey { entry, elem: related }, by: By::Dir }, Some(related));
+    let seated = screen.scroll_target;
+    screen.scroll_target = seated + 50.0;
+    step(&mut screen, &landing, Some(related));
+    assert_eq!(screen.scroll_target, seated, "with no glide, a landing keeps the focused section in reading position");
     clear();
 }
