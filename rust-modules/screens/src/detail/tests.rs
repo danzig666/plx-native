@@ -5292,3 +5292,41 @@ fn the_hold_hint_over_an_episode_still_waits_while_the_season_loads() {
     assert!(hinted(&screen), "the hint is back once the season has landed");
     clear();
 }
+
+/// The pointer's edge glide (a fractional wheel every frame) scrolls the detail page itself: a
+/// page resting on a lower section glides up continuously, never past the top, and down no further
+/// than the last section's reveal.
+#[test]
+fn a_wheel_glides_the_detail_page_within_its_range() {
+    let sid = ServerId::UNSET;
+    let mut page = detail(sid, "show");
+    page.related = (1..=12).map(|i| collection_member(sid, &format!("r{i}"))).collect();
+    let _guard = install(page);
+    let mut screen = bare(&_guard, sid, "show");
+    let wheel = |dy: f32| ScreenEvent::Input(InputEvent {
+        at: Default::default(),
+        source: plx_machine::machine::Source::Script,
+        kind: InputKind::Wheel { dy },
+    });
+    let max = {
+        let measure = plx_ui::fixture::FixtureMeasure;
+        let d = screen.detail(test_store().view()).unwrap();
+        let (sections, n) = screen.sections(Some(d));
+        screen.reveal_target(sections[n - 1], d, &measure)
+    };
+    assert!(max > 300.0, "the fixture scrolls: {max}");
+    screen.scroll.jump(max);
+    screen.scroll_target = max;
+    let mut last = max;
+    for _ in 0..10 {
+        assert_eq!(step(&mut screen, &wheel(0.05), None).0, Handled::Yes);
+        assert!(screen.scroll_target < last, "every frame of the glide moves the page up");
+        last = screen.scroll_target;
+    }
+    assert!((max - last - 0.5 * plx_ui::consts::ROW_PITCH).abs() < 0.5, "half a row: {max} -> {last}");
+    for _ in 0..200 { step(&mut screen, &wheel(0.1), None); }
+    assert_eq!(screen.scroll_target, 0.0, "never past the top");
+    for _ in 0..400 { step(&mut screen, &wheel(-0.1), None); }
+    assert_eq!(screen.scroll_target, max, "down no further than the last section's reveal");
+    clear();
+}

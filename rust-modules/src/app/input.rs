@@ -70,40 +70,66 @@ impl Pointer {
 
 /// How far from the top or bottom of the screen the pointer scrolls the page ([`EdgeScroll`]).
 pub(crate) const EDGE_BAND: f32 = 120.0;
-/// How long the pointer rests in an edge band before the first step.
-pub(crate) const EDGE_DWELL_MS: u32 = 300;
-/// The pace of the steps while it stays there.
-pub(crate) const EDGE_REPEAT_MS: u32 = 450;
+/// How long the pointer rests in an edge band before the page starts to move.
+pub(crate) const EDGE_DWELL_MS: u32 = 150;
+/// How long the glide takes to come up to its speed once it starts.
+pub(crate) const EDGE_RAMP_MS: u32 = 350;
+/// The glide's speed with the pointer at the very edge, in the page's own rows a second (the unit
+/// of `InputKind::Wheel`'s `dy`: the Library scales it by its grid pitch).
+pub(crate) const EDGE_ROWS_PER_S: f32 = 2.6;
+/// The share of that speed at the band's inner border: deeper into the band is faster.
+const EDGE_MIN_SHARE: f32 = 0.35;
 
-/// **The pointer at the top or bottom edge scrolls the page**, the way the Magic Remote scrolls
-/// LG's own lists.
+/// **The pointer at the top or bottom edge glides the page**, the way the Magic Remote scrolls
+/// LG's own lists (and Glasshouse's home rows): continuously, not a row at a time.
 ///
 /// Hover alone moves a page only where it parks focus on a card, and a page rests its focused
 /// row or section at the TOP of the screen: below it the next row stands nearly whole, so the
 /// pointer near the bottom scrolls on, but above it at most a sliver of the previous row is left
 /// (the Library clips its grid's stops at the content top, so with the chrome tucked the band
 /// over the hidden row is ~56 px; Detail leaves 0..80 px of the section above, often nothing but
-/// the focused section's heading and air). So a pointer resting in an edge band over NO control
-/// steps focus the way the wheel does (`bridge::wheel_input`: one Up or Down), first after
-/// [`EDGE_DWELL_MS`] and then every [`EDGE_REPEAT_MS`]. Over a control the pointer's hover rules,
-/// unchanged.
+/// the focused section's heading and air). So a pointer that comes to rest in an edge band over
+/// NO control glides the page: after [`EDGE_DWELL_MS`] every frame hands the page a fractional
+/// `InputKind::Wheel` (+ up, - down, the wheel's sign), easing in over [`EDGE_RAMP_MS`] to a
+/// speed that grows toward the edge. Stepping FOCUS a row at a time could not do this: the
+/// critically damped scroll spring settles between steps, so the page pulsed (measured in a
+/// simulation of `gfx::spring` at `K_SCROLL`: still a 2:1 speed swing at a step every 160 ms).
+///
+/// While a glide runs, the pointer's moves inside the band are not hover ([`moved`](Self::moved)
+/// says so): cards sliding under it would park focus and their reveal would pull the page back.
+/// Leaving the band ends the glide and hands the pointer back to hover. A pointer that enters a
+/// band over a control (the shown tab bar) does not glide; hover rules there, unchanged.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EdgeScroll {
     /// The pointer's last position, `None` once it is hidden (LG's auto-hide or a D-pad press).
     at: Option<(f32, f32)>,
-    /// The band the pointer rests in (+1 top, -1 bottom: the wheel's sign) and when it steps next.
-    dwell: Option<(i32, u32)>,
+    /// The glide under way: its direction (+1 up, -1 down) and when the pointer came to the band.
+    glide: Option<(i32, u32)>,
 }
 
 impl EdgeScroll {
-    pub(crate) const IDLE: EdgeScroll = EdgeScroll { at: None, dwell: None };
+    pub(crate) const IDLE: EdgeScroll = EdgeScroll { at: None, glide: None };
 
-    /// The pointer moved to `(x, y)`.
-    pub(crate) fn moved(&mut self, x: f32, y: f32) {
-        self.at = Some((x, y));
+    fn band(y: f32) -> Option<i32> {
+        if y < EDGE_BAND {
+            Some(1)
+        } else if y >= plx_ui::consts::SCR_H - EDGE_BAND {
+            Some(-1)
+        } else {
+            None
+        }
     }
 
-    /// The pointer is gone (hidden, or the D-pad took over): no step until it moves again.
+    /// The pointer moved to `(x, y)`. `true` while a glide holds it, so the move is not hover.
+    pub(crate) fn moved(&mut self, x: f32, y: f32) -> bool {
+        self.at = Some((x, y));
+        if self.glide.is_some_and(|(dir, _)| Self::band(y) != Some(dir)) {
+            self.glide = None;
+        }
+        self.glide.is_some()
+    }
+
+    /// The pointer is gone (hidden, or the D-pad took over): no glide until it moves again.
     pub(crate) fn stop(&mut self) {
         *self = Self::IDLE;
     }
@@ -113,30 +139,39 @@ impl EdgeScroll {
         self.at
     }
 
-    /// One frame at `now`: the wheel step (+1 Up, -1 Down) to take now, if any. `on_control` is
-    /// whether the pointer is over a stop of the hit map.
-    pub(crate) fn step(&mut self, on_control: bool, now: u32) -> Option<i32> {
-        let band = self.at.and_then(|(_, y)| {
-            if y < EDGE_BAND { Some(1) } else if y >= plx_ui::consts::SCR_H - EDGE_BAND { Some(-1) } else { None }
-        });
-        let Some(dir) = band.filter(|_| !on_control) else {
-            self.dwell = None;
+    /// One frame at `now`, `dt` seconds long: the wheel `dy` to hand the page, if any. `on_control`
+    /// is whether the pointer is over a stop of the hit map; it is read only while no glide runs.
+    pub(crate) fn step(&mut self, on_control: bool, now: u32, dt: f32) -> Option<f32> {
+        let Some((_, y)) = self.at else {
+            self.glide = None;
             return None;
         };
-        match self.dwell {
-            Some((d, next)) if d == dir => {
-                if now.wrapping_sub(next) as i32 >= 0 {
-                    self.dwell = Some((dir, now.wrapping_add(EDGE_REPEAT_MS)));
-                    Some(dir)
-                } else {
-                    None
-                }
+        let Some(dir) = Self::band(y) else {
+            self.glide = None;
+            return None;
+        };
+        let since = match self.glide {
+            Some((d, since)) if d == dir => since,
+            _ if on_control => {
+                self.glide = None;
+                return None;
             }
             _ => {
-                self.dwell = Some((dir, now.wrapping_add(EDGE_DWELL_MS)));
-                None
+                self.glide = Some((dir, now));
+                now
             }
+        };
+        let t = now.wrapping_sub(since);
+        if t < EDGE_DWELL_MS {
+            return None;
         }
+        let ramp = ((t - EDGE_DWELL_MS) as f32 / EDGE_RAMP_MS as f32).min(1.0);
+        let ramp = ramp * ramp * (3.0 - 2.0 * ramp);
+        let from_edge = if dir > 0 { y } else { plx_ui::consts::SCR_H - y };
+        let depth = (1.0 - from_edge / EDGE_BAND).clamp(0.0, 1.0);
+        let share = EDGE_MIN_SHARE + (1.0 - EDGE_MIN_SHARE) * depth;
+        let dy = dir as f32 * EDGE_ROWS_PER_S * share * ramp * dt.clamp(0.0, 0.1);
+        (dy != 0.0).then_some(dy)
     }
 }
 
@@ -1800,58 +1835,70 @@ mod click_is_ok_tests {
 
 #[cfg(test)]
 mod edge_scroll_tests {
-    use super::{EdgeScroll, EDGE_BAND, EDGE_DWELL_MS, EDGE_REPEAT_MS};
+    use super::{EdgeScroll, EDGE_BAND, EDGE_DWELL_MS, EDGE_RAMP_MS};
     use plx_ui::consts::SCR_H;
 
-    /// The steps one `EdgeScroll` takes over `ms` frames of 16 ms from `t0`.
-    fn run(e: &mut EdgeScroll, on_control: bool, t0: u32, ms: u32) -> Vec<(u32, i32)> {
-        (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16).map(|d| (t0 + i * 16, d))).collect()
+    const DT: f32 = 1.0 / 60.0;
+
+    /// The `dy` an `EdgeScroll` hands out on every 16 ms frame of `ms` from `t0`.
+    fn run(e: &mut EdgeScroll, on_control: bool, t0: u32, ms: u32) -> Vec<(u32, f32)> {
+        (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16, DT).map(|d| (t0 + i * 16, d))).collect()
     }
 
-    /// The reported bug: the pointer near the TOP of a scrolled page moved nothing, because the
-    /// row above the focused one leaves no hoverable card there. Resting in the top band over no
-    /// control steps Up (the wheel's +1) after the dwell, then at the repeat pace.
+    /// The reported bug: the pointer near the TOP of a scrolled page moved nothing. Resting in the
+    /// top band over no control glides the page up after the dwell, on EVERY frame (continuous,
+    /// not a row at a time), easing in and then holding a steady speed.
     #[test]
-    fn the_pointer_resting_at_the_top_edge_over_nothing_scrolls_up() {
+    fn the_pointer_resting_at_the_top_edge_glides_up_every_frame() {
         let mut e = EdgeScroll::IDLE;
         e.moved(960.0, 40.0);
-        let steps = run(&mut e, false, 1000, 1000);
-        assert_eq!(steps.first().map(|s| s.1), Some(1), "{steps:?}");
-        assert!(steps[0].0 >= 1000 + EDGE_DWELL_MS, "no step before the dwell: {steps:?}");
-        assert!(steps.len() >= 2 && steps[1].0 - steps[0].0 >= EDGE_REPEAT_MS, "{steps:?}");
+        let out = run(&mut e, false, 1000, 2000);
+        assert!(out[0].0 >= 1000 + EDGE_DWELL_MS && out[0].0 < 1000 + EDGE_DWELL_MS + 32, "{out:?}");
+        assert!(out.iter().all(|&(_, d)| d > 0.0), "up is the wheel's +");
+        assert!(out.windows(2).all(|w| w[1].0 - w[0].0 == 16), "no frame without motion: {out:?}");
+        let steady: Vec<f32> = out.iter().filter(|(t, _)| *t > 1000 + EDGE_DWELL_MS + EDGE_RAMP_MS).map(|p| p.1).collect();
+        assert!(steady.len() > 50 && steady.iter().all(|&d| (d - steady[0]).abs() < 1e-6), "a steady glide: {steady:?}");
+        assert!(out[0].1 < steady[0], "it eases in");
     }
 
     #[test]
-    fn the_bottom_edge_scrolls_down_and_the_middle_scrolls_nothing() {
-        let mut e = EdgeScroll::IDLE;
-        e.moved(960.0, SCR_H - 10.0);
-        assert_eq!(run(&mut e, false, 0, 1000).first().map(|s| s.1), Some(-1));
-        let mut e = EdgeScroll::IDLE;
-        e.moved(960.0, EDGE_BAND + 1.0);
-        assert!(run(&mut e, false, 0, 2000).is_empty());
+    fn the_bottom_edge_glides_down_faster_nearer_the_edge_and_the_middle_not_at_all() {
+        let speed = |y: f32| {
+            let mut e = EdgeScroll::IDLE;
+            e.moved(960.0, y);
+            run(&mut e, false, 0, 1500).last().map(|p| p.1)
+        };
+        let (deep, shallow) = (speed(SCR_H - 5.0).unwrap(), speed(SCR_H - EDGE_BAND + 5.0).unwrap());
+        assert!(deep < 0.0 && shallow < 0.0 && deep < shallow, "{deep} {shallow}");
+        assert_eq!(speed(EDGE_BAND + 1.0), None);
+        assert_eq!(speed(SCR_H / 2.0), None);
     }
 
-    /// Over a control the pointer's hover is what moves focus: the edge stays out of it.
+    /// Over a control the pointer's hover rules; a hidden pointer glides nothing.
     #[test]
-    fn a_control_under_the_pointer_or_a_hidden_pointer_takes_no_step() {
+    fn a_control_under_a_resting_pointer_or_a_hidden_pointer_glides_nothing() {
         let mut e = EdgeScroll::IDLE;
         e.moved(960.0, 40.0);
         assert!(run(&mut e, true, 0, 2000).is_empty());
+        assert!(!e.moved(960.0, 41.0), "no glide, so the move is hover");
         e.stop();
         assert!(run(&mut e, false, 0, 2000).is_empty(), "a pointer LG hid, or the D-pad took over, is gone");
         let mut fresh = EdgeScroll::IDLE;
         assert!(run(&mut fresh, false, 0, 2000).is_empty(), "no pointer yet");
     }
 
-    /// Leaving the band and coming back starts the dwell again, so a pass through it is not a step.
+    /// A glide that has started holds the pointer: cards sliding under it neither stop it nor take
+    /// hover; leaving the band ends it and the next move is hover again.
     #[test]
-    fn crossing_the_band_restarts_the_dwell() {
+    fn a_running_glide_holds_the_band_until_the_pointer_leaves_it() {
         let mut e = EdgeScroll::IDLE;
         e.moved(960.0, 40.0);
-        assert!(run(&mut e, false, 0, EDGE_DWELL_MS - 20).is_empty());
-        e.moved(960.0, 500.0);
-        assert!(e.step(false, EDGE_DWELL_MS).is_none());
-        e.moved(960.0, 40.0);
-        assert!(run(&mut e, false, EDGE_DWELL_MS + 16, EDGE_DWELL_MS - 40).is_empty());
+        assert!(!run(&mut e, false, 0, 600).is_empty());
+        assert!(e.step(true, 616, DT).is_some(), "a card sliding under the pointer does not stop it");
+        assert!(e.moved(900.0, 60.0), "a move inside the band while gliding is not hover");
+        assert!(!e.moved(900.0, 400.0), "leaving the band ends the glide");
+        assert!(e.step(false, 632, DT).is_none());
+        e.moved(900.0, 60.0);
+        assert!(run(&mut e, false, 648, EDGE_DWELL_MS - 20).is_empty(), "coming back starts the dwell again");
     }
 }

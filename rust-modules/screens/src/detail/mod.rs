@@ -2181,6 +2181,24 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                     self.restore_intent = None;
                     self.return_pending = false;
                 }
+                // A wheel (and the pointer's edge glide, a fractional one) moves the page itself,
+                // focus staying where it is, as the Library's does: `dy` rows of `ROW_PITCH`, up
+                // to the scroll the last section's reveal takes.
+                if let InputKind::Wheel { dy } = input.kind {
+                    if !dy.is_finite() || self.full_trailer() {
+                        return Handled::Yes;
+                    }
+                    self.restore_intent = None;
+                    self.return_pending = false;
+                    let max = self.detail(meta).map_or(0.0, |d| {
+                        let (sections, n) = self.sections(Some(d));
+                        if n == 0 { 0.0 } else { self.reveal_target(sections[n - 1], d, cx.measure) }
+                    });
+                    let to = self.scroll_target - dy * plx_ui::consts::ROW_PITCH;
+                    self.scroll_target = if dy > 0.0 { to.max(0.0) } else { to.min(max.max(self.scroll_target)) };
+                    fx.invalidate(Provenance::Input);
+                    return Handled::Yes;
+                }
                 if matches!(
                     input.kind,
                     InputKind::Key {

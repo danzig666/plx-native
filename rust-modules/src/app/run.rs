@@ -1335,7 +1335,10 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         // drove HOME's focus underneath instead. The press-cancel each of them paid for
         // by hand — a pointer sliding off the control it armed must abandon that press —
         // is `dispatch`'s ingest, which cancels an arm whose hit no longer resolves to it.
-        app.ptr.edge.moved(mx, my);
+        // a running edge glide holds the pointer: its moves in the band are not hover
+        if app.ptr.edge.moved(mx, my) {
+            return;
+        }
         if super::bridge::owns_input(&app.pages) {
             // `app.last_input`, stamped from the clock at the top of this arm: `fr.now`
             // is not written until after ingest (`tree_tick` above says why).
@@ -2057,17 +2060,21 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
                 player.publish();
             }
         }
-        // the pointer resting at the top or bottom edge scrolls the page (`input::EdgeScroll`)
+        // the pointer resting at the top or bottom edge glides the page (`input::EdgeScroll`)
         if !matches!(app.route(), AppArg::Player)
             && !app.ptr.dpad_mode
             && !app.ptr.button_down
             && !app.pages.surface_up()
-            && !super::bridge::search_owns_input(&app.pages)
             && super::bridge::owns_input(&app.pages)
         {
             let on_control = app.ptr.edge.at().is_some_and(|(x, y)| app.pages.input.hit.top_at(x, y).is_some());
-            if let Some(dy) = app.ptr.edge.step(on_control, fr.now) {
-                app.inputs.extend(super::bridge::wheel_input(dy, plx_machine::machine::Tick { ms: fr.now, dt_us: 0 }));
+            if let Some(dy) = app.ptr.edge.step(on_control, fr.now, fr.dt) {
+                // a fractional wheel: the pages that scroll freely glide by it
+                app.inputs.push(plx_machine::machine::InputEvent {
+                    at: plx_machine::machine::Tick { ms: fr.now, dt_us: 0 },
+                    source: plx_machine::machine::Source::Sdl,
+                    kind: plx_machine::machine::InputKind::Wheel { dy },
+                });
             }
         } else {
             app.ptr.edge.stop();
