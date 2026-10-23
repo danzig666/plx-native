@@ -2064,8 +2064,7 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         if !matches!(app.route(), AppArg::Player)
             && !app.ptr.dpad_mode
             && !app.ptr.button_down
-            && !app.pages.surface_up()
-            && super::bridge::owns_input(&app.pages)
+            && super::bridge::page_glides(&app.pages)
         {
             let on_control = app.ptr.edge.at().is_some_and(|(x, y)| app.pages.input.hit.top_at(x, y).is_some());
             if let Some(dy) = app.ptr.edge.step(on_control, fr.now, fr.dt) {

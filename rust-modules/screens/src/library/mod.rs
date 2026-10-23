@@ -728,7 +728,9 @@ impl LibraryScreen {
         self.relayout(Some(key));
         let want = if let Some(index) = self.pair.detail.index_of(key.elem) {
             // held in the coordinates `scroll` is in until the grid's tick rebases both by a landing
-            Some(self.target_layout.row_reveal(index / self.layout.cols()) - self.pair.detail.pending_shift(cx))
+            let row = index / self.layout.cols();
+            let rest = self.target_layout.row_reveal(row) - self.pair.detail.pending_shift(cx);
+            Some(if by == By::Pointer { self.pointer_reveal(row, rest) } else { rest })
         } else if let Some(top) = self.header_focus().and_then(|focus| focus.reveal(key.elem)) {
             Some(top)
         } else if key.elem == RETRY {
@@ -750,6 +752,24 @@ impl LibraryScreen {
         }
         self.relayout(Some(key));
         self.pair.master.refresh(cx, &mut self.keys);
+    }
+
+    /// **The scroll a POINTED card's row asks for: only as much as shows it** (the way Glasshouse's
+    /// home rows and LG's own lists answer a pointer). A key seats the focused row where the first
+    /// row rests (`rest`, `Layout::row_reveal`); a pointer that did that yanked the row it touched
+    /// to the top of the screen, so every hover moved the page a screenful, and a hover after an
+    /// edge glide threw away the glide. Here a row already wholly on screen keeps the scroll, a row
+    /// running off the bottom scrolls up just enough to show it (never past `rest`), and a row
+    /// standing above its resting line (under the header) settles to `rest`.
+    fn pointer_reveal(&self, row: usize, rest: f32) -> f32 {
+        let at = self.scroll_target;
+        let top = self.target_layout.row_y(row, at);
+        if top < self.target_layout.row_y(row, rest) - 0.5 {
+            return rest;
+        }
+        let bottom = self.target_layout.row_y(row + 1, at) - plx_ui::consts::UNDER_LABEL_AIR;
+        let over = bottom - SCR_H;
+        if over > 0.0 { (at + over).min(rest).max(0.0) } else { at }
     }
 
     fn follow<H: LibraryLike>(&mut self, elem: u32, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
@@ -1569,6 +1589,7 @@ impl<H: LibraryLike> Screen<H> for LibraryScreen {
     fn redraw_focused(&self, f: &mut DrawFrame<'_, '_, H>, focus: Option<plx_machine::machine::FocusKey<u32>>) {
         LibraryScreen::redraw_focused::<H>(self, f, focus)
     }
+    fn glides(&self) -> bool { true }
     fn name(&self) -> &'static str { "library" }
     fn chrome_tuck(&self) -> f32 { self.handoff.tuck() }
     fn state(&self) -> &dyn LogicalState { self }

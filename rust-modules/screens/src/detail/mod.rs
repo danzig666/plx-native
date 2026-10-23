@@ -2108,7 +2108,11 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                     self.return_pending = false;
                     self.restore_intent = None;
                 }
-                self.reveal_focus(Some(*to), cx.measure, meta);
+                if *by == By::Pointer {
+                    self.reveal_pointer(*to, cx, meta);
+                } else {
+                    self.reveal_focus(Some(*to), cx.measure, meta);
+                }
                 if let Some(located) = self.locate(to.elem, meta) {
                     if let Located::Season(i) = located {
                         if matches!(by, By::Dir | By::Pointer) {
@@ -2432,6 +2436,7 @@ impl<H: ContentLike + crate::registry::MetadataLike> Screen<H> for DetailScreen 
     fn redraw_focused(&self, f: &mut DrawFrame<'_, '_, H>, focus: Option<plx_machine::machine::FocusKey<u32>>) {
         DetailScreen::redraw_focused::<H>(self, f, focus)
     }
+    fn glides(&self) -> bool { true }
     fn name(&self) -> &'static str {
         "detail"
     }
@@ -3489,6 +3494,30 @@ impl DetailScreen {
         let Some(located) = focus.filter(|key| key.entry == self.entry).and_then(|key| self.locate(key.elem, meta)) else { return };
         let Some(detail) = self.detail(meta) else { return };
         self.scroll_target = self.reveal_target(located.section(), detail, measure);
+    }
+
+    /// **A POINTED element scrolls the page only as much as shows it** (the way Glasshouse's home
+    /// rows and LG's own lists answer a pointer). A key brings its section into reading position
+    /// ([`reveal_target`](Self::reveal_target)); a pointer that did that yanked the section it
+    /// touched up to the title, so every hover moved the page, and a hover after an edge glide
+    /// threw the glide away. Here an element wholly between the title band and the screen's foot
+    /// keeps the scroll; one under the title band scrolls down just enough, one past the foot up
+    /// just enough. The hero is still the top of the page.
+    fn reveal_pointer<H: ContentLike + crate::registry::MetadataLike>(&mut self, key: FocusKey<u32>, cx: &Cx<'_, H>, meta: plx_data::metadata::MetadataView<'_>) {
+        if self.return_waiting(meta) { return; }
+        let Some(located) = self.locate(key.elem, meta).filter(|_| key.entry == self.entry) else { return };
+        if located.section() == 0 {
+            return self.reveal_focus(Some(key), cx.measure, meta);
+        }
+        let Some(placed) = <Self as Focusable<H>>::place(self, &key.elem, cx, At::SpringTarget) else { return };
+        let r = placed.rest_rect;
+        let (top, foot) = (plx_ui::detail_layout::TOP_MARGIN, plx_ui::consts::SCR_H - plx_ui::consts::MARGIN_Y);
+        let shift = if r.y < top { r.y - top } else if r.y + r.h > foot { (r.y + r.h - foot).min(r.y - top) } else { 0.0 };
+        let max = self.detail(meta).map_or(0.0, |d| {
+            let (sections, n) = self.sections(Some(d));
+            if n == 0 { 0.0 } else { self.reveal_target(sections[n - 1], d, cx.measure) }
+        });
+        self.scroll_target = (self.scroll_target + shift).clamp(0.0, max.max(self.scroll_target));
     }
 
     /// The scroll that brings `section` into reading position: its top at `TOP_MARGIN`, the hero

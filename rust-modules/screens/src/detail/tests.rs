@@ -5330,3 +5330,37 @@ fn a_wheel_glides_the_detail_page_within_its_range() {
     assert_eq!(screen.scroll_target, max, "down no further than the last section's reveal");
     clear();
 }
+
+/// **A pointed element scrolls the detail page only as much as shows it**; a key still brings its
+/// section into reading position. Before, a Magic Remote hover yanked the section it touched up
+/// to the title band, so every hover moved the page and a hover after an edge glide undid it.
+#[test]
+fn a_pointed_element_scrolls_the_detail_page_only_as_much_as_shows_it() {
+    let sid = ServerId::UNSET;
+    let mut page = detail(sid, "show");
+    page.related = (1..=12).map(|i| collection_member(sid, &format!("r{i}"))).collect();
+    page.extras = (1..=12).map(|i| plx_data::metadata::Extra { rk: format!("x{i}"), ..Default::default() }).collect();
+    let _guard = install(page);
+    let mut screen = bare(&_guard, sid, "show");
+    let related = screen.engine_key(related::elem(0).unwrap()).unwrap();
+    let related_next = screen.engine_key(related::elem(1).unwrap()).unwrap();
+    let moved = |screen: &mut DetailScreen, from: u32, to: u32, by: By| {
+        let ev = ScreenEvent::FocusMoved { from: Some(FocusKey { entry: screen.entry, elem: from }),
+            to: FocusKey { entry: screen.entry, elem: to }, by };
+        step(screen, &ev, Some(to));
+    };
+    // a key brings Related into reading position
+    moved(&mut screen, hero::ELEM_PLAY, related, By::Dir);
+    let seated = screen.scroll_target;
+    assert!(seated > 0.0);
+    // the pointer on the next card of that shelf, wholly on screen, moves nothing
+    moved(&mut screen, related, related_next, By::Pointer);
+    assert_eq!(screen.scroll_target, seated);
+    // scrolled up by a glide so the shelf stands low on the screen but whole, a hover keeps the glide
+    let glided = (seated - 150.0).max(0.0);
+    screen.scroll_target = glided;
+    screen.scroll.jump(glided);
+    moved(&mut screen, related_next, related, By::Pointer);
+    assert_eq!(screen.scroll_target, glided, "a hover after a glide does not pull the page back");
+    clear();
+}
