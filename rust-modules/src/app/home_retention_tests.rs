@@ -531,7 +531,10 @@ fn home_worker_results_cross_the_addressed_dispatcher_ingest_once() {
     struct Results(Vec<Addr>);
     impl Tap<AppHost> for Results {
         fn result(&mut self, _f: u64, addr: &Addr, msg: &AppMsg) {
-            let AppMsg::HubsResult(result) = msg else { panic!("wrong result type") };
+            // Only the Hubs store's results are this test's subject. Other owners' results cross
+            // the same ingest in these frames too: since the session owner refills its cache by
+            // a result of its own (#973), Home's first frame delivers an `AppMsg::Session`.
+            let AppMsg::HubsResult(result) = msg else { return };
             assert_eq!(addr.req.0, result.request_id());
             self.0.push(*addr);
         }
