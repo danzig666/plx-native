@@ -1,0 +1,24 @@
+{
+  "packages": [
+    {
+      "id": "com.beb.plxnative",
+      "title": "PlxNative (danzig666 fork)",
+      "shortDescription": "Native Plex client with this fork's extras: automatic intro and credits skipping and a media line in the player. Replaces PlxNative.",
+      "iconUri": "https://raw.githubusercontent.com/danzig666/plx-native/homebrew/largeIcon.png",
+      "manifest": {
+        "id": "com.beb.plxnative",
+        "version": "0.9.13",
+        "type": "native",
+        "title": "PlxNative",
+        "iconUri": "https://raw.githubusercontent.com/danzig666/plx-native/homebrew/largeIcon.png",
+        "sourceUrl": "https://github.com/danzig666/plx-native",
+        "rootRequired": false,
+        "ipkUrl": "https://github.com/danzig666/plx-native/releases/download/v0.9.0-fork.13/com.beb.plxnative_0.9.13_arm.ipk",
+        "ipkHash": {
+          "sha256": "e4d3f50725b007929462d7d64b4ed16bf09bbdf11afd957343ee18c56606ea67"
+        },
+        "ipkSize": 18727674
+      }
+    }
+  ]
+}
