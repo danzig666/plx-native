@@ -155,6 +155,45 @@ pub fn coming_on(release: &str, width: MonthWidth) -> Option<String> {
     Some(msg::watchlist_state_coming_on(&date))
 }
 
+/// **The time of day** — "21:05", or "9:05 PM" on a 12-hour clock: the player's corner clock.
+/// The TV's own 12/24-hour setting decides when it reports one; a locale that leaves it to the
+/// language reads 12-hour for US English and 24-hour for everything else.
+pub fn time_of_day(t: plx_base::wallclock::WallTime) -> String {
+    let cx = plx_platform::i18n::current();
+    let h12 = match cx.clock() {
+        plx_platform::i18n::Clock::H12 => true,
+        plx_platform::i18n::Clock::H24 => false,
+        plx_platform::i18n::Clock::Locale => {
+            let l = cx.format_locale();
+            l == "en" || l.starts_with("en-US") || l.starts_with("en_US")
+        }
+    };
+    hm(t.hour, t.minute, h12)
+}
+
+fn hm(hour: u8, minute: u8, h12: bool) -> String {
+    if !h12 {
+        return format!("{hour:02}:{minute:02}");
+    }
+    let suffix = if hour < 12 { "AM" } else { "PM" };
+    let h = match hour % 12 { 0 => 12, h => h };
+    format!("{h}:{minute:02} {suffix}")
+}
+
+#[cfg(test)]
+mod time_of_day_tests {
+    use super::hm;
+
+    #[test]
+    fn a_24_hour_clock_pads_and_a_12_hour_clock_names_the_half_of_the_day() {
+        assert_eq!(hm(21, 5, false), "21:05");
+        assert_eq!(hm(0, 0, false), "00:00");
+        assert_eq!(hm(21, 5, true), "9:05 PM");
+        assert_eq!(hm(0, 7, true), "12:07 AM");
+        assert_eq!(hm(12, 30, true), "12:30 PM");
+    }
+}
+
 /// Playback clock — "1:23:45" past the hour, else "3:45" (scrubber clocks, chapter stamps).
 pub fn clock(ms: i64) -> String {
     let s = (ms / 1000).max(0);

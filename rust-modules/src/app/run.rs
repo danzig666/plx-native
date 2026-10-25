@@ -216,7 +216,7 @@ pub(crate) unsafe fn run(app: &mut App) {
         // D1) the first frame after it returns (`player::engine::PendingRelease`).
         app.adapters.player.poll_release();
         app.player.session.repair_status = app.player.repair.state();
-        app.bridge.publish_playback(&app.player.session, was_player);
+        app.bridge.publish_playback(&app.player.session, was_player, was_player.then(plx_base::wallclock::local_now).flatten());
         // The container runs its frame: the pending navigation's commit (at `PageDip`'s floor),
         // then the owned screens' inputs, ticks, timers and effects. `app/bridge.rs` is the seam.
         let supplied = match app.rec.replay_results(|id| app.bridge.recorded_client(id)) {

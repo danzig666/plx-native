@@ -245,6 +245,7 @@ impl PlayerScreen {
         now: u32,
         measure: &dyn plx_machine::machine::Measure,
         meta: plx_data::metadata::MetadataView<'_>,
+        wall: Option<plx_base::wallclock::WallTime>,
     ) {
         plx_appkit::player_hud::draw_hud(
             ps,
@@ -259,6 +260,7 @@ impl PlayerScreen {
             self.transport,
             measure,
             meta,
+            wall,
         );
     }
 
@@ -1475,6 +1477,9 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Screen<H> for PlayerScreen {
         let ps = H::session(cx);
         if self.transport && self.hud_drawn(ps, cx.tick.ms) {
             self.clock_warm.queue_live(ps);
+            if let Some(t) = H::wall(cx) {
+                self.clock_warm.queue_wall(t);
+            }
         }
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, H>) {
@@ -1515,7 +1520,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Screen<H> for PlayerScreen {
         // and so cannot be carried by a bare `ScreenEvent::Activate` at all.
         let hud_drawn = self.hud_drawn(ps, now);
         if hud_drawn {
-            self.draw_hud(ps, now, f.measure, H::metadata(f.cx));
+            self.draw_hud(ps, now, f.measure, H::metadata(f.cx), H::wall(f.cx));
         } else {
             self.row.reset_title();
         }

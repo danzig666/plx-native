@@ -26,6 +26,7 @@ pub mod surface; // what we are actually drawing into: drawable vs the 1920x1080
 pub mod tile; // `Tile`: the shelf-tile trait the data layer implements and `ui` draws through
 pub mod hold; // `HOLD_ROWS`, `clamp_hold`: the rows a paged store keeps, which the store and `ui::cards::HoldBand` both apply
 pub mod devtrig; // the /tmp trigger PRIMITIVES (`flag`, `read`, `latched_flag!`, `no_wan`...)
+pub mod wallclock; // the time of day, for the player's corner clock (read by the loop, never a screen)
 pub mod diag; // the frame instruments (`heartbeat`, `spans`) and the zlib helper
 #[cfg(any(test, feature = "test-support"))]
 pub mod testlock; // one lock for every test that touches a process-global

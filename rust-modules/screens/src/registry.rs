@@ -1263,6 +1263,11 @@ pub trait HomeLike: AppLike<Memory = PageMemory> + Sized {
 /// on this path by construction.
 pub trait PlayerLike: AppLike<Memory = PageMemory> + Sized {
     fn session<'a>(cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession;
+    /// The time of day this frame was published with, for the HUD's corner clock; `None` draws
+    /// no clock. A provided method so a test host shows none unless it says otherwise.
+    fn wall(_cx: &Cx<'_, Self>) -> Option<plx_base::wallclock::WallTime> {
+        None
+    }
 }
 
 pub trait SearchLike: AppLike<Memory = PageMemory> + Sized {

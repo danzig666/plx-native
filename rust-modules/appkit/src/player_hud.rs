@@ -82,9 +82,27 @@ pub struct ClockWarm {
     key: Option<(i64, i64)>,
     /// `(text, bold, size)` exactly as [`draw_playbar`] hands them to `Painter::text`.
     strings: Vec<(CString, c_int, c_int)>,
+    /// The time of day [`Self::wall`] formatted, and that minute's and the next one's strings.
+    wall: Option<(plx_base::wallclock::WallTime, [Option<CString>; 2])>,
 }
 
 impl ClockWarm {
+    /// Queue the corner clock ([`draw_wall_clock`]) for `t` and the minute after it, so the draw
+    /// never meets a new minute cold.
+    pub fn queue_wall(&mut self, t: plx_base::wallclock::WallTime) {
+        if self.wall.as_ref().map(|(k, _)| *k) != Some(t) {
+            let next = {
+                let m = (u16::from(t.hour) * 60 + u16::from(t.minute) + 1) % (24 * 60);
+                plx_base::wallclock::WallTime { hour: (m / 60) as u8, minute: (m % 60) as u8 }
+            };
+            let text = |t| CString::new(plx_ui::fmt::time_of_day(t)).ok();
+            self.wall = Some((t, [text(t), text(next)]));
+        }
+        for s in self.wall.iter().flat_map(|(_, s)| s.iter().flatten()) {
+            plx_gfx::text::queue_prewarm(s.as_ptr(), WALL_CLOCK_SZ, 1);
+        }
+    }
+
     /// Queue the clocks for the playhead the playbar would draw right now.
     pub fn queue_live(&mut self, ps: &plx_media::route::PlaybackSession) {
         let pos = display_pos_ns(
@@ -1609,6 +1627,35 @@ pub fn draw_scrim(p: Painter) {
     );
 }
 
+/// The top ramp the corner clock stands on: the HUD's bottom scrim's twin, shallower and lighter,
+/// because it carries one line of text and not the transport.
+const TOP_SCRIM_H: f32 = 200.0;
+const WALL_CLOCK_SZ: c_int = theme::size::HEADLINE;
+
+/// **The time of day, top right**, while the transport is up (`Plex HTPC` puts it there too). It
+/// fades with the title block and the control row, so a scrub's preview card has the frame to
+/// itself. `t` is the frame's publication (`PlayerLike::wall`), never a read made here.
+fn draw_wall_clock(p: Painter, t: plx_base::wallclock::WallTime) {
+    p.rect(
+        Rect::new(0.0, 0.0, SCR_W, TOP_SCRIM_H),
+        0.0,
+        theme::scrim_black(0.55),
+        theme::scrim_black(0.0),
+        0.0,
+    );
+    if let Ok(cs) = CString::new(plx_ui::fmt::time_of_day(t)) {
+        p.text(
+            cs.as_ptr(),
+            SCR_W - plx_ui::consts::MARGIN_X,
+            plx_ui::consts::MARGIN_Y,
+            WALL_CLOCK_SZ,
+            theme::TEXT_PRIMARY,
+            2,
+            1,
+        );
+    }
+}
+
 /// The line over a transport's display title. Non-owning `*const c_char`, the `Label` rule
 /// (`ui/CLAUDE.md`): keep the `CString` (or the session's fixed buffer) alive across the draw.
 #[derive(Clone, Copy, Debug)]
@@ -1969,6 +2016,7 @@ pub fn draw_hud(
     transport: bool,
     measure: &dyn plx_machine::machine::Measure,
     meta: plx_data::metadata::MetadataView<'_>,
+    wall: Option<plx_base::wallclock::WallTime>,
 ) {
     // A FAILURE owns the frame, and it outranks every branch below — including the Up Next card,
     // which cannot coexist with one but must not be the arm that decides so. `Player Screen.dc.html`
@@ -2047,6 +2095,10 @@ pub fn draw_hud(
                 let ctx = unsafe { std::ffi::CStr::from_ptr(plx_media::route::ctxline_cptr(ps)) };
                 let w = measure.width(ctx, theme::size::CAPTION, false);
                 draw_media_after(pc, SB_X + w, ps, meta);
+            }
+
+            if let Some(t) = wall {
+                draw_wall_clock(pc, t);
             }
 
             // The right control row, from the slot the CALLER resolved — so what is drawn and what a
@@ -2571,6 +2623,35 @@ mod tests {
         assert_eq!(source_line(3840, 2160, false, true, "hevc", None), "4K \u{b7} HDR \u{b7} HEVC");
     }
 
+
+    /// **The corner clock stands in the top-right of the safe frame**, over a ramp from the top
+    /// edge, and its minute and the next one are resident before the draw (midnight wraps).
+    #[test]
+    fn the_wall_clock_draws_top_right_and_its_next_minute_is_warm() {
+        use plx_base::wallclock::WallTime;
+        let _g = plx_base::testlock::serial();
+        let log = plx_ui::draw_census::capture(|| {
+            draw_wall_clock(plx_ui::Painter::recording(), WallTime { hour: 21, minute: 5 });
+        });
+        let texts: Vec<Rect> = log.iter().filter(|(tag, _)| *tag == 100).map(|(_, r)| *r).collect();
+        assert_eq!(texts.len(), 1, "one line: {log:?}");
+        let t = texts[0];
+        // A recorded run keeps its anchor: right-aligned, `x` is the line's right edge.
+        assert!(t.x <= SCR_W - plx_ui::consts::MARGIN_X + 0.5 && t.x - t.w > SCR_W / 2.0, "right side, inside the frame: {t:?}");
+        assert!(t.y >= plx_ui::consts::MARGIN_Y - 0.5 && t.y + t.h <= TOP_SCRIM_H, "on the ramp, inside the frame: {t:?}");
+
+        plx_gfx::text::reset_prewarm_for_test();
+        let mut warm = ClockWarm::default();
+        warm.queue_wall(WallTime { hour: 23, minute: 59 });
+        while plx_gfx::text::prewarm_pending() {
+            plx_ui::panel_motion::PanelMotion::drain_queued_text_for_test();
+        }
+        for t in [WallTime { hour: 23, minute: 59 }, WallTime { hour: 0, minute: 0 }] {
+            let text = plx_ui::fmt::time_of_day(t);
+            assert!(plx_gfx::text::prewarm_resident_for_test(text.as_bytes(), WALL_CLOCK_SZ, 1), "{text:?} was left cold");
+        }
+        plx_gfx::text::reset_prewarm_for_test();
+    }
 
     /// **The transport's clocks are resident before the draw, this second's and the next one's.**
     /// On the TV the draw met each new clock string cold AFTER the back-buffer wait (`clear:12.4 …
