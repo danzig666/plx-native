@@ -218,7 +218,7 @@ mod auto_skip_tests {
         assert_eq!(auto_skip(skip(closing), false, true), Some(AutoSkip::Advance), "closing credits finish");
         assert_eq!(auto_skip(ControlSlot::UpNext(closing), false, true), Some(AutoSkip::Advance));
         assert_eq!(auto_skip(ControlSlot::UpNext(closing), true, false), None);
-        assert_eq!(auto_skip(ControlSlot::Discs, true, true), None);
+        assert_eq!(auto_skip(ControlSlot::Discs(crate::player_hud::Controls::NONE), true, true), None);
     }
 
     /// The notice fades in, holds, fades out and is GONE at its deadline — the deadline is also
