@@ -72,7 +72,10 @@ jobs:
     name: host checks (${{ matrix.stage }})
     needs: prior
     if: needs.prior.outputs.checked != 'true'
-    runs-on: ubuntu-latest
+    # Pinned: `ubuntu-latest` moved to 26.04 on 2026-10-26, whose libcurl fails the media key-mode
+    # seek tests (curlio_keymode_tests) and whose smaller disk trips ci/test_disk_preflight.py. Both
+    # passed on 24.04 the day before with the same code; the TV runs its own libcurl, not this one.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
