@@ -1816,8 +1816,9 @@ impl TrackMenuState {
     /// idiom the Subtitles tab's Timing/Style pair uses, plus an optional non-selectable note (an
     /// inert slot: it takes a layout row and has no identity). Mirrors [`Self::layout`] for the
     /// Subtitles tab.
-    fn audio_form(&self, meta: metadata::MetadataView<'_>) -> TrackForm {
+    fn audio_form(&self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>) -> TrackForm {
         self.audio_form_for(
+            ps,
             meta,
             (self.enhance_shown, self.enhance_route, self.enhance_disabled, self.enhance_subtitle_effect),
         )
@@ -1825,7 +1826,7 @@ impl TrackMenuState {
 
     /// [`Self::audio_form`] against an explicit enhancement answer ([`Self::enh_state`]'s shape),
     /// so the Audio root can be built while the menu shows Subtitles and has not stored one.
-    fn audio_form_for(&self, meta: metadata::MetadataView<'_>, enh: EnhState) -> TrackForm {
+    fn audio_form_for(&self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>, enh: EnhState) -> TrackForm {
         let (enhance_shown, enhance_route, enhance_disabled, enhance_subtitle_effect) = enh;
         let mut sec = FormSection::new(plx_platform::i18n::msg::widgets_tracks_audio());
         let d = match tracks(meta) {
@@ -1858,7 +1859,7 @@ impl TrackMenuState {
             } else {
                 name
             };
-            let sub = audio_sub_line(sub, s);
+            let sub = audio_sub_line(ps, sub, s);
             if !sub.is_empty() {
                 row = row.detail(sub);
             }
@@ -2010,7 +2011,7 @@ impl TrackMenuState {
     fn rebuild(&mut self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>, tab: c_int, slide: bool) {
         if tab == 0 {
             let (shown, route, disabled, subtitle_effect) = Self::enh_state(ps);
-            self.rebuild_audio(shown, route, disabled, subtitle_effect, meta, slide);
+            self.rebuild_audio(ps, shown, route, disabled, subtitle_effect, meta, slide);
         } else {
             let form = self.layout(ps, meta);
             let keep = self.active_sub_id();
@@ -2048,6 +2049,7 @@ impl TrackMenuState {
     /// below — landing on the checked track — is exactly the existing open/switch behaviour.
     fn rebuild_audio(
         &mut self,
+        ps: &plx_media::route::PlaybackSession,
         enhance_shown: Option<plx_plex::plex::AudioEnhancements>,
         enhance_route: Option<plx_media::route::EnhancementRoute>,
         enhance_disabled: Option<plx_media::route::DisabledReason>,
@@ -2068,7 +2070,7 @@ impl TrackMenuState {
         self.enhance_route = enhance_route;
         self.enhance_disabled = enhance_disabled;
         self.enhance_subtitle_effect = enhance_subtitle_effect;
-        let form = self.audio_form(meta);
+        let form = self.audio_form(ps, meta);
         // The offer is back: prefer the banked identity over `prev_target` (which names whatever
         // row the cursor happened to sit on while the rows were gone) whenever it still exists.
         let restored = if enhance_shown.is_some() { self.sticky_audio_target.take() } else { None };
@@ -2126,7 +2128,7 @@ impl TrackMenuState {
                 || disabled != self.enhance_disabled
                 || subtitle_effect != self.enhance_subtitle_effect
             {
-                self.rebuild_audio(shown, route, disabled, subtitle_effect, meta, false);
+                self.rebuild_audio(ps, shown, route, disabled, subtitle_effect, meta, false);
             }
         } else {
             self.poll_subtitle_state(ps, meta);
@@ -2182,7 +2184,7 @@ impl TrackMenuState {
                 let forced = Self::forced_readout(ps, meta, self.active_sub, self.forced_only);
                 self.sub_root_form(ps, meta, forced.as_deref()).0
             } else {
-                self.audio_form_for(meta, Self::enh_state(ps))
+                self.audio_form_for(ps, meta, Self::enh_state(ps))
             };
             let mut other = TrackTable::new(BAND_BASE);
             other.table.min_panel_w = theme::layout::PLAYER_MENU_MIN_W;
@@ -2374,11 +2376,11 @@ use plx_data::metadata::track_label::Kind;
 /// The sub-line under an audio track, saying so when the server would convert it: a track the TV
 /// cannot decode ("AAC 7.1" here) plays through the server's remux with only its audio converted,
 /// and the menu names that on the track it concerns rather than leaving the viewer to learn it
-/// from a log. Whether a track is converted is the planner's capability answer
-/// (`route::audio_converted_by_server`). Always ONE line: the longest label is graded against the
-/// panel by `converted_audio_sub_lines_fit_the_panel_in_every_language`.
-fn audio_sub_line(sub: String, s: &metadata::Stream) -> String {
-    audio_sub_line_for(sub, plx_media::route::audio_converted_by_server(&s.codec, s.channels))
+/// from a log. Whether a track is converted is the planner's capability answer for THIS playback's
+/// attempt (`route::audio_converted_by_server`, which reads `ps`). Always ONE line: the longest label
+/// is graded against the panel by `converted_audio_sub_lines_fit_the_panel_in_every_language`.
+fn audio_sub_line(ps: &plx_media::route::PlaybackSession, sub: String, s: &metadata::Stream) -> String {
+    audio_sub_line_for(sub, plx_media::route::audio_converted_by_server(ps, &s.codec, s.channels, s.sampling_rate))
 }
 
 /// [`audio_sub_line`] with the conversion fact given — the pure choice, host-testable.
@@ -3203,6 +3205,8 @@ mod tests {
                         channels: 8,
                         can_normalize_loudness: true,
                         immersive: true,
+                        sample_rate: 0,
+                        bit_depth: 0,
                     },
                     memo: Some(plx_plex::plex::session::prefs::AudioMemo {
                         codec: "eac3".into(),
@@ -4336,8 +4340,9 @@ mod enhancement_menu_tests {
         // the capability answer it is fed: TrueHD is outside the profile's audio list, AC-3 is not
         let truehd = metadata::Stream { codec: "truehd".into(), channels: 8, ..Default::default() };
         let ac3 = metadata::Stream { codec: "ac3".into(), channels: 6, ..Default::default() };
-        assert!(plx_media::route::audio_converted_by_server(&truehd.codec, truehd.channels));
-        assert!(!plx_media::route::audio_converted_by_server(&ac3.codec, ac3.channels));
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        assert!(plx_media::route::audio_converted_by_server(&ps, &truehd.codec, truehd.channels, truehd.sampling_rate));
+        assert!(!plx_media::route::audio_converted_by_server(&ps, &ac3.codec, ac3.channels, ac3.sampling_rate));
     }
 
     /// **The longest converted sub-line fits the Audio panel in every shipped language** — graded
@@ -5550,6 +5555,7 @@ mod localized_offset_tests {
             (Preference::Fr, "fr-FR", "-0,1 s", "+1,3 s"),
             (Preference::De, "de-DE", "-0,1 s", "+1,3 s"),
             (Preference::Hu, "hu-HU", "-0,1 mp", "+1,3 mp"),
+            (Preference::Ru, "ru-RU", "-0,1 с", "+1,3 с"),
         ] {
             let locale = LocaleContext::resolve(preference, None, Some(region), None, None);
             assert_eq!(crate::timing_capsule::offset_seconds_in(-100, true, &locale), negative);

@@ -47,7 +47,7 @@ impl LogicalState for PickerState {
     }
 }
 
-pub const SHAPE: &str = "PickerV1{field:u8,selection:u32,busy:bool,status:str,quality:u8,direct_play:u8,checked:u32,confirm:bool,affirm:bool,alert_scroll:u32}";
+pub const SHAPE: &str = "PickerV2{field:u8,selection:u32,busy:bool,status:str,quality:u8,direct_play:u8,checked:u32,confirm:bool,affirm:bool,alert_scroll:u32}";
 
 pub struct PickerPage {
     entry: EntryId,
