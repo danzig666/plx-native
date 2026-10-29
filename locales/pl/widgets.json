@@ -42,6 +42,8 @@
   "widgets.chapters.number": "Rozdział {number}",
   "widgets.skip.intro": "Pomiń czołówkę",
   "widgets.skip.credits": "Pomiń napisy końcowe",
+  "widgets.skip.intro_skipped": "Pominięto czołówkę",
+  "widgets.skip.credits_skipped": "Pominięto napisy końcowe",
   "widgets.next.episode": "Następny odcinek",
   "widgets.next.credits": "Obejrzyj napisy końcowe",
   "widgets.next.caption": "Następnie · {episode}",
