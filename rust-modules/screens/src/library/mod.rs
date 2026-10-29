@@ -1444,14 +1444,6 @@ impl LibraryScreen {
                     self.reseat(FocusTarget::ContainerGroup(self.pair.groups_config().detail), fx);
                     return Handled::Yes;
                 }
-                // A click brings the page to the card it clicked, the way a key's move does.
-                if let InputKind::Click { hit: Some(hit), .. } = input.kind {
-                    if let Some(index) = self.pair.detail.index_of(hit) {
-                        self.scroll_target = self.target_layout.row_reveal(index / self.layout.cols())
-                            - self.pair.detail.pending_shift(cx);
-                        fx.invalidate(Provenance::Input);
-                    }
-                }
                 if let InputKind::Wheel { dy } = input.kind {
                     self.scroll_target = (self.scroll_target - dy * self.layout.grid_pitch())
                         .clamp(0.0, self.target_layout.max_scroll());

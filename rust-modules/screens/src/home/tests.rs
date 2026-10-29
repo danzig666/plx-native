@@ -5881,7 +5881,7 @@ fn a_caption_input_that_changes_under_a_kept_row_reaches_the_drawn_block() {
 /// frame) slides the page out of the hero into the shelves and through them and back, a hover
 /// moves focus and nothing else, a click brings the page to its card, and a key rests its row.
 #[test]
-fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
+fn the_edge_glide_moves_home_evenly_a_hover_does_not_and_a_click_moves_nothing() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -5896,11 +5896,15 @@ fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
         for _ in 0..3 { step(s, view, Some(focus), &ScreenEvent::Tick(Tick { ms: 16, dt_us: 16_667 })); }
     };
     let input = |kind| ScreenEvent::Input(InputEvent { at: Tick::default(), source: plx_machine::machine::Source::Script, kind });
-    // the glide down leaves the hero for the shelves, then scrolls through them, focus staying put
+    // the glide down moves through the hero-to-grid dive at the wheel's own pixels (no jump to
+    // the shelves), then scrolls through them, focus staying put
     step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 }));
-    assert_eq!(s.snap_target, 1.0, "down from the hero goes to the shelves");
-    for _ in 0..60 { step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 })); }
+    let first = 0.05 * ROW_PITCH / HERO_DIVE_PX;
+    assert!((s.snap_target - first).abs() < 1e-4, "one glide step moves the dive by its pixels, not to the shelves: {}", s.snap_target);
+    assert_eq!(s.grid.scroll_target, 0.0, "the shelves do not scroll before the dive is through");
+    for _ in 0..400 { step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 })); }
     tick(&mut s, hero);
+    assert_eq!(s.snap_target, 1.0, "the dive is through");
     let glided = s.grid.scroll_target;
     assert!(glided > 100.0, "the shelves glide by the wheel: {glided}");
     // a hover on a shelf card moves focus, not the page
@@ -5908,12 +5912,12 @@ fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
     step(&mut s, view, Some(near), &ScreenEvent::FocusMoved { from: Some(hero), to: near, by: By::Pointer });
     tick(&mut s, near);
     assert_eq!(s.grid.scroll_target, glided, "a hover moves focus, not the page");
-    // a click brings the page to its card
+    // a click moves nothing: the card opens where it stands
     step(&mut s, view, Some(near), &input(InputKind::Click { x: 0.0, y: 0.0, hit: Some(near.elem) }));
     tick(&mut s, near);
-    assert_eq!(s.grid.scroll_target, rest_scroll(1, rows, band_open_of(false)), "a click rests its card's row");
-    // the glide up goes back through the shelves to the hero
-    for _ in 0..400 { step(&mut s, view, Some(near), &input(InputKind::Wheel { dy: 0.05 })); }
+    assert_eq!((s.grid.scroll_target, s.snap_target), (glided, 1.0), "a click moves no page");
+    // the glide up goes back through the shelves, then up the dive, to the hero
+    for _ in 0..1200 { step(&mut s, view, Some(near), &input(InputKind::Wheel { dy: 0.05 })); }
     assert_eq!((s.grid.scroll_target, s.snap_target), (0.0, 0.0), "up through the shelves to the hero");
     // a key rests its row again
     let deep = card(&s, rows - 1);
@@ -5922,14 +5926,12 @@ fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
     assert_eq!((s.grid.scroll_target, s.snap_target), (rest_scroll(rows - 1, rows, band_open_of(false)), 1.0));
 }
 
-/// **The shelf peeking under the hero is clickable, and its click brings it into view.** The
-/// reported gripe: on the top of Home the first shelf's posters show at the bottom of the screen,
-/// but nothing could be clicked there until the page was scrolled (the shelves registered no stops
-/// while the hero was up). Now its cards are stops (hovering them takes no focus from the hero), a
-/// click on one scrolls the page down to it, and that click does not open it; once in view, a click
-/// opens it as usual.
+/// **The shelf peeking under the hero is clickable, and its click opens the card where it stands.**
+/// On the top of Home the first shelf's posters show at the bottom of the screen; its cards are
+/// stops (hovering them takes no focus from the hero), and a click on one opens it without moving
+/// the page first (the owner's call, 2026-10-29: no scroll to a tile on a click).
 #[test]
-fn a_card_peeking_under_the_hero_is_clickable_and_its_click_brings_it_into_view() {
+fn a_card_peeking_under_the_hero_is_clickable_and_its_click_opens_it_in_place() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -5958,20 +5960,18 @@ fn a_card_peeking_under_the_hero_is_clickable_and_its_click_brings_it_into_view(
     step(&mut s, view, Some(card), &ScreenEvent::FocusMoved { from: Some(hero), to: card, by: By::Pointer });
     step(&mut s, view, Some(card), &ScreenEvent::Input(InputEvent { at: Tick::default(),
         source: plx_machine::machine::Source::Script, kind: InputKind::Click { x, y, hit: Some(card.elem) } }));
-    assert_eq!(s.snap_target, 1.0, "the click brings the page down to the shelf");
+    assert_eq!(s.snap_target, 0.0, "the click moves no page");
     let commit = |s: &mut HomeScreen, id| step(s, view, Some(card), &ScreenEvent::PressCommit(plx_machine::machine::PressId(id))).1;
-    assert!(!has_home(&commit(&mut s, 1), |r| matches!(r, HomeReq::Detail { .. })), "that click does not open the card");
-    for i in 1..=90 { step(&mut s, view, Some(card), &ScreenEvent::Tick(Tick { ms: i * 16, dt_us: 16_667 })); }
-    assert!(s.snap.pos > 0.99, "the page has come down to the shelf: {}", s.snap.pos);
-    assert!(has_home(&commit(&mut s, 2), |r| matches!(r, HomeReq::Detail { .. })), "a click once it is in view opens it");
+    let opened = commit(&mut s, 1);
+    assert!(has_home(&opened, |r| matches!(r, HomeReq::Detail { .. })), "the click opens the card");
+    assert!(!has_home(&opened, |r| matches!(r, HomeReq::Play { .. })), "and never plays the hero behind it");
 }
 
 /// **The pointer's sideways glide moves the shelf under it, and the shelf stays there.** A shelf
 /// wider than the screen glides by the `Pan` the application sends while the pointer rests at a
-/// side edge; neither its focus nor a hover pulls it back, and a click on one of its cards brings
-/// it to that card again.
+/// side edge; neither its focus, a hover nor a click pulls it back, and a key's move along it does.
 #[test]
-fn the_sideways_glide_moves_the_shelf_under_the_pointer_and_a_click_brings_it_back() {
+fn the_sideways_glide_moves_the_shelf_under_the_pointer_and_only_a_key_brings_it_back() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -6002,6 +6002,10 @@ fn the_sideways_glide_moves_the_shelf_under_the_pointer_and_a_click_brings_it_ba
     step(&mut s, view, Some(first), &ScreenEvent::Input(InputEvent { at: Tick::default(),
         source: plx_machine::machine::Source::Script, kind: InputKind::Click { x: 0.0, y, hit: Some(first.elem) } }));
     tick(&mut s, first);
-    tick(&mut s, first);
-    assert!(s.grid.shelves[0].scroll() < 1.0, "a click on its first card brings the shelf back to it: {}", s.grid.shelves[0].scroll());
+    assert_eq!(s.grid.shelves[0].scroll(), 500.0, "nor does a click");
+    let next = card(&s, 0, 1);
+    step(&mut s, view, Some(next), &ScreenEvent::FocusMoved { from: Some(first), to: next, by: By::Dir });
+    tick(&mut s, next);
+    tick(&mut s, next);
+    assert!(s.grid.shelves[0].scroll() < 499.0, "a key's move along it brings the shelf back to its focus: {}", s.grid.shelves[0].scroll());
 }

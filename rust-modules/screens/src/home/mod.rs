@@ -628,13 +628,10 @@ pub struct HomeScreen {
     snap_target: f32,
     /// **The page is where the pointer put it, not where focus would rest it.** Set by a wheel (the
     /// pointer's edge glide, `app::input::EdgeScroll`) and by a hover, which moves focus but never
-    /// the page; cleared by a key's move and by a click, which bring the page back to the focused
-    /// shelf. While set, the tick does not pull `grid.scroll_target` to the focused row.
+    /// the page; cleared by a key's move, which brings the page back to the focused shelf. A click
+    /// moves nothing: it opens what it clicked where it stands. While set, the tick does not pull
+    /// `grid.scroll_target` to the focused row.
     free: bool,
-    /// **A click that only brings a card into view.** A click on a shelf card the screen shows only
-    /// part of (the shelf peeking under the hero, a shelf cut by the bottom edge) scrolls the page to
-    /// it and does not open it: its press is dropped when it commits. Cleared by any key.
-    reveal_press: Option<u32>,
     /// Stable element still visible while the engine has already crossed the hero/grid door.
     /// This is a press landing policy, not current focus, and retires at the visual midpoint.
     visible_activation: Option<u32>,
@@ -696,7 +693,6 @@ impl HomeScreen {
             covered: false,
             snap_target: 0.0,
             free: false,
-            reveal_press: None,
             visible_activation: None,
             cta_available: false,
             strip_chosen: false,
@@ -1484,6 +1480,11 @@ impl HomeScreen {
     /// on a linked heading, and `fallback` (the row a hero→grid door would open) otherwise.
     /// The band the shelf at `row` opens when focused (`None`, a linked heading focused, opens none):
     /// the Continue Watching deck's is its own ([`shelf_policy`]).
+    /// How far a wheel may scroll the shelves: the last shelf's rest, with its caption band.
+    fn wheel_max_scroll(&self) -> f32 {
+        grid_max_scroll(self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)))
+    }
+
     fn band_open_at(&self, row: Option<usize>) -> f32 {
         row.and_then(|row| self.rows.get(row)).map_or_else(|| band_open_of(false),
             |hub| band_open_of(hub.identity == HomeHubIdentity::ContinueWatching))
@@ -2359,8 +2360,8 @@ impl HomeScreen {
             }
         }
         // The shelves have stops under the hero too: the first one peeks under it, and a click on
-        // a peeking card brings the page down to it (`reveal_press`). A hover there takes no focus
-        // from the hero (`OnlyIfFocused`, `pointable` is false while the hero is up).
+        // a peeking card opens it where it stands. A hover there takes no focus from the hero
+        // (`OnlyIfFocused`, `pointable` is false while the hero is up).
         {
             let hero_up = self.snap.pos < 0.5;
             let focused_row = self.focused_grid(focus).map(|(row, _)| row).filter(|_| !hero_up);
@@ -2523,11 +2524,8 @@ impl LogicalState for HomeScreen {
             snap_target: _,
             // Whether the tick pulls the scroll to the focused shelf. What it decides is
             // `grid.scroll_target`, encoded below, and it is a hand-off from the pointer's events
-            // (a wheel, a hover, a click) to the next `Tick`, like a shelf's `seen`.
+            // (a wheel, a hover) to the next `Tick`, like a shelf's `seen`.
             free: _,
-            // A press hand-off from a click to its commit, like `free`: what it decides (whether
-            // the commit opens the card) is an effect, and the page it moves is `snap_target`.
-            reveal_press: _,
             visible_activation: _, cta_available: _, strip_chosen: _, snap: _, status_ms: _,
             hero_pop: _, backdrop: _, grid: _,
             // The disc's membership is the Watchlist store's (the application feeds it); the flip
@@ -3033,29 +3031,11 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
         if let ScreenEvent::Input(InputEvent { at, kind: InputKind::Key { key, edge, .. }, .. }) = ev {
             self.backdrop.note_key(*key, *edge, at.ms);
         }
-        if let ScreenEvent::Input(InputEvent { kind: InputKind::Key { .. }, .. }) = ev {
-            self.reveal_press = None;
-        }
-        // A click brings the page to what it clicked, the way a key's move does; a click on a
-        // card the screen shows only part of does only that (`reveal_press`).
-        if let ScreenEvent::Input(InputEvent { kind: InputKind::Click { hit: Some(elem), .. }, .. }) = ev {
-            if let Some(loc) = self.locate(*elem) {
-                self.reveal_press = matches!(loc, Located::Item(..))
-                    .then(|| Focusable::<H>::place(self, elem, cx, At::Drawn))
-                    .flatten()
-                    .filter(|placed| placed.rect.y < 0.0 || placed.rect.y + placed.rect.h > SCR_H)
-                    .map(|_| *elem);
-                self.free = false;
-                self.snap_target = if loc.on_grid() { 1.0 } else { 0.0 };
-                if let Located::Item(row, _) = loc {
-                    if let Some(shelf) = self.grid.shelves.get_mut(row) { shelf.unfree(); }
-                }
-                fx.invalidate(Provenance::Input);
-            }
-        }
+        // A click moves nothing: it opens what it clicked where it stands, a card the screen shows
+        // only part of included. Only a key's move brings the page to the focus.
         match ev {
             // The pointer's sideways glide moves the shelf under it, which stays where it put it
-            // until a key moves along it or a click lands on one of its cards (`Shelf::glide`).
+            // until a key moves along it (`Shelf::glide`).
             ScreenEvent::Input(InputEvent { kind: InputKind::Pan { dx, y, .. }, .. }) => {
                 if dx.is_finite() {
                     let under = (0..self.grid.shelves.len()).find(|&row| {
@@ -3072,26 +3052,19 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 Handled::Yes
             }
             // A wheel (the pointer's edge glide, a fractional one every frame) moves the page
-            // itself, focus staying where it is: down from the hero into the shelves, then through
-            // them by `ROW_PITCH` a row; up through the shelves, then back to the hero.
+            // itself, focus staying where it is, at one speed all the way: down from the hero into
+            // the shelves (the hero-to-grid dive travels `HERO_DIVE_PX` and is moved through
+            // fractionally, never jumped), then through them by `ROW_PITCH` a row; up through the
+            // shelves, then back up the dive to the hero.
             ScreenEvent::Input(InputEvent { kind: InputKind::Wheel { dy }, .. }) => {
                 if !dy.is_finite() || self.rows.is_empty() {
                     return Handled::Yes;
                 }
                 self.free = true;
-                let max = grid_max_scroll(self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)));
-                let to = self.grid.scroll_target - dy * ROW_PITCH;
-                if *dy > 0.0 {
-                    if self.snap_target >= 0.5 && self.grid.scroll_target > 0.0 {
-                        self.grid.scroll_target = to.max(0.0);
-                    } else {
-                        self.snap_target = 0.0;
-                    }
-                } else if self.snap_target < 0.5 {
-                    self.snap_target = 1.0;
-                } else {
-                    self.grid.scroll_target = to.min(max.max(self.grid.scroll_target));
-                }
+                let (snap, scroll) =
+                    wheel_page(self.snap_target, self.grid.scroll_target, *dy, self.wheel_max_scroll());
+                self.snap_target = snap;
+                self.grid.scroll_target = scroll;
                 fx.invalidate(Provenance::Input);
                 Handled::Yes
             }
@@ -3149,13 +3122,18 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 self.feed_shelves(ev, cx, fx);
                 let from_loc = from.and_then(|key| self.locate(key.elem));
                 let to_loc = self.locate(to.elem);
+                // A key's move across the hero/grid door leaves the control on screen as what OK
+                // acts on until the picture follows. A pointer's does not: it moved focus onto what
+                // it points at, which is on screen (a card peeking under the hero), and a click
+                // there opens that card, never the hero's Play.
                 if let (Some(a), Some(b)) = (from_loc, to_loc) {
                     if a.on_grid() != b.on_grid() {
-                        self.visible_activation = from.map(|key| key.elem);
+                        self.visible_activation = (*by != By::Pointer).then(|| from.map(|key| key.elem)).flatten();
                     }
                 }
-                // A hover moves focus, never the page: the pointer scrolls by the screen's edges
-                // (and a click by what it clicked). Every other move brings the page to the focus.
+                // A hover moves focus, never the page: the pointer scrolls by the screen's edges,
+                // and a click opens what it clicked where it stands. Every other move brings the
+                // page to the focus.
                 if *by == By::Pointer {
                     self.free = true;
                 } else {
@@ -3207,10 +3185,7 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                     .filter(|k| k.entry == self.entry)
                     .map(|k| k.elem)
                 {
-                    // the click that brought a partly shown card into view does not open it
-                    if self.reveal_press.take() != Some(elem) {
-                        self.activate(elem, cx, fx);
-                    }
+                    self.activate(elem, cx, fx);
                 }
                 Handled::Yes
             }
@@ -3421,6 +3396,31 @@ fn write_item_identity(identity: &HomeItemIdentity, c: &mut Canon) {
             c.u32(*generation).u32(*ordinal);
         }
     }
+}
+
+/// The page travel of the hero-to-grid dive: the first shelf's top from where it peeks under the
+/// hero (`PEEK_Y`) to where the grid rests it (`GRID_TOP_Y`). A wheel moves `snap_target` through
+/// it at the pixels per step it moves the grid, so the edge glide's speed does not change at the door.
+const HERO_DIVE_PX: f32 = PEEK_Y - GRID_TOP_Y;
+
+/// One wheel step of Home's page: `(snap_target, grid scroll_target)` after `dy` rows
+/// (`dy > 0` up). Down spends the dive first, then the grid's scroll up to `max`; up spends the
+/// grid's scroll first, then the dive, at `ROW_PITCH` pixels a row throughout.
+fn wheel_page(snap: f32, scroll: f32, dy: f32, max: f32) -> (f32, f32) {
+    let mut px = -dy * ROW_PITCH;
+    let (mut snap, mut scroll) = (snap.clamp(0.0, 1.0), scroll);
+    if px > 0.0 {
+        let dive = ((1.0 - snap) * HERO_DIVE_PX).min(px);
+        snap += dive / HERO_DIVE_PX;
+        px -= dive;
+        scroll = (scroll + px).min(max.max(scroll));
+    } else if px < 0.0 {
+        let up = scroll.max(0.0).min(-px);
+        scroll -= up;
+        px += up;
+        snap = (snap + px / HERO_DIVE_PX).max(0.0);
+    }
+    (snap, scroll)
 }
 
 fn pinned_snap(target: f32, rows: usize) -> f32 {

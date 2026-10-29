@@ -420,7 +420,7 @@ impl CardRow {
         self.scroll_x.jump((self.scroll_x.pos + dx).clamp(0.0, max));
         self.free = true;
     }
-    /// The row follows its focused cell again (a key's move along it, a click on one of its cards).
+    /// The row follows its focused cell again (a key's move along it).
     pub fn unfree(&mut self) {
         self.free = false;
     }

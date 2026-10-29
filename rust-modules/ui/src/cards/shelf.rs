@@ -265,16 +265,6 @@ impl Shelf {
                 .focused_elem(cx, src)
                 .filter(|&(i, _)| src.holdable(i))
                 .map(|(_, e)| CardEvent::Hold(e)),
-            // A click on one of the row's cards brings the row back to its focus (the card).
-            ScreenEvent::Input(input) => {
-                if let plx_machine::machine::InputKind::Click { hit: Some(hit), .. } = &input.kind {
-                    if src.index_of(hit).is_some() {
-                        self.row.unfree();
-                        fx.invalidate(Provenance::Input);
-                    }
-                }
-                None
-            }
             // A covering menu changes nothing here: the page keeps its focus and the settled pop is
             // what the opener redraw reads.
             _ => None,
@@ -994,15 +984,9 @@ impl Shelf {
     }
 
     /// **The pointer's sideways glide** (`InputKind::Pan`) over this row: move it by `dx` px, held
-    /// to its `n` cards, and leave it there until a key moves along it or a click lands on one of
-    /// its cards ([`CardRow::glide`]).
+    /// to its `n` cards, and leave it there until a key moves along it ([`CardRow::glide`]).
     pub fn glide(&mut self, dx: f32, n: usize) {
         self.row.glide(dx, n, self.style);
-    }
-
-    /// Release a row the pointer's glide holds: it follows its focused card again.
-    pub fn unfree(&mut self) {
-        self.row.unfree();
     }
 
     /// Restore a saved viewport (`n` is the current card count).

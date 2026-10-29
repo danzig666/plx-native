@@ -5336,11 +5336,11 @@ fn a_wheel_glides_the_detail_page_within_its_range() {
     clear();
 }
 
-/// **A hover moves focus, never the detail page; a click brings the page to what it clicked**; a
-/// key still brings its section into reading position. Before, a Magic Remote hover yanked the
+/// **Neither a hover nor a click moves the detail page**; a key still brings its section into
+/// reading position. Before, a Magic Remote hover yanked the
 /// section it touched up to the title band, so every hover moved the page and undid a glide.
 #[test]
-fn a_hover_moves_no_detail_page_and_a_click_brings_it_to_its_element() {
+fn a_hover_or_a_click_moves_no_detail_page() {
     let sid = ServerId::UNSET;
     let mut page = detail(sid, "show");
     page.related = (1..=12).map(|i| collection_member(sid, &format!("r{i}"))).collect();
@@ -5365,7 +5365,7 @@ fn a_hover_moves_no_detail_page_and_a_click_brings_it_to_its_element() {
     let click = ScreenEvent::Input(InputEvent { at: Default::default(), source: plx_machine::machine::Source::Script,
         kind: InputKind::Click { x: 0.0, y: 0.0, hit: Some(related) } });
     step(&mut screen, &click, Some(related));
-    assert_eq!(screen.scroll_target, seated, "a click brings the page to what it clicked");
+    assert_eq!(screen.scroll_target, 0.0, "a click moves no page");
     clear();
 }
 

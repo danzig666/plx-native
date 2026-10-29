@@ -287,7 +287,7 @@ pub struct DetailScreen {
     free: bool,
     episode_scroll: Spring,
     /// The episode strip is where the pointer's sideways glide put it (`InputKind::Pan`): the tick
-    /// stops steering it to the focused episode until a key's move or a click. Like `free`, not in
+    /// stops steering it to the focused episode until a key's move. Like `free`, not in
     /// the canon (what it decides, `episode_scroll`, is).
     episode_free: bool,
     /// What the episode strip last asked the store to have loaded, and when.
@@ -2128,8 +2128,8 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                     self.return_pending = false;
                     self.restore_intent = None;
                 }
-                // A hover moves focus, never the page: the pointer scrolls by the screen's edges
-                // (and a click by what it clicked, `Input`'s `Click` arm).
+                // A hover moves focus, never the page: the pointer scrolls by the screen's edges,
+                // and a click acts where it stands.
                 if *by == By::Pointer {
                     self.free = true;
                 } else {
@@ -2209,17 +2209,10 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                     self.restore_intent = None;
                     self.return_pending = false;
                 }
-                // A click brings the page to what it clicked, the way a key's move does.
-                if let InputKind::Click { hit: Some(hit), .. } = input.kind {
-                    if !self.full_trailer() {
-                        self.free = false;
-                        self.episode_free = false;
-                        self.reveal_focus(Some(FocusKey { entry: self.entry, elem: hit }), cx.measure, meta);
-                        fx.invalidate(Provenance::Input);
-                    }
-                }
+                // A click moves nothing: it acts where it stands. Only a key's move brings the page
+                // to the focus.
                 // The pointer's sideways glide moves the row under it: one of the four shelves, or
-                // the episode strip, each left where it put it until a key's move or a click.
+                // the episode strip, each left where it put it until a key's move.
                 if let InputKind::Pan { dx, y, .. } = input.kind {
                     if dx.is_finite() && !self.full_trailer() {
                         self.pan_row(dx, y, meta, cx.measure);
