@@ -454,6 +454,7 @@ pub(super) fn draw_player_title_at(
     measure: &dyn Measure,
     paused: bool,
     clock: &plx_ui::marquee::Clock,
+    media: &str,
 ) {
     let TitleLook { x: left, kicker_y, title_y, kicker_size, title_size, title_ink, title_bold, .. } = look;
     let width = (right - left).max(0.0);
@@ -465,8 +466,15 @@ pub(super) fn draw_player_title_at(
     if look.kicker_visible && !text.is_null() {
         let (ink, bold) = (look.kicker_ink.unwrap_or(ink), look.kicker_bold.unwrap_or(bold));
         let label = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
-        let fitted = measure.fit_line(&label, width, kicker_size, bold);
+        let (fitted, used) = measure.fit_line_measured(&label, width, kicker_size, bold);
         p.text(fitted.as_ptr(), left, kicker_y, kicker_size, ink, 0, i32::from(bold));
+        // The media line ([`super::media_line`]) runs on after the kicker in the context line's
+        // quiet ink, in whatever room the kicker leaves: the kicker keeps its priority.
+        if !media.is_empty() && used < width {
+            let sep = if used > 0.0 { " \u{b7} " } else { "" };
+            let run = measure.fit_line(&format!("{sep}{media}"), width - used, kicker_size, false);
+            p.text(run.as_ptr(), left + used, kicker_y, kicker_size, theme::TEXT_SECONDARY, 0, 0);
+        }
     }
     if title.is_null() {
         clock.release();

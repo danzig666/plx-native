@@ -30,6 +30,7 @@ pub mod command;
 pub mod geometry;
 pub mod loaded;
 pub mod model;
+pub mod media_line;
 pub mod motion;
 pub mod render;
 pub mod seek_jump;

@@ -54,7 +54,7 @@ fn draw_player_title(
     paused: bool,
     clock: &plx_ui::marquee::Clock,
 ) {
-    draw_player_title_at(p, TitleLook::default(), kicker, title, right, measure, paused, clock);
+    draw_player_title_at(p, TitleLook::default(), kicker, title, right, measure, paused, clock, "");
 }
 
 /// **The right edge of the title's cell in the compiled classic** for a frame's slot: where the compile's
@@ -2037,4 +2037,29 @@ fn the_wall_clock_draws_top_right_and_its_next_minute_is_warm() {
         assert!(plx_gfx::text::prewarm_resident_for_test(text.as_bytes(), WALL_CLOCK_SZ, 1), "{text:?} was left cold");
     }
     plx_gfx::text::reset_prewarm_for_test();
+}
+
+/// **The media line runs on after the kicker**, in the room the kicker leaves inside the title's
+/// cell, and is drawn nowhere when there is nothing to say.
+#[test]
+fn the_media_line_follows_the_kicker_inside_the_title_cell() {
+    let _g = plx_base::testlock::serial();
+    let fm = plx_ui::fixture::FixtureMeasure;
+    let clock = plx_ui::marquee::Clock::default();
+    let kicker = std::ffi::CString::new("S1, E2 \u{b7} Pilot").unwrap();
+    let title = std::ffi::CString::new("A Show").unwrap();
+    let right = 1500.0;
+    let runs = |media: &str| {
+        let log = plx_ui::draw_census::capture(|| {
+            draw_player_title_at(plx_ui::Painter::recording(), TitleLook::default(), Kicker::Episode(kicker.as_ptr()),
+                title.as_ptr(), right, &fm, false, &clock, media);
+        });
+        log.iter().filter(|(tag, _)| *tag == 100).map(|(_, r)| *r).collect::<Vec<plx_ui::Rect>>()
+    };
+    let bare = runs("");
+    let with = runs("4K \u{b7} HEVC \u{b7} TrueHD Atmos 7.1");
+    assert_eq!(with.len(), bare.len() + 1, "one more run: the media line");
+    let (k, m) = (bare[0], with[1]);
+    assert!((m.y - k.y).abs() < 0.5 && m.x >= k.x + k.w - 0.5, "on the kicker's line, after it: {k:?} {m:?}");
+    assert!(m.x + m.w <= right + 0.5, "inside the title's cell: {m:?}");
 }

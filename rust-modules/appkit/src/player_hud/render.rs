@@ -760,11 +760,12 @@ fn draw_title(f: &Frame<'_>, row: &mut HudMotion, q: Painter, kicker: Option<Tit
     };
     let right = main.rect.x + main.rect.w;
     let paused = f.model.paused;
+    let media = super::media_line::media_line(f.ps, f.meta);
     if let Some(n) = f.meta.now_playing().filter(|n| n.is_real_episode) {
         let kicker = CString::new(plx_ui::fmt::episode_kicker(n.season, n.index, &n.ep_title)).unwrap_or_default();
         // an interior-NUL title drew nothing before the title was factored out: it still does
         if let Ok(title) = CString::new(n.title.clone()) {
-            draw_player_title_at(q, look, Kicker::Episode(kicker.as_ptr()), title.as_ptr(), right, f.measure, paused, &row.title_clock);
+            draw_player_title_at(q, look, Kicker::Episode(kicker.as_ptr()), title.as_ptr(), right, f.measure, paused, &row.title_clock, &media);
         }
     } else {
         draw_player_title_at(
@@ -776,6 +777,7 @@ fn draw_title(f: &Frame<'_>, row: &mut HudMotion, q: Painter, kicker: Option<Tit
             f.measure,
             paused,
             &row.title_clock,
+            &media,
         );
     }
 }
