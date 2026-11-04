@@ -1,34 +1,38 @@
 //! Library shelf physical-hold engine item capture.
 
 use super::*;
+use plx_ui::screen::Focusable;
 #[allow(unused_imports)]
 use super::test_support::*;
 use super::test_support::{frame};
 
+/// The page the Library header's Recommended control pushes; the hubs are its rows.
+const RECOMMENDED: AppArg = AppArg::LibraryRecommended { section: 0 };
+
 #[test]
 fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
-    let _guard = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("library-shelf-hold");
+    let _guard = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("library-shelf-hold");
     session.watching("u-library-shelf-hold");
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
     for row in 0..2 {
-        crate::plex::reset_servers_for_test();
+        plx_plex::plex::reset_servers_for_test();
         let own =
-            crate::plex::register_for_test("shelf-own", "127.0.0.1", 9, "synthetic", "fixture");
+            plx_plex::plex::register_for_test("shelf-own", "127.0.0.1", 9, "synthetic", "fixture");
         let shared =
-            crate::plex::register_for_test("shelf-shared", "127.0.0.1", 10, "synthetic", "fixture");
-        crate::plex::set_current(own);
+            plx_plex::plex::register_for_test("shelf-shared", "127.0.0.1", 10, "synthetic", "fixture");
+        plx_plex::plex::set_current(own);
         let mut d = Dispatcher::<AppHost>::new();
         let mut rig = Bridge::for_test(|| 0);
         rig.stores.browse.borrow_mut().seed_registered_table_for_test([own, shared]);
         rig.refresh_browse_directory();
-        rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+        rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
         {
             let mut browse = rig.stores.browse.borrow_mut();
             browse.seed_items_for_test(12);
@@ -40,14 +44,14 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
             browse.seed_landscape_for_test(0, "Synthetic show");
         }
         for i in 0..80 {
-            frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
+            frame(&mut d, &mut rig, RECOMMENDED, tick(i), vec![]);
         }
         let position = |d: &Dispatcher<AppHost>| {
             d.top_screen()
                 .unwrap()
                 .as_any()
                 .unwrap()
-                .downcast_ref::<crate::screens::library::LibraryScreen>()
+                .downcast_ref::<plx_screens::library::RecommendedScreen>()
                 .unwrap()
                 .probe_viewport(d.focus())
         };
@@ -62,7 +66,7 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
             frame(
                 &mut d,
                 &mut rig,
-                AppArg::Library,
+                RECOMMENDED,
                 tick(i),
                 script_key(Key::Down, tick(i)),
             );
@@ -71,13 +75,13 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
         frame(
             &mut d,
             &mut rig,
-            AppArg::Library,
+            RECOMMENDED,
             tick(i),
             script_key(Key::Right, tick(i)),
         );
         i += 1;
         for n in i..i + 80 {
-            frame(&mut d, &mut rig, AppArg::Library, tick(n), vec![]);
+            frame(&mut d, &mut rig, RECOMMENDED, tick(n), vec![]);
         }
         i += 80;
         assert_eq!(
@@ -105,7 +109,7 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
         frame(
             &mut d,
             &mut rig,
-            AppArg::Library,
+            RECOMMENDED,
             tick(i),
             key_input(Edge::Down, i),
         );
@@ -113,9 +117,9 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
         assert!(d.input.press.is_live());
         let mut requests = Vec::new();
         let mut saw_scaled_press = false;
-        let rect = |r: crate::ui::Rect| [r.x, r.y, r.w, r.h];
+        let rect = |r: plx_ui::Rect| [r.x, r.y, r.w, r.h];
         for n in i + 1..i + 80 {
-            frame(&mut d, &mut rig, AppArg::Library, tick(n), vec![]);
+            frame(&mut d, &mut rig, RECOMMENDED, tick(n), vec![]);
             assert_eq!(d.focus(), Some(key));
             let page = d
                 .nav
@@ -127,26 +131,21 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
                 .screen
                 .as_any()
                 .unwrap()
-                .downcast_ref::<crate::screens::library::LibraryScreen>()
+                .downcast_ref::<plx_screens::library::RecommendedScreen>()
                 .unwrap();
             let parts = CxParts {
                 tick: tick(n),
-                press: crate::ui::machine::PressRead {
+                press: plx_machine::machine::PressRead {
                     scale: d.input.press.scale(),
                     is_long: d.input.press.was_long(),
+                    held_ms: None,
+                    owner: d.input.dip_owner,
                 },
                 focus: d.input.engine.read(InputOwner::Entry(key.entry)),
                 owner: InputOwner::Entry(key.entry),
             };
             let cx = parts.cx::<AppHost>(
-                AppViews {
-                    auth: rig.session.read(),
-                    hubs: rig.hubs.view(),
-                    listing: rig.listing.view(),
-                    directory: rig.directory.view(),
-                    section_hubs: rig.section_hubs.view(),
-                    search: rig.search.view(), person: rig.stores.person_view(), session: crate::route::idle_session_for_test(),
-                },
+                rig.views_with(plx_media::route::idle_session_for_test()),
                 &rig.measure,
             );
             let placed = page.place(&key.elem, &cx, At::Drawn).unwrap();
@@ -190,20 +189,19 @@ fn shelf_physical_hold_captures_engine_item_deck_flag_and_bridge_rest_opener() {
             }
         );
         assert_eq!(requests[0].2.focus, Some(key));
-        let (selected, opener) = rig
-            .library_selection(&d, key.entry, requests[0].2.focus)
-            .unwrap();
+        let (selected, opener) =
+            rig.library_selection(&d, key.entry, requests[0].2.focus).unwrap();
         assert_eq!((selected.sid, selected.rk), (item.sid, item.rk));
         assert!(opener.rect.is_some());
         frame(
             &mut d,
             &mut rig,
-            AppArg::Library,
+            RECOMMENDED,
             tick(i + 80),
             key_input(Edge::Up, i + 80),
         );
         for n in i + 81..i + 120 {
-            frame(&mut d, &mut rig, AppArg::Library, tick(n), vec![]);
+            frame(&mut d, &mut rig, RECOMMENDED, tick(n), vec![]);
         }
         assert!(
             !rig.take_library_reqs().iter().any(|(_, req, _)| matches!(

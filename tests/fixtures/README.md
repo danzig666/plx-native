@@ -1,11 +1,34 @@
 # `tests/fixtures` — synthesizing the media the suite needs
 
+## Dolby Vision random-access comparison (issue #1166)
+
+The pipeline tier has an original DV Profile 8.1 A/B pair:
+
+```sh
+python3 tests/fixtures/make_fixtures.py --tier pipeline \
+  --only pipe_hevc_eac3_4k_dovi_p8,pipe_hevc_eac3_4k_dovi_idr --out /path/out
+```
+
+Both clips use synthetic 4K HDR10-compatible video, authored Dolby Vision RPU metadata,
+E-AC-3 audio, and a 60-second duration. The `p8` clip begins with an IDR and has CRA seek
+points; the `idr` control uses closed GOPs and later IDRs. Each banner identifies its clip.
+Verification reads the first five seconds' actual key-packet NAL types and requires an RPU
+at each inspected key, rather than trusting the container's keyframe flag. The results are
+in `video.random_access` in `fixtures.json`. Builds shorter than three seconds verify only
+the initial key; use the full clips for the comparison.
+
+Compare playback from the start, seeking to 4.2 seconds, and a cold resume at 4.2 seconds
+with Dolby Vision enabled. The reported webOS 5.5 failure skips CRA at the DV splitter's
+initial random-access gate. Matching that packet structure is a candidate reproducer;
+it is not proof that a generated clip reproduces the fault on that TV. See
+[the trace analysis](../../docs/measurements/issue1166-cra.md).
+
 `tests/run.py` grades the player against nine symbolic **item shapes**
 (`movie_h264_ac3_1080p`, `episode_hevc_4k_hdr10_eac3`, …), and
 `tests/manifest.local.json` maps each shape to a ratingKey on whatever PMS you own. That
 mapping is the entire barrier to entry, and it is a real one: the shapes include a TrueHD
 default track with an AC-3 sibling, a Dolby Vision profile 8.1 base layer, a PGS bitmap
-subtitle track, and an eight-track audio file with **English DTS at ordinal 6**. Nobody
+subtitle track, and an eight-track audio file with **English TrueHD at ordinal 6**. Nobody
 has that lying around by accident, and two of those — TrueHD and Dolby Vision — have no
 freely-licensed example anywhere in the world, so "go and find one" is not advice, it is a
 dead end.
@@ -189,17 +212,23 @@ fill `items` with the ratingKeys. The shape keys are identical on both sides:
   "movie_hevc_4k_pgs_subs":          "12354",
 
   "movie_in_home_catalog":           "12345",
-  "movie_cast0_in_both_libraries":   "<ratingKey>"
+  "movie_cast0_in_both_libraries":   "<ratingKey>",
+  "collection":                      "<ratingKey>",
+  "collection_member_movie":         "<ratingKey>"
 }
 ```
 
-The last two are **fps-scene keys, not playback shapes**, and they are in the example
+The last four are **fps-scene keys, not playback shapes**, and they are in the example
 overlay too — leaving them out of this block is how `fps:detail-transition` and
 `fps:home-detail-nav` get silently dropped for no reason. `movie_in_home_catalog` is
 satisfied by **any** of the movies above once it appears in Home's recently-added row, so
 reuse a ratingKey you already have. `movie_cast0_in_both_libraries` is the one key this
 generator cannot satisfy at all — Personal Media items carry no cast — so leave it bracketed
-and `fps:person-page` skips by name.
+and `fps:person-page` skips by name. `collection` is a movie COLLECTION's ratingKey (two or
+more members with posters, in the Movies library the library scenes enter); this generator
+builds none, so leave it bracketed too and `fps:collection-page` / `fps:library-collections`
+skip by name. `collection_member_movie` needs cast and extras, which this generator's items
+do not have, so leave it bracketed as well and `fps:detail-collection-shelf` skips by name.
 
 `episode_hevc_4k_hdr10_eac3_next` must be the episode that *follows* the one above it in
 the same season — s01e02 of `PlxTest HDR Show`, which is what the generator built it as.
@@ -250,19 +279,20 @@ the real one.)
 | shape | dur | what makes it this shape |
 |---|---|---|
 | `movie_h264_ac3_1080p` | 1080 s | H.264 High + AC-3 5.1 + **four** SRT tracks ordered `[rus-forced, rus, eng, eng-SDH]`. 1080 s because `subtitle_text_srt` seeds 843 s (843/0.9 = 937 floor). CRF 20, not the 25 the rest of the H.264 set uses, and it declares a **`min_mbit` floor `verify()` asserts**: both rapid-seek cases' H.264 half lives here and seek *coalescing* is what they grade. |
-| `episode_hevc_4k_hdr10_eac3` (+`_next`) | 300 s ×2 | HEVC Main10 4K HDR10 (real mastering-display + CLL in-band) with a **German default** E-AC-3 at index 0 and English at index 1 — `audio_switch_native` picks row 0 and expects a native switch. Built as a pair for `marker_credits_up_next`, with a shared 130 s intro and a 40 s black credits tail (see *markers*, below). Also carries a `min_mbit` floor. |
-| `movie_hevc_4k_hdr10_truehd` | 90 s | TrueHD 5.1 default + AC-3 5.1 sibling: the smart-direct-play shape. Also the item every player-tier fps scene decodes under its overlay. |
+| `episode_hevc_4k_hdr10_eac3` (+`_next`) | 300 s ×2 | HEVC Main10 4K HDR10 (real mastering-display + CLL in-band) with a **German default** E-AC-3 at index 0 and English at index 1 — with no Plex language preference the file's default (row 0, German) is what plays at start (#210), so `audio_switch_native` picks row 1 to switch to the English track and expects a native switch. Built as a pair for `marker_credits_up_next`, with a shared 130 s intro and a 40 s black credits tail (see *markers*, below). Also carries a `min_mbit` floor. |
+| `movie_hevc_4k_hdr10_truehd` | 90 s | TrueHD 5.1 default + AC-3 5.1 sibling: the smart-direct-play shape. Also the item every player-tier fps scene decodes under. `info-panel` and `chapters-panel` have no overlay; they select a HUD section word. |
 | `movie_hevc_4k_dovi_p8` | 90 s | Dolby Vision **8.1**, RPU authored from scratch by `dovi_tool generate` and injected into a synthetic HDR10 base layer, muxed by `mkvmerge`. ffprobe reads back `dv_profile=8, bl_compat=1, el_present=0, rpu_present=1`, plus in-band `Dolby Vision RPU Data`. Carries the **four-track SRT stack** as well — its case covers `embedded-srt-many`. |
-| `movie_hevc_aac_mp4` | 90 s | HEVC/AAC in mp4 (`hvc1`, faststart) with a **sidecar** `.en.srt`. AAC **stereo**: this case is the mov-demuxer/ADTS path, real-world mp4s are usually 2.0, and `devcaps::audio_has` ignores the channel count so a 5.1 claim is one nothing in the app would ever check. |
+| `movie_hevc_aac_mp4` | 90 s | HEVC/AAC in mp4 (`hvc1`, faststart) with a **sidecar** `.en.srt`. AAC **stereo**: this case is the mov-demuxer/ADTS path, real-world mp4s are usually 2.0, and Auto checks the device table’s per-codec channel limit. |
 | `episode_h264_aac` | 90 s | H.264/AAC episode with no subtitle tracks at all. |
-| `movie_h264_ac3_many_audio` | 90 s | **Eight** audio tracks, each language-tagged, with **DTS English at index 6** — `audio_switch_transcode` picks row 6 and expects the switch to force a transcode. |
-| `movie_av1_no_dp_audio` | 780 s | AV1 4K + Opus: no direct-playable video *and* no direct-playable audio, so the server must transcode. 780 s because `resume_transcode` seeds 600 s. **Its three cases need a Plex Pass server** — see below. |
-| `movie_hevc_4k_pgs_subs` | 780 s | HEVC 4K HDR10 + a **PGS bitmap** subtitle track at index 0 (`subtitle_image_pgs` picks row 1; row 0 is *Off*). Seeds 600 s. |
+| `movie_h264_ac3_many_audio` | 90 s | **Eight** audio tracks, each language-tagged, with **TrueHD English at index 6** — `audio_switch_transcode` picks row 6 and expects the switch to force a transcode. |
+| `movie_av1_no_dp_audio` | 780 s | AV1 4K + Opus: on a set whose codec table lists no AV1 decoder (the dev set), no direct-playable video *and* no direct-playable audio, so the server must transcode. 780 s because `resume_transcode` seeds 600 s. **Its three cases need a Plex Pass server** — see below. |
+| `movie_hevc_4k_pgs_subs` | 780 s | HEVC 4K HDR10 + a **PGS bitmap** subtitle track at index 0 (`subtitle_image_pgs` names it `"track": 0`, which counts tracks only, so the rows above the tracks do not move it). Seeds 600 s. |
 
 **Track ORDER is part of the spec, not a detail.** `tests/README.md`: the audio tab's row is
-the metadata audio index in file order, and the subtitle tab's row 0 is *Off* with row *r*
-being subtitle index *r−1*. Three cases assert positions, and the generator's declarative
-spec — the same one `verify()` reads back — is what pins them.
+the metadata audio index in file order, and the subtitle cases name their track by position
+(`"track": N`, which counts the Subtitles tab's tracks only), so the rows above the tracks —
+row 0 *Off*, row 1 *Forced only* — never move a case. Three cases assert positions, and the
+generator's declarative spec — the same one `verify()` reads back — is what pins them.
 
 ### You can see the shape without opening a manifest
 
@@ -335,18 +365,18 @@ skips both splices; `--quick` never builds them, since a 20 s clip cannot carry 
 intro.
 
 **The three AV1 cases need a Plex Pass server with HEVC encoding enabled.**
-`transcode_av1_no_dp_audio`, `seek_transcode` and `resume_transcode` all assert
-`codec: hevc`, and `transcoder.rs` sends `videoCodec=hevc,h264` precisely because HEVC
-*encoding* sits behind Plex Pass — a free server picks h264 and those three cases go red
-reading `codec=h264 … (want hevc)` while the media is perfectly fine. Enable *Settings →
-Transcoder → Enable HEVC video encoding*, or bracket `movie_av1_no_dp_audio` in
+`transcode_av1_no_dp_audio`, `seek_transcode` and `resume_transcode` all assert `codec: hevc`, and
+`transcoder.rs` sends `videoCodec=hevc,h264` (`,av1` is appended only when the table lists the AV1
+row) precisely because HEVC *encoding* sits behind Plex Pass — a free server picks h264 and those
+three cases go red reading `codec=h264 … (want hevc)` while the media is perfectly fine. Enable
+*Settings → Transcoder → Enable HEVC video encoding*, or bracket `movie_av1_no_dp_audio` in
 `manifest.local.json` and let the three skip by name.
 
-**`movie_cast0_in_both_libraries`** — one of the two fps-scene item keys. It needs a *matched*
+**`movie_cast0_in_both_libraries`** — one of the four fps-scene item keys. It needs a *matched*
 item whose first-billed cast member has titles in **both** libraries, so the person page
 draws two poster shelves. Personal Media items have no cast at all, so this is
 unreachable by construction; the `person-page` scene stays a real-library scene.
-(`movie_in_home_catalog`, the other fps-only key, is satisfied in practice by any of these
+(`movie_in_home_catalog`, another fps-only key, is satisfied in practice by any of these
 movies — a freshly scanned library puts them all in recently-added — but that is a property
 of the Home catalog, not something this script verifies.)
 
@@ -401,7 +431,7 @@ a Mac. Four things were not, and saying which is which is the point of this sect
 * **Nothing here has been through a real Plex scan.** Steps 3–5 (agent choice, scan and
   analysis timing, ratingKey mapping) are reasoned from `docs/pms-api.md` and prior art, not
   executed. In particular: whether PMS enumerates a nine-stream file in **container index
-  order** is what the `audio row 6 = English DTS` and `subtitle row 3 = English` contracts
+  order** is what the `audio row 6 = English TrueHD` and `subtitle row 3 = English` contracts
   rest on. Everything client-side checks out; the server half is untested.
 * **Whether the rapid-seek cases actually coalesce** at the bitrate these files carry
   depends on the LAN round trip and the television. The `min_mbit` floor puts the H.264 seek
@@ -506,3 +536,26 @@ and right for HEVC.
 **The rate/size table is measured, not guessed.** `SHAPES[k]["rate"]` (encode seconds per
 output second) and `MBIT[k]` exist only to print an honest ETA. Re-measure both if the CRFs
 move; a wrong ETA on a twenty-minute job is how somebody concludes it hung.
+
+### DTS core packet regression artifact
+
+`dts-core-frame.dts` is the first 1,884-byte audio packet of the generated
+`pipe_h264_dts_1080p` fixture (48 kHz, DTS core 5.1, synthetic tone). Generate the fixture
+with `make_fixtures.py --tier pipeline --only pipe_h264_dts_1080p`, then extract with
+`ffmpeg -i pipe_h264_dts_1080p.mkv -map 0:a:0 -c:a copy -frames:a 1 -f dts dts-core-frame.dts`.
+The host regression grades exact preservation and extension stripping; audible decoding,
+synchronization and seeking are TV checks. The many-audio fixture now uses TrueHD at ordinal
+6 so its forced-transcode case remains a test of an unsupported format on DTS-capable TVs.
+
+
+### Dolby Vision Profile 7 RPU fixtures
+
+`dovi-p7-mel-rpu.bin` and `dovi-p7-fel-rpu.bin` are one Profile 7 RPU each (MEL and FEL), and
+`dovi-p7-mel-to-81-rpu.bin` is the MEL one after `dovi_tool`'s mode-2 conversion to Profile 8.1.
+They are dovi_tool's own test assets (`assets/tests/mel_orig.bin`, `fel_orig.bin` and
+`mel_to_81.bin` at commit `614c816b6446dcd1dbaf433403d499a6026fbb5a`, MIT; see
+`THIRD-PARTY-NOTICES.md`), copied unmodified. Each file is a 4-byte start code followed by the
+RPU after its `7C 01` NAL header, the form `dovi_tool` writes. The host regression in
+`ff_packet_framing_tests.rs` holds the in-app MEL conversion to dovi_tool's output byte for byte
+and the FEL one to a Profile 8 result (dovi_tool keeps no mode-2 output for its FEL asset);
+whether the panel engages Dolby Vision on the converted stream is a TV check.

@@ -52,6 +52,24 @@ repository:
     $(cat .tv-host)"` names the file, reads it and publishes the contents on one visible line.
     Also found on 2026-08-23, and also previously allowed: the substitution's own segment is a
     `cat`, which is not outbound, and the outer token is quoted prose, which the path check skips.
+  * `tools/pr-land.py merge`: its `--subject` and body become the squash commit's message on `main`,
+    so they are scanned like a `git commit -m`. A `--subject` and a `--body-file` the script scans
+    again itself before any `gh`; a `--body-from-pr` body only the script sees (once, after fetching it).
+
+A SECOND QUESTION, UNRELATED TO PRIVATE VALUES: `merge_verdict` refuses a pull request merged by
+hand. A PR lands through `tools/pr-land.py` (the `land-pr` skill), which merges only a head whose
+checks say it may land; `gh pr merge` typed after a watcher, or read off a `gh run list` that said
+"completed" mid-run, is how #387 merged red. Refused: `gh pr merge` (any arguments), a `gh api` call
+to `.../pulls/N/merge` that is not a GET, and a GraphQL `mergePullRequest` written on the command line
+or in a heredoc (`merge_reason` tests only that text, so a query read from a file, `-F query=@f` or
+`--input f`, is not seen; the private-value scan reads those files, this does not). It matches the COMMAND,
+never the words (a grep, an echo, a commit message and a heredoc are prose) and is pure string work.
+Its hatch is its own prefix, `PLX_MERGE_BYPASS=1`, for the owner's manual merge; it does not open
+the private-value scan above and `PLX_PUBLISH_BYPASS=1` does not open it. The refusal never echoes
+the command: a raw merge can carry a `--body` the scan above has not read. Cooperative, like the rest:
+`bash -c`, a script, a query file, curl with a token and the GitHub MCP connector are not seen here (the connector's
+merge tool has a `permissions.deny` rule in `.claude/settings.json`). The tool itself calls `gh pr
+merge` from a subprocess this hook cannot see.
 
 WHY `git push` IS DELIBERATELY NOT THE GATE. By push time the message is already an object in the
 local history and the interesting half of the leak has happened; `git commit` is where the text is
@@ -82,7 +100,9 @@ has no editor, so `git commit` with no `-m` hangs or fails rather than committin
 WHAT IT MATCHES. Two halves, and they fail in opposite directions on purpose.
 
 (a) LITERAL VALUES, read at the moment the hook runs out of the gitignored files that hold them —
-    `.tv-host` (the dev television's address), `.tv-mac` (its Wake-on-LAN MAC), `src/config.local.h`
+    `.tv-host` (the dev television's address), `.tv-mac` (its Wake-on-LAN MAC) — and their per-user
+    twins `tv-host`/`tv-mac` under `${PLX_TV_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/plxnative}`,
+    which tools/tv-config.sh reads so that every worktree shares one copy — `src/config.local.h`
     (`PMS_HOST`/`PMS_TOKEN`, the real Plex owner token), `tests/manifest.local.json` (PMS host, the
     test user's plex.tv id, this library's ratingKeys, and the shared_server block when there is
     one), `pkg/auth.json` (the persisted session: `account_token` and each source's per-server
@@ -193,6 +213,7 @@ import subprocess
 import sys
 
 BYPASS = re.compile(r"\bPLX_PUBLISH_BYPASS=1\b")
+MERGE_BYPASS = re.compile(r"\bPLX_MERGE_BYPASS=1\b")
 
 # The gitignored files that hold private values. All eight are named in `.gitignore`, and seven of
 # them carry their own reason in its comments — `src/config.local.h` and `local.env` under "local
@@ -226,6 +247,13 @@ PRIVATE_FILES = (
     ".tv-remote-url",
 )
 
+# The per-USER copies of `.tv-host` / `.tv-mac` (tools/tv-config.sh): one set of files per machine
+# instead of one per checkout, under ${PLX_TV_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/plxnative}.
+# They sit OUTSIDE every checkout, so they cannot be named relative to `root` like PRIVATE_FILES;
+# `private_paths` adds them. Same values, same rule: the address and MAC are the maintainer's home
+# network, and `cat ~/.config/plxnative/tv-host` must be as refused in a payload as `cat .tv-host`.
+USER_TV_FILES = ("tv-host", "tv-mac")
+
 # Gitignored DIRECTORIES whose every descendant is private (restructure spec §5.6 rule 1): a
 # recording taken against a real server carries the household's every keypress and every server
 # answer. Matched by path COMPONENT wherever the directory sits (the runtime root on the set, a
@@ -252,7 +280,7 @@ I32_MAX = (1 << 31) - 1
 # purpose. Compared lowercased.
 GENERIC = frozenset({
     "localhost", "127.0.0.1", "0.0.0.0", "255.255.255.255", "1.2.3.4",
-    "32400", "8910", "8911", "alpine", "example.com", "stable", "debug",
+    "32400", "8910", "8911", "8912", "alpine", "example.com", "stable", "debug", "nightly",
 })
 PLACEHOLDER = re.compile(
     r"^(?:<.*>|\{\{.*\}\}|\$\{?\w+\}?|(?:your|my|the)[_\-].+|x{3,}|redacted|changeme"
@@ -294,6 +322,31 @@ def _walk_json(out, node, path, origin):
         _add(out, "%s (%s)" % (path, origin), node)
 
 
+def user_config_dir():
+    """The per-user TV config directory; the same rule as `tools/tv-config.sh dir` (ci/test_tv_config.py
+    pins the two equal). "" when HOME is unset and nothing overrides it."""
+    d = os.environ.get("PLX_TV_CONFIG_DIR")
+    if d:
+        return d
+    x = os.environ.get("XDG_CONFIG_HOME")
+    if x:
+        return os.path.join(x, "plxnative")
+    h = os.environ.get("HOME")
+    return os.path.join(h, ".config", "plxnative") if h else ""
+
+
+def private_paths(root):
+    """[(label, absolute path)] of every file that holds a private value: the gitignored ones under
+    `root`, then the per-user TV files (labelled `plxnative/<name>`, which is how they read in a
+    refusal)."""
+    out = [(rel, os.path.join(root, rel)) for rel in PRIVATE_FILES]
+    d = user_config_dir()
+    if d:
+        out += [("plxnative/" + n + " (the per-user TV config)", os.path.join(d, n))
+                for n in USER_TV_FILES]
+    return out
+
+
 def load_secrets(root):
     """[(label, value)] read from the gitignored files under `root`. Missing files are skipped.
 
@@ -301,8 +354,7 @@ def load_secrets(root):
     directory of FAKE secrets — no real value belongs in a tracked test file.
     """
     out = []
-    for rel in PRIVATE_FILES:
-        path = os.path.join(root, rel)
+    for rel, path in private_paths(root):
         try:
             if not os.path.isfile(path) or os.path.getsize(path) > MAX_READ:
                 continue
@@ -741,6 +793,15 @@ def local_url(u):
     return bool(m) and bool(LOCAL_HOST.match(m.group(1)))
 
 
+def pr_land_merge(base, args):
+    """True for `tools/pr-land.py merge ...`, run directly or as `python3 tools/pr-land.py merge ...`."""
+    subs = subcommands(args)
+    if base == "pr-land.py":
+        return subs[:1] == ["merge"]
+    return (base.startswith("python") and len(subs) > 1
+            and os.path.basename(subs[0]) == "pr-land.py" and subs[1] == "merge")
+
+
 def outbound(seg):
     """Reason string if this segment publishes its text, else None."""
     w = words(seg)
@@ -749,6 +810,9 @@ def outbound(seg):
     cw = command_word(w)
     base = os.path.basename(cw)
     args = w[w.index(cw) + 1:] if cw in w else w[1:]
+
+    if pr_land_merge(base, args):
+        return "pr-land.py merge writes its --subject and body into main's history"
 
     if base == "gh":
         subs = subcommands(args)
@@ -802,6 +866,11 @@ TEXT_FLAGS = {
     "git": {"-m", "--message"},
     "curl": {"--data-raw", "--form-string", "--body-data"},
     "wget": {"--post-data", "--body-data"},
+    # `tools/pr-land.py merge --subject T`: T is a commit subject, not a path. Keyed by the command
+    # word, so it is `python3` for the usual spelling; the other python flags take no text anyway.
+    "python3": {"--subject"},
+    "python": {"--subject"},
+    "pr-land.py": {"--subject"},
 }
 SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 
@@ -945,7 +1014,7 @@ def named_private_paths(seg, root, cwd):
     already graded outbound.
     """
     hits, seen = [], set()
-    targets = {os.path.realpath(os.path.join(root, rel)): rel for rel in PRIVATE_FILES}
+    targets = {os.path.realpath(path): rel for rel, path in private_paths(root)}
 
     def look(text, how, skip_after):
         prev = None
@@ -960,6 +1029,8 @@ def named_private_paths(seg, root, cwd):
                 t = t.split("@", 1)[1]  # curl's `-F body=@file`
             if not t or t.startswith("-"):
                 continue
+            if t.startswith("~") or "$" in t:
+                t = os.path.expandvars(os.path.expanduser(t))   # ~/.config/... and $HOME/... name the user files
             rp = os.path.realpath(t if os.path.isabs(t) else os.path.join(cwd, t))
             rel = targets.get(rp)
             if rel and rel not in seen:
@@ -1032,6 +1103,87 @@ def grade(cmd):
     return graded
 
 
+MERGE_ENDPOINT = re.compile(r"/pulls/[^/?#]+/merge(?:[/?#]|$)", re.I)
+
+
+def api_method(args):
+    """The HTTP method `gh api` will send for `args`.
+
+    Explicit `-X M` / `--method M` / `-XM` wins; otherwise gh sends POST as soon as there is a field
+    or an input file and GET when there is none. (`--method GET` with fields makes them a query
+    string, which is why the method is read, not the presence of a field alone.)
+    """
+    named = flag_values(args, {"-X", "--method"})
+    named += [t[2:] for t in args if re.match(r"^-X[^=]", t)]
+    if named:
+        return named[-1].upper()
+    fields = any(re.match(r"^-[fF]", t) or t.split("=", 1)[0] in ("--field", "--raw-field", "--input")
+                 for t in args)
+    return "POST" if fields else "GET"
+
+
+def merge_reason(seg, bodies=""):
+    """Reason string if this segment merges a pull request by hand, else None."""
+    w = words(seg)
+    cw = command_word(w)
+    if os.path.basename(cw) != "gh":
+        return None
+    args = w[w.index(cw) + 1:]
+    subs = subcommands(args)
+    if subs[:2] == ["pr", "merge"]:
+        return "gh pr merge"
+    if subs[:1] == ["api"]:
+        if "graphql" in subs[1:]:
+            if "mergePullRequest" in seg or "mergePullRequest" in bodies:
+                return "a GraphQL mergePullRequest"
+        elif any(MERGE_ENDPOINT.search("/" + s) for s in subs[1:]) and api_method(args) != "GET":
+            return "a gh api write to a pull request's merge endpoint"
+    return None
+
+
+SUBSTITUTION = re.compile(r"\$\(([^()]*)\)")     # the pattern `segments()` recurses on
+
+
+def merge_candidates(text, bodies=""):
+    """[(segment, heredoc bodies)] that `text` would run, for `merge_verdict`.
+
+    `segments()` recurses into `$(...)` for the private-value scan and splits the inside on newlines
+    without `units()`, so the body of a heredoc opened inside a substitution -- how a commit message
+    or a PR body is written, `-m "$(cat <<'EOF' ... EOF)"` -- came back as commands, and a body line
+    that began `gh pr merge` refused the whole command. Here each substitution is cut out of `text`
+    and its inside goes through `units()` like a command of its own, so a heredoc stays a body
+    wherever it was opened. The scan keeps `segments()` as it was: more text scanned, never less.
+    """
+    inners = []
+    while True:                     # innermost first; what is left of an outer one is cut next round
+        found = SUBSTITUTION.findall(text)
+        if not found:
+            break
+        inners += found
+        text = SUBSTITUTION.sub(" ", text)
+    out = [(seg, bodies) for seg in segments(text)]
+    for inner in inners:
+        for inner_text, inner_bodies in units(inner):
+            out.extend((seg, inner_bodies) for seg in segments(inner_text))
+    return out
+
+
+def merge_verdict(cmd):
+    """The reason `cmd` merges a pull request outside tools/pr-land.py, or None.
+
+    Pure string work, and the word test comes first so the 99% of Bash calls that mention no merge
+    never pay for the tokenizer.
+    """
+    if "merge" not in cmd.lower() or MERGE_BYPASS.search(cmd):
+        return None
+    for text, bodies in units(cmd):
+        for seg, seg_bodies in merge_candidates(text, bodies):
+            reason = merge_reason(seg, seg_bodies)
+            if reason:
+                return reason
+    return None
+
+
 def verdict(cmd, root, cwd=None, secrets=None, published=None):
     """(segment, reason, [(what, how, where)], secrets) if the command must be refused, else None.
 
@@ -1055,7 +1207,7 @@ def verdict(cmd, root, cwd=None, secrets=None, published=None):
     for seg, reason, bodies in graded:
         hits = []
         for rel, how in named_private_paths(seg, root, cwd):
-            hits.append(("%s, which is gitignored because it holds private values" % rel,
+            hits.append(("%s, which holds private values (gitignored, or kept outside the repo)" % rel,
                          how, "the command line"))
         for where, text in payload_parts(seg, bodies, cwd):
             for what, how in findings(text, secrets, published):
@@ -1106,6 +1258,22 @@ def main():
     if not isinstance(cwd, str) or not cwd:
         cwd = os.getcwd()
 
+    merging = merge_verdict(cmd)
+    if merging:
+        sys.stderr.write(
+            "BLOCKED: a pull request merged by hand (%s).\n"
+            "\n"
+            "A PR lands through tools/pr-land.py (the `land-pr` skill): it merges only a head whose\n"
+            "checks say it may land, then verifies the merge reached the base branch.\n"
+            "  python3 tools/pr-land.py merge N --sha S --subject T (--body-file F | --body-from-pr)\n"
+            "  python3 tools/pr-land.py gate N | wait N --sha S | restack ...   (see the skill)\n"
+            "It grants no authority to merge: a PR still needs the owner's say-so, and `main` takes\n"
+            "squash merges only.\n"
+            "\n"
+            "For the owner's own manual merge, prefix the command with PLX_MERGE_BYPASS=1. That is\n"
+            "not a way around a missing authorization or a red check.\n" % merging)
+        return 2
+
     # Nothing outbound → answer before paying for a repo root, a file read or a `git grep`.
     if BYPASS.search(cmd) or not grade(cmd):
         return 0
@@ -1136,7 +1304,8 @@ def main():
         "and tests/manifest.local.json.example uses `<pms-host>`, `<tv-host>`, `<ratingKey>`.\n"
         "\n"
         "If the reader genuinely needs the real value, name the gitignored FILE it comes from\n"
-        "(.tv-host, src/config.local.h, tests/manifest.local.json) and let them read their own copy.\n"))
+        "(.tv-host, ~/.config/plxnative/tv-host, src/config.local.h, tests/manifest.local.json) and let\n"
+        "them read their own copy.\n"))
     return 2
 
 

@@ -33,7 +33,7 @@ in eight locked batches. Branch `blur/e7-opaque`.
 
 ## 1. The EGL capability probe
 
-`rust-modules/src/egl.rs`, called once from `app.rs` after `SDL_GL_CreateContext`. Read-only,
+`rust-modules/gfx/src/egl.rs`, called once from `app.rs` after `SDL_GL_CreateContext`. Read-only,
 always on, ~5 lines in the event log.
 
 ### 1a. It does not link libEGL, and must not
@@ -59,9 +59,14 @@ on the only firmware family this app has ever run on — a black screen with no 
 
 It is also unnecessary. SDL created the GLES2 context **through EGL**, so whichever EGL the
 firmware has is already mapped with its symbols in the global scope.
-`dynlib::Handle::self_handle()` (`RTLD_DEFAULT`) resolves them, with `SDL_GL_GetProcAddress` and a
-SONAME candidate list as fallbacks. **`tools/fwcompat.py` is byte-identical before and after this
+`dynlib::Handle::self_handle()` (`RTLD_DEFAULT`) resolves them, with a SONAME candidate list
+opened `RTLD_NOLOAD` (an EGL already mapped, never a fresh load) as the fallback. **`tools/fwcompat.py` is byte-identical before and after this
 work: OK on 4.4.2 through 11.2.0.**
+
+`SDL_GL_GetProcAddress` was once a second fallback and is not any more: on a GLX backend it is
+`glXGetProcAddressARB`, which returns a GL dispatch stub for any name, and the Linux simulator
+(desktop GL through GLX) crashed on the garbage those `egl*` "stubs" returned. Nothing in `egl.rs`
+calls EGL until `eglGetCurrentContext` reports a current context on the render thread.
 
 ### 1b. What the television said
 
@@ -87,6 +92,14 @@ egl damage: eglSwapBuffersWithDamageKHR(0,0,64,64)  ok=1 err=0x3000 EGL_SUCCESS
 egl surface (after 120 presents): buffer_age=2 ok=1 err=EGL_SUCCESS
 ```
 
+The last line is **opt-in** (2026-10-24): it appears only when the `eglage` trigger was present at
+boot (`$(make -s print-rundir)/plxnative-eglage`, section 7). The re-ask is off by default because
+that one `eglQuerySurface(EGL_BUFFER_AGE)` blocks a swap 13-16 ms on this Mali-T820, about 2 s after
+every launch: one dropped frame, and the cycle-1 miss in the `hero-pong` / `grid-pong` fps benches
+(15 of 15 baseline runs had it; 0 of 3 with the query compiled out). Everything above it is still
+logged at every boot except the `egl preserve:` and `egl damage:` lines, which need the `eglprobe`
+trigger.
+
 Line by line, because each one closes something:
 
 - **No `EGL_KHR_partial_update`, no `EGL_KHR_swap_buffers_with_damage`, no `EGL_EXT_buffer_age`**
@@ -103,9 +116,10 @@ Line by line, because each one closes something:
   policy. `docs/perf-damage-tracking-verdict.md` §4's second blocker ("you cannot know what is in
   the back buffer") is **confirmed on the device** for every route except partial update itself.
 - **`buffer_age` is 0 at boot and 2 after 120 presents.** The boot reading is 0 by construction —
-  before the first swap the buffer has no history — which is why the probe asks again later. The
-  answer **2** is a real double-buffered age from an extension that is not advertised. A correct
-  damage implementation must therefore union **two frames** of damage.
+  before the first swap the buffer has no history — which is why the probe asks again later (only
+  with the `eglage` trigger armed since 2026-10-24: the re-ask blocks a swap 13-16 ms on this
+  set). The answer **2** is a real double-buffered age from an extension that is not advertised. A
+  correct damage implementation must therefore union **two frames** of damage.
 - **`GL_EXTENSIONS`** (91 entries, logged in full) carries `GL_EXT_discard_framebuffer`,
   `GL_EXT_disjoint_timer_query`, `GL_ARM_shader_framebuffer_fetch`,
   `GL_EXT_shader_pixel_local_storage`, and the whole ES 3.1/3.2 pack. The driver reports
@@ -128,7 +142,7 @@ words 4 / 14 / 20 / 26 / 27, which are already in `hwcnt::COUNTERS` — that agr
 | gator `hardware_counter_names`, T820 block 2 | `T820_FRAG_TRANS_ELIM` |
 | modern libmali `gen.h` | `T820_FRAG_TRANS_ELIM` |
 
-Added to **both** `rust-modules/src/hwcnt.rs` and `tools/analyze-hwcnt.py`; the host test that
+Added to **both** `rust-modules/gfx/src/hwcnt.rs` and `tools/analyze-hwcnt.py`; the host test that
 asserts the two tables are identical still passes (756 tests).
 
 **The `PRFCNT_EN` check.** The profiler logs `jm=0xff tiler=0x1f l2=0xffff sc0=0xffff sc1=0xffff`.
@@ -409,6 +423,12 @@ shippable:
 ```sh
 # EGL capability probe: on by default, in the boot log
 make deploy && make run RUN_SECS=12 | grep -E '^(egl|gl extensions)'
+
+# the buffer-age re-ask after 120 presents (the `egl surface (after 120 presents)` line). OFF by
+# default since 2026-10-24: its query blocks that present's swap 13-16 ms on the T820, so arm it
+# only for the reading, never for a smoothness run. Read once at boot: arm it BEFORE launching.
+# Spelled with the install's runtime root, so it arms the install `make deploy` put there.
+ssh root@TV "touch $(make -s print-rundir)/plxnative-eglage"
 
 # the mutating probe (config surface type, BUFFER_PRESERVED attempt, the two damage calls)
 ssh root@TV 'touch /tmp/plxnative-eglprobe'

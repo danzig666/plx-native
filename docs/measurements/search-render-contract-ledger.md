@@ -71,7 +71,7 @@ Tiers, because a row's destination is not a matter of taste:
 | `the_first_shelfs_whole_row_clears_the_raised_keyboard` | Ported; `top`/`block_h`/`KEYBOARD_H`. |
 | `a_shelf_scrolls_only_as_far_as_its_own_block_needs` | Ported; `reveal`, the same shared minimal-reveal helper used by the screen. |
 | `a_tile_scrolled_under_the_chrome_is_not_a_pointer_target` | Ported as `screens::search::tests::a_tile_scrolled_under_the_chrome_is_not_a_pointer_target`, over `Focusable::place`'s clip and the real `HitMap`. It found a SHARED bug: `rect ∩ clip` fed `Rect::contains`, which is inclusive, so a stop clipped entirely away answered along its clip's edge and a zero-size stop answered at its corner. Fixed in `ui/hit.rs` (`a_stop_with_no_visible_area_is_not_a_target`) for every page, not in this screen. |
-| `the_heading_states_its_count_and_annotates_only_a_borrowed_source` | Ported; `heading_flow` is now the draw/test expression, including count gap, source padding, ink and weight. |
+| `the_heading_states_its_count_and_annotates_only_a_borrowed_source` | Ported; the test paints through `plx_ui::cards::draw_heading_c` (`card_row::heading_parts`), with the count a dotted note on `HEADING_SOURCE_PAD`, and reads the painted runs back (ink and weight included). |
 | `the_owner_annotation_swaps_its_words_only_while_it_is_invisible` | Ported as `screens::search::tests::the_owner_annotation_swaps_its_words_only_while_it_is_invisible`, over three real registry sources. `OWNER_FLOOR` moved to `mod.rs` so the alpha the renderer refuses to draw below and the alpha the instance swaps its word at are one constant. |
 | `a_settled_annotation_goes_quiet_and_a_moving_one_does_not` | Ported as `screens::search::tests::a_settled_annotation_goes_quiet_and_a_moving_one_does_not`. RED first: the spring reported to `ui::idle` and said nothing to the dispatcher's gate — `ran 0 frames`. The three springs this instance owns now step through `ui::motion::spring`. |
 | `a_caption_identifies_the_result_and_names_a_borrowed_source_last` | Ported; `subtitle`. |
@@ -100,7 +100,7 @@ spinner or loading sentence. Searching draws no statement; Failed draws the exis
 | `terms_are_written_under_the_profile_that_searched_them` | Covered by the same-named test in `search::recents::tests`. |
 | `the_cap_drops_the_oldest_term` | Covered by the same-named test in `search::recents::tests`; `layout::RECENT_CAP` is that module's own `CAP`. |
 | `a_hand_edited_list_is_cleaned_up_on_the_way_in` | Covered by the same-named test in `search::recents::tests`. |
-| `a_full_block_finishes_clear_of_the_raised_keyboard` | Ported in `layout::tests`; `recent_block_bottom` and the real `recents::CAP`/table geometry are used. |
+| `a_full_block_finishes_clear_of_the_raised_keyboard` | Ported in `layout::tests`; `layout::clear` (the control's rect under a full block) and the real `recents::CAP`/table geometry are used. |
 | `the_clear_control_takes_focus_past_the_last_shown_term` | Ported as `screens::search::tests::the_recents_cursor_stops_on_the_clear_control`: ▼ walks every drawn term, caps on Clear, and Clear's own press clears this profile's history, drops the rows and hands focus back to the field. |
 
 ## Screen (`ui/search/mod.rs`)

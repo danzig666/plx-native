@@ -6,11 +6,11 @@ use super::super::{
     bridge::{self, AppHost, Bridge},
     content, playback,
 };
-use crate::plex::ServerId;
-use crate::screens::registry::{AppArg, ContentArg, ItemMenuKind};
-use crate::ui::dispatch::Dispatcher;
-use crate::ui::machine::Key;
-use crate::ui::screen::ScreenArg;
+use plx_plex::plex::ServerId;
+use plx_screens::registry::{AppArg, ContentArg, ItemMenuKind};
+use plx_ui::dispatch::Dispatcher;
+use plx_machine::machine::Key;
+use plx_ui::screen::ScreenArg;
 
 const SID: ServerId = ServerId::from_raw(0);
 
@@ -36,8 +36,10 @@ struct Resources {
 impl playback::PlaybackResources for Resources {
     fn request_movie(
         &mut self,
-        _: &mut crate::route::PlaybackSession,
-        item: &crate::pms::PmsMovie,
+        _: &mut plx_media::route::PlaybackSession,
+        _: &mut plx_data::stores::metadata::MetadataStore,
+        item: &plx_data::pms::PmsMovie,
+        _: Option<plx_plex::plex::MediaId>,
     ) -> bool {
         self.calls.push(ResourceCall::Movie {
             sid: item.sid,
@@ -47,17 +49,17 @@ impl playback::PlaybackResources for Resources {
         });
         self.accept_request
     }
-    fn request_episode(&mut self, _: &mut crate::route::PlaybackSession, rk: &str) -> bool {
+    fn request_episode(&mut self, _: &mut plx_media::route::PlaybackSession, _: &mut plx_data::stores::metadata::MetadataStore, rk: &str, _: Option<plx_plex::plex::MediaId>) -> bool {
         self.calls.push(ResourceCall::Episode(rk.into()));
         self.accept_request
     }
-    fn describe_movie(&mut self, sid: ServerId, rk: &str) {
+    fn describe_movie(&mut self, _: &mut plx_data::stores::metadata::MetadataStore, sid: ServerId, rk: &str) {
         self.calls.push(ResourceCall::Describe(sid, rk.into()));
     }
     fn prepare_start(
         &mut self,
-        _: &mut crate::route::PlaybackSession,
-        _: &mut crate::player::adapter::PlayerAdapter,
+        _: &mut plx_media::route::PlaybackSession,
+        _: &mut plx_media::player::adapter::PlayerAdapter,
         resume_ns: i64,
     ) -> bool {
         self.calls.push(ResourceCall::Start(resume_ns));
@@ -67,7 +69,7 @@ impl playback::PlaybackResources for Resources {
 
 fn frame(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, now: &mut u32, key: Option<Key>) {
     *now += 16;
-    let tick = crate::ui::fixture::tick(*now);
+    let tick = plx_ui::fixture::tick(*now);
     bridge::frame(
         d,
         rig,
@@ -109,7 +111,7 @@ fn chain(host: AppArg, episode: bool, accept_request: bool, accept_start: bool) 
     let entry = d.nav.top_page().unwrap().id;
     let instance = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
     // The played item differs from the host's identity, including Related on Detail.
-    let row = crate::pms::PmsMovie {
+    let row = plx_data::pms::PmsMovie {
         sid: SID,
         rk: "played-3".into(),
         part: "/library/parts/3/file.mkv".into(),
@@ -129,7 +131,8 @@ fn chain(host: AppArg, episode: bool, accept_request: bool, accept_start: bool) 
         // Seed the filmstrip menu's captured subject; activation and request flags come from the
         // real ItemMenuScreen. The live metadata lookup itself is the resource under substitution.
         arg.kind = ItemMenuKind::Episode {
-            mark: crate::ui::widgets::PosterMark::None,
+            mark: plx_ui::widgets::PosterMark::None,
+            versions: Vec::new(),
         };
         arg.loaded_episode = true;
     }
@@ -139,29 +142,29 @@ fn chain(host: AppArg, episode: bool, accept_request: bool, accept_start: bool) 
     let menu = d.nav.modals.top().unwrap().entry.id;
     assert_eq!(d.nav.top_page().unwrap().id, entry);
     // Partial movie: Go to Movie / separator / Watched / Unwatched / Play from Start.
-    // Filmstrip: Watched / Play from Start.
+    // Filmstrip: Watched / Play from Start. Rows are addressed by identity, not position.
     for _ in 0..if episode { 1 } else { 3 } {
         frame(&mut d, &mut rig, &mut now, Some(Key::Down));
     }
     assert_eq!(
         d.focus().map(|f| (f.entry, f.elem)),
-        Some((menu, if episode { 1 } else { 4 }))
+        Some((menu, plx_screens::item_menu::ItemRow::PlayFromStart.focus_key()))
     );
     frame(&mut d, &mut rig, &mut now, Some(Key::Ok));
     assert_eq!(
         d.nav.modals.top().unwrap().phase,
-        crate::ui::containers::modal::Phase::Closing
+        plx_ui::containers::modal::Phase::Closing
     );
 
-    let mut ps = crate::route::PlaybackSession::default();
+    let mut ps = plx_media::route::PlaybackSession::default();
     let mut pa =
-        crate::player::adapter::PlayerAdapter::new(unsafe { crate::task::MainThread::assume() });
+        plx_media::player::adapter::PlayerAdapter::new(unsafe { plx_base::task::MainThread::assume() });
     let mut resources = Resources {
         calls: Vec::new(),
         accept_request,
         accept_start,
     };
-    content::drain_item_menu_requests(&mut ps, &mut pa, &mut d, &mut rig, &mut resources);
+    content::drain_item_menu_requests(&mut ps, &mut pa, &mut d, &mut rig, &mut resources, &mut None, 0);
     let mut expected = if episode {
         vec![ResourceCall::Episode(row.rk.clone())]
     } else {
@@ -179,7 +182,7 @@ fn chain(host: AppArg, episode: bool, accept_request: bool, accept_start: bool) 
         expected.push(ResourceCall::Start(0)); // real PlayFromStart policy drops the captured resume
     }
     assert_eq!(resources.calls, expected);
-    content::drain_item_menu_requests(&mut ps, &mut pa, &mut d, &mut rig, &mut resources);
+    content::drain_item_menu_requests(&mut ps, &mut pa, &mut d, &mut rig, &mut resources, &mut None, 0);
     assert_eq!(
         resources.calls, expected,
         "one activation is drained exactly once"
@@ -210,9 +213,9 @@ fn chain(host: AppArg, episode: bool, accept_request: bool, accept_start: bool) 
 
 #[test]
 fn card_menu_activation_returns_to_all_hosts_through_production_launch() {
-    let _serial = crate::testlock::serial();
-    let _session = crate::plex::session::TempSession::new("menu-card-return");
-    crate::plex::reset_servers_for_test();
+    let _serial = plx_base::testlock::serial();
+    let _session = plx_plex::plex::session::TempSession::new("menu-card-return");
+    plx_plex::plex::reset_servers_for_test();
     // Non-Home first: Home alone can hide a missing origin.
     for host in [
         AppArg::Library,
@@ -227,17 +230,17 @@ fn card_menu_activation_returns_to_all_hosts_through_production_launch() {
 
 #[test]
 fn filmstrip_menu_activation_returns_to_detail_through_production_launch() {
-    let _serial = crate::testlock::serial();
-    let _session = crate::plex::session::TempSession::new("menu-filmstrip-return");
-    crate::plex::reset_servers_for_test();
+    let _serial = plx_base::testlock::serial();
+    let _session = plx_plex::plex::session::TempSession::new("menu-filmstrip-return");
+    plx_plex::plex::reset_servers_for_test();
     chain(detail(), true, true, true);
 }
 
 #[test]
 fn refused_menu_resources_leave_the_retained_host_and_do_not_repeat_work() {
-    let _serial = crate::testlock::serial();
-    let _session = crate::plex::session::TempSession::new("menu-refused-return");
-    crate::plex::reset_servers_for_test();
+    let _serial = plx_base::testlock::serial();
+    let _session = plx_plex::plex::session::TempSession::new("menu-refused-return");
+    plx_plex::plex::reset_servers_for_test();
     for episode in [false, true] {
         chain(detail(), episode, false, true);
         chain(detail(), episode, true, false);

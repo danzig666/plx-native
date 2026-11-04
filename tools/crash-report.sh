@@ -12,6 +12,9 @@
 #
 # The C tracer (src/main.c) writes, per crash:
 #     *** SIGNAL <n> (<name>) addr=0x… pc=0x… lr=0x…
+#     time: <unix seconds>                                    (wall clock; the fallback event's timestamp)
+#     thread: tid=<n> main=<0|1> name=<comm>                  (newer builds: which thread faulted)
+#     phase: <running|shutdown|exiting> uptime=<secs>         (newer builds: how far the process had got)
 #     reg: sp=0x… fp=0x… ip=0x… cpsr=0x… r0=0x… … r10=0x…     (2026-08-29 and later builds)
 #     at:  <the /proc/self/maps line containing pc or lr>     (which library faulted)
 #     bin: <the maps line for our own binary>                 (our load base)
@@ -92,18 +95,18 @@ tv_host() {
   # while it sat there answering. Same trap tools/tv-session.sh documents; this was its twin.
   make -s -C "$REPO" print-tv 2>/dev/null
 }
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=8)
 HOST="$(tv_host)"
-tv() { ssh "${SSH_OPTS[@]}" "root@$HOST" "$@" 2>/dev/null; }
+# Through tools/tv-ssh: the key first, `sshpass` only if the set refuses it (see its header).
+tv() { PLX_TV_ADDR="$HOST" "$REPO/tools/tv-ssh" ssh tv "$@" 2>/dev/null; }
 
 mode="${1:-last}"
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 
 # ---- 0. is the TV even up? a sleeping TV mimics every failure ----------------
-echo "== triaging $APPID [$FLAVOR] on ${HOST:-<no TV address>}"
+echo "== triaging $APPID [$FLAVOR] on the TV"
 if ! tv true; then
-  echo "TV ${HOST:-<no TV address>} is unreachable — wake it first (.agents/skills/wake-tv/wake-tv.sh)."
+  echo "the TV is unreachable — wake it first (.agents/skills/wake-tv/wake-tv.sh)."
   echo "NOTE: a sleeping TV makes every log assertion fail as 'no line found'; that is"
   echo "      not a crash. Re-run whatever failed after waking before triaging."
   exit 2
@@ -192,6 +195,8 @@ else
   pc=$(echo "$block"   | sed -n 's/.*pc=0x\([0-9a-f]*\).*/\1/p' | head -1)
   lr=$(echo "$block"   | sed -n 's/.*lr=0x\([0-9a-f]*\).*/\1/p' | head -1)
   at=$(echo "$block"   | sed -n 's/^at: *//p' | head -1)
+  # Newer builds only; an older record has neither line and this prints nothing for it.
+  echo "$block" | grep -E '^(thread|phase): ' | sed 's/^/  /'
   # WHICH `bin:` line. The tracer emits one per maps line naming our executable, and that path
   # carries the app directory — so the match has to be ANCHORED on `/<id>/`. A bare substring test
   # would not do: `com.beb.plxnative` is a PREFIX of `com.beb.plxnative.debug`, so triaging the

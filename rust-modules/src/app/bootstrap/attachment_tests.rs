@@ -1,14 +1,14 @@
 use super::*;
 use crate::app::{boot, recorder::Recplay};
-use crate::plex::session::{self, Session};
+use plx_plex::plex::session::{self, Session};
 
 fn initial_for(saved: Session, entropy: Option<[u8; 16]>) -> Initial {
     let mut initial = Initial::synthetic_home(17, 32517, None).unwrap();
-    let crate::auth::owner::BootstrapAuthority::DevPms { primary, .. } = initial.session.authority
+    let plx_session::auth::owner::BootstrapAuthority::DevPms { primary, .. } = initial.session.authority
     else {
         unreachable!()
     };
-    initial.session = crate::auth::SessionInit::captured_boot(saved, Some(primary), Vec::new());
+    initial.session = plx_session::auth::SessionInit::captured_boot(saved, Some(primary), Vec::new());
     initial.entropy = Entropy::Captured(entropy);
     initial.validate().unwrap();
     initial
@@ -16,7 +16,7 @@ fn initial_for(saved: Session, entropy: Option<[u8; 16]>) -> Initial {
 
 #[test]
 fn concurrent_session_change_after_attachment_rolls_back_only_this_attempt() {
-    let _serial = crate::testlock::serial();
+    let _serial = plx_base::testlock::serial();
     let temp = session::TempSession::new("recording-attachment-race");
     temp.assert_only_target();
     let root = temp.path().parent().unwrap().to_path_buf();
@@ -37,7 +37,7 @@ fn concurrent_session_change_after_attachment_rolls_back_only_this_attempt() {
     let initial = initial_for(saved, entropy);
     let mut rec = Recplay::recording_with_sink(
         &initial,
-        Box::new(crate::ui::rec::DirSink::create(&latest).unwrap()),
+        Box::new(plx_ui::rec::DirSink::create(&latest).unwrap()),
     )
     .unwrap();
     assert!(latest.join("manifest.json").exists());
@@ -48,7 +48,7 @@ fn concurrent_session_change_after_attachment_rolls_back_only_this_attempt() {
         ..Default::default()
     });
     let newer = std::fs::read(temp.path()).unwrap();
-    assert!(boot::apply_deferred_capture(&mut rec, deferred).is_err());
+    assert!(boot::apply_deferred_capture(&mut rec, plx_machine::landgate::fixture_gate(), deferred).is_err());
     drop(rec); // the production refusal drops App; no later drop may recreate capture files
     assert!(std::fs::read(temp.path()).unwrap() == newer);
     assert!(
@@ -56,7 +56,7 @@ fn concurrent_session_change_after_attachment_rolls_back_only_this_attempt() {
         "refused attempt must not retain typed credentials or block create_new"
     );
     assert!(!latest.join("rec-0000.jsonl").exists());
-    assert!(crate::ui::rec::Recording::load(&latest, crate::app::recorder::state_fp()).is_err());
+    assert!(plx_ui::rec::Recording::load(&latest, crate::app::recorder::state_fp()).is_err());
     assert_eq!(
         std::fs::read(latest.join("preexisting-sentinel")).unwrap(),
         b"keep existing artifact"
@@ -75,10 +75,10 @@ fn concurrent_session_change_after_attachment_rolls_back_only_this_attempt() {
     let initial = initial_for(saved, entropy);
     let mut retry = Recplay::recording_with_sink(
         &initial,
-        Box::new(crate::ui::rec::DirSink::create(&latest).unwrap()),
+        Box::new(plx_ui::rec::DirSink::create(&latest).unwrap()),
     )
     .expect("immediate next attempt can open");
-    boot::apply_deferred_capture(&mut retry, deferred).unwrap();
+    boot::apply_deferred_capture(&mut retry, plx_machine::landgate::fixture_gate(), deferred).unwrap();
     retry.tick(0, 0.0);
-    assert!(!retry.finish());
+    assert!(!retry.finish(plx_machine::landgate::fixture_gate()));
 }

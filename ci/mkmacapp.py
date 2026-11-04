@@ -39,6 +39,8 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'ci'))
+from rust_toolchain import pinned  # noqa: E402
 
 # A dependency under these prefixes is the OS's own: present on every Mac, in the dyld shared
 # cache, and not ours to copy (copying one is how you ship a library older than the kernel).
@@ -72,8 +74,8 @@ def version() -> str:
 
     **The same rule, spelled twice, because this script cannot ask cargo what it emitted.** It has
     to match, and the way it can go wrong is worth stating: the cargo subprocess below inherits
-    this process's environment, so it reads the same `PLX_RELEASE` — a Makefile-exported empty
-    value under `make macapp`, `1` under `make RELEASE=1 macapp`. Reading `Cargo.toml` alone (which
+    this process's environment, so it reads the same `PLX_RELEASE` — absent under `make macapp`,
+    `1` under `make RELEASE=1 macapp`. Reading `Cargo.toml` alone (which
     this did) put `0.5.0` in the Finder metadata and the zip filename of a bundle whose diagnostics
     panel says `0.6.0-dev`: the very ambiguity the suffix exists to remove, recreated on the one
     artifact that is handed to somebody who has none of this checkout.
@@ -121,12 +123,13 @@ def build_binary(tdir: Path) -> Path:
     `--no-default-features` drops `devtools` (the on-screen counter) and `devtriggers` (the whole
     `/tmp/plxnative-*` surface, the remote FIFO and the capture listener). A binary somebody was
     sent must not take instructions from a world-writable directory — and with the feature off
-    there is nothing to take: `dev::flag` is `false` and `dev::read` is `None` at COMPILE time.
+    there is nothing to take: `devtrig::flag` is `false` and `devtrig::read` is `None` at COMPILE time.
     """
     print("==> building plxnative-sim (release, no dev features)")
-    run("cargo", "build", "--manifest-path", REPO / "rust-modules/Cargo.toml",
+    run("cargo", "+" + pinned(REPO), "build", "--manifest-path", REPO / "rust-modules/Cargo.toml",
         "--target-dir", tdir, "--release", "--no-default-features",
-        "--features", "hostsim", "--bin", "plxnative-sim")
+        "--features", "hostsim", "--bin", "plxnative-sim",
+        env=dict(os.environ, CARGO_INCREMENTAL="0"))
     return tdir / "release/plxnative-sim"
 
 
@@ -229,11 +232,11 @@ def bundle_dlopened_sdl3(frameworks: Path):
     sys.exit("mkmacapp: sdl2-compat needs libSDL3 and none was found — the app would not start")
 
 
-def verify_self_contained(macos: Path, frameworks: Path):
+def verify_self_contained(macos: Path, frameworks: Path, resources: Path):
     """The one check that would have caught any of the three traps in the module doc."""
     print("==> verifying self-containment")
     leaks = []
-    for obj in sorted(list(macos.iterdir()) + list(frameworks.iterdir())):
+    for obj in sorted(list(macos.iterdir()) + list(frameworks.iterdir()) + list(resources.glob('*.dylib'))):
         if obj.is_dir():
             continue
         for dep in deps(obj):
@@ -263,6 +266,7 @@ def main():
     macos, frameworks, res = contents / "MacOS", contents / "Frameworks", contents / "Resources"
 
     binary = build_binary(Path(args.target_dir))
+    run(REPO / 'ci/build-libass.sh', env=dict(os.environ, HOST='1'))
 
     print(f"==> assembling {app}")
     if app.exists():
@@ -272,12 +276,14 @@ def main():
     shutil.copy2(binary, macos / "PlxNative")
     (macos / "PlxNative").chmod(0o755)
 
-    # The payload the app reads at RUNTIME is fonts and nothing else — every icon is an SVG
-    # compiled into the binary (`ui/icons.rs`'s `include_str!`), and `paths::app_dir` resolves
-    # `Contents/Resources` when it finds itself inside a bundle. The rest is provenance: the
-    # licences a redistributed binary owes.
-    for f in ("appfont.ttf", "appfont-bold.ttf", "OFL.txt"):
+    # paths::app_dir resolves Contents/Resources: both fonts and the dynamically
+    # loaded native subtitle renderer must be placed there.
+    for f in ("appfont.ttf", "appfont-bold.ttf", "appfont-cjk.ttf", "appfont-emoji.ttf",
+              "appfont-arabic.ttf", "appfont-arabic-bold.ttf", "appfont-hebrew.ttf", "appfont-hebrew-bold.ttf",
+              "OFL.txt", "le-roots.pem", "libass-plx.0.dylib"):
         shutil.copy2(REPO / "pkg" / f, res / f)
+    # The subtitle faces (tools/cut-noto-subs.py): paths::app_dir/fonts/subs, read by player::ass::fonts.
+    shutil.copytree(REPO / "pkg" / "fonts" / "subs", res / "fonts" / "subs")
     shutil.copy2(REPO / "LICENSE", res / "LICENSE.txt")
     shutil.copy2(REPO / "LICENSING.md", res / "LICENSING.md")
     shutil.copytree(REPO / "licenses", res / "licenses")
@@ -291,7 +297,7 @@ def main():
     # One rpath, on the executable: every rewritten reference is `@rpath/<leaf>` and resolves
     # through it, including the ones inside the bundled libraries themselves.
     run("install_name_tool", "-add_rpath", "@executable_path/../Frameworks", macos / "PlxNative")
-    verify_self_contained(macos, frameworks)
+    verify_self_contained(macos, frameworks, res)
 
     # Ad-hoc signing is what is available without a paid Developer ID: it satisfies Apple Silicon's
     # "code must be signed to run at all" rule, and does NOT satisfy Gatekeeper's "signed by a known

@@ -26,21 +26,20 @@
 #     method      : DISPLAY (default) | VIDEO | GRAPHIC   (see above)
 #
 # Environment overrides:
-#     TV_HOST (default: the gitignored .tv-host)  TV_USER (root)  TV_PASS (alpine)
+#     TV_HOST (default: tools/tv-config.sh -- .tv-host, else ~/.config/plxnative/tv-host)  TV_USER (root)  TV_PASS (alpine)
 #     CAP_W (1920)  CAP_H (1080)
 #
-# Requires: bash, ssh, scp, and (only if no SSH key is installed) sshpass.
+# Requires: bash, ssh, scp, and (only if the TV refuses your SSH key) sshpass -- see tv-ssh.
 #           sips (built into macOS) is used for non-native format conversion.
 #
 set -euo pipefail
 
-# The TV's address comes from $TV_HOST, else the gitignored .tv-host next to the Makefile (the
-# same file `make TV=` falls back to) — the repo carries no home-network address of its own.
-TV_HOST="${TV_HOST:-$(cat "$(dirname "$0")/../.tv-host" 2>/dev/null || true)}"
-# A linked worktree has no `.tv-host` of its own (it is gitignored), and that is where the parallel
-# agents live — ask the Makefile, which knows the main checkout's copy.
-[ -n "$TV_HOST" ] || TV_HOST="$(make -s -C "$(dirname "$0")/.." print-tv 2>/dev/null | head -1)"
-[ -n "$TV_HOST" ] || { echo "no TV configured — put its IP in .tv-host, or set TV_HOST=<ip>" >&2; exit 1; }
+# The TV's address comes from $TV_HOST, else tools/tv-config.sh (the same lookup `make TV=` falls
+# back to): this checkout's gitignored .tv-host, the main checkout's — a linked worktree has none of
+# its own, and that is where the parallel agents live — then the per-user ~/.config/plxnative/tv-host.
+# The repo carries no home-network address of its own.
+TV_HOST="${TV_HOST:-$("$(dirname "$0")/tv-config.sh" host 2>/dev/null || true)}"
+[ -n "$TV_HOST" ] || { echo "no TV configured — put its IP in ~/.config/plxnative/tv-host (or .tv-host), or set TV_HOST=<ip>" >&2; exit 1; }
 
 # A capture is a MEASUREMENT of one moment on a set that only one lane may be steering: taken
 # during somebody else's session it is a picture of a screen THEY navigated to, and nothing in the
@@ -50,7 +49,7 @@ TV_HOST="${TV_HOST:-$(cat "$(dirname "$0")/../.tv-host" 2>/dev/null || true)}"
 _LOCK="$(dirname "$0")/tv-lock.sh"
 if [ -x "$_LOCK" ]; then TV="$TV_HOST" "$_LOCK" require --quiet --why "capture-screen.sh"; fi
 TV_USER="${TV_USER:-root}"
-TV_PASS="${TV_PASS:-alpine}"
+export TV_PASS="${TV_PASS:-alpine}"
 CAP_W="${CAP_W:-1920}"
 CAP_H="${CAP_H:-1080}"
 
@@ -68,18 +67,12 @@ case "$ext" in
 esac
 REMOTE="/tmp/capture/cap-$$.${DEV_EXT}"
 
-# ---- SSH/SCP transport: prefer key auth, fall back to sshpass ------------------
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          -o LogLevel=ERROR -o ConnectTimeout=10)
-if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "${TV_USER}@${TV_HOST}" true 2>/dev/null; then
-  SSH=(ssh "${SSH_OPTS[@]}"); SCP=(scp "${SSH_OPTS[@]}")
-elif command -v sshpass >/dev/null 2>&1; then
-  SSH=(sshpass -p "$TV_PASS" ssh "${SSH_OPTS[@]}")
-  SCP=(sshpass -p "$TV_PASS" scp "${SSH_OPTS[@]}")
-else
-  echo "ERROR: cannot auth to ${TV_USER}@${TV_HOST}. Install an SSH key or sshpass." >&2
-  exit 1
-fi
+# ---- SSH/SCP transport: tools/tv-ssh (the key first, sshpass only if the set refuses it) -----
+# Its address and (optional) TV_PASS come through the environment; `tv` / `tv:` are its placeholders
+# for the television. TV_USER (default root) rides on explicit user@address arguments below.
+TVSSH="$(dirname "$0")/tv-ssh"
+SSH=("$TVSSH" ssh); SCP=("$TVSSH" scp)
+export PLX_TV_ADDR="$TV_HOST"
 
 # ---- run the capture ----------------------------------------------------------
 # luna-send only delivers its request reliably under a pseudo-TTY -> ssh -tt.

@@ -38,65 +38,6 @@ extern "C" {
     fn g_main_context_iteration(ctx: *mut c_void, may_block: c_int) -> c_int;
 }
 
-/// Whether SDL has completed foreground entry. This gate is independent of idle damage:
-/// queued uploads, animations, the video plane and noidle must never authorize a background
-/// EGL swap. SDL/Mali owns additional Wayland proxies that clearing our borrowed handles cannot
-/// protect. Owned by the app's main loop, and never inferred from the current UI route.
-pub(crate) struct WindowActivity {
-    active: bool,
-    first_frame: bool,
-}
-
-impl WindowActivity {
-    pub(crate) const fn new() -> Self { Self { active: true, first_frame: true } }
-
-    pub(crate) fn event(&mut self, event: u32) {
-        match event {
-            0x103 | 0x104 => self.active = false,
-            0x106 => { self.active = true; self.first_frame = true; }
-            _ => {} // WILL foreground does not yet authorize rendering.
-        }
-    }
-
-    pub(crate) fn allow_present(&self, requested: bool) -> bool {
-        self.active && requested
-    }
-
-    pub(crate) fn begin_present(&self, playing: bool) {
-        if self.first_frame {
-            crate::telemetry::window::record(crate::telemetry::window::Observation::step(
-                crate::telemetry::window::Stage::FirstFrame, Some(playing)));
-        }
-    }
-
-    pub(crate) fn presented(&mut self, playing: bool) {
-        if self.first_frame {
-            self.first_frame = false;
-            crate::telemetry::window::record(crate::telemetry::window::Observation::step(
-                crate::telemetry::window::Stage::FirstSwapComplete, Some(playing)));
-        }
-    }
-}
-
-/// WSLg's X11/GLX swap can accept interval 1 without waiting for the Windows compositor. Keep
-/// that host-specific wall-clock adapter here, outside the app's logical clock: recorded UI
-/// replays must continue to see only their injected ticks.
-#[cfg(all(feature = "hostsim", target_os = "linux"))]
-pub(crate) struct WslgFrameBudget(std::time::Instant);
-
-#[cfg(all(feature = "hostsim", target_os = "linux"))]
-impl WslgFrameBudget {
-    pub(crate) fn begin() -> Self { Self(std::time::Instant::now()) }
-
-    pub(crate) fn finish(self) {
-        if let Some(remaining) = std::time::Duration::from_nanos(16_666_667)
-            .checked_sub(self.0.elapsed())
-        {
-            std::thread::sleep(remaining);
-        }
-    }
-}
-
 static mut G_WL_SURFACE: *mut c_void = std::ptr::null_mut();
 static mut G_WL_DISPLAY: *mut c_void = std::ptr::null_mut();
 
@@ -128,8 +69,9 @@ pub(crate) fn clear_opaque_region() {
 /// SDL owns these client-side proxies; our references must not outlive an active window.
 /// Background notifications revoke the borrow before any later frame can marshal through it.
 /// This does not destroy SDL's objects. Foreground reacquires them from SDL, and resets the
-/// opaque-region cache so a replacement surface receives its own request.
-pub(crate) fn sys_release_wayland() {
+/// opaque-region cache so a replacement surface receives its own request. Answers whether a
+/// surface was held.
+pub(crate) fn sys_release_wayland() -> bool {
     unsafe {
         let had_surface = !G_WL_SURFACE.is_null();
         G_WL_SURFACE = std::ptr::null_mut();
@@ -141,6 +83,7 @@ pub(crate) fn sys_release_wayland() {
         if had_surface {
             log("wm: released borrowed Wayland handles");
         }
+        had_surface
     }
 }
 
@@ -160,8 +103,8 @@ pub(crate) fn ls2_pump() {
 }
 
 pub(crate) fn sys_grab_wayland(winp: *mut c_void) {
-    crate::telemetry::window::record(crate::telemetry::window::Observation::step(
-        crate::telemetry::window::Stage::WmQuery, None));
+    plx_telemetry::telemetry::window::record(plx_telemetry::telemetry::window::Observation::step(
+        plx_telemetry::telemetry::window::Stage::WmQuery, None));
     unsafe {
         let mut wmbuf = [0u8; 512];
         // SDL_VERSION(&wm->version): major/minor/patch (u8) at offset 0.
@@ -238,7 +181,7 @@ pub(crate) fn sys_grab_wayland(winp: *mut c_void) {
     }
 }
 
-use crate::log;
+use plx_base::eventlog::log;
 
 // ------------------------------------------------------------------------------------------
 // EXPERIMENT (`/tmp/plxnative-opaque`): declare the UI surface OPAQUE where nothing is behind it
@@ -310,7 +253,7 @@ struct RegistryListener {
 /// is already mapped; this only avoids naming these particular symbols in `DT_NEEDED`.
 #[cfg(not(feature = "hostsim"))]
 fn wl_sym(name: &str) -> Option<*mut c_void> {
-    crate::dynlib::Handle::self_handle()
+    plx_base::dynlib::Handle::self_handle()
         .sym(name)
         .filter(|p| !p.is_null())
 }
@@ -371,7 +314,7 @@ unsafe extern "C" fn on_global(
 /// armed; returns without touching the surface's current (NULL) region either way.
 #[cfg(not(feature = "hostsim"))]
 pub(crate) fn opaque_region_init() {
-    if !crate::dev::flag("opaque") {
+    if !plx_base::devtrig::flag("opaque") {
         return;
     }
     let (display, surface) = unsafe { (G_WL_DISPLAY, G_WL_SURFACE) };
@@ -437,9 +380,9 @@ pub(crate) fn opaque_region_init() {
         return;
     };
     // Surface-local coordinates. `viewport()` is the rect the renderer actually draws into, which
-    // is the whole 1920x1080 surface on every set seen so far and is the honest answer on a
-    // letterboxed one, where the bars are not ours to claim.
-    let (vx, vy, vw, vh) = crate::surface::viewport();
+    // is the whole drawable (1920x1080 unless a webOS 1-3 owner picked a smaller Interface resolution, or the debug drawable trigger asked for one)
+    // and is the honest answer on a letterboxed one, where the bars are not ours to claim.
+    let (vx, vy, vw, vh) = plx_base::surface::viewport();
     let region = unsafe {
         let r = ctor(
             compositor,
@@ -514,6 +457,310 @@ pub(crate) fn opaque_route(player: bool) {
 #[cfg(feature = "hostsim")]
 pub(crate) fn opaque_route(_player: bool) {}
 
+// ---- The COMPOSITOR FRAME-CALLBACK PROBE (`/tmp/plxnative-framecb`) -----------------------------
+//
+// A present's wait for a free back buffer is paid inside the frame's first framebuffer-0 command
+// (the `clear` span), and from inside the app that wait reads the same whether the compositor
+// repainted late, skipped a repaint, or repainted on time and we were slow to notice. This probe
+// asks the compositor directly: one `wl_surface.frame` request per presented frame, placed before
+// the swap that commits it, whose `done(time)` event carries the COMPOSITOR'S OWN millisecond
+// stamp of the repaint that picked the commit up. Printed beside the frame's `FRAMEDROP` line
+// with our own monotonic clock, the two tell those cases apart.
+//
+// It also prices the frame thread over the three stretches of a frame's present: `w` (the
+// first framebuffer command, where the driver waits for a back buffer), `d` (the draw after it)
+// and `s` (the swap). Each prints `<p>=<wall>/<cpu>/<runq>` in ms and `<p>sw=<slept>/<preempted>`
+// context switches: wall time that is neither CPU nor run-queue wait was spent BLOCKED, run-queue
+// wait is a thread that wanted to run and was not given a CPU, and CPU is work. `wait_at=` is the
+// monotonic ms at which the wait began, for lining a frame up with a kernel trace.
+//
+// A fourth stretch, `p`, prices the frame loop's `prepare_window` (the `prepare=` stage): it runs
+// BEFORE the back-buffer wait, on every frame, presenting or not, so it has its own pair of marks
+// (`frame_probe_prepare_begin`/`_end`) apart from the wait/commit slots. Each frame's begin
+// overwrites the pair, so a value is never carried into a later frame's line; it prints only when
+// both marks of the frame that is being reported were taken.
+//
+// Same linkage rule as the opaque experiment above: every libwayland entry point is resolved
+// from the process's own scope, ONCE (`frame_syms`, on the first armed present, before the swap
+// stretch is marked), so the probe adds no symbol to the link and its lookups are not charged to
+// the `s` stretch. Unarmed it is one latched bool per presented frame. The whole probe is
+// compiled only with `devtriggers` (and not in the simulator); the shipping build has the empty
+// stubs at the end of this section.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+plx_base::devtrig::latched_flag!(
+    /// `/tmp/plxnative-framecb` — see the section comment above.
+    pub(crate) fn frame_probe_armed = "framecb";
+);
+
+/// `(frame seq, compositor stamp ms, our CLOCK_MONOTONIC µs at dispatch)` for every `done` that
+/// arrived since the last [`frame_probe_fields`].
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+static FRAME_DONE: std::sync::Mutex<Vec<(u32, u32, u64)>> = std::sync::Mutex::new(Vec::new());
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+static FRAME_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+fn mono_us() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a plain clock read into a local.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+}
+
+/// What the frame thread has cost so far, read at each boundary of a frame's present.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+#[derive(Clone, Copy, Default)]
+struct ThreadCost {
+    /// `CLOCK_MONOTONIC`, µs.
+    at: u64,
+    /// On-CPU time, µs.
+    cpu: u64,
+    /// Time spent RUNNABLE but waiting for a CPU, µs (`/proc/thread-self/schedstat`, field 2).
+    /// Wall minus `cpu` minus this is time spent blocked.
+    runq: u64,
+    /// Voluntary context switches: the thread slept.
+    slept: u64,
+    /// Involuntary ones: it was preempted.
+    preempted: u64,
+}
+
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+impl ThreadCost {
+    fn now() -> Self {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a plain clock read into a local.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        let cpu = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000;
+        #[cfg(target_os = "linux")]
+        let (slept, preempted) = {
+            // SAFETY: `getrusage` fills the zeroed struct it is handed.
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+            (ru.ru_nvcsw as u64, ru.ru_nivcsw as u64)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (slept, preempted) = (0, 0);
+        Self { at: mono_us(), cpu, runq: Self::runq_us(), slept, preempted }
+    }
+
+    /// The scheduler's own run-queue wait for this thread. One `pread` on a descriptor opened
+    /// once, by the frame thread, for itself; 0 where the file does not exist.
+    fn runq_us() -> u64 {
+        static FD: std::sync::OnceLock<c_int> = std::sync::OnceLock::new();
+        // SAFETY: a NUL-terminated literal path; the descriptor lives for the process.
+        let fd = *FD.get_or_init(|| unsafe {
+            libc::open(c"/proc/thread-self/schedstat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        });
+        if fd < 0 {
+            return 0;
+        }
+        let mut buf = [0u8; 96];
+        // SAFETY: `buf` is a live local of the length passed.
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let text = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap_or("");
+        // "<run ns> <run-queue wait ns> <timeslices>"
+        text.split_ascii_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) / 1000
+    }
+
+    /// ` <p>=<wall>/<cpu>/<runq> <p>sw=<slept>/<preempted>` for the stretch from `from` to `self`.
+    fn since(&self, from: &Self, phase: &str) -> String {
+        let ms = |a: u64, b: u64| a.saturating_sub(b) as f64 / 1000.0;
+        format!(
+            " {phase}={:.2}/{:.2}/{:.2} {phase}sw={}/{}",
+            ms(self.at, from.at),
+            ms(self.cpu, from.cpu),
+            ms(self.runq, from.runq),
+            self.slept.saturating_sub(from.slept),
+            self.preempted.saturating_sub(from.preempted)
+        )
+    }
+}
+
+/// This frame's boundaries: `[before the first framebuffer command, back buffer acquired, before
+/// the swap]`. Frame-thread only; a `Mutex` because it is a `static`.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+static FRAME_COST: std::sync::Mutex<[Option<ThreadCost>; 3]> = std::sync::Mutex::new([None; 3]);
+
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+fn frame_probe_mark(slot: usize) {
+    if !frame_probe_armed() {
+        return;
+    }
+    if let Ok(mut cost) = FRAME_COST.lock() {
+        cost[slot] = Some(ThreadCost::now());
+    }
+}
+
+/// `prepare_window`'s boundaries: `[before, after]`. Independent of [`FRAME_COST`]: it is marked on
+/// frames that never reach the wait. Frame-thread only.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+static PREPARE_COST: std::sync::Mutex<[Option<ThreadCost>; 2]> = std::sync::Mutex::new([None; 2]);
+
+/// `prepare_window` is next. Starts the frame's `p` stretch, dropping any earlier frame's marks.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+pub(crate) fn frame_probe_prepare_begin() {
+    if !frame_probe_armed() {
+        return;
+    }
+    if let Ok(mut cost) = PREPARE_COST.lock() {
+        *cost = [Some(ThreadCost::now()), None];
+    }
+}
+
+/// `prepare_window` has returned: closes the frame's `p` stretch.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+pub(crate) fn frame_probe_prepare_end() {
+    if !frame_probe_armed() {
+        return;
+    }
+    if let Ok(mut cost) = PREPARE_COST.lock() {
+        cost[1] = Some(ThreadCost::now());
+    }
+}
+
+/// The frame's first framebuffer command is next: the wait for a back buffer starts here.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+pub(crate) fn frame_probe_waiting() {
+    frame_probe_mark(0);
+}
+
+/// The frame's first framebuffer command has returned: the back buffer is acquired.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+pub(crate) fn frame_probe_acquired() {
+    frame_probe_mark(1);
+}
+
+/// The libwayland entry points the probe calls, as addresses (a raw pointer is not `Sync`).
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+struct FrameSyms {
+    ctor: usize,
+    add_listener: usize,
+    callback_interface: usize,
+    /// Absent on a libwayland without it: the callback is then simply not destroyed.
+    destroy: Option<usize>,
+}
+
+/// Resolved once. `None` when any of the three request symbols is missing, which makes the probe a
+/// silent no-op.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+fn frame_syms() -> Option<&'static FrameSyms> {
+    static SYMS: std::sync::OnceLock<Option<FrameSyms>> = std::sync::OnceLock::new();
+    SYMS.get_or_init(|| {
+        Some(FrameSyms {
+            ctor: wl_sym("wl_proxy_marshal_constructor")? as usize,
+            add_listener: wl_sym("wl_proxy_add_listener")? as usize,
+            callback_interface: wl_sym("wl_callback_interface")? as usize,
+            destroy: wl_sym("wl_proxy_destroy").map(|p| p as usize),
+        })
+    })
+    .as_ref()
+}
+
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+unsafe extern "C" fn on_frame_done(data: *mut c_void, callback: *mut c_void, time: c_uint) {
+    if let Ok(mut done) = FRAME_DONE.lock() {
+        done.push((data as usize as u32, time, mono_us()));
+    }
+    // `wl_callback` is a one-shot: the client destroys it from its own `done`.
+    if let Some(destroy) = frame_syms().and_then(|s| s.destroy) {
+        let destroy: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(destroy) };
+        unsafe { destroy(callback) };
+    }
+}
+
+/// Ask for this frame's callback. Call on a PRESENTING frame, before the swap that commits it.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+pub(crate) fn frame_probe_request() {
+    if !frame_probe_armed() {
+        return;
+    }
+    // Before the swap stretch is marked, so a first-use lookup is not charged to it.
+    let syms = frame_syms();
+    frame_probe_mark(2);
+    let surface = unsafe { G_WL_SURFACE };
+    if surface.is_null() {
+        return;
+    }
+    let Some(syms) = syms else {
+        return;
+    };
+    let iface = syms.callback_interface as *const c_void;
+    let ctor: unsafe extern "C" fn(*mut c_void, c_uint, *const c_void, ...) -> *mut c_void =
+        unsafe { std::mem::transmute(syms.ctor) };
+    let add_listener: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
+        unsafe { std::mem::transmute(syms.add_listener) };
+    // `struct wl_callback_listener` is one function pointer.
+    static LISTENER: unsafe extern "C" fn(*mut c_void, *mut c_void, c_uint) = on_frame_done;
+    const WL_SURFACE_FRAME: c_uint = 3;
+    let seq = FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    unsafe {
+        let callback = ctor(surface, WL_SURFACE_FRAME, iface, std::ptr::null_mut::<c_void>());
+        if !callback.is_null() {
+            add_listener(
+                callback,
+                std::ptr::from_ref(&LISTENER).cast::<c_void>(),
+                seq as usize as *mut c_void,
+            );
+        }
+    }
+}
+
+/// The probe's trailing `FRAMEDROP` fields for the frame just presented: `seq=` (the request this
+/// frame made), `mono=` (our monotonic clock, ms, now), the three present stretches described in
+/// the section comment, then `p=`/`psw=` for the frame's `prepare_window` (independent of them: it
+/// prints whenever that frame took both of its marks, wait or no wait), then `cb=<seq>:<compositor ms>:<our ms at dispatch>` for each callback that
+/// arrived since the previous line. `""` unarmed.
+#[cfg(all(not(feature = "hostsim"), feature = "devtriggers"))]
+pub(crate) fn frame_probe_fields() -> String {
+    if !frame_probe_armed() {
+        return String::new();
+    }
+    let done = FRAME_DONE.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default();
+    let mut out = format!(
+        " seq={} mono={:.1}",
+        FRAME_SEQ.load(std::sync::atomic::Ordering::Relaxed),
+        mono_us() as f64 / 1000.0
+    );
+    let [waiting, acquired, before_swap] =
+        FRAME_COST.lock().map(|mut c| std::mem::take(&mut *c)).unwrap_or_default();
+    if let Some(before_swap) = before_swap {
+        if let (Some(waiting), Some(acquired)) = (waiting, acquired) {
+            out.push_str(&format!(" wait_at={:.2}", waiting.at as f64 / 1000.0));
+            out.push_str(&acquired.since(&waiting, "w"));
+            out.push_str(&before_swap.since(&acquired, "d"));
+        }
+        out.push_str(&ThreadCost::now().since(&before_swap, "s"));
+    }
+    if let Ok(mut prepare) = PREPARE_COST.lock() {
+        if let [Some(begin), Some(end)] = std::mem::take(&mut *prepare) {
+            out.push_str(&end.since(&begin, "p"));
+        }
+    }
+    out.push_str(" cb=");
+    for (i, (seq, stamp, at)) in done.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(&format!("{seq}:{stamp}:{:.1}", *at as f64 / 1000.0));
+    }
+    out
+}
+
+#[cfg(any(feature = "hostsim", not(feature = "devtriggers")))]
+pub(crate) fn frame_probe_request() {}
+#[cfg(any(feature = "hostsim", not(feature = "devtriggers")))]
+pub(crate) fn frame_probe_prepare_begin() {}
+#[cfg(any(feature = "hostsim", not(feature = "devtriggers")))]
+pub(crate) fn frame_probe_prepare_end() {}
+#[cfg(any(feature = "hostsim", not(feature = "devtriggers")))]
+pub(crate) fn frame_probe_waiting() {}
+#[cfg(any(feature = "hostsim", not(feature = "devtriggers")))]
+pub(crate) fn frame_probe_acquired() {}
+#[cfg(any(feature = "hostsim", not(feature = "devtriggers")))]
+pub(crate) fn frame_probe_fields() -> String {
+    String::new()
+}
+
 // Publish SDL's borrowed handles. Kept separate from the native query so failed queries can
 // be exercised without loading the television's SDL or marshalling a fake proxy.
 #[cfg(any(not(feature = "hostsim"), test))]
@@ -532,12 +779,12 @@ unsafe fn update_wayland_info(ok: c_int, info: &[u8; 512]) {
             G_WL_SURFACE = surface;
         }
     }
-    use crate::telemetry::window::{Observation, Stage};
+    use plx_telemetry::telemetry::window::{Observation, Stage};
     let stage = if ok == 0 { Stage::WmFailed }
         else if subsystem != 6 { Stage::WmWrongBackend }
         else if G_WL_SURFACE.is_null() { Stage::WmNoSurface }
         else { Stage::WmReady };
-    crate::telemetry::window::record(Observation { stage, playing: None,
+    plx_telemetry::telemetry::window::record(Observation { stage, playing: None,
         version: Some([info[0], info[1], info[2]]),
         display: Some(display_present), surface: Some(surface_present) });
 }
@@ -547,28 +794,8 @@ mod wayland_tests {
     use super::*;
 
     #[test]
-    fn background_blocks_every_present_request_until_did_foreground() {
-        let mut window = WindowActivity::new();
-        assert!(window.allow_present(true));
-        assert!(!window.allow_present(false));
-        for _ in 0..3 {
-            for event in [0x103, 0x104, 0x105, 0x200] {
-                window.event(event);
-                // The request may include a bound plane, queued uploads, noidle or keepalive.
-                assert!(!window.allow_present(true), "event {event:x} permits a background swap");
-            }
-            window.event(0x106);
-            assert!(window.allow_present(true));
-            assert!(!window.allow_present(false));
-        }
-        // Some platforms send only DID background. It must be sufficient on its own.
-        window.event(0x104);
-        assert!(!window.allow_present(true));
-    }
-
-    #[test]
     fn failed_refresh_cannot_reuse_a_previous_surface() {
-        let _guard = crate::testlock::serial();
+        let _guard = plx_base::testlock::serial();
         unsafe {
             let mut display = 0u8;
             let mut surface = 0u8;
@@ -585,7 +812,7 @@ mod wayland_tests {
 
     #[test]
     fn background_release_and_foreground_refresh_replace_the_borrow() {
-        let _guard = crate::testlock::serial();
+        let _guard = plx_base::testlock::serial();
         unsafe {
             let mut display = 0u8;
             let mut surface = 0u8;
@@ -600,8 +827,8 @@ mod wayland_tests {
             let acquired = (G_WL_DISPLAY, G_WL_SURFACE);
             #[cfg(not(feature = "hostsim"))]
             { G_OPAQUE_SENT = 1; }
-            sys_release_wayland();
-            sys_release_wayland(); // WILL + DID background is idempotent.
+            assert!(sys_release_wayland(), "a held surface answers true");
+            assert!(!sys_release_wayland(), "WILL + DID background is idempotent: nothing left to release");
             #[cfg(not(feature = "hostsim"))]
             { let sent = G_OPAQUE_SENT; assert_eq!(sent, -1); }
             let released = (G_WL_DISPLAY, G_WL_SURFACE);
@@ -620,7 +847,7 @@ mod wayland_tests {
 
     #[test]
     fn foreign_or_incomplete_wm_info_cannot_supply_wayland_handles() {
-        let _guard = crate::testlock::serial();
+        let _guard = plx_base::testlock::serial();
         unsafe {
             for subsystem in [0i32, 4, 6] {
                 let mut info = [0u8; 512];

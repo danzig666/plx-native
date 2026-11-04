@@ -7,39 +7,39 @@ use super::test_support::{frame};
 
 #[test]
 fn leaving_after_query_commit_before_arrival_cannot_restore_the_old_query_bookmark() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-query-leave");
+    let session = plx_plex::plex::session::TempSession::new("library-query-leave");
     session.watching("u-library-query-leave");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let sid =
-        crate::plex::register_for_test("query-leave-own", "127.0.0.1", 9, "synthetic", "fixture");
-    let shared = crate::plex::register_for_test(
+        plx_plex::plex::register_for_test("query-leave-own", "127.0.0.1", 9, "synthetic", "fixture");
+    let shared = plx_plex::plex::register_for_test(
         "query-leave-shared",
         "127.0.0.1",
         10,
         "synthetic",
         "fixture",
     );
-    crate::plex::set_current(sid);
+    plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(120);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
-    d.nav.tabs.stack.transition = Box::new(crate::ui::containers::transition::Immediate);
+    d.nav.tabs.stack.transition = Box::new(plx_ui::containers::transition::Immediate);
     frame(&mut d, &mut rig, AppArg::Library, tick(1), vec![]);
     Bridge::library_command(
         &mut d,
-        crate::screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 },
+        plx_screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 },
     );
     for i in 2..80 {
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
@@ -50,16 +50,16 @@ fn leaving_after_query_commit_before_arrival_cannot_restore_the_old_query_bookma
         MachineId::Nav,
         Fx::App(AppFx::Store(
             StoreId::Browse,
-            crate::stores::StoreCmd::Browse(crate::stores::browse::BrowseCmd::Addressed {
-                target: crate::stores::browse::SectionAddress {
+            plx_data::stores::StoreCmd::Browse(plx_data::stores::browse::BrowseCmd::Addressed {
+                target: plx_data::stores::browse::SectionAddress {
                     epoch: id.epoch,
                     sid: id.sid,
                     section: id.section,
                 },
-                work: crate::stores::browse::LibraryWork::Commit {
+                work: plx_data::stores::browse::LibraryWork::Commit {
                     select: false,
                     choice: false,
-                    query: Some(crate::stores::browse::QueryEdit::Unwatched(true)),
+                    query: Some(plx_data::stores::browse::QueryEdit::Unwatched(true)),
                 },
             }),
         )),
@@ -74,9 +74,9 @@ fn leaving_after_query_commit_before_arrival_cannot_restore_the_old_query_bookma
     let snapshot = rig.listing.clone();
     assert_eq!(snapshot.view().id(), Some(owned_id));
     assert_eq!(snapshot.view().total(), -1, "no new page has arrived");
-    assert!(snapshot.view().cursor().is_none_or(|cursor| matches!(cursor.at, crate::stores::browse::CursorAt::SlotIndex(0))),
+    assert!(snapshot.view().cursor().is_none_or(|cursor| matches!(cursor.at, plx_data::stores::browse::CursorAt::SlotIndex(0))),
         "the carried WillLeave save must not overwrite the new query with an old deep bookmark: {:?}", snapshot.view().cursor());
-    rig.enter_library(crate::stores::browse::SecKind::Movie);
+    rig.enter_library(plx_data::stores::browse::SecKind::Movie);
     for i in 81..86 {
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
     }
@@ -87,14 +87,20 @@ fn leaving_after_query_commit_before_arrival_cannot_restore_the_old_query_bookma
     let new_entry = d.nav.top_page().unwrap().id;
     assert_ne!(entry, new_entry);
     let instance = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
+    let heading = d
+        .top_screen()
+        .unwrap()
+        .as_any()
+        .unwrap()
+        .downcast_ref::<plx_screens::library::LibraryScreen>()
+        .unwrap()
+        .toolbar_group();
     d.emit(
         MachineId::Nav,
         Fx::Deliver(
             MachineId::Instance(instance),
-            Delivery::Screen(ScreenEvent::Enter(crate::ui::screen::Enter::Fresh {
-                focus: crate::ui::screen::FocusTarget::ContainerGroup(
-                    crate::screens::library::TOOLBAR_GROUP,
-                ),
+            Delivery::Screen(ScreenEvent::Enter(plx_ui::screen::Enter::Fresh {
+                focus: plx_ui::screen::FocusTarget::ContainerGroup(heading),
             })),
         ),
     );
@@ -107,39 +113,42 @@ fn leaving_after_query_commit_before_arrival_cannot_restore_the_old_query_bookma
         script_key(Key::Down, tick(167)),
     );
     let (item, _) = rig.library_selection(&d, new_entry, d.focus()).unwrap();
-    assert_eq!(
-        item.rk, "1",
-        "the new entry starts the accepted query at its first item"
+    // Down from the header lands on the grid's first row (the new entry remembers nothing, so
+    // the engine projects under the control it left), never on the old query's bookmark.
+    let slot: usize = item.rk.parse().expect("synthetic ratingKeys are slot numbers");
+    assert!(
+        (1..=6).contains(&slot),
+        "the new entry starts the accepted query on its first row, got {}", item.rk
     );
 }
 
 #[test]
 fn a_filter_menu_resets_its_covered_library_grid_memory_without_taking_menu_focus() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-covered-query-reset");
+    let session = plx_plex::plex::session::TempSession::new("library-covered-query-reset");
     session.watching("u-library-covered-query-reset");
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test("query-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("query-own", "127.0.0.1", 9, "synthetic", "fixture");
     let shared =
-        crate::plex::register_for_test("query-shared", "127.0.0.1", 10, "synthetic", "fixture");
-    crate::plex::set_current(sid);
+        plx_plex::plex::register_for_test("query-shared", "127.0.0.1", 10, "synthetic", "fixture");
+    plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(120);
     frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
     Bridge::library_command(
         &mut d,
-        crate::screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 },
+        plx_screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 },
     );
     for i in 1..80 {
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
@@ -156,18 +165,26 @@ fn a_filter_menu_resets_its_covered_library_grid_memory_without_taking_menu_focu
         .find(|(_, elem)| *elem == grid.elem)
         .unwrap()
         .0;
+    let heading = d
+        .top_screen()
+        .unwrap()
+        .as_any()
+        .unwrap()
+        .downcast_ref::<plx_screens::library::LibraryScreen>()
+        .unwrap()
+        .toolbar_group();
     d.emit(
         MachineId::Nav,
         Fx::Deliver(
             MachineId::Instance(instance),
-            Delivery::Screen(ScreenEvent::Enter(crate::ui::screen::Enter::Fresh {
-                focus: crate::ui::screen::FocusTarget::ContainerGroup(
-                    crate::screens::library::TOOLBAR_GROUP,
-                ),
+            Delivery::Screen(ScreenEvent::Enter(plx_ui::screen::Enter::Fresh {
+                focus: plx_ui::screen::FocusTarget::ContainerGroup(heading),
             })),
         ),
     );
     frame(&mut d, &mut rig, AppArg::Library, tick(80), vec![]);
+    // The heading seats TYPE (every library lists more than one type); two RIGHTs reach FILTER.
+    frame(&mut d, &mut rig, AppArg::Library, tick(80), script_key(Key::Right, tick(80)));
     frame(
         &mut d,
         &mut rig,
@@ -175,13 +192,14 @@ fn a_filter_menu_resets_its_covered_library_grid_memory_without_taking_menu_focu
         tick(81),
         script_key(Key::Right, tick(81)),
     );
+    frame(&mut d, &mut rig, AppArg::Library, tick(81), script_key(Key::Right, tick(81)));
     let toolbar = d.focus().unwrap();
     let page = d
         .top_screen()
         .unwrap()
         .as_any()
         .unwrap()
-        .downcast_ref::<crate::screens::library::LibraryScreen>()
+        .downcast_ref::<plx_screens::library::LibraryScreen>()
         .unwrap();
     assert_eq!(
         page.probe_viewport(Some(toolbar)).0,
@@ -206,27 +224,31 @@ fn a_filter_menu_resets_its_covered_library_grid_memory_without_taking_menu_focu
         d.input.press.is_live(),
         requests.iter().map(|(_, req, _)| req).collect::<Vec<_>>()
     );
-    let (kind, anchor, target) = requests
+    let (kind, anchor, target, folded, control) = requests
         .into_iter()
         .find_map(|(_, req, _)| match req {
             LibraryReq::Menu {
                 kind,
                 anchor,
                 target,
-            } => Some((kind, anchor, target)),
+                folded,
+                control,
+            } => Some((kind, anchor, target, folded, control)),
             _ => None,
         })
         .unwrap_or_else(|| panic!("the real toolbar activation must request its menu: {evidence}"));
-    assert_eq!(kind, crate::screens::registry::LibraryMenuKind::Filter);
-    d.nav.next_style = crate::ui::containers::modal::Style::Compact;
+    assert_eq!(kind, plx_screens::registry::LibraryMenuKind::SortFilter);
+    d.nav.next_style = plx_ui::containers::modal::Style::Compact;
     d.request(
         MachineId::Nav,
         NavOp::Present(AppArg::LibraryMenu(
-            crate::screens::registry::LibraryMenuArg {
+            plx_screens::registry::LibraryMenuArg {
                 host: instance,
                 kind,
                 anchor,
                 target,
+                folded,
+                opener: Some((d.nav.entry_of_instance(instance).unwrap(), control)),
             },
         )),
     );
@@ -278,7 +300,7 @@ fn a_filter_menu_resets_its_covered_library_grid_memory_without_taking_menu_focu
         .iter()
         .find(|key| {
             matches!(&key.identity,
-        crate::screens::registry::LibraryIdentity::Grid { sid: item_sid, rk, section }
+        plx_screens::registry::LibraryIdentity::Grid { sid: item_sid, rk, section }
             if *item_sid == sid && rk == "1" && section.key == target.section)
         })
         .unwrap()
@@ -309,5 +331,15 @@ fn a_filter_menu_resets_its_covered_library_grid_memory_without_taking_menu_focu
         tick(290),
         script_key(Key::Down, tick(290)),
     );
-    assert_eq!(d.focus(), Some(FocusKey { entry, elem: first }));
+    // DOWN from the heading lands in the grid's first row (the reset left nothing remembered, so
+    // `CONTENT_HEAD_SEAT` projects under the chip it left); the reset memory above is what the
+    // rail's door reads.
+    let page = d
+        .top_screen()
+        .unwrap()
+        .as_any()
+        .unwrap()
+        .downcast_ref::<plx_screens::library::LibraryScreen>()
+        .unwrap();
+    assert_eq!(page.grid_position(d.focus()).map(|(row, _)| row), Some(0));
 }

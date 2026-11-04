@@ -12,7 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from source_bundle import canonical, digest, read_regular, snapshot, validate, write_archive
+from source_bundle import (PRIVATE_KEY_PATTERN, SENTRY_DSN_PATTERN, canonical, digest, read_regular,
+                           snapshot, validate, write_archive)
 
 
 class BundleTests(unittest.TestCase):
@@ -29,7 +30,7 @@ class BundleTests(unittest.TestCase):
             'rust-modules/Cargo.toml': (b'[package]\nlicense = "GPL-3.0-or-later"\n', 0o644),
             'rust-modules/Cargo.lock': (b'version = 4\n', 0o644),
             'pkg/appinfo.json': (b'{"id":"com.example.test"}', 0o644),
-            'vendor/sentry-native/webos-arm32.patch': (b'patch source', 0o644),
+            'ci/patches/sentry-native-0001-webos-arm32.patch': (b'patch source', 0o644),
         }
         deps = []
         for name in ['ffmpeg', 'sentry-native', 'cargo-vendor', 'rust-runtime']:
@@ -38,7 +39,7 @@ class BundleTests(unittest.TestCase):
             self.contents[path] = data, 0o644
             deps.append({'id': name, 'version': 'pinned-test', 'license': 'MIT',
                          'sources': [{'path': path, 'sha256': digest(data)}], 'recipes': ['Makefile'],
-                         'patches': ['vendor/sentry-native/webos-arm32.patch'] if name == 'sentry-native' else []})
+                         'patches': ['ci/patches/sentry-native-0001-webos-arm32.patch'] if name == 'sentry-native' else []})
         self.manifest = {'schema': 1, 'license': 'GPL-3.0-or-later', 'dependencies': deps,
                          'build_environment': {'compiler': 'fixture'}, 'git_commit': 'a' * 40}
         self.refresh()
@@ -105,7 +106,7 @@ class BundleTests(unittest.TestCase):
             self.check()
 
     def test_missing_patch(self):
-        del self.contents['vendor/sentry-native/webos-arm32.patch']
+        del self.contents['ci/patches/sentry-native-0001-webos-arm32.patch']
         self.refresh()
         with self.assertRaisesRegex(ValueError, 'recipe/patch'):
             self.check()
@@ -121,10 +122,105 @@ class BundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'rust-runtime'):
             self.check()
 
+    def test_ass_source_requires_every_static_dependency(self):
+        self.contents['ci/dependencies.json'] = json.dumps([
+            {'id': name, 'bundled': True} for name in ['libass', 'freetype', 'fribidi', 'harfbuzz']]).encode(), 0o644
+        for name in ['libass', 'freetype', 'fribidi', 'harfbuzz']:
+            self.refresh()
+            with self.assertRaisesRegex(ValueError, 'missing dependency source mapping: ' + name):
+                self.check()
+            path = 'dependencies/' + name + '/' + name + '.tar.xz'
+            self.contents[path] = b'corresponding source', 0o644
+            self.manifest['dependencies'].append({'id': name, 'version': 'pinned-test', 'license': 'MIT',
+                'sources': [{'path': path, 'sha256': digest(b'corresponding source')}],
+                'recipes': ['Makefile'], 'patches': []})
+        self.refresh()
+        self.check()
+
     def test_unknown_license(self):
         self.manifest['dependencies'][0]['license'] = 'NOASSERTION'
         with self.assertRaisesRegex(ValueError, 'unresolved dependency license'):
             self.check()
+
+    def test_ass_compositor_header_is_required_when_the_facade_includes_it(self):
+        self.test_ass_source_requires_every_static_dependency()
+        for name in ['ci/build-libass.sh', 'ci/build-libass.py', 'ci/deps.py', 'include/ass.h']:
+            self.contents[name] = b'fixture recipe', 0o644
+        self.contents['src/ass.c'] = b'/* older facade without the private header */', 0o644
+        self.refresh()
+        self.check()  # Existing source bundles remain valid.
+        self.contents['src/ass.c'] = b'#include "ass_composite.h"\n', 0o644
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'missing ASS renderer source: src/ass_composite.h'):
+            self.check()
+        self.contents['src/ass_composite.h'] = b'fixture compositor', 0o644
+        self.refresh()
+        self.check()
+
+    PATCH_PATH = 'ci/patches/libass-0001-fixture.patch'
+    PATCH = b'diff --git a/libass/x.c b/libass/x.c\n'
+
+    def pin_a_patch(self, listed=True, present=True, wrong_bytes=False):
+        """A PR 4-shaped bundle: the libass pin names a patch, the bundle carries (or not) the file."""
+        self.test_ass_source_requires_every_static_dependency()
+        pins = json.loads(self.contents['ci/dependencies.json'][0])
+        for pin in pins:
+            if pin['id'] == 'libass':
+                pin['patches'] = [{'path': self.PATCH_PATH, 'sha256': digest(self.PATCH), 'result': {}}]
+        self.contents['ci/dependencies.json'] = json.dumps(pins).encode(), 0o644
+        if present:
+            self.contents[self.PATCH_PATH] = (self.PATCH + b'tampered' if wrong_bytes else self.PATCH), 0o644
+        for dep in self.manifest['dependencies']:
+            if dep['id'] == 'libass':
+                dep['patches'] = [self.PATCH_PATH] if listed else []
+        self.refresh()
+
+    def test_ass_patch_pinned_and_carried_passes(self):
+        self.pin_a_patch()
+        self.check()
+
+    def test_a_bundle_without_the_pinned_ass_patch_is_refused(self):
+        self.pin_a_patch(present=False)
+        with self.assertRaisesRegex(ValueError, 'missing pinned patch: ' + self.PATCH_PATH):
+            self.check()
+
+    def test_a_bundle_whose_libass_entry_does_not_list_the_patch_is_refused(self):
+        self.pin_a_patch(listed=False)
+        with self.assertRaisesRegex(ValueError, 'missing pinned patch'):
+            self.check()
+
+    def test_a_bundle_with_different_patch_bytes_is_refused(self):
+        self.pin_a_patch(wrong_bytes=True)
+        with self.assertRaisesRegex(ValueError, 'missing pinned patch'):
+            self.check()
+
+    def test_the_font_count_probe_source_is_required_when_the_facade_includes_it(self):
+        self.test_ass_source_requires_every_static_dependency()
+        for name in ['ci/build-libass.sh', 'ci/build-libass.py', 'ci/deps.py', 'include/ass.h']:
+            self.contents[name] = b'fixture recipe', 0o644
+        self.contents['src/ass.c'] = b'#include "ass_internal.h"\n', 0o644
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'missing ASS renderer source: src/ass_internal.h'):
+            self.check()
+        self.contents['src/ass_internal.h'] = b'fixture', 0o644
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'missing ASS renderer source: src/ass_fonts.c'):
+            self.check()
+        self.contents['src/ass_fonts.c'] = b'fixture', 0o644
+        self.refresh()
+        self.check()
+
+    def test_the_ui_text_source_is_required_when_the_recipe_compiles_it(self):
+        self.test_ass_source_requires_every_static_dependency()
+        for name in ['ci/build-libass.sh', 'ci/deps.py', 'include/ass.h', 'src/ass.c']:
+            self.contents[name] = b'fixture recipe', 0o644
+        self.contents['ci/build-libass.py'] = b"str(ROOT / 'src/ass_text.c')\n", 0o644
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'missing ASS renderer source: src/ass_text.c'):
+            self.check()
+        self.contents['src/ass_text.c'] = b'fixture', 0o644
+        self.refresh()
+        self.check()
 
     def test_corrupt_compression_requires_exact_reviewed_hash(self):
         data = b'\x1f\x8bintentionally invalid gzip fixture'
@@ -182,6 +278,17 @@ class BundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'private path'):
             self.check()
 
+    def test_per_user_tv_config_files_are_private_paths(self):
+        # `.tv-host`/`.tv-mac` and their per-user twins (`~/.config/plxnative/tv-host`, `tv-mac`,
+        # read by tools/tv-config.sh) hold the maintainer's home network: neither spelling may ship.
+        for name in ('.tv-host', '.tv-mac', 'tools/plxnative/tv-host', 'tools/plxnative/tv-mac'):
+            with self.subTest(name=name):
+                self.contents[name] = b'192.0.2.1\n', 0o644
+                self.refresh()
+                with self.assertRaisesRegex(ValueError, 'private path'):
+                    self.check()
+                del self.contents[name]
+
     def nested_archive(self, *, link=None, secret=False):
         out = io.BytesIO()
         with tarfile.open(fileobj=out, mode='w:gz') as archive:
@@ -210,7 +317,7 @@ class BundleTests(unittest.TestCase):
         from source_bundle import scan
         sample = b'https://' + b'0' * 32 + b'@o0.ingest.sentry.io/1'
         name = 'fixture/sample.java'
-        with patch('source_bundle.PUBLIC_DEMO_DSN_FILES', {name: digest(sample)}):
+        with patch('source_bundle.PUBLIC_SAMPLE_FILES', {name: (SENTRY_DSN_PATTERN, digest(sample))}):
             scan(sample, 'outer.tar.gz:' + name)
             with self.assertRaisesRegex(ValueError, 'credential pattern'):
                 scan(sample + b'changed', 'outer.tar.gz:' + name)
@@ -218,6 +325,17 @@ class BundleTests(unittest.TestCase):
                 scan(sample, 'another.java')
             with self.assertRaisesRegex(ValueError, 'private value'):
                 scan(sample, name, [sample])
+
+    def test_public_sample_exception_is_pattern_scoped(self):
+        from source_bundle import scan
+        key = b'-----BEGIN PRIVATE KEY-----\n' + b'A' * 64 + b'\n-----END PRIVATE KEY-----\n'
+        name = 'cargo-vendor/fixture/src/lib.rs'
+        with patch('source_bundle.PUBLIC_SAMPLE_FILES', {name: (PRIVATE_KEY_PATTERN, digest(key))}):
+            scan(key, 'cargo-vendor.tar.gz:' + name)
+        # The same file exempted for a DIFFERENT pattern is still refused.
+        with patch('source_bundle.PUBLIC_SAMPLE_FILES', {name: (SENTRY_DSN_PATTERN, digest(key))}):
+            with self.assertRaisesRegex(ValueError, 'credential pattern'):
+                scan(key, 'cargo-vendor.tar.gz:' + name)
 
     def test_input_symlink_escape(self):
         (self.root / 'link').symlink_to('/etc/passwd')
@@ -240,6 +358,32 @@ class BundleTests(unittest.TestCase):
             self.check()
 
     def test_restore_wires_supplied_cargo_and_runtime_sources(self):
+        self.test_ass_source_requires_every_static_dependency()
+        # The restore puts every bundled upstream input where the build finds it: the download
+        # cache, under the names ci/dependencies.json gives them (a multi-file entry in a
+        # directory of its own).
+        pins = []
+        for name in ['ffmpeg', 'sentry-native', 'libass', 'freetype', 'fribidi', 'harfbuzz', 'nanosvg']:
+            members = ['dependencies/' + name + '/' + name + '.tar.xz']
+            pin = {'id': name, 'bundled': True, 'version': 'pinned-test', 'license': 'MIT', 'patches': []}
+            if name == 'nanosvg':
+                members = ['dependencies/nanosvg/nanosvg.h', 'dependencies/nanosvg/nanosvgrast.h']
+                pin['assets'] = {Path(m).stem: {'name': Path(m).name, 'url': 'https://example.invalid/' + Path(m).name,
+                                                'sha256': digest(b'corresponding source')} for m in members}
+            else:
+                pin.update(archive=name + '.tar.xz', url='https://example.invalid/' + name,
+                           sha256=digest(b'corresponding source'))
+            for member in members:
+                self.contents[member] = b'corresponding source', 0o644
+            dep = next((d for d in self.manifest['dependencies'] if d['id'] == name), None)
+            if dep is None:
+                dep = {'id': name, 'version': 'pinned-test', 'license': 'MIT', 'recipes': ['Makefile'], 'patches': []}
+                self.manifest['dependencies'].append(dep)
+            dep['sources'] = [{'path': m, 'sha256': digest(b'corresponding source')} for m in members]
+            pins.append(pin)
+        self.contents.pop('dependencies/ffmpeg/source.txt')
+        self.contents.pop('dependencies/sentry-native/source.txt')
+        self.contents['ci/dependencies.json'] = json.dumps(pins).encode(), 0o644
         self.contents['rust-modules/.cargo/config.toml'] = b'[build]\n', 0o644
         for name, files in [
             ('cargo-vendor', {'cargo-vendor/test-crate/Cargo.toml': (b'[package]\nname="fixture"\n', 0o644)}),
@@ -255,6 +399,10 @@ class BundleTests(unittest.TestCase):
         self.write()
         sysroot = self.root / 'isolated-toolchain'
         (sysroot / 'bin').mkdir(parents=True)
+        # the prebuilt ARMv7 std the rebuild links (restore refuses a sysroot without it)
+        std = sysroot / 'lib/rustlib/armv7-unknown-linux-gnueabi/lib'
+        std.mkdir(parents=True)
+        (std / 'libstd-0123456789abcdef.rlib').write_bytes(b'fixture prebuilt std')
         compiler = sysroot / 'bin/rustc'
         compiler.write_text('#!/bin/sh\nprintf "commit-hash: pinned-test\\n"\n')
         compiler.chmod(0o755)
@@ -264,12 +412,20 @@ class BundleTests(unittest.TestCase):
                                  '--destination', str(destination), '--rust-sysroot', str(sysroot)],
                                 capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((sysroot / 'lib/rustlib/src/rust/library/Cargo.lock').read_bytes(), b'fixture runtime source')
+        # rust-src is the std's corresponding SOURCE, restored beside the tree; it is not installed
+        # into the toolchain, because the build uses the prebuilt std and needs none.
+        self.assertEqual((destination / 'rust-runtime-src/library/Cargo.lock').read_bytes(), b'fixture runtime source')
+        self.assertFalse((sysroot / 'lib/rustlib/src').exists())
+        self.assertEqual((destination / 'rust-runtime-notices/LICENSE').read_bytes(), b'fixture retained notice')
         self.assertTrue((destination / 'rust-modules/cargo-vendor/test-crate/Cargo.toml').is_file())
         self.assertIn(str(destination / 'rust-modules/cargo-vendor'),
                       (destination / 'rust-modules/.cargo/config.toml').read_text())
-        self.assertTrue((destination / 'vendor/ffmpeg-build/source.txt').is_file())
-        self.assertTrue((destination / 'vendor/source.txt').is_file())
+        for name in ['ffmpeg', 'sentry-native', 'libass', 'freetype', 'fribidi', 'harfbuzz']:
+            self.assertEqual((destination / 'vendor/downloads' / (name + '.tar.xz')).read_bytes(),
+                             b'corresponding source')
+        for name in ['nanosvg.h', 'nanosvgrast.h']:
+            self.assertEqual((destination / 'vendor/downloads/nanosvg-pinned-test' / name).read_bytes(),
+                             b'corresponding source')
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('restore-source-inputs.py')),
                                  str(self.path), '--expect-snapshot', self.manifest['snapshot_sha256'],
                                  '--destination', str(destination), '--rust-sysroot', str(sysroot)],
@@ -319,6 +475,33 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(before, validate(self.path)['snapshot_sha256'])
 
+    def test_producer_keeps_locale_catalogs_as_build_inputs(self):
+        catalogs = {
+            'locales/en/widgets.json': b'{"widgets.title":{"value":"Information"}}',
+            'locales/es/widgets.json': '{"widgets.title":"Información"}'.encode(),
+            'locales/be/widgets.json': '{"widgets.title":"Звесткі"}'.encode(),
+        }
+        for name, data in catalogs.items():
+            self.contents[name] = data, 0o644
+        self.refresh()
+        _repo, command = self.producer_fixture()
+        result = subprocess.run(command, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = validate(self.path)['files']
+        with tarfile.open(self.path, 'r:*') as archive:
+            for name, data in catalogs.items():
+                self.assertIn(name, files, "catalogs are required Cargo build inputs")
+                self.assertEqual(archive.extractfile(name).read(), data)
+
+    def test_producer_untracked_locale_catalog_refused(self):
+        repo, command = self.producer_fixture()
+        catalog = repo / 'locales/en/new.json'
+        catalog.parent.mkdir(parents=True)
+        catalog.write_text('{"widgets.new":{"value":"New label"}}')
+        result = subprocess.run(command, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b'untracked source', result.stderr)
+
     def test_producer_untracked_source_refused(self):
         repo, command = self.producer_fixture()
         (repo / 'src').mkdir()
@@ -357,6 +540,27 @@ class BundleTests(unittest.TestCase):
                                  str(self.path), '--expect-snapshot', '0' * 64], capture_output=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn(b'expected candidate', result.stderr)
+
+
+class RepositoryTreeScan(unittest.TestCase):
+    """Run the bundle's credential scan over the REAL tree, before any ARM build.
+
+    The release step scans the bundle only after a full cross-build; a first-party fixture that
+    looked like a token (X-Plex-Token=<20+ chars>) surfaced there and nowhere earlier.
+    """
+
+    def test_every_bundled_file_passes_the_credential_scan(self):
+        from source_bundle import scan, tracked_sources
+        root = Path(__file__).resolve().parents[1]
+        failures, count = [], 0
+        for name, data, _mode, _transformation in tracked_sources(root):
+            count += 1
+            try:
+                scan(data, name, [])
+            except ValueError as error:
+                failures.append(str(error))
+        self.assertGreater(count, 100)
+        self.assertEqual(failures, [])
 
 
 if __name__ == '__main__':

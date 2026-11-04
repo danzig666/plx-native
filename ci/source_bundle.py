@@ -7,6 +7,7 @@ import io
 import json
 import posixpath
 import re
+import subprocess
 import tarfile
 import zipfile
 import zlib
@@ -18,11 +19,14 @@ GPL_SHA256 = "fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0"
 ROOT_FILES = {'Makefile', 'LICENSE', 'LICENSING.md', 'THIRD-PARTY-NOTICES.md',
               'README.md', 'CONTRIBUTING.md', 'DCO', 'PRIVACY.md', 'SECURITY.md',
               'TRADEMARKS.md', '.gitignore', 'AGENTS.md', 'CLAUDE.md'}
-ROOT_DIRS = {'src', 'include', 'rust-modules', 'assets', 'ci', 'tools', 'docs', 'tests', 'licenses', '.agents'}
-PKG_FILES = {'OFL.txt', 'appfont.ttf', 'appfont-bold.ttf', 'appfont-cjk.ttf',
+ROOT_DIRS = {'src', 'include', 'rust-modules', 'assets', 'ci', 'tools', 'docs', 'tests', 'licenses', 'locales', '.agents'}
+PKG_FILES = {'OFL.txt', 'appfont.ttf', 'appfont-bold.ttf', 'appfont-cjk.ttf', 'appfont-emoji.ttf', 'le-roots.pem',
+             'appfont-arabic.ttf', 'appfont-arabic-bold.ttf', 'appfont-hebrew.ttf', 'appfont-hebrew-bold.ttf',
              'appinfo.json', 'icon.png', 'icon160.png', 'icon320.png', 'icon400.png',
              'largeIcon.png', 'splash.png', 'telemetry.local.json.example'}
-PRIVATE_NAMES = {'.tv-host', '.tv-mac', '.tv-dpad-pass', '.tv-remote-url',
+# `tv-host`/`tv-mac` (no dot) are the per-user copies of the first two (tools/tv-config.sh,
+# ~/.config/plxnative/): outside every checkout, but a copy dropped into the tree must not ship.
+PRIVATE_NAMES = {'.tv-host', '.tv-mac', 'tv-host', 'tv-mac', '.tv-dpad-pass', '.tv-remote-url',
                  'config.local.h', 'manifest.local.json', 'auth.json', 'lab.json',
                  'telemetry.local.json', 'local.env', '.env', 'id_rsa', 'id_ed25519'}
 # flate2 1.1.9 crate checksum 843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c;
@@ -68,10 +72,43 @@ def allowed(name):
         return not any(part in {'target', '__pycache__'} for part in p.parts)
     if p.parts[0] == 'pkg':
         return (name[4:] in PKG_FILES or
+                (len(p.parts) == 4 and p.parts[1:3] == ('fonts', 'subs') and
+                 (p.suffix == '.ttf' or p.name == 'manifest.json')) or
                 (len(p.parts) == 4 and p.parts[1] == 'resources' and p.name == 'appinfo.json') or
-                name in {'pkg/dev/icon.png', 'pkg/dev/largeIcon.png'})
-    return (name.startswith('vendor/nanosvg/') or name == 'vendor/sentry-native/webos-arm32.patch'
-            or name.startswith('.github/'))
+                name in {'pkg/dev/icon.png', 'pkg/dev/largeIcon.png',
+                         'pkg/nightly/icon.png', 'pkg/nightly/largeIcon.png'})
+    return name.startswith('.github/')
+
+
+def tracked_sources(root, private_values=()):
+    """Yield (name, data, mode, transformation) for every file the source bundle carries.
+
+    THE one selection: tracked files that pass allowed(), with release records redacted exactly as
+    archived. make-source-bundle.py builds from it and test_source_bundle.py scans it, so the
+    pre-build credential check sees the same bytes the release step will.
+    """
+    listing = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-s', '-z'])
+    for item in listing.decode().split('\0'):
+        if not item:
+            continue
+        metadata, name = item.split('\t', 1)
+        if metadata.split()[0] == '160000':
+            fail('submodule needs explicit source support: ' + name)
+        # Deliberate allowlist: untracked files and gitignored inputs never enter here.
+        if not allowed(name):
+            continue
+        data, filemode = read_regular(root, name)
+        transformation = None
+        if name.startswith(('docs/release-audits/', 'docs/release-notes/')):
+            original = data
+            data = re.sub(rb'(?mi)^.*\| telemetry endpoints \|.*$',
+                b'| telemetry endpoints | Redacted in the source reconstruction copy; original release record unchanged |', data)
+            for value in sorted(private_values, key=len, reverse=True):
+                if value: data = data.replace(value, b'<redacted-private-value>')
+            if data != original:
+                transformation = {'original_sha256': digest(original),
+                    'operation': 'Redact confidential literals in copied release record; repository original unchanged'}
+        yield name, data, filemode, transformation
 
 
 def read_regular(root, name):
@@ -90,12 +127,28 @@ def read_regular(root, name):
     return path.read_bytes(), 0o755 if path.stat().st_mode & 0o111 else 0o644
 
 
-# Public demo endpoint in the checksum-pinned upstream Android sample, not our configuration.
-# Only this pattern is exempt; literal private values and all other credential checks still run.
+# Public sample credentials inside checksum-pinned upstream sources, not our configuration: each
+# entry exempts ONE pattern in ONE file at ONE exact digest. Any other pattern in the same file, the
+# same text anywhere else, a changed file, and every literal private value still fail the scan.
 SENTRY_DSN_PATTERN = rb'https?://[0-9a-fA-F]{24,}@[A-Za-z0-9.-]*ingest[A-Za-z0-9.-]*sentry\.io/'
-PUBLIC_DEMO_DSN_FILES = {
-    'sentry-native-0.16.6/ndk/sample/src/main/java/io/sentry/ndk/sample/MainActivity.java':
-        '5c67de55db824517dc03b4d3aba066f45bb6e94425ce7c176733aad75719b1be',
+PRIVATE_KEY_PATTERN = rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=\r\n]{32,}'
+# The Sentry Native top-level directory inside its pinned archive carries the pinned version.
+SENTRY_NATIVE_DIR = 'sentry-native-' + next(
+    dep['version'] for dep in json.loads((Path(__file__).resolve().parents[1] / 'ci/dependencies.json').read_text())
+    if dep['id'] == 'sentry-native')
+PUBLIC_SAMPLE_FILES = {
+    # Demo DSN in the upstream Android sample app.
+    SENTRY_NATIVE_DIR + '/ndk/sample/src/main/java/io/sentry/ndk/sample/MainActivity.java':
+        (SENTRY_DSN_PATTERN, '5c67de55db824517dc03b4d3aba066f45bb6e94425ce7c176733aad75719b1be'),
+    # Doc-example and unit-test keys in the crates behind the `rcgen` dev-dependency (Cargo.lock
+    # pins each crate's checksum; `cargo vendor` ships dev-dependencies because a build from the
+    # vendored tree must resolve the whole lock).
+    'cargo-vendor/pem/README.md':
+        (PRIVATE_KEY_PATTERN, '0f96e3ccaadcaa6b59c2947e7148e12c762865db05802ba2d2f5e7edf3a7fc30'),
+    'cargo-vendor/pem/src/lib.rs':
+        (PRIVATE_KEY_PATTERN, 'be6a429443a8687241f20f9bd2511614b9b8a150e52ed89e445960fbd2ae1906'),
+    'cargo-vendor/rcgen/src/certificate.rs':
+        (PRIVATE_KEY_PATTERN, '04d367a1ffb3a4c6f74154b68721690fef8e319fe591118211eb039a672963a1'),
 }
 
 def scan(data, name, private_values=(), depth=0, budget=None):
@@ -108,7 +161,7 @@ def scan(data, name, private_values=(), depth=0, budget=None):
     for value in private_values:
         if value and value in data:
             fail('private value found in: ' + name)  # Never print the matched value.
-    patterns = [rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=\r\n]{32,}',
+    patterns = [PRIVATE_KEY_PATTERN,
                 rb'PLXNATIVE_' + rb'PRIVATE_SENTINEL_[A-Za-z0-9]+',
                 rb'\bgh[pousr]_[A-Za-z0-9]{30,}',
                 rb'\bAKIA[A-Z0-9]{16}\b',
@@ -118,8 +171,7 @@ def scan(data, name, private_values=(), depth=0, budget=None):
     for pattern in patterns:
         if not re.search(pattern, data):
             continue
-        if (pattern == SENTRY_DSN_PATTERN
-                and PUBLIC_DEMO_DSN_FILES.get(name.rsplit(':', 1)[-1]) == digest(data)):
+        if PUBLIC_SAMPLE_FILES.get(name.rsplit(':', 1)[-1]) == (pattern, digest(data)):
             continue
         fail('credential pattern found in: ' + name)
     if data.startswith(b'PK\x03\x04'):
@@ -242,6 +294,41 @@ def validate(path, expected_snapshot=None, private_values=()):
     for required in ['ffmpeg', 'sentry-native', 'cargo-vendor', 'rust-runtime']:
         if required not in ids:
             fail('missing dependency source mapping: ' + required)
+    # Older source bundles predate the renderer. For a tree carrying its build
+    # recipe, every statically contained font dependency is a required source.
+    if 'ci/build-libass.py' in contents or 'src/ass.c' in contents:
+        for required in ['ci/dependencies.json', 'ci/deps.py', 'ci/build-libass.sh',
+                         'ci/build-libass.py', 'src/ass.c', 'include/ass.h']:
+            if required not in contents:
+                fail('missing ASS renderer source: ' + required)
+        # Earlier published facades did not use this private implementation header.
+        if re.search(rb'^\s*#\s*include\s*"ass_composite\.h"', contents['src/ass.c'], re.M):
+            if 'src/ass_composite.h' not in contents:
+                fail('missing ASS renderer source: src/ass_composite.h')
+        # Facades from the ABI 3 bump on read libass's private font count in a second file.
+        if re.search(rb'^\s*#\s*include\s*"ass_internal\.h"', contents['src/ass.c'], re.M):
+            for required in ['src/ass_internal.h', 'src/ass_fonts.c']:
+                if required not in contents:
+                    fail('missing ASS renderer source: ' + required)
+        # From ABI 4 the recipe also compiles the UI text surface into the same library.
+        if b'src/ass_text.c' in contents.get('ci/build-libass.py', b''):
+            if 'src/ass_text.c' not in contents:
+                fail('missing ASS renderer source: src/ass_text.c')
+    if 'ci/dependencies.json' in contents:
+        # Every dependency the manifest bundles (FFmpeg, Sentry Native, the libass stack, nanosvg)
+        # is a required source of this tree.
+        for required in json.loads(contents['ci/dependencies.json']):
+            if not required.get('bundled'):
+                continue
+            if required['id'] not in ids:
+                fail('missing dependency source mapping: ' + required['id'])
+            # A pinned patch is part of the corresponding source: present, byte-exact, and named by
+            # the dependency's own entry.
+            listed = next(dep for dep in dependencies if dep['id'] == required['id']).get('patches', [])
+            for patch in required.get('patches', []):
+                if (patch['path'] not in contents or digest(contents[patch['path']]) != patch['sha256']
+                        or patch['path'] not in listed):
+                    fail('missing pinned patch: ' + patch['path'])
     for dep in dependencies:
         for key in ['id', 'version', 'license']:
             if not dep.get(key) or dep[key] in {'UNKNOWN', 'NOASSERTION'}:

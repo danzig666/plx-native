@@ -53,7 +53,7 @@ use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::log;
+use plx_base::eventlog::log;
 
 /// The listener's port for the app users install. A flavoured install steps off it — see
 /// [`default_port`].
@@ -73,14 +73,22 @@ const STABLE_PORT: u16 = 8910;
 /// rather than accidental — but the whole point of that guard having a named hatch is that
 /// somebody will use it.
 ///
-/// The rule is deliberately the simplest one that can be spelled twice: there are two flavours,
-/// so there are two ports. `make -s print-appport` is the same rule for the shell (that is what
+/// There are three flavours now, so there are three named ports rather than "stable, or one
+/// higher" — nightly was the third flavour the old comment here warned would need a real
+/// decision. `make -s print-appport` is the same rule for the shell (that is what
 /// `tools/tv-session.sh` passes to `stream-screen.py --app-port`), and `ci/flavor.py --selftest`
-/// compares the two. A THIRD flavour needs a decision in both places, and the selftest is what
-/// will say so.
+/// compares the two. A FOURTH flavour needs its own decision in both places, the same way nightly
+/// just did, and the selftest is what will say so.
 pub(crate) fn default_port() -> u16 {
-    match crate::paths::flavour() {
+    match plx_base::paths::flavour() {
         None => STABLE_PORT,
+        Some("debug") => STABLE_PORT + 1,
+        Some("nightly") => STABLE_PORT + 2,
+        // Defensive rather than reachable: the Makefile's FLAVORS whitelist and `paths::app_id`'s
+        // install-directory read are what actually decide a real television's flavour, so any
+        // OTHER suffix here means something outside that whitelist got installed by hand. Falling
+        // back to the debug port rather than panicking keeps a stray install's capture stream
+        // merely wrong rather than crashing the app over a dev convenience feature.
         Some(_) => STABLE_PORT + 1,
     }
 }
@@ -133,18 +141,18 @@ static CYC_N: AtomicU32 = AtomicU32::new(0);
 /// the crate's only listener, it binds `INADDR_ANY` and its hello handshake carries no credential
 /// of any kind, so anyone on the LAN who reached it would be served the app's own framebuffer —
 /// the signed-in profile name, the user's library. Arming it took nothing but the ability to
-/// create a file in a world-writable `/tmp`. The gate is `dev::read` below being compile-time
+/// create a file in a world-writable `/tmp`. The gate is `devtrig::read` below being compile-time
 /// `None` without the `devtriggers` feature, which makes the two `spawn`s unreachable.
 pub(crate) fn init() {
-    let Some(content) = crate::dev::read("capture") else {
+    let Some(content) = plx_base::devtrig::read("capture") else {
         return;
     };
     let port: u16 = content.parse().unwrap_or_else(|_| default_port());
     let mut hs = HANDLES.lock().unwrap();
     // Both halves are required — a listener with no encoder serves an empty stream — but whatever
     // did spawn still goes into HANDLES (Option is IntoIterator) so `shutdown` joins it either way.
-    let listener = crate::task::spawn("cap-listen", move || caplisten(port));
-    let encoder = crate::task::spawn("cap-encode", capenc);
+    let listener = plx_base::task::spawn("cap-listen", move || caplisten(port));
+    let encoder = plx_base::task::spawn("cap-encode", capenc);
     let both = listener.is_some() && encoder.is_some();
     hs.extend(listener);
     hs.extend(encoder);
@@ -178,7 +186,7 @@ pub(crate) fn shutdown() {
     for h in HANDLES.lock().unwrap().drain(..) {
         // one aggregate name: the Vec mixes cap-listen and cap-encode, and which one stalled is a
         // question for the next person who sees a number here at all
-        crate::task::join("capture", h);
+        plx_base::task::join("capture", h);
     }
 }
 
@@ -208,7 +216,13 @@ pub(crate) fn tick(now: u32) {
     // client must not keep pinning the size). The mpeg encoder is fixed at 960x540.
     let want_960 = (FD_MPEG.load(Ordering::Relaxed) >= 0 && MPEG_960.load(Ordering::Relaxed))
         || (FD_JPEG.load(Ordering::Relaxed) >= 0 && JPEG_960.load(Ordering::Relaxed));
-    match crate::gfx::cap_cycle(want_960, &mut buf) {
+    // A GL downscale and readback: GL work, labelled so for the hang watchdog.
+    let cycle = {
+        #[cfg(feature = "threadcheck")]
+        let _readback = plx_base::task::watchdog::readback_scope();
+        plx_gfx::gfx::cap_cycle(want_960, &mut buf)
+    };
+    match cycle {
         Some((w, h, flip)) => {
             let f = Frame {
                 seq: SEQ.fetch_add(1, Ordering::Relaxed),
@@ -455,7 +469,7 @@ struct TurboJpeg {
 fn tj_load() -> Option<TurboJpeg> {
     unsafe {
         let path = std::ffi::CString::new(
-            crate::paths::in_app_dir("libturbojpeg.so.0")
+            plx_base::paths::in_app_dir("libturbojpeg.so.0")
                 .into_os_string()
                 .into_string()
                 .ok()?,
@@ -546,8 +560,8 @@ impl TurboJpeg {
 
 // ----------------------------------------------------------------- capjpeg --
 
-/// Write every byte to `fd` (MSG_NOSIGNAL — SIGPIPE would kill the app). Shared with
-/// ff.rs's venc AVIO write callback so both halves have one partial-write policy.
+/// Write every byte to `fd` (MSG_NOSIGNAL — SIGPIPE would kill the app). Handed to
+/// `ff::Venc::open` as its AVIO write policy so both halves have one partial-write policy.
 pub(crate) fn send_all(fd: c_int, data: &[u8]) -> bool {
     let mut off = 0usize;
     while off < data.len() {
@@ -572,7 +586,7 @@ fn capenc() {
     let mut my_jfd: c_int = -1;
     let mut my_mfd: c_int = -1;
     let mut turbo = tj_load(); // None (logged) -> pure-Rust fallback; dropped for good on a tj error
-    let mut venc: Option<Box<crate::ff::Venc>> = None; // mpeg1/ts session, per client
+    let mut venc: Option<Box<plx_media::ff::Venc>> = None; // mpeg1/ts session, per client
     let mut last_mpeg_ticks: u32 = 0;
     let mut rgb: Vec<u8> = Vec::new();
     let mut jpg: Vec<u8> = Vec::new(); // fallback-path encode target
@@ -580,7 +594,7 @@ fn capenc() {
                                             // The newest frame's pixels, kept by SWAP with the pool rather than copied, so the idle
                                             // keepalive below can re-encode the picture we ALREADY have instead of asking the UI to
                                             // render an identical one. Re-rendering a still screen to feed a dev stream would hand back
-                                            // exactly the cost `ui::idle` exists to remove.
+                                            // exactly the cost `plx_machine::idle` exists to remove.
     let mut last_rgba: Vec<u8> = Vec::new();
     let mut last_flip = false;
 
@@ -703,10 +717,11 @@ fn capenc() {
                         venc = None;
                     }
                     if venc.is_none() {
-                        venc = crate::ff::Venc::open(
+                        venc = plx_media::ff::Venc::open(
                             f.w,
                             f.h,
                             MPEG_RATE.load(Ordering::Relaxed) as i64,
+                            send_all,
                         );
                         if venc.is_none() {
                             // bring-up failed (encoder/muxer missing): latch off so we
@@ -740,8 +755,8 @@ fn capenc() {
                         CYC_N.swap(0, Ordering::Relaxed),
                     );
                     let (rd_us, rd_n) = (
-                        crate::gfx::CAP_READ_US.swap(0, Ordering::Relaxed),
-                        crate::gfx::CAP_READ_N.swap(0, Ordering::Relaxed),
+                        plx_gfx::gfx::CAP_READ_US.swap(0, Ordering::Relaxed),
+                        plx_gfx::gfx::CAP_READ_N.swap(0, Ordering::Relaxed),
                     );
                     log(&format!(
                         "capture: {} frm/{:.1}s ({:.1}fps) enc {:.1}ms avg (max {:.1}) send {:.1}ms \

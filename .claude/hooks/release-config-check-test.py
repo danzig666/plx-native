@@ -31,10 +31,12 @@ checkout (another lane's crate, another lane's target dir).
 
 `/repo` below is a fabricated root: `rust_src_target` is pure path arithmetic, so nothing needs to
 exist on disk. The one case that reads the real tree is `nightly()`, deliberately — it parses the
-actual Makefile, so renaming `RUST_NIGHTLY` fails here instead of silently falling back.
+actual Makefile, so renaming `RUST_TOOLCHAIN` fails here instead of silently falling back.
 """
 import importlib.util
 import os
+import pathlib
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -60,13 +62,26 @@ def edit(path, tool="Edit", key="file_path", **extra):
 CASES = [
     # --- fires: this lane's lib sources ---------------------------------------
     (FIRE, "plain edit", edit("/repo/rust-modules/src/app.rs"), ROOT),
-    (FIRE, "nested module", edit("/repo/rust-modules/src/ui/widgets.rs"), ROOT),
+    (FIRE, "nested module", edit("/repo/rust-modules/src/app/bootstrap/effects.rs"), ROOT),
     (FIRE, "Write", edit("/repo/rust-modules/src/dev.rs", tool="Write"), ROOT),
-    (FIRE, "MultiEdit", edit("/repo/rust-modules/src/gfx.rs", tool="MultiEdit"), ROOT),
+    (FIRE, "a layer crate's source", edit("/repo/rust-modules/base/src/paths.rs"), ROOT),
+    (FIRE, "the machine layer crate's source", edit("/repo/rust-modules/machine/src/idle.rs"), ROOT),
+    (FIRE, "the platform layer crate's source", edit("/repo/rust-modules/platform/src/webos.rs"), ROOT),
+    (FIRE, "the gfx layer crate's source", edit("/repo/rust-modules/gfx/src/gfx.rs"), ROOT),
+    (FIRE, "the net layer crate's source", edit("/repo/rust-modules/net/src/net.rs"), ROOT),
+    (FIRE, "the ui layer crate's source", edit("/repo/rust-modules/ui/src/widgets.rs"), ROOT),
+    (FIRE, "the plex layer crate's source", edit("/repo/rust-modules/plex/src/plex/session.rs"), ROOT),
+    (FIRE, "the telemetry layer crate's source", edit("/repo/rust-modules/telemetry/src/telemetry/sender.rs"), ROOT),
+    (FIRE, "the data layer crate\'s source", edit("/repo/rust-modules/data/src/pms.rs"), ROOT),
+    (FIRE, "the session layer crate\'s source", edit("/repo/rust-modules/session/src/auth.rs"), ROOT),
+    (FIRE, "the media layer crate\\'s source", edit("/repo/rust-modules/media/src/player/mod.rs"), ROOT),
+    (FIRE, "the appkit layer crate\\'s source", edit("/repo/rust-modules/appkit/src/player_hud/mod.rs"), ROOT),
+    (FIRE, "the screens layer crate\\'s source", edit("/repo/rust-modules/screens/src/home/mod.rs"), ROOT),
+    (FIRE, "MultiEdit", edit("/repo/rust-modules/src/app/run.rs", tool="MultiEdit"), ROOT),
     (FIRE, "relative to root", edit("rust-modules/src/route.rs"), ROOT),
     (FIRE, "relative to a subdir", edit("src/plex/client.rs"), "/repo/rust-modules"),
     (FIRE, "relative climbing out", edit("../rust-modules/src/net.rs"), "/repo/tools"),
-    (FIRE, "un-normalised absolute", edit("/repo/rust-modules/src/ui/../ff.rs"), ROOT),
+    (FIRE, "un-normalised absolute", edit("/repo/rust-modules/src/app/../ff.rs"), ROOT),
     # A worktree IS its own lane: same file, but `git rev-parse` from its own cwd returns ITS root.
     (FIRE, "worktree, from inside it",
      {"tool_name": "Edit", "tool_input": {"file_path": WT + "/rust-modules/src/app.rs"},
@@ -84,7 +99,7 @@ CASES = [
      edit(WT + "/rust-modules/src/app.rs"), ROOT),
 
     # --- does not fire: not a Rust source edit --------------------------------
-    (SKIP, "the crate's CLAUDE.md", edit("/repo/rust-modules/src/ui/CLAUDE.md"), ROOT),
+    (SKIP, "the crate's CLAUDE.md", edit("/repo/rust-modules/ui/src/CLAUDE.md"), ROOT),
     # Cargo.toml is where `[features]` itself lives, so this one is a real choice, not an
     # oversight — the hook grades a Rust edit's side effect on a configuration its author was not
     # thinking about, and someone editing the feature list is thinking about exactly that. Cost is
@@ -141,7 +156,7 @@ VERDICTS = [
     ("ok", 0, ""),
     ("broken", 101, E0428),
     ("broken", 101, DENIED_LINT),                       # `warnings = "deny"` is the sharp edge
-    ("unusable", 1, "error: toolchain 'nightly-2026-07-02' is not installed"),
+    ("unusable", 1, "error: toolchain '1.0.0' is not installed"),
     ("unusable", 127, "error: could not run cargo: [Errno 2] No such file or directory: 'cargo'"),
     ("unusable", 1, "error: failed to acquire package cache lock"),
     ("unusable", 101, SMB_NO_LOCK),                     # a build DIRECTORY fault, not a code fault
@@ -165,9 +180,9 @@ TARGET_DIRS = [
 # line is the wrong choice and was the original one: on these paths cargo has usually printed its
 # `Checking …` banner first, and a note that quotes the banner names nothing the reader can act on.
 FIRST_ERROR = [
-    ("error: toolchain 'nightly-2026-07-02' is not installed",
+    ("error: toolchain '1.0.0' is not installed",
      "    Checking plxnative-modules v0.4.1 (/repo/rust-modules)\n"
-     "error: toolchain 'nightly-2026-07-02' is not installed"),
+     "error: toolchain '1.0.0' is not installed"),
     ("error: could not run cargo: [Errno 2] No such file or directory: 'cargo'",
      "error: could not run cargo: [Errno 2] No such file or directory: 'cargo'"),
     # No `error` line at all: fall back to the first non-empty one rather than saying nothing.
@@ -252,25 +267,27 @@ def main():
         if saved_to is not None:
             os.environ[hook.TIMEOUT_ENV] = saved_to
 
-    # Reads the REAL Makefile, so a renamed variable fails here rather than silently defaulting.
-    saved = os.environ.pop("RUST_NIGHTLY", None)
+    # Reads the REAL rust-toolchain.toml, so a renamed key fails here rather than silently defaulting.
+    saved = os.environ.pop("RUST_TOOLCHAIN", None)
     try:
-        tc = hook.nightly(REPO)
-        if not tc or "nightly" not in tc:
+        tc = hook.pinned_toolchain(REPO)
+        want = re.search(r'^channel\s*=\s*"([^"]+)"',
+                         (pathlib.Path(REPO) / "rust-modules/rust-toolchain.toml").read_text(), re.M).group(1)
+        if tc != want or tc == "stable":
             fails += 1
-            print(f"  FAIL  nightly() parsed {tc!r} out of the Makefile's RUST_NIGHTLY")
-        os.environ["RUST_NIGHTLY"] = "nightly-2026-07-02"
-        if hook.nightly(REPO) != "nightly-2026-07-02":
+            print(f"  FAIL  pinned_toolchain() returned {tc!r}, rust-toolchain.toml says {want!r}")
+        os.environ["RUST_TOOLCHAIN"] = "some-other-toolchain"
+        if hook.pinned_toolchain(REPO) != "some-other-toolchain":
             fails += 1
-            print("  FAIL  a RUST_NIGHTLY in the environment must win, as make's ?= does")
+            print("  FAIL  a RUST_TOOLCHAIN in the environment must win, as make's ?= does")
     finally:
-        os.environ.pop("RUST_NIGHTLY", None)
+        os.environ.pop("RUST_TOOLCHAIN", None)
         if saved is not None:
-            os.environ["RUST_NIGHTLY"] = saved
+            os.environ["RUST_TOOLCHAIN"] = saved
 
     if not hook.has_latched_flag(REPO):
         fails += 1
-        print("  FAIL  dev::latched_flag! not found — the failure message cites a macro that is gone")
+        print("  FAIL  devtrig::latched_flag! not found — the failure message cites a macro that is gone")
 
     total = len(CASES) + len(VERDICTS) + len(TARGET_DIRS) + len(FIRST_ERROR) + 12
     print(f"release-config-check: {total - fails}/{total} checks correct")

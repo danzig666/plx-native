@@ -272,7 +272,7 @@ H.264 Load was refused by the pipeline before a byte was fed.
 
 ### 3.1 The line
 
-`rust-modules/src/player/engine.rs:601`, in the streamed-A/V branch of `apply_plan`:
+`rust-modules/media/src/player/engine.rs:601`, in the streamed-A/V branch of `apply_plan`:
 
 ```rust
 // Sink envelope = the panel max (4K) regardless of codec; the pipeline reads the
@@ -651,6 +651,14 @@ strings. Set the two boot logs side by side:
 | config `surface_type` | `0x0007` | `0x0405` |
 | `SWAP_BEHAVIOR_PRESERVED_BIT` | **0** (and `eglSurfaceAttrib` → `EGL_BAD_MATCH`) | **1** |
 | `buffer_age` after 120 presents | 2 | **3** |
+
+(The `buffer_age after 120 presents` row was read before 2026-10-24. That re-ask is now opt-in: it
+logs only when the `eglage` trigger was present at boot, because its query blocks a swap 13-16 ms
+on the dev set's Mali-T820. A lab set boot no longer records this row: no `/tmp` trigger can be
+armed on a lab set (`docs/lab-diagnostics.md`), and the lab set ran the debug flavour, whose trigger
+root is its own `runtime=` path, not the bare `/tmp`. The row could be re-measured only on a set
+where a trigger can be armed (the dev TV), or by a lab-config switch that arms it from the uploaded
+.ipk, which does not exist today. See `docs/egl-partial-update-and-damage.md`, section 7.)
 
 That document's verdict — *"On the extension string alone the whole direction is closed"* — is
 correct **for the dev set and only for it**. On webOS 10 hardware the extension is real, the

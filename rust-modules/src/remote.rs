@@ -17,10 +17,10 @@ use libc::c_void;
 use std::os::unix::io::RawFd;
 
 /// The control FIFO. Kept in the `plxnative-*` dev namespace for consistency — and resolved
-/// through [`crate::paths`] rather than a literal, so a host build running several simulators at
+/// through [`plx_base::paths`] rather than a literal, so a host build running several simulators at
 /// once gives each its own FIFO instead of all of them draining one.
 fn fifo_path() -> std::path::PathBuf {
-    crate::paths::in_runtime_dir("plxnative-remote")
+    plx_base::paths::in_runtime_dir("plxnative-remote")
 }
 
 pub struct Remote {
@@ -30,7 +30,48 @@ pub struct Remote {
     buf: String,
 }
 
+#[cfg(feature = "devtriggers")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HangProbe {
+    ms: u64,
+    raw: bool,
+}
+
+#[cfg(feature = "devtriggers")]
+impl HangProbe {
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        let (ms, raw) = if let Some(ms) = token.strip_prefix("hang:") {
+            (ms, false)
+        } else {
+            (token.strip_prefix("hang-raw:")?, true)
+        };
+        if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self {
+            ms: ms.parse::<u64>().ok()?.min(5000),
+            raw,
+        })
+    }
+
+    pub(crate) fn run(self) {
+        let _guard = if self.raw {
+            None
+        } else {
+            Some(plx_base::task::assert_may_block(
+                const { &plx_base::task::BlockingLabel::new("dev hang probe") },
+            ))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(self.ms));
+    }
+}
+
 impl Remote {
+    #[cfg(all(test, feature = "devtriggers", feature = "hostsim"))]
+    pub(crate) fn buffered_for_test(tokens: &str) -> Self {
+        Self { fd: -1, buf: tokens.to_owned() }
+    }
+
     /// Create + open the control FIFO non-blocking. `O_RDWR` keeps a writer end open
     /// on our side so reads never hit EOF between host writes (the standard self-pipe
     /// trick). Returns `None` on any failure — the app then just runs without a remote:
@@ -47,7 +88,7 @@ impl Remote {
         // pointer handler. Not a theoretical hole: `ck:X,Y` clicks replay through the same path
         // as a physical remote. It was ungated on every boot, before the event loop, with no
         // trigger file required to arm it.
-        if !crate::dev::ENABLED {
+        if !plx_base::devtrig::ENABLED {
             return None;
         }
         // Exact bytes, not `to_string_lossy`: an instance root comes from the environment, and a
@@ -59,7 +100,7 @@ impl Remote {
             libc::mkfifo(path.as_ptr(), 0o666);
             let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK);
             if fd < 0 {
-                // Logged, unlike the `dev::ENABLED` return above — that one is a build behaving
+                // Logged, unlike the `devtrig::ENABLED` return above — that one is a build behaving
                 // as it was built, and a line for it would print on every release boot. This one
                 // is a real failure, and nothing downstream reports it: `app.rs` calls
                 // `Remote::open()` without branching on the answer, so the app runs on and every
@@ -80,7 +121,7 @@ impl Remote {
                 // local BEFORE the path is rebuilt for the message, so nothing runs between the
                 // failed call and the read.
                 let err = std::io::Error::last_os_error();
-                crate::log(&format!(
+                plx_base::eventlog::log(&format!(
                     "remote: open {} failed ({err}) — no remote control this run",
                     fifo_path().display()
                 ));
@@ -155,6 +196,53 @@ impl Drop for Remote {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn hang_probe_parses_and_clamps_milliseconds() {
+        for (prefix, raw) in [("hang:", false), ("hang-raw:", true)] {
+            for (input, ms) in [
+                ("0", 0),
+                ("1", 1),
+                ("0050", 50),
+                ("5000", 5000),
+                ("5001", 5000),
+                ("18446744073709551615", 5000),
+            ] {
+                assert_eq!(
+                    HangProbe::parse(&format!("{prefix}{input}")),
+                    Some(HangProbe { ms, raw })
+                );
+            }
+            for bad in [
+                "",
+                "-1",
+                "+1",
+                "1.0",
+                "1ms",
+                " 1",
+                "1 ",
+                "1:2",
+                "abc",
+                "１",
+                "18446744073709551616",
+            ] {
+                assert_eq!(HangProbe::parse(&format!("{prefix}{bad}")), None);
+            }
+        }
+        for bad in ["hang", "hang-raw", "hangraw:1", "HANG:1", "up", "xhang:1"] {
+            assert_eq!(HangProbe::parse(bad), None);
+        }
+    }
+
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn drain_passes_hang_probes_through_without_running_them() {
+        let _frame = plx_base::task::FrameScope::enter();
+        let (tokens, tail) = drain_buffer("down\nhang:1\nhang-raw:1\nup\n");
+        assert_eq!(tokens, ["down", "hang:1", "hang-raw:1", "up"]);
+        assert!(tail.is_empty());
+    }
 
     /// Run `drain` over a pre-loaded buffer with **no FIFO**: fd = -1 makes the `read(2)` fail
     /// with EBADF on the first call, so `drain` falls straight through to the tokenizer — which

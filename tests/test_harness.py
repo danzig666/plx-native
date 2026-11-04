@@ -22,6 +22,8 @@ synthetic): the invariants being checked — every case ends with an `rk` or a `
 skips only its owner — are properties of the tracked matrix as it actually stands, and a case added
 tomorrow that breaks one of them should fail here rather than on the television.
 """
+import concurrent.futures
+import functools
 import http.client
 import importlib.util
 import inspect
@@ -65,6 +67,21 @@ def _manifest():
 def _overlay(items):
     """A minimal, syntactically complete overlay carrying `items` and nothing optional."""
     return {"pms": {"host": "10.0.0.2", "port": 32400}, "tv": "10.0.0.3", "items": items}
+
+
+class RequireLogTests(unittest.TestCase):
+    """`require_log`: a scene proves its own stimulus ran (more-quality-osc must push the page)."""
+
+    def test_absent_line_fails_and_present_line_passes(self):
+        scene = {"require_log": ["moreosc: depth=1"]}
+        ok, detail = run.grade_required_log(scene, ["moreosc: depth=0 key=Right"])
+        self.assertFalse(ok)
+        self.assertIn("moreosc: depth=1", detail)
+        ok, _ = run.grade_required_log(scene, ["x", "moreosc: depth=1 key=Left"])
+        self.assertTrue(ok)
+
+    def test_a_scene_without_the_field_is_unaffected(self):
+        self.assertEqual(run.grade_required_log({}, []), (True, ""))
 
 
 class _Overlay:
@@ -556,6 +573,8 @@ class ReplayFixtures(unittest.TestCase):
                                         "%s/%s: a %d-char string outside the alphabet" % (name, fn, len(v)))
         self.assertGreater(checked, 0)
 
+    QUARANTINED_FIXTURES = {}
+
     def test_every_committed_fixture_carries_the_trees_recording_schema(self):
         """`ui/rec.rs`'s SCHEMA moved 1 -> 2 in restructure phase 11 and this suite did not
         notice: a stale fixture's manifest only refuses to LOAD at replay time
@@ -563,14 +582,24 @@ class ReplayFixtures(unittest.TestCase):
         the tree the way `ci/flavor.py` reads other Rust constants agreed with a second language —
         a plain regex over the source, no cargo invocation — and check every committed fixture's
         manifest agrees with it, so a fixture left behind by a schema bump fails loudly beside the
-        alphabet check above instead of only at `tests/focusfp.sh --replay` time."""
-        rec_rs_path = os.path.join(REPO_ROOT, "rust-modules", "src", "ui", "rec.rs")
+        alphabet check above instead of only at `tests/focusfp.sh --replay` time.
+
+        `schema` alone is not the only way a fixture goes stale: two anchors can share `schema`
+        while their `state_fp` (the recorded state SHAPE — route/overlay/focus/tree/session/
+        consent/initial) has moved apart, which is exactly what `tools/plxnative-rec rerecord`
+        reports as a load-time REFUSED and what the README documents happened to fixture 12. So
+        this also checks every non-quarantined fixture's `state_fp` agrees with the majority
+        value among committed anchors, and reports (without reddening `make check`) any
+        quarantined fixture whose `state_fp` has drifted onto the current value — at that point
+        the quarantine itself is stale and should be lifted."""
+        rec_rs_path = os.path.join(REPO_ROOT, "rust-modules", "ui", "src", "rec.rs")
         with open(rec_rs_path, encoding="utf-8") as f:
             rec_rs = f.read()
         m = re.search(r"(?m)^pub const SCHEMA: u32 = (\d+);", rec_rs)
         self.assertIsNotNone(m, "ui/rec.rs SCHEMA constant found")
         schema = int(m.group(1))
         checked = 0
+        fps = {}
         for name in sorted(os.listdir(self.FIXTURES)):
             d = os.path.join(self.FIXTURES, name)
             if not os.path.isdir(d):
@@ -585,7 +614,27 @@ class ReplayFixtures(unittest.TestCase):
                               "%s/manifest.json: schema %r does not match ui/rec.rs SCHEMA=%d "
                               "(tools/plxnative-rec rerecord it)"
                               % (name, manifest.get("schema"), schema))
+            fps[name] = manifest.get("state_fp")
         self.assertGreater(checked, 0)
+
+        live_fps = {n: fp for n, fp in fps.items() if n not in self.QUARANTINED_FIXTURES}
+        if live_fps:
+            from collections import Counter
+            current_fp, _ = Counter(live_fps.values()).most_common(1)[0]
+            for name, fp in live_fps.items():
+                self.assertEqual(fp, current_fp,
+                                  "%s/manifest.json: state_fp %r does not match the other "
+                                  "committed anchors' %r (tools/plxnative-rec rerecord it, or "
+                                  "quarantine it in QUARANTINED_FIXTURES with a reason)"
+                                  % (name, fp, current_fp))
+            for name, reason in self.QUARANTINED_FIXTURES.items():
+                if name not in fps:
+                    continue
+                if fps[name] == current_fp:
+                    print("NOTE: quarantined fixture %s now shares state_fp with the live "
+                          "anchors (%r) — lift its QUARANTINED_FIXTURES entry" % (name, current_fp))
+                else:
+                    print("QUARANTINED: %s/manifest.json — %s" % (name, reason))
 
     def _tool(self, *args):
         tool = os.path.join(os.path.dirname(self.FIXTURES), "..", "..", "tools", "plxnative-rec")
@@ -829,9 +878,228 @@ class TeardownProcessTable(unittest.TestCase):
         fake.assert_called_once_with(["ps", "-Ao", "pid,command"], capture_output=True)
 
 
+class CrashGate(unittest.TestCase):
+    """`crash_gate`: a case whose app died keeps `plxnative-stderr.log` (the next launch truncates
+    it) and FAILS, unless the case declares `expect_crash`."""
+
+    SIGLINE = "*** SIGNAL 6 (SIGABRT) addr=0x0 pc=0x76a1b2c4 lr=0x76a1b2c8"
+
+    def _gate(self, case, lines, crash_log, baseline, save=None):
+        files = {run.CRASH_LOG: crash_log, run.STDERR_LOG: "abort: assertion failed\n"}
+        out = tempfile.mkdtemp()
+        cfg = {"tv": "192.0.2.20", "save_logs": save or None}
+        with mock.patch.object(run, "pull_runtime_file", side_effect=lambda tv, n: files[n]), \
+             mock.patch.object(run.tempfile, "gettempdir", return_value=out), \
+             mock.patch.object(run, "_CRASH_BASELINE", baseline), \
+             mock.patch("builtins.print") as shown:
+            res = run.crash_gate(cfg, case, "case_a", lines, True, [("x", True, "ok")])
+        return res, out, shown
+
+    def test_new_crash_record_fails_the_case_and_keeps_stderr(self):
+        (passed, results), out, shown = self._gate({}, ["loop=60"], f"old\n{self.SIGLINE}\n", 0)
+        self.assertFalse(passed)
+        self.assertEqual(results[-1][0], "app_alive")
+        kept = os.path.join(out, "plxnative-crash-evidence", "case_a.stderr.log")
+        with open(kept) as f:
+            self.assertEqual(f.read(), "abort: assertion failed\n")
+        self.assertIn(kept, " ".join(str(c) for c in shown.call_args_list))
+
+    def test_signal_line_in_the_case_log_alone_fails_it(self):
+        (passed, results), _out, _shown = self._gate({}, ["loop=60", self.SIGLINE], "", None)
+        self.assertFalse(passed)
+        self.assertFalse(results[-1][1])
+
+    def test_a_crash_before_the_case_is_not_this_cases(self):
+        (passed, results), out, _shown = self._gate({}, ["loop=60"], f"{self.SIGLINE}\n", 1)
+        self.assertTrue(passed)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(os.path.exists(os.path.join(out, "plxnative-crash-evidence")))
+
+    def test_expect_crash_keeps_evidence_without_failing(self):
+        (passed, results), out, _shown = self._gate(
+            {"expect_crash": True}, ["loop=60"], f"{self.SIGLINE}\n", 0)
+        self.assertTrue(passed)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(os.path.exists(
+            os.path.join(out, "plxnative-crash-evidence", "case_a.crash.log")))
+
+    def test_save_logs_keeps_stderr_even_for_a_clean_case(self):
+        save = tempfile.mkdtemp()
+        (passed, _results), _out, _shown = self._gate({}, ["loop=60"], "", 0, save=save)
+        self.assertTrue(passed)
+        self.assertTrue(os.path.exists(os.path.join(save, "case_a.stderr.log")))
+
+    def test_apply_triggers_records_the_crash_baseline(self):
+        saved = run.RUNDIR
+        run.RUNDIR = "/tmp/com.beb.plxnative.debug"
+        try:
+            done = subprocess.CompletedProcess([], 0, stdout="3\n", stderr="")
+            with mock.patch.object(run, "ssh", return_value=done) as ssh:
+                run.apply_triggers("192.0.2.20", [])
+            self.assertIn("plxnative-crash.log", ssh.call_args.args[1])
+            self.assertEqual(run._CRASH_BASELINE, 3)
+        finally:
+            run.RUNDIR = saved
+            run._CRASH_BASELINE = None
+
+    def test_parse_crash_count(self):
+        self.assertEqual(run.parse_crash_count("0\n"), 0)
+        self.assertEqual(run.parse_crash_count(""), None)
+        self.assertEqual(run.parse_crash_count("noise\n4\n"), 4)
+
+
+class TestUserTokenFile(unittest.TestCase):
+    """`test_user.token_file` supplies an already-resolved managed-user token: no plex.tv call."""
+
+    def _file(self, text):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_token_file_is_read_and_skips_the_owner_lookup(self):
+        path = self._file("synthetic-token-value\n")
+        with mock.patch.object(run, "fetch_managed_user_token") as fetch, \
+                mock.patch.object(run, "read_token") as owner:
+            tok = run.resolve_test_user_token({"id": "1", "token_file": path}, "h", 32400)
+        self.assertEqual(tok, "synthetic-token-value")
+        fetch.assert_not_called()
+        owner.assert_not_called()
+
+    def test_without_token_file_the_shared_servers_lookup_is_unchanged(self):
+        with mock.patch.object(run, "fetch_managed_user_token", return_value="t") as fetch, \
+                mock.patch.object(run, "read_token", return_value="owner"):
+            self.assertEqual(run.resolve_test_user_token({"id": "7"}, "h", 1), "t")
+        fetch.assert_called_once_with("owner", "h", 1, "7")
+
+    def test_empty_multiline_or_missing_file_is_refused(self):
+        for path in (self._file(""), self._file("a\nb\n"), "/nonexistent/plx-token"):
+            with self.assertRaises(SystemExit):
+                run.resolve_test_user_token({"id": "1", "token_file": path}, "h", 1)
+
+
+class QuietTv(unittest.TestCase):
+    """`quiet_tv` is what `--fps --mock` uses to set the panel and sound. The panel is OFF by
+    default, fps runs included: it is only the backlight, and the app keeps presenting at full
+    rate (measured 2026-10-24); only `--panel on` lights it, for a run someone wants to watch."""
+
+    def _steps(self, **kw):
+        calls = []
+
+        def fake(cmd, **_):
+            calls.append(tuple(cmd[1:]))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(run.subprocess, "run", fake):
+            run.quiet_tv("tv.invalid", **kw)
+        return calls
+
+    def test_default_blanks_the_panel_and_mutes_once(self):
+        self.assertEqual(self._steps(), [("screen", "off")])
+        self.assertEqual(self._steps(sound=True), [("screen", "off"), ("sound", "off")])
+
+    def test_panel_on_is_the_opt_in_and_the_sound_is_muted_either_way(self):
+        self.assertEqual(self._steps(sound=True, panel="on"),
+                         [("screen", "on"), ("sound", "off")])
+
+    def test_a_bad_panel_value_is_refused_and_a_failed_step_stops_the_run(self):
+        with self.assertRaises(ValueError):
+            run.quiet_tv("tv.invalid", panel="dim")
+        fail = lambda cmd, **_: subprocess.CompletedProcess(cmd, 1, "", "no")
+        with mock.patch.object(run.subprocess, "run", fail), self.assertRaises(SystemExit):
+            run.quiet_tv("tv.invalid")
+
+    def test_the_cli_exposes_panel_with_off_as_default(self):
+        # One constant feeds the flag, `quiet_tv`'s default and both `cfg.get("panel", ...)`
+        # fallbacks, so the value is pinned once here and each user of it is pinned below.
+        self.assertEqual(run.PANEL_DEFAULT, "off")
+        src = inspect.getsource(run.main)
+        self.assertIn('"--panel", choices=("on", "off"), default=PANEL_DEFAULT', src)
+        self.assertIn('cfg["panel"] = args.panel', src)
+
+    def test_quiet_tv_defaults_to_the_shared_panel_default(self):
+        self.assertEqual(inspect.signature(run.quiet_tv).parameters["panel"].default,
+                         run.PANEL_DEFAULT)
+
+    def test_a_config_without_a_panel_key_falls_back_to_off(self):
+        # `run_mock_fps_scene` and `run_fps_suite` read `cfg.get("panel", ...)`: a cfg built
+        # without the CLI (a test, a caller) must get the same default the CLI has.
+        seen = []
+        with mock.patch.object(run, "quiet_tv", lambda tv, sound=False, panel="?": seen.append(panel)), \
+                mock.patch.object(run, "run_fps_scene", return_value=(True, "")), \
+                mock.patch.object(run.mock_fps, "MockPms"), \
+                mock.patch.object(run.mock_fps, "mock_server_args", return_value=[]), \
+                mock.patch.object(run.mock_fps, "resolve_mock_token", return_value="t"):
+            run.run_mock_fps_scene({"name": "x"}, {"tv": "tv.invalid", "mock": {"host": "h", "port": 1}})
+        self.assertEqual(seen, ["off"])
+
+    def test_the_fps_suite_without_a_panel_key_blanks_the_panel_too(self):
+        # `run_fps_suite` asserts the panel and mutes the sound once, up front, from its own
+        # `cfg.get("panel", ...)`; `run_mock_fps_scene` (stubbed here) re-asserts it per scene.
+        calls = []
+
+        def fake_quiet_tv(tv, sound=False, panel="?"):
+            calls.append((sound, panel))
+
+        cfg = {"tv": "tv.invalid", "mock": {"host": "h", "port": 1}}
+        out = io.StringIO()
+        with mock.patch.object(run, "quiet_tv", fake_quiet_tv), \
+                mock.patch.object(run, "run_mock_fps_scene", return_value=(True, "")), \
+                contextlib.redirect_stdout(out):
+            rc = run.run_fps_suite([{"name": "x"}], cfg, "tok", False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [(True, "off")])
+        self.assertIn("panel rule: panel OFF", out.getvalue())
+
+
+class StoredSessionGate(unittest.TestCase):
+    """A `session: stored` case with no stored sign-in on the install used to call
+    `require_stored_session()` -> `sys.exit()` from inside `run_case`, and `SystemExit` is not an
+    `Exception` — the per-case `except Exception` in main()'s run loop let it straight through and
+    killed the whole batch at the first such case. The fix moves the check in front of the loop
+    (`stored_session_reason` + `partition_stored_sessions`) so an unmet precondition SKIPS just
+    those cases instead."""
+
+    def test_stored_session_reason_is_none_when_a_session_file_is_present(self):
+        with mock.patch.object(run, "ssh") as ssh:
+            ssh.return_value = subprocess.CompletedProcess([], 0)
+            self.assertIsNone(run.stored_session_reason("192.0.2.5"))
+
+    def test_stored_session_reason_names_how_to_fix_it_when_absent(self):
+        with mock.patch.object(run, "ssh") as ssh:
+            ssh.return_value = subprocess.CompletedProcess([], 1)
+            reason = run.stored_session_reason("192.0.2.5")
+        self.assertIn("signed-in session", reason)
+        self.assertIn("sign in on that install once", reason)
+
+    def test_a_stored_case_is_skipped_not_dropped_as_a_systemexit(self):
+        """This is the regression itself: before the fix, the only way main() learned a stored
+        session was missing was `require_stored_session()` raising `SystemExit` from inside the
+        per-case try/except — which does not catch it. `partition_stored_sessions` must instead
+        move the case out of `cases` and into the skip list, raising nothing."""
+        cases = [{"name": "offline_play", "session": "stored"},
+                 {"name": "normal_case"}]
+        remaining, skipped = run.partition_stored_sessions(
+            cases, "needs a signed-in session on com.beb.plxnative")
+        self.assertEqual([c["name"] for c in remaining], ["normal_case"])
+        self.assertEqual([c["name"] for c in skipped], ["offline_play"])
+
+    def test_a_present_session_leaves_every_case_untouched(self):
+        cases = [{"name": "offline_play", "session": "stored"}, {"name": "normal_case"}]
+        remaining, skipped = run.partition_stored_sessions(cases, None)
+        self.assertEqual(remaining, cases)
+        self.assertEqual(skipped, [])
+
+    def test_no_stored_case_in_the_batch_is_untouched_even_with_a_reason(self):
+        cases = [{"name": "normal_case"}]
+        remaining, skipped = run.partition_stored_sessions(cases, "some reason")
+        self.assertEqual(remaining, cases)
+        self.assertEqual(skipped, [])
+
+
 class ItemResolution(unittest.TestCase):
     def test_placeholder_reads_as_absent(self):
-        """The stranger's dominant path is `cp` the example, which ships all twelve keys bracketed.
+        """The stranger's dominant path is `cp` the example, which ships every key bracketed.
         If only the ABSENT branch skipped, that path would still die — one guard further down."""
         items = {"present": 1234, "blank": "<ratingKey>"}
         self.assertEqual(run._item_rk(items, "present"), "1234")   # ints are stringified
@@ -882,6 +1150,50 @@ class FpsIdentity(unittest.TestCase):
         self.assertEqual(run.parse_fps(lines, "home", "privacy"), [59])
         self.assertEqual(run.parse_fps(lines, "home", "legal"), [58])
 
+    def test_a_scene_that_pins_a_section_grades_only_the_heartbeats_that_name_it(self):
+        """A section is the player page's state, not a surface: ` overlay=` stays `none` and the
+        heartbeat gains ` section=<word>` after it, which only a scene with a `"section"` key reads."""
+        lines = [
+            "loop=60 route=player overlay=none fps=60",
+            "loop=61 route=player overlay=none section=info fps=59",
+            "loop=62 route=player overlay=none section=chapters fps=58",
+            "loop=63 route=player overlay=none section=chapters_info fps=57",
+            "loop=64 route=player overlay=menu fps=56",
+            "coldopen screen=player ms=12",
+        ]
+        info = {"route": "player", "overlay": "none", "section": "info"}
+        picked = run.select_section(lines, info)
+        self.assertEqual(run.parse_fps(picked, "player", "none"), [59])
+        self.assertEqual(run.parse_loop(picked, "player", "none"), [61])
+        self.assertIn("coldopen screen=player ms=12", picked, "a line that is not a heartbeat is kept")
+        chapters = {"route": "player", "overlay": "none", "section": "chapters"}
+        self.assertEqual(run.parse_fps(run.select_section(lines, chapters), "player", "none"), [58])
+        # the word is exact: `chapters_info` is its own word, not a section named `chapters`
+        self.assertEqual(run.parse_fps(run.select_section(lines, {"section": "chapters_info"}), "player", "none"), [57])
+
+    def test_a_scene_without_a_section_key_reads_every_heartbeat_it_did_before(self):
+        lines = [
+            "loop=60 route=player overlay=none fps=60",
+            "loop=61 route=player overlay=none section=info fps=59",
+        ]
+        self.assertIs(run.select_section(lines, {"route": "player", "overlay": "none"}), lines)
+
+    def test_a_build_that_prints_no_section_word_gives_a_section_scene_no_samples(self):
+        """The failure the gate must keep loud: a heartbeat with no ` section=` field is `none`, so a
+        scene that pins a section finds nothing rather than grading the bare player as its card."""
+        lines = ["loop=60 route=player overlay=none fps=60"] * 8
+        picked = run.select_section(lines, {"route": "player", "overlay": "none", "section": "info"})
+        self.assertEqual(run.parse_fps(picked, "player", "none"), [])
+
+    def test_the_players_section_scenes_pin_a_bare_player_and_a_section_word(self):
+        scenes = {s["name"]: s for s in _manifest()["fps_scenes"]}
+        for name, word in (("info-panel", "info"), ("chapters-panel", "chapters")):
+            with self.subTest(scene=name):
+                self.assertEqual(scenes[name]["route"], "player")
+                self.assertEqual(scenes[name]["overlay"], "none",
+                                 "overlay= means a modal surface; the section is its own word")
+                self.assertEqual(scenes[name]["section"], word)
+
     def test_first_run_routes_have_the_50_fps_contract(self):
         lines = [
             "loop=60 route=home fps=7",
@@ -911,6 +1223,8 @@ class FpsIdentity(unittest.TestCase):
     def test_settings_scenes_carry_the_50_fps_contract_and_idle_inverse(self):
         scenes = {s["name"]: s for s in _manifest()["fps_scenes"]}
         for name, overlay in (("settings-root", "settings"),
+                              ("settings-playback", "playback"),
+                              ("settings-picker", "picker"),
                               ("settings-privacy", "privacy"),
                               ("settings-legal", "legal")):
             with self.subTest(scene=name):
@@ -1109,6 +1423,378 @@ class FrameCeilingsManifest(unittest.TestCase):
                          "a cold open grades its FIRST frames")
 
 
+class UploadPacingGrading(unittest.TestCase):
+    """`grade_upload_pacing` — `upload_per_frame_min`/`upload_late_share_max` over the heartbeat's `pupf=` tally."""
+
+    HB = ("loop=60 route=library fps=60 worstframe=1.0ms worstprep=0.4ms carried=0 dropped=0 "
+          "budget=3/0 evicted_hot=0 frame_n=60 frame_gt16=3 frame_gt33=0 frame_gt50=0 "
+          "frame_gt100=0 frame_max=20.0ms frame_p95=17.0ms frame_p99=18.0ms")
+
+    def _lines(self, *tallies, route="library"):
+        out = []
+        for frames, late, uploads in tallies:
+            out.append(self.HB.replace("route=library", f"route={route}")
+                       + f" pupf={frames} pupf_ge22={late} pup={uploads}")
+        return out
+
+    def test_the_share_of_late_upload_frames_is_graded_against_the_limit(self):
+        scene = {"upload_late_share_max": 0.35}
+        ok, detail = run.grade_upload_pacing(scene, self._lines((10, 1, 14), (17, 0, 25)),
+                                             "library", None)
+        self.assertTrue(ok, detail)
+        self.assertIn("1/27", detail)
+        # the backstop: well over a third of the upload frames late
+        ok, detail = run.grade_upload_pacing(scene, self._lines((10, 5, 10), (17, 8, 17)),
+                                             "library", None)
+        self.assertFalse(ok)
+        self.assertIn("FAIL", detail)
+        # the limit is inclusive
+        ok, _ = run.grade_upload_pacing({"upload_late_share_max": 0.2}, self._lines((20, 4, 30)),
+                                        "library", None)
+        self.assertTrue(ok)
+
+    def test_the_uploads_per_frame_floor_passes_the_fix_and_fails_the_base(self):
+        scene = {"upload_per_frame_min": 1.25}
+        # the fix's weakest measured run: 1.41 uploads per upload frame
+        ok, detail = run.grade_upload_pacing(scene, self._lines((20, 6, 28), (17, 5, 24)),
+                                             "library", None)
+        self.assertTrue(ok, detail)
+        self.assertIn("1.41", detail)
+        # the base: exactly one upload per upload frame, however few late frames it had
+        ok, detail = run.grade_upload_pacing(scene, self._lines((20, 0, 20), (17, 0, 17)),
+                                             "library", None)
+        self.assertFalse(ok)
+        self.assertIn("FAIL", detail)
+        self.assertIn("1.00", detail)
+        # both keys together: the floor can fail while the backstop passes, and the reverse
+        both = {"upload_per_frame_min": 1.25, "upload_late_share_max": 0.35}
+        self.assertFalse(run.grade_upload_pacing(both, self._lines((20, 0, 20)), "library", None)[0])
+        self.assertFalse(run.grade_upload_pacing(both, self._lines((20, 10, 40)), "library", None)[0])
+        self.assertTrue(run.grade_upload_pacing(both, self._lines((20, 6, 30)), "library", None)[0])
+
+    def test_a_scene_that_loaded_nothing_or_a_log_without_the_field_fails_not_passes(self):
+        scene = {"upload_late_share_max": 0.35, "upload_per_frame_min": 1.25}
+        for lines in ([], [self.HB], self._lines((5, 0, 9)), self._lines((40, 0, 70), route="home")):
+            ok, detail = run.grade_upload_pacing(scene, lines, "library", None)
+            self.assertFalse(ok, lines)
+            self.assertIn("need 15", detail)
+        ok, _ = run.grade_upload_pacing({**scene, "upload_frames_min": 5}, self._lines((5, 0, 9)),
+                                        "library", None)
+        self.assertTrue(ok)
+
+    def test_a_scene_without_the_key_is_untouched_and_the_key_arms_the_detector_quietly(self):
+        self.assertEqual(run.grade_upload_pacing({}, [], "library", None), (True, ""))
+        self.assertIsNone(run.frame_ceiling_threshold({"loop_floor": 30}))
+        self.assertEqual(run.frame_ceiling_threshold({"upload_late_share_max": 0.35}),
+                         str(run.UPLOAD_GATE_THRESHOLD_MS))
+        self.assertEqual(run.frame_ceiling_threshold({"upload_per_frame_min": 1.25}),
+                         str(run.UPLOAD_GATE_THRESHOLD_MS))
+        # an explicit ceiling still wins: its threshold is the lower one
+        self.assertEqual(run.frame_ceiling_threshold({"upload_late_share_max": 0.35,
+                                                      "stall_ceiling_ms": 60}), "60")
+
+    def test_library_scroll_declares_the_gate_and_arms_the_detector(self):
+        s = {x["name"]: x for x in _manifest()["fps_scenes"]}["library-scroll"]
+        self.assertEqual(s["upload_late_share_max"], 0.35)
+        self.assertEqual(s["upload_per_frame_min"], 1.25)
+        self.assertGreaterEqual(s["upload_frames_min"], 1)
+        self.assertIsNotNone(run.frame_ceiling_threshold(s))
+
+
+class BenchGrading(unittest.TestCase):
+    """`parse_bench`/`grade_bench` — the stress-bench (`push-100`/`modal-100`) parser and its four
+    fail conditions (missed refreshes, drift, rss-growth, incomplete-run). Synthetic `bench:`
+    lines, so the arithmetic is pinned here rather than first exercised on the television — the
+    same reason `FrameCeilings` above is synthetic."""
+
+    def _lines(self, kind, worsts, rss=None, n=None, done=True, target="detail", missed=None):
+        n = n if n is not None else len(worsts)
+        rss = rss if rss is not None else [1000] * len(worsts)
+        missed = missed if missed is not None else [0] * len(worsts)
+        out = [
+            f"bench: kind={kind} cycle={i}/{n} target={target} worst_ms={w:.1f} frames=5 "
+            f"dur_ms=1400 rss_kb={r} tex=108/49125 first_ms=6.0 missed={k} "
+            f"open=first:6.0,worst:{w:.1f}@3,iv:{w:.1f},missed:{k} "
+            f"close=first:5.0,worst:16.9@2,iv:17.0,missed:0"
+            for i, (w, r, k) in enumerate(zip(worsts, rss, missed), start=1)
+        ]
+        if done:
+            out.append(f"bench: kind={kind} done cycles={n}")
+        return out
+
+    def test_parse_bench_reads_every_field_and_ignores_the_other_kind(self):
+        lines = self._lines("push", [5.0, 6.5]) + self._lines("modal", [9.0])
+        cycles, done = run.parse_bench(lines, "push")
+        self.assertTrue(done)
+        self.assertEqual([c["cycle"] for c in cycles], [1, 2])
+        self.assertEqual(cycles[0],
+                         {"cycle": 1, "n": 2, "target": "detail", "worst_ms": 5.0, "frames": 5,
+                          "dur_ms": 1400, "rss_kb": 1000, "first_ms": 6.0, "missed": 0,
+                          "open": "first:6.0,worst:5.0@3,iv:5.0,missed:0",
+                          "close": "first:5.0,worst:16.9@2,iv:17.0,missed:0",
+                          "iv_max_ms": 17.0, "defer_first": None})
+        modal_cycles, modal_done = run.parse_bench(lines, "modal")
+        self.assertTrue(modal_done)
+        self.assertEqual(len(modal_cycles), 1)
+
+    def test_the_new_half_fields_are_parsed_and_an_old_line_still_is(self):
+        new = ("bench: kind=hold cycle=1/2 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+               "rss_kb=1000 first_ms=6.0 missed=3 "
+               "open=first:6.0,worst:14.0@4,iv:47.2,missed:3,defer_first:2 "
+               "close=first:5.0,worst:12.0@2,iv:33.3,missed:0,defer_first:1")
+        old = ("bench: kind=hold cycle=2/2 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+               "rss_kb=1000 first_ms=6.0 missed=0 open=first:6.0,worst:14.0@4,iv:17.0,missed:0")
+        cycles, _ = run.parse_bench([new, old], "hold")
+        self.assertEqual((cycles[0]["iv_max_ms"], cycles[0]["defer_first"]), (47.2, 3))
+        self.assertEqual((cycles[1]["iv_max_ms"], cycles[1]["defer_first"]), (17.0, None))
+
+    def test_bench_iv_max_ms_fails_a_slow_interval_and_defer_first_is_reported_not_graded(self):
+        line = ("bench: kind=hold cycle=1/1 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+                "rss_kb=1000 first_ms=6.0 missed=0 "
+                "open=first:6.0,worst:14.0@4,iv:{iv},missed:0,defer_first:2")
+        done = "bench: kind=hold done cycles=1"
+        scene = {"bench": "hold", "bench_missed_max": 0}
+        ok, detail = run.grade_bench(scene, [line.format(iv="30.0"), done])
+        self.assertTrue(ok, detail)  # no ceiling set: defer_first never fails a run
+        self.assertIn("defer_first=2", detail)
+        scene["bench_iv_max_ms"] = 40.0
+        ok, detail = run.grade_bench(scene, [line.format(iv="30.0"), done])
+        self.assertTrue(ok, detail)
+        ok, detail = run.grade_bench(scene, [line.format(iv="47.0"), done])
+        self.assertFalse(ok)
+        self.assertIn("worst present interval=47.0ms vs bench_iv_max_ms 40.0", detail)
+
+    def test_a_missed_ceiling_below_the_deferral_misses_fails_the_21_fps_open(self):
+        line = ("bench: kind=hold cycle=1/1 target=home worst_ms=14.0 frames=9 dur_ms=3000 "
+                "rss_kb=1000 first_ms=6.0 missed=2 open=first:6.0,worst:14.0@4,iv:47.0,missed:2,"
+                "defer_first:0")
+        ok, detail = run.grade_bench({"bench": "hold", "bench_missed_max": 1},
+                                     [line, "bench: kind=hold done cycles=1"])
+        self.assertFalse(ok)
+        self.assertIn("missed refreshes=2", detail)
+
+    def test_a_healthy_run_of_100_cycles_passes(self):
+        lines = self._lines("push", [5.0] * 100, rss=[1000] * 100)
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertTrue(ok, detail)
+        self.assertIn("worst_ms (Top->Swap", detail)
+        self.assertIn("missed refreshes=0", detail)
+
+    def test_top_to_swap_over_budget_without_a_missed_refresh_passes(self):
+        """The vsync wait sits inside Top->Swap on this driver: 23 ms frames with no repeated
+        picture are a clean run, and the old 20 ms ceiling failed them."""
+        lines = self._lines("push", [23.0] * 12)
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertTrue(ok, detail)
+
+    def test_one_missed_refresh_fails_and_names_the_cycle_and_its_halves(self):
+        missed = [0] * 11 + [1]
+        lines = self._lines("push", [18.0] * 11 + [29.0], missed=missed)
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("FAIL: missed refreshes=1 in 1 cycle(s) of 12 vs bench_missed_max 0", detail)
+        self.assertIn("cycle=12/12 target=detail missed=1 open=first:6.0,worst:29.0@3", detail)
+        ok, _ = run.grade_bench({"bench": "push", "bench_missed_max": 1}, lines)
+        self.assertTrue(ok)
+
+    def test_a_line_without_the_missed_field_fails_rather_than_grading_clean(self):
+        lines = [f"bench: kind=push cycle={i}/12 target=detail worst_ms=5.0 frames=5 dur_ms=1400 "
+                 f"rss_kb=1000" for i in range(1, 13)] + ["bench: kind=push done cycles=12"]
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("carry no `missed=` field", detail)
+
+    def test_last_ten_cycles_drifting_above_the_first_ten_fails(self):
+        worsts = [5.0] * 10 + [10.0] * 10
+        lines = self._lines("push", worsts)
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("drift(last10-first10)=+5.00ms", detail)
+        # a drift ceiling raised past the measured drift passes the same run
+        ok, _ = run.grade_bench({"bench": "push", "bench_drift_ms": 10.0}, lines)
+        self.assertTrue(ok)
+
+    def test_rss_growing_past_cycle_ten_fails(self):
+        rss = [1000] * 10 + [20000] * 2  # growth is measured from cycle 10, not cycle 1
+        lines = self._lines("push", [5.0] * 12, rss=rss)
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("rss growth(last-cycle10)=19000kB", detail)
+        ok, _ = run.grade_bench({"bench": "push", "bench_rss_growth_kb": 20000}, lines)
+        self.assertTrue(ok)
+
+    def test_a_run_missing_the_done_line_fails_even_if_every_cycle_looks_clean(self):
+        lines = self._lines("push", [5.0] * 12, done=False)
+        ok, detail = run.grade_bench({"bench": "push"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("no `done` line", detail)
+
+    def test_no_bench_lines_at_all_fails_rather_than_passing_vacuously(self):
+        ok, detail = run.grade_bench({"bench": "push"}, ["loop=60 route=home fps=12"])
+        self.assertFalse(ok)
+        self.assertIn("no `bench: kind=push` cycle lines", detail)
+
+    def test_push_and_modal_kinds_are_graded_independently(self):
+        lines = self._lines("push", [5.0] * 12) + self._lines("modal", [25.0] * 12, missed=[1] * 12)
+        ok_push, _ = run.grade_bench({"bench": "push"}, lines)
+        ok_modal, _ = run.grade_bench({"bench": "modal"}, lines)
+        self.assertTrue(ok_push)
+        self.assertFalse(ok_modal)
+
+
+class BenchManifest(unittest.TestCase):
+    def test_push_100_and_modal_100_are_bench_scenes_with_an_item_and_enough_run_secs(self):
+        scenes = {s["name"]: s for s in _manifest()["fps_scenes"]}
+        push = scenes["push-100"]
+        modal = scenes["modal-100"]
+        self.assertEqual(push["bench"], "push")
+        self.assertEqual(modal["bench"], "modal")
+        self.assertEqual(push.get("item"), "movie_in_home_catalog")
+        # 100 cycles * 2 half-periods each; run_secs must clear that plus warmup with margin.
+        self.assertGreater(push["run_secs"], 100 * 2 * 1.4 + push.get("warmup_s", 5))
+        self.assertGreater(modal["run_secs"], 100 * 2 * 1.5 + modal.get("warmup_s", 5))
+        for name in ("push-100", "modal-100"):
+            self.assertEqual(scenes[name]["tier"], "ui")
+            self.assertIn("plxnative-framedrop", scenes[name]["triggers"],
+                         f"{name}: bench worst_ms reads 0.0 unarmed — see bench_frame_tick's doc")
+
+
+class DeepBenchGrading(unittest.TestCase):
+    """`parse_deep_bench`/`grade_deep_bench` — the DEEP-stack bench (`deep-100`) parser and its
+    five fail conditions (missed refreshes, push drift, pop drift, depth-rss growth, unwound root
+    rss) plus the incomplete-run case. Synthetic `bench: kind=deep` lines, same reasoning as
+    `BenchGrading` above: pinned here rather than first exercised on the television."""
+
+    def _lines(self, depth, worsts=None, rss=None, done=True, target="detail", missed=None,
+               root=None):
+        n = 2 * depth
+        worsts = worsts if worsts is not None else [5.0] * n
+        rss = rss if rss is not None else [1000] * n
+        missed = missed if missed is not None else [0] * n
+        out = []
+        for i in range(n):
+            cycle = i + 1
+            if i < depth:
+                dirn, d = "push", i + 1
+            else:
+                dirn, d = "pop", depth - 1 - (i - depth)
+            out.append(
+                f"bench: kind=deep cycle={cycle}/{n} target={target} dir={dirn} depth={d} "
+                f"worst_ms={worsts[i]:.1f} frames=5 dur_ms=1400 rss_kb={rss[i]} tex=108/49125 "
+                f"first_ms=6.0 missed={missed[i]} "
+                f"open=first:6.0,worst:{worsts[i]:.1f}@2,iv:17.0,missed:{missed[i]}"
+            )
+        if done:
+            out.append(f"bench: kind=deep done cycles={n} "
+                       f"rss_root_kb={root if root is not None else (rss[-1] if rss else 1000)}")
+        return out
+
+    def test_parse_deep_bench_reads_every_field(self):
+        lines = self._lines(3)
+        steps, rss_root_kb = run.parse_deep_bench(lines)
+        self.assertEqual(len(steps), 6)
+        self.assertEqual(rss_root_kb, 1000)
+        self.assertEqual(
+            steps[0],
+            {"cycle": 1, "n": 6, "target": "detail", "dir": "push", "depth": 1,
+             "worst_ms": 5.0, "frames": 5, "dur_ms": 1400, "rss_kb": 1000, "first_ms": 6.0,
+             "missed": 0, "open": "first:6.0,worst:5.0@2,iv:17.0,missed:0", "close": None,
+             "iv_max_ms": 17.0, "defer_first": None},
+        )
+        self.assertEqual([s["dir"] for s in steps], ["push"] * 3 + ["pop"] * 3)
+        self.assertEqual([s["depth"] for s in steps], [1, 2, 3, 2, 1, 0])
+
+    def test_a_healthy_run_of_depth_100_passes(self):
+        lines = self._lines(100)
+        ok, detail = run.grade_deep_bench({"bench": "deep", "bench_root_rss_kb": 2000}, lines)
+        self.assertTrue(ok, detail)
+
+    def test_no_deep_bench_lines_at_all_fails_rather_than_passing_vacuously(self):
+        ok, detail = run.grade_deep_bench({"bench": "deep"}, ["loop=60 route=home fps=12"])
+        self.assertFalse(ok)
+        self.assertIn("no `bench: kind=deep` step lines", detail)
+
+    def test_a_run_missing_the_done_line_fails_even_if_every_step_looks_clean(self):
+        lines = self._lines(20, done=False)
+        ok, detail = run.grade_deep_bench({"bench": "deep"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("no `done` line", detail)
+
+    def test_one_missed_refresh_fails_and_names_the_step(self):
+        missed = [0] * 20
+        missed[11] = 2  # step 12 (a pop) repeated two pictures
+        lines = self._lines(10, missed=missed)
+        ok, detail = run.grade_deep_bench({"bench": "deep"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("FAIL: missed refreshes=2 in 1 step(s) of 20", detail)
+        self.assertIn("cycle=12/20 dir=pop target=detail missed=2", detail)
+
+    def test_push_drift_growing_with_depth_fails(self):
+        depth = 20
+        worsts = ([5.0] * 10 + [10.0] * 10) + [5.0] * depth  # pushes drift, pops flat
+        lines = self._lines(depth, worsts=worsts)
+        ok, detail = run.grade_deep_bench({"bench": "deep"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("push drift(last10-first10)=+5.00ms", detail)
+        ok, _ = run.grade_deep_bench({"bench": "deep", "bench_drift_ms": 10.0}, lines)
+        self.assertTrue(ok)
+
+    def test_pop_drift_growing_toward_the_root_fails(self):
+        depth = 20
+        # pops in log order run deepest->shallowest; "last 10 pops" (shallowest) drifting above
+        # "first 10 pops" (deepest) is the failure this catches.
+        worsts = [5.0] * depth + ([5.0] * 10 + [10.0] * 10)
+        lines = self._lines(depth, worsts=worsts)
+        ok, detail = run.grade_deep_bench({"bench": "deep"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("pop drift(last10-first10)=+5.00ms", detail)
+        ok, _ = run.grade_deep_bench({"bench": "deep", "bench_drift_ms": 10.0}, lines)
+        self.assertTrue(ok)
+
+    def test_memory_held_by_depth_beyond_the_unwound_root_fails(self):
+        depth = 20
+        # rss climbs steadily across the 20 pushes and is given back across the 20 pops: the
+        # deepest push is 38000 kB over the unwound root, past the default bench_depth_rss_kb=16384.
+        push_rss = [1000 + 2000 * i for i in range(depth)]
+        pop_rss = list(reversed(push_rss))
+        lines = self._lines(depth, rss=push_rss + pop_rss)
+        ok, detail = run.grade_deep_bench({"bench": "deep"}, lines)
+        self.assertFalse(ok)
+        self.assertIn("depth rss(maxdepth-root)=38000kB (maxdepth=39000, root=1000)", detail)
+        ok, _ = run.grade_deep_bench({"bench": "deep", "bench_depth_rss_kb": 1000000}, lines)
+        self.assertTrue(ok)
+
+    def test_the_unwound_root_is_graded_against_an_absolute_ceiling_not_step_ten(self):
+        """The device shape that failed the old step-10 delta: step 10 read while caches were still
+        filling (68104 kB), a root that unwound to the same ~86 MB every run. Absolute: passes."""
+        depth = 20
+        rss = [68104] * 10 + [86000] * 30
+        lines = self._lines(depth, rss=rss, root=86856)
+        ok, detail = run.grade_deep_bench({"bench": "deep", "bench_root_rss_kb": 98304}, lines)
+        self.assertTrue(ok, detail)
+        self.assertIn("root rss=86856kB vs bench_root_rss_kb 98304", detail)
+        # …and a root that did NOT give its pages back fails whatever step 10 read
+        lines = self._lines(depth, rss=rss, root=120000)
+        ok, detail = run.grade_deep_bench({"bench": "deep", "bench_root_rss_kb": 98304}, lines)
+        self.assertFalse(ok)
+        self.assertIn("root rss=120000kB vs bench_root_rss_kb 98304", detail)
+
+
+class DeepBenchManifest(unittest.TestCase):
+    def test_deep_100_is_a_bench_scene_with_an_item_and_enough_run_secs(self):
+        scenes = {s["name"]: s for s in _manifest()["fps_scenes"]}
+        deep = scenes["deep-100"]
+        self.assertEqual(deep["bench"], "deep")
+        self.assertEqual(deep.get("item"), "movie_in_home_catalog")
+        self.assertEqual(deep["tier"], "ui")
+        # depth=100 -> 200 steps * 2 half-periods each; run_secs must clear that plus warmup.
+        self.assertGreater(deep["run_secs"], 200 * 2 * 1.4 + deep.get("warmup_s", 5))
+        self.assertIn("plxnative-framedrop", deep["triggers"],
+                     "deep-100: bench worst_ms reads 0.0 unarmed — see bench_frame_tick's doc")
+        self.assertIn("bench_depth_rss_kb", deep)
+        self.assertIn("bench_root_rss_kb", deep, "the unwound end state is graded absolutely")
+
+
 class LoadManifest(unittest.TestCase):
     """The whole overlay merge, against the real tracked matrix."""
 
@@ -1161,6 +1847,54 @@ class LoadManifest(unittest.TestCase):
         m = self._load(_overlay(self._all_keys()))
         self.assertFalse([c["name"] for c in m["cases"] if c.get("skip")])
         self.assertFalse([s["name"] for s in m.get("fps_scenes", []) if s.get("skip")])
+
+    def test_collection_scenes_resolve_through_the_overlay(self):
+        """manifest.json is installation-independent, so the collection scenes may not carry a
+        mock_pms ratingKey: on a real server `plxnative-collection=50001` opens a collection that
+        does not exist and the page's fps_ceiling passes vacuously on its failure read-out."""
+        tracked = {s["name"]: s for s in _manifest()["fps_scenes"]}
+        for name in ("collection-page", "library-collections"):
+            with self.subTest(scene=name):
+                self.assertEqual(tracked[name]["item"], "collection")
+        self.assertEqual(tracked["collection-page"]["triggers"]["plxnative-collection"], "$rk")
+
+        items = self._all_keys()
+        items["collection"] = 424242
+        scenes = {s["name"]: s for s in self._load(_overlay(items))["fps_scenes"]}
+        page = scenes["collection-page"]
+        self.assertIn(("plxnative-collection", "424242"), run.fps_trigger_files(page))
+        # library-collections declares the key as a requirement only: nothing reads its `$rk`.
+        self.assertNotIn("424242", [v for _, v in run.fps_trigger_files(scenes["library-collections"])])
+
+        items["collection"] = "<ratingKey: a movie COLLECTION, not a movie>"
+        scenes = {s["name"]: s for s in self._load(_overlay(items))["fps_scenes"]}
+        for name in ("collection-page", "library-collections"):
+            with self.subTest(scene=name):
+                self.assertIn("template placeholder", scenes[name]["skip"])
+                self.assertNotIn("rk", scenes[name])
+
+    def test_no_fps_trigger_holds_a_literal_ratingkey(self):
+        """A scene that opens one item names it by `item` + `$rk`, never by a number that is true
+        on one server only. These are the triggers whose value carries a ratingKey."""
+        takes_rk = ("plxnative-detail", "plxnative-collection", "plxnative-play", "plxnative-navosc",
+                    "plxnative-pushbench", "plxnative-modalbench", "plxnative-deepbench")
+        for scene in _manifest()["fps_scenes"]:
+            for trigger, value in scene.get("triggers", {}).items():
+                if trigger in takes_rk and value is not True:
+                    with self.subTest(scene=scene["name"], trigger=trigger):
+                        self.assertIn("$rk", str(value))
+                        # a scene that plays a file the MOCK is handed (`mock.extra_media`) opens no
+                        # library item of anyone's server: its `mock.rk` is the mock's own id block
+                        if (scene.get("mock") or {}).get("extra_media"):
+                            self.assertTrue(scene["mock"].get("only"), scene["name"])
+                            continue
+                        self.assertIn("item", scene)
+
+    def test_the_example_overlay_names_every_item_key(self):
+        """A key missing from the template is a scene nobody copying it can ever run."""
+        with open(run.MANIFEST_LOCAL_EXAMPLE) as f:
+            example = json.load(f)["items"]
+        self.assertFalse(set(self._all_keys()) - set(example))
 
     def test_placeholders_outside_items_are_still_fatal(self):
         """No run of any size can proceed without these, so they keep the loud death."""
@@ -1265,7 +1999,7 @@ class PipelineTier(unittest.TestCase):
 
         `apply_triggers` now quotes arbitrary apostrophes too, so this is no longer the command's
         security boundary; the no-apostrophe property remains useful for copied case headers and
-        has a twin in rust-modules/src/dev.rs.
+        has a twin in rust-modules/media/src/player/playurl.rs (`the_harness_payload_carries_no_apostrophe`).
         """
         for c in self._pipeline_cases():
             files = run.triggers_for_case(c, url_base="http://192.0.2.10:8020")
@@ -1284,6 +2018,12 @@ class PipelineTier(unittest.TestCase):
             ("plxnative-play", "1234"),
             ("plxnative-quality", "original"),
             ("plxnative-stats", None),
+            # issue #266 PR4 review: EVERY case forces the persisted audio-enhancement preference
+            # too, default "off" -- see test_audio_enhancement_boot_trigger_defaults_off_and_is_overridable.
+            ("plxnative-audioenh", "off"),
+            # track memory: EVERY case forgets what a menu pick on an episode remembered -- see
+            # test_every_case_forgets_track_memory_at_the_seat.
+            ("plxnative-trackmemory", "clear"),
         ])
 
     def test_an_integration_case_can_explicitly_grade_auto(self):
@@ -1368,15 +2108,15 @@ class PipelineTier(unittest.TestCase):
             self.assertEqual(m["tv"], "10.0.0.9")
             self.assertTrue(m["pipeline_cases"])
             # ...but a TV address is still required, and is the ONLY thing this path can die for.
-            # `.tv-host` is the maintainer's own fallback and exists on this machine, so point the
-            # lookup at a path that cannot.
-            saved_host = run.TV_HOST_FILE
-            run.TV_HOST_FILE = os.path.join(TESTS_DIR, "no-such-tv-host")
+            # `.tv-host` / the per-user tv-host are the maintainer's own fallback and exist on this
+            # machine, so point the resolver at a script that cannot be run.
+            saved_script = run.tv_config.SCRIPT
+            run.tv_config.SCRIPT = os.path.join(TESTS_DIR, "no-such-tv-config.sh")
             try:
                 with self.assertRaises(SystemExit):
                     run.load_manifest(pipeline_only=True, tv_override=None)
             finally:
-                run.TV_HOST_FILE = saved_host
+                run.tv_config.SCRIPT = saved_script
         finally:
             run.MANIFEST_LOCAL = saved
 
@@ -1530,6 +2270,21 @@ class DefaultTier(unittest.TestCase):
             self.assertNotEqual(self._list("--pipeline", extra).returncode, 0,
                                 f"--pipeline {extra} should refuse")
 
+    def test_fps_listing_survives_a_bench_scene_with_no_loop_floor(self):
+        """`--fps --list` walks every fps_scene and printed `loop_floor={s['loop_floor']}`
+        unconditionally, which assumed every scene gates on it. The push/modal/deep-100 bench
+        scenes gate on missed refreshes instead and carry no `loop_floor` at all, so the listing
+        crashed with KeyError('loop_floor') partway through printing — after the ordinary cases,
+        so a bare `--list` (the pipeline-tier listing) never saw it. The fix must print what a
+        bench scene actually gates on rather than assuming every scene shares one key."""
+        out = self._list("--fps")
+        self.assertEqual(out.returncode, 0,
+                         f"--fps --list crashed:\n{out.stdout}\n{out.stderr}")
+        self.assertIn("fps:push-100", out.stdout)
+        self.assertIn("bench_missed_max=0", out.stdout)
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertNotIn("KeyError", out.stderr)
+
     def test_the_manifest_declares_a_frame_rate_axis(self):
         """Every fixture ran at 24p until 2026-08-22, so `engine::fps_rational`'s branches had one
         input between them. Pin that the matrix now carries both sides of its split: a
@@ -1647,20 +2402,59 @@ class CompletionCase(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("froze", why)
 
-    def test_only_a_case_that_asks_to_reach_the_end_may_name_the_short_clip(self):
-        """The rule is not "exactly one case", which is what it said while there was one — it is
-        that a case graded through a TEARDOWN has to have asked for one. The short clip ends inside
-        every window, so any case naming it without `reaches_eos` would have its assertions cut off
-        by a finish it never declared."""
+    def test_a_finish_with_the_playhead_short_of_the_duration_is_still_a_finish(self):
+        """Since #865 the pump ends the film on the pipeline's own end-of-stream as well as on
+        `pos >= dur - 1s`, and the clip whose audio outlasts its picture (`pipe_finish_audio_tail`)
+        reads `playpos=19s/23s`: four seconds short, by construction. The assertion is the line and
+        the teardown behind it; a check of the playhead against the duration added here would fail
+        the one clip built to end the other way."""
+        eos = "EOS reached: playpos=19s/23s -> ended\n"
+        ok, why = run.a_finished([self.POS, eos, self.TORN])
+        self.assertTrue(ok, why)
+
+    def test_only_a_case_that_asks_to_reach_the_end_may_name_a_clip_that_runs_out(self):
+        """The rule is not "exactly one case", which is what it said while there was one, and not
+        "exactly one clip" either, which it said until a clip whose audio outlasts its picture
+        joined (#865) — it is that a case graded through a TEARDOWN has to have asked for one.
+        Every clip a `reaches_eos` case names ENDS inside its window, so any case naming it
+        without `reaches_eos` would have its assertions cut off by a finish it never declared."""
         cases = _manifest()["pipeline_cases"]
         eos = [c for c in cases if c["expect"].get("reaches_eos")]
         self.assertTrue(eos, "no case reaches EOS — LG #46 has nothing behind it")
-        short = {c["fixture"] for c in eos}
-        self.assertEqual(len(short), 1, f"the completion cases disagree on which clip ends: {short}")
+        runs_out = {c["fixture"] for c in eos}
         strays = [c["name"] for c in cases
-                  if c["fixture"] in short and not c["expect"].get("reaches_eos")]
-        self.assertFalse(strays, f"the short clip ENDS mid-window; {strays} would be graded "
+                  if c["fixture"] in runs_out and not c["expect"].get("reaches_eos")]
+        self.assertFalse(strays, f"{sorted(runs_out)} END mid-window; {strays} would be graded "
                                  f"through a teardown they never asked for")
+
+    def test_every_clip_a_finish_case_names_ends_inside_the_cap_it_is_given(self):
+        """The bound `_resolve_fixtures` skips on, pinned statically against the generator's own
+        table: a clip that must be played out `1 + replays` times inside 0.6 of the case's cap. The
+        runtime check only fires on a pack someone regenerated; this one fires on the edit that
+        made the manifest and the generator disagree, before any pack exists."""
+        shapes = fixturegen.PIPE_SHAPES
+        for c in _manifest()["pipeline_cases"]:
+            exp = c["expect"]
+            if not exp.get("reaches_eos"):
+                continue
+            key, _, ext = c["fixture"].rpartition(".")
+            self.assertIn(key, shapes, f"{c['name']} names a clip the generator does not build")
+            self.assertEqual(ext, shapes[key]["ext"], c["name"])
+            views = 1 + exp.get("replays", 0)
+            self.assertLessEqual(
+                shapes[key]["duration"] * views, 0.6 * c["run_secs"],
+                f"{c['name']}: {shapes[key]['duration']}s x {views} viewing(s) does not fit "
+                f"0.6 x {c['run_secs']}s, so `_resolve_fixtures` would skip it on a pack built "
+                f"at the declared length")
+
+    def test_a_clip_whose_audio_outlasts_its_picture_is_named_by_a_finish_case(self):
+        """`audio_tail_s` exists to make a clip that only the pipeline's own end-of-stream can end,
+        so a shape carrying it that no `reaches_eos` case names is media nothing grades."""
+        named = {c["fixture"] for c in _manifest()["pipeline_cases"]
+                 if c["expect"].get("reaches_eos")}
+        for key, spec in fixturegen.PIPE_SHAPES.items():
+            if spec.get("audio_tail_s"):
+                self.assertIn(f"{key}.{spec['ext']}", named, key)
 
     def test_the_replay_case_grades_both_halves_of_46(self):
         """#46 is "replay AFTER completion", so the case that grades the replay must also be the
@@ -2777,6 +3571,354 @@ class AbrTraceMetrics(unittest.TestCase):
         self.assertFalse(run.op_audio_transcode([h264, "reload_transcode: fresh Load at offset 5s"])[0],
                          "a transcode reload with no switch line is not an audio switch")
 
+    def test_audio_enhancement_op_writes_a_named_target_not_a_row(self):
+        """issue #266 PR4 review: `audio_enhancement` reuses `plxnative-menupick` at tab 0, but
+        writes a NAMED target (`TrackRow`/`TrackMenuState::row_for_audio_target` resolve it
+        against the panel's own row map) rather than a row number derived from the item's track
+        count -- the bug this review caught was exactly a hand-derived row going stale against the
+        real server's track count. There is no track count to fetch or get wrong any more: the
+        same two triggers are correct for every item, whatever it carries."""
+        case = {
+            "rk": "1",
+            "operations": [{"op": "play"}, {"op": "audio_enhancement", "which": "normalize_loudness"}],
+        }
+        files = run.triggers_for_case(case)
+        self.assertIn(("plxnative-menupick", "0,loudness"), files)
+        case["operations"][1] = {"op": "audio_enhancement", "which": "boost_dialog"}
+        files = run.triggers_for_case(case)
+        self.assertIn(("plxnative-menupick", "0,boost"), files)
+
+    def test_subtitle_op_names_a_track_not_a_row(self):
+        """`subtitle_text_srt` once hard-coded row 3, which became the Color row (`menupick: row 3
+        already active -- no commit`). A `track` op derives the row in the app from the panel's own
+        row map; `row` still passes through verbatim."""
+        case = {"rk": "1", "operations": [{"op": "play"}, {"op": "subtitle", "tab": 1, "track": 0}]}
+        self.assertIn(("plxnative-menupick", "1,track:0"), run.triggers_for_case(case))
+        case["operations"][1] = {"op": "subtitle", "tab": 1, "row": 3}
+        self.assertIn(("plxnative-menupick", "1,3"), run.triggers_for_case(case))
+        with open(os.path.join(os.path.dirname(__file__), "manifest.json")) as fh:
+            manifest = json.load(fh)
+        rows = [op for c in manifest["cases"] for op in c.get("operations", [])
+                if op.get("op") == "subtitle" and "row" in op]
+        self.assertEqual(rows, [], "a hard-coded subtitle-menu row drifts; use `track`")
+
+    def test_audio_enhancement_boot_trigger_defaults_off_and_is_overridable(self):
+        """issue #266 PR4 review: EVERY case forces the persisted preference at boot (default
+        `off`), so a case's starting preference never depends on what an earlier case's pick left
+        behind; a case opts into a non-off start with `audio_enhancements_boot`."""
+        files = run.triggers_for_case({"rk": "1", "operations": [{"op": "play"}]})
+        self.assertIn(("plxnative-audioenh", "off"), files)
+        files = run.triggers_for_case({
+            "rk": "1", "audio_enhancements_boot": "loudness", "operations": [{"op": "play"}],
+        })
+        self.assertIn(("plxnative-audioenh", "loudness"), files)
+
+    def test_every_case_forgets_track_memory_at_the_seat(self):
+        """A `menupick` is a viewer's pick, and a pick on an episode is remembered for its show by
+        the SEATED profile; without a per-case `clear` the next case that plays that show would start
+        from the previous case's tracks. Both tiers write it, and a case cannot opt out of it."""
+        for case in ({"rk": "1", "operations": [{"op": "play"}]},
+                     {"rk": "1", "operations": [{"op": "play"}, {"op": "subtitle", "tab": 1, "track": 0}]},
+                     {"rk": "1", "operations": [{"op": "play"}, {"op": "audio_switch", "tab": 0, "row": 1}]}):
+            files = run.triggers_for_case(case)
+            self.assertEqual([f for f in files if f[0] == "plxnative-trackmemory"],
+                             [("plxnative-trackmemory", "clear")], case)
+        pipeline = run.triggers_for_case({"fixture": "x.mkv", "operations": [{"op": "play"}]},
+                                         url_base="http://192.0.2.10:8020")
+        self.assertIn(("plxnative-trackmemory", "clear"), pipeline)
+
+    def test_audio_enhancement_op_grades_applied_remux_and_ac3(self):
+        """A live Normalize Loudness pick that took effect: the server ran the DSP params
+        (`enhancement: applied ..`, printed only for `EnhancementOutcome::Applied`), the Load
+        declares the audio the decision NEGOTIATED (never a literal: PMS answers an AAC source's
+        DSP ask with a=aac, an AC-3 source's with ac3), the video codec is unchanged across the
+        switch (a copy, i.e. a remux and not a full re-encode), the resulting stream is
+        `start.mkv` (ProgressiveMkv), and no source failed to open after the toggle."""
+        h264 = "ff: v=#0 codec=h264 codec_id=27 1920x1080 trc=1 pri=1 spc=1 a=#1 dur_ns=1"
+        dp_load = 'load: v=H264 a="AAC" fps=25.000 dv=present:0 P0/0 el:0 atmos:0 max=1920x1080@25'
+        aac_load = 'load: v=H264 a="AAC" fps=0.000 dv=present:0 P0/0 el:0 atmos:0 max=1920x1080@60'
+        ac3_load = 'load: v=H264 a="AC3" fps=0.000 dv=present:0 P0/0 el:0 atmos:0 max=1920x1080@60'
+        remux = "stream: example.com path=/video/:/transcode/universal/start.mkv?a=1"
+        applied = "enhancement: applied boost=0 loudness=1"
+        # PR4's device shape: the direct play was torn down before it logged `ff: v=`, so the
+        # pre-toggle video evidence is its `load: v=` line; the source is AAC and so is the output.
+        good = [dp_load, "decision output: v=h264 a=aac", applied,
+                "ff: aborted during open_input r=-1094995529", aac_load, remux, h264]
+        ok, why = run.op_audio_enhancement(good)
+        self.assertTrue(ok, why)
+        # The same with an AC-3 source: whatever the decision says, the Load must say it too.
+        ok, why = run.op_audio_enhancement(
+            [h264, "decision output: v=h264 a=ac3", applied, ac3_load, remux, h264])
+        self.assertTrue(ok, why)
+        # E-AC3 is "AC3 PLUS" in LG's Load vocabulary.
+        eac3_load = ac3_load.replace('a="AC3"', 'a="AC3 PLUS"')
+        ok, why = run.op_audio_enhancement(
+            [h264, "decision output: v=h264 a=eac3", applied, eac3_load, remux, h264])
+        self.assertTrue(ok, why)
+        # No `enhancement: applied` line at all -- the pick never took effect.
+        no_commit = [h264, "menupick: row 2 already active — no commit"]
+        ok, why = run.op_audio_enhancement(no_commit)
+        self.assertFalse(ok, why)
+        self.assertIn("no `enhancement: applied` line", why)
+        # The row was never offered at all (`menupick: unknown target ".." — no commit`,
+        # dev/scenarios.rs) -- the miss preamble must quote this line too, not just the
+        # "row already active" shape.
+        unknown_target = [h264, 'menupick: unknown target "loudness" — no commit']
+        ok, why = run.op_audio_enhancement(unknown_target)
+        self.assertFalse(ok, why)
+        self.assertIn("no `enhancement: applied` line", why)
+        self.assertIn("unknown target", why)
+        refused = [h264, "enhancement: refused/ignored by server; current stream retained"]
+        ok, why = run.op_audio_enhancement(refused)
+        self.assertFalse(ok, why)
+        self.assertIn("refused/ignored", why)
+        # `enhancement: applied` present but for the WRONG field (boost, not loudness) fails --
+        # this case's row is specifically Normalize Loudness.
+        wrong_field = [h264, "decision output: v=h264 a=ac3", "enhancement: applied boost=1 loudness=0", h264]
+        ok, why = run.op_audio_enhancement(wrong_field)
+        self.assertFalse(ok, why)
+        self.assertIn("loudness=1", why)
+        # The Load declared a codec the decision did not negotiate (the old hard-coded ac3).
+        mislabeled = [dp_load, "decision output: v=h264 a=aac", applied, ac3_load, remux, h264]
+        ok, why = run.op_audio_enhancement(mislabeled)
+        self.assertFalse(ok, why)
+        self.assertIn("negotiated", why)
+        # Applied, but the video was RE-ENCODED across the switch -- not a remux.
+        hevc = "ff: v=#0 codec=hevc codec_id=173 1920x1080 trc=1 pri=1 spc=1 a=#1 dur_ns=1"
+        reencoded = [h264, "decision output: v=hevc a=ac3", applied,
+                     ac3_load.replace("v=H264", "v=H265"), remux, hevc]
+        ok, why = run.op_audio_enhancement(reencoded)
+        self.assertFalse(ok, why)
+        self.assertIn("RE-ENCODED", why)
+        # Applied and copied -- but the post-toggle stream is start.m3u8, a capped-rung re-encode
+        # rather than a remux.
+        no_remux = [h264, "decision output: v=h264 a=ac3", applied, ac3_load,
+                    "stream: example.com path=/video/:/transcode/universal/start.m3u8?a=1", h264]
+        ok, why = run.op_audio_enhancement(no_remux)
+        self.assertFalse(ok, why)
+        self.assertIn("not a remux", why)
+        # A source that really failed to open after the toggle.
+        failed = [dp_load, "decision output: v=h264 a=aac", applied,
+                  "ff: open_input failed r=-1094995529", aac_load, remux, h264]
+        ok, why = run.op_audio_enhancement(failed)
+        self.assertFalse(ok, why)
+        self.assertIn("open_input failed", why)
+
+    def test_audio_enhancement_release_op_grades_the_cleanup_leg(self):
+        """`audio_enhancement_normalize_reset`'s own assertion: a second pick of the same row,
+        from a fresh boot that inherited the persisted preference, must release the route back to
+        Original direct play and STAY there: the next stream is the item's `/library/parts/` Part,
+        no transcode stream follows (a failed trial rolls back to the enhanced remux), and no 503
+        answers it (PR4's first device run)."""
+        released = "enhancement: released to Original direct play; remux encoder held pending frames"
+        part = "stream: example.com path=/library/parts/1/2/file.mkv?a=1"
+        remux = "stream: example.com path=/video/:/transcode/universal/start.mkv?a=1"
+        ok, why = run.op_audio_enhancement_release(
+            [remux, released, part, "ff: open status=206 clen=1"])
+        self.assertTrue(ok, why)
+        # PR4's device run: the Part answered 503 and the rollback restored the enhanced remux.
+        ok, why = run.op_audio_enhancement_release(
+            [remux, released, part, "stream: GET /library/parts/1/2/file.mkv status=503", remux])
+        self.assertFalse(ok, why)
+        self.assertIn("rolled back", why)
+        ok, why = run.op_audio_enhancement_release(
+            [remux, released, part, "stream: GET /library/parts/1/2/file.mkv status=503"])
+        self.assertFalse(ok, why)
+        self.assertIn("503", why)
+        # The admission found the Part refused and the release became the plain remux.
+        ok, why = run.op_audio_enhancement_release(
+            ["enhancement: server refused the Original Part (HTTP 503); restoring Original as a remux",
+             "enhancement: released to Original remux; previous encoder held pending frames", remux])
+        self.assertFalse(ok, why)
+        self.assertIn("refused the Original Part", why)
+        ok, why = run.op_audio_enhancement_release([released])
+        self.assertFalse(ok, why)
+        self.assertIn("no `stream: .. path=` line after the release", why)
+        ok, why = run.op_audio_enhancement_release(["menupick: row 2 already active — no commit"])
+        self.assertFalse(ok, why)
+        self.assertIn("no `enhancement: released` line", why)
+        ok, why = run.op_audio_enhancement_release(["some unrelated line"])
+        self.assertFalse(ok, why)
+
+    def test_audio_enhancement_burn_op_tells_reencode_from_remux(self):
+        """The grader used to fail EVERY correct Burn: it rejected any post-pick stream whose path
+        contained `start.mkv`, but a Burn (a real re-encode) is ALSO served from `start.mkv`
+        (`TranscodeDelivery::ProgressiveMkv`) — only the ordinary enhanced REMUX is disqualified,
+        and the two are told apart by the query fields `transcoder.rs`'s `transcode_query` sets
+        (transcoder.rs:311-324): a remux carries `directStreamAudio=1` and no cap; a re-encode
+        carries `videoResolution=`+`maxVideoBitrate=` and never `directStreamAudio`.
+
+        Fixture paths below are lifted from real TV log lines (redacted of nothing but the host,
+        which `redact()` already strips): the remux shape carries `directStreamAudio=1`, the burn
+        shape carries `directStream=1&videoResolution=3840x2160&maxVideoBitrate=60000&
+        audioStreamID=10976&normalizeLoudness=1&subtitleStreamID=10980&subtitleSize=100&
+        subtitles=burn`.
+        """
+        applied = "enhancement: applied boost=0 loudness=1"
+        burn_path = (
+            "/video/:/transcode/universal/start.mkv?directStream=1&videoResolution=3840x2160&"
+            "maxVideoBitrate=60000&audioStreamID=10976&normalizeLoudness=1&"
+            "subtitleStreamID=10980&subtitleSize=100&subtitles=burn"
+        )
+        remux_path = (
+            "/video/:/transcode/universal/start.mkv?directStreamAudio=1&audioStreamID=10976&"
+            "normalizeLoudness=1&subtitleStreamID=10980&subtitleSize=100&subtitles=burn"
+        )
+        burn_stream = f"stream: 1.2.3.4 path={burn_path}"
+        remux_stream = f"stream: 1.2.3.4 path={remux_path}"
+
+        # The correct Burn: the grader must accept it. This is the case that used to fail outright
+        # because `"start.mkv" in path` is true for a Burn too.
+        ok, why = run.op_audio_enhancement_burn([applied, burn_stream])
+        self.assertTrue(ok, why)
+
+        # The remux shape must still fail — a burn denies the remux flavour
+        # (`enhancement_policy`'s `remux: !force_burn`), so seeing `directStreamAudio=1` after the
+        # pick means the server never re-encoded at all.
+        ok, why = run.op_audio_enhancement_burn([applied, remux_stream])
+        self.assertFalse(ok, why)
+        self.assertIn("ordinary enhanced remux", why)
+
+        # A stream that is neither shape (no cap, no directStreamAudio) is caught too, distinctly.
+        neither_stream = "stream: 1.2.3.4 path=/video/:/transcode/universal/start.mkv?subtitleStreamID=10980&subtitles=burn"
+        ok, why = run.op_audio_enhancement_burn([applied, neither_stream])
+        self.assertFalse(ok, why)
+        self.assertIn("re-encode shape", why)
+
+    def test_audio_enhancement_burn_op_grades_the_second_identical_applied_line(self):
+        """A LIVE RECONCILE manifest logs TWO `enhancement: applied boost=.. loudness=..` lines
+        with IDENTICAL text: the boot-time preference decorates the candidate as an ordinary
+        remux first (no subtitle in the picture yet), then the pick reroutes it to a burn,
+        producing a second, textually-identical `applied` line. `hits[-1]` correctly picks the
+        LAST line by content, but `lines.index(hit)` then re-finds the FIRST occurrence of that
+        same text and grades the stream that follows the wrong (pre-reroute) pick — exactly what
+        happened on the real TV log at `/tmp/enh-burn-tv3/logs/
+        audio_enhancement_burns_embedded_subtitle.log`, where the grader failed a case whose
+        actual last-pick stream (around line 201) had the correct burn shape.
+        """
+        applied = "enhancement: applied boost=0 loudness=1"
+        remux_path = (
+            "/video/:/transcode/universal/start.mkv?directStreamAudio=1&audioStreamID=10976&"
+            "normalizeLoudness=1"
+        )
+        burn_path = (
+            "/video/:/transcode/universal/start.mkv?directStream=1&videoResolution=3840x2160&"
+            "maxVideoBitrate=60000&audioStreamID=10976&normalizeLoudness=1&"
+            "subtitleStreamID=10980&subtitleSize=100&subtitles=burn"
+        )
+        remux_stream = f"stream: 1.2.3.4 path={remux_path}"
+        burn_stream = f"stream: 1.2.3.4 path={burn_path}"
+        lines = [applied, remux_stream, applied, burn_stream]
+        ok, why = run.op_audio_enhancement_burn(lines)
+        self.assertTrue(ok, why)
+
+    # The side-reader shape (#474): on a local link with a moderate Part bitrate the app reads an
+    # embedded subtitle beside the enhanced remux and draws it itself, so nothing is burned. Lines
+    # are the v0.9.0 TV run's, reduced; ids and the host are placeholders.
+    _CLIENT_REMUX = ("stream: <addr> path=/video/:/transcode/universal/start.mkv?directPlay=0&"
+                     "directStream=1&directStreamAudio=1&audioStreamID=11&normalizeLoudness=1&"
+                     "subtitleStreamID=0&subtitles=none")
+
+    def _cold_client(self):
+        return ["enhancement: boost_dialog=false normalize_loudness=true — direct play becomes "
+                "an enhanced remux", "decision output: v=h264 a=aac",
+                "enhancement: applied boost=0 loudness=1",
+                "server-selected subtitle: sid=21 render_idx=0", self._CLIENT_REMUX,
+                "subside: open tracks=4 ordinal=0 kbps=10000",
+                "subside: anchor match=exact part_kf_ms=0 remux_kf_ms=44",
+                "sub cue [4296..7049ms] len=50"]
+
+    def _live_client(self):
+        remux = self._CLIENT_REMUX.replace("&subtitleStreamID=0&subtitles=none", "")
+        return ["enhancement: applied boost=0 loudness=1", remux,
+                "loop=60 route=player overlay=menu pos=5s play=1000pm",
+                "select streams: part=31 audio=11 sub=24 -> HTTP 200",
+                "subside: open tracks=6 ordinal=3 kbps=26000",
+                "sub cue [4296..7049ms] len=50"]
+
+    def test_enhancement_subtitle_client_presenter_passes_the_v090_shapes(self):
+        """The two v0.9.0 TV failures were this product behaviour graded as a missing burn."""
+        ok, why = run.op_audio_enhancement_subtitle(self._cold_client(), "client", live=False)
+        self.assertTrue(ok, why)
+        ok, why = run.op_audio_enhancement_subtitle(self._live_client(), "client", live=True)
+        self.assertTrue(ok, why)
+
+    def test_enhancement_subtitle_client_presenter_rejects_a_burn_or_a_lost_subtitle(self):
+        burned = [ln.replace("directStreamAudio=1&", "").replace("subtitles=none", "subtitles=burn")
+                  for ln in self._cold_client()]
+        ok, why = run.op_audio_enhancement_subtitle(burned, "client", live=False)
+        self.assertFalse(ok, why)
+        no_reader = [ln for ln in self._cold_client() if not ln.startswith("subside:")]
+        ok, why = run.op_audio_enhancement_subtitle(no_reader, "client", live=False)
+        self.assertFalse(ok, why)
+        self.assertIn("subside: open", why)
+        other_track = [ln.replace("ordinal=0", "ordinal=2") for ln in self._cold_client()]
+        ok, why = run.op_audio_enhancement_subtitle(other_track, "client", live=False)
+        self.assertFalse(ok, why)
+        no_cue = [ln for ln in self._cold_client() if not ln.startswith("sub cue")]
+        ok, why = run.op_audio_enhancement_subtitle(no_cue, "client", live=False)
+        self.assertFalse(ok, why)
+        failed = self._cold_client() + ["subside: failed"]
+        ok, why = run.op_audio_enhancement_subtitle(failed, "client", live=False)
+        self.assertFalse(ok, why)
+
+    def test_enhancement_subtitle_live_pick_must_not_rebuild_the_stream(self):
+        """`embedded_pick_on_a_live_remux_queues_no_retranscode`'s device half: the pick starts
+        the reader and leaves the enhanced remux alone."""
+        lines = self._live_client()
+        rebuilt = lines[:4] + ["enhancement: applied boost=0 loudness=1", lines[1]] + lines[4:]
+        ok, why = run.op_audio_enhancement_subtitle(rebuilt, "client", live=True)
+        self.assertFalse(ok, why)
+        no_pick = [ln for ln in lines if not ln.startswith("select streams:")]
+        ok, why = run.op_audio_enhancement_subtitle(no_pick, "client", live=True)
+        self.assertFalse(ok, why)
+
+    def test_enhancement_subtitle_burn_presenter_is_the_burn_grader(self):
+        applied = "enhancement: applied boost=0 loudness=1"
+        burn = ("stream: 1.2.3.4 path=/video/:/transcode/universal/start.mkv?directStream=1&"
+                "videoResolution=3840x2160&maxVideoBitrate=60000&normalizeLoudness=1&"
+                "subtitleStreamID=24&subtitles=burn")
+        self.assertTrue(run.op_audio_enhancement_subtitle([applied, burn], "burn", live=False)[0])
+        self.assertFalse(run.op_audio_enhancement_subtitle(self._cold_client(), "burn", live=False)[0])
+
+    def test_enhancement_subtitle_cases_name_their_presenter(self):
+        """Each case STATES which presenter its item gets (`side_reader_inputs_admit`: a local link
+        and a Part of at most 30000 kbps admit the app's reader), and evaluate() grades it."""
+        cases = {c["name"]: c for c in _manifest()["cases"]}
+        cold = cases["audio_enhancement_draws_server_selected_subtitle"]
+        live = cases["audio_enhancement_draws_embedded_subtitle"]
+        self.assertIn({"op": "audio_enhancement_subtitle", "presenter": "client"}, cold["operations"])
+        self.assertTrue(any(o.get("op") == "subtitle" and o.get("enhanced") == "client"
+                            for o in live["operations"]))
+        _, results = run.evaluate({"rk": "1", **cold}, self._cold_client())
+        self.assertIn(("audio_enhancement_subtitle", True),
+                      [(label, ok) for label, ok, _ in results])
+        _, results = run.evaluate({"rk": "1", **live}, self._live_client())
+        self.assertIn(("audio_enhancement_subtitle", True),
+                      [(label, ok) for label, ok, _ in results])
+
+    def test_audio_enhancement_dispatch_picks_release_by_settle(self):
+        """`evaluate()`'s per-operation dispatch: `settle: "released"` grades the cleanup leg, and
+        its absence grades the ordinary apply leg."""
+        case = {
+            "rk": "1",
+            "operations": [{"op": "play"}, {"op": "audio_enhancement", "which": "normalize_loudness"}],
+            "expect": {},
+        }
+        h264 = "ff: v=#0 codec=h264 codec_id=27 1920x1080 trc=1 pri=1 spc=1 a=#1 dur_ns=1"
+        lines = [h264, "decision output: v=h264 a=ac3", "enhancement: applied boost=0 loudness=1",
+                 "stream: example.com path=/video/:/transcode/universal/start.mkv?a=1", h264]
+        _, results = run.evaluate(case, lines)
+        self.assertIn("audio_enhancement", dict((label, ok) for label, ok, _ in results))
+        release_case = dict(case)
+        release_case["operations"] = [
+            {"op": "play"},
+            {"op": "audio_enhancement", "which": "normalize_loudness", "settle": "released"},
+        ]
+        _, results = run.evaluate(release_case,
+                                  ["enhancement: released to Original direct play; remux encoder held pending frames"])
+        self.assertIn("audio_enhancement_release", dict((label, ok) for label, ok, _ in results))
+
     def test_seek_inplace_ignores_a_reload_that_preceded_the_seek(self):
         """`original_then_auto_and_seek`, 2026-09-02: handing playback to Auto now restarts the
         source (`route transition: adaptive direct reload` -> `reload_at: fresh Load at 12s`), and
@@ -2836,7 +3978,7 @@ class AbrLogLineContract(unittest.TestCase):
     fields were renamed and an old log read as "no samples".
     """
 
-    FF = os.path.join(REPO_ROOT, "rust-modules", "src", "ff.rs")
+    FF = os.path.join(REPO_ROOT, "rust-modules", "media", "src", "ff.rs")
 
     def _emitted_fields(self, prefix):
         """The `name=` fields of the app's format literal for `abr: <prefix>`, in order."""
@@ -3119,7 +4261,7 @@ class EverySeekGiveUpPathDisarmsTheSpinner(unittest.TestCase):
     """
 
     def _src(self, *parts):
-        with open(os.path.join(REPO_ROOT, "rust-modules", "src", *parts), encoding="utf-8") as fh:
+        with open(os.path.join(REPO_ROOT, "rust-modules", "media", "src", *parts), encoding="utf-8") as fh:
             return fh.read()
 
     def test_a_failed_transcode_seek_rebuild_abandons_the_seek(self):
@@ -3404,8 +4546,8 @@ class AbrLadderFixtures(unittest.TestCase):
 # here to catch.
 # ---------------------------------------------------------------------------------------------
 
-FF_RS = os.path.join(REPO_ROOT, "rust-modules", "src", "ff.rs")
-WINDOW_RS = os.path.join(REPO_ROOT, "rust-modules", "src", "abr", "window.rs")
+FF_RS = os.path.join(REPO_ROOT, "rust-modules", "media", "src", "ff.rs")
+WINDOW_RS = os.path.join(REPO_ROOT, "rust-modules", "media", "src", "abr", "window.rs")
 
 # `name=` in a format string or a regex pattern. Deliberately anchored on the `=`, because that is
 # what both sides actually agree on -- the surrounding placeholder/capture syntax differs.
@@ -3641,6 +4783,269 @@ class AbrSegmentVariation(unittest.TestCase):
                     int(shapes[key].get("hls_segments") or 0), 2,
                     f"{key} is served as an ABR rung but is not cut into segments, so that rung "
                     "delivers one byte size for the whole playback")
+
+
+class LateAudioFixture(unittest.TestCase):
+    """The late-audio clip and its case (PR #603): a file whose audio starts 11 s after its video.
+
+    Static only. The clip is only worth anything if it really puts more video than the video lane
+    holds ahead of its first audio packet, and the case is only worth anything if it can tell a
+    stalled clock and an audio lane that never reached Starfish from a healthy start.
+    """
+
+    KEY = "pipe_h264_eac3_late_audio"
+
+    def _packets(self, audio_at, video_every=1 / 24.0, video_size=1000, seconds=14):
+        pkts = [{"stream_index": 0, "pts_time": f"{i * video_every:.3f}", "size": str(video_size)}
+                for i in range(int(seconds / video_every))]
+        return pkts + [{"stream_index": 1, "pts_time": f"{audio_at + i * 0.032:.3f}",
+                        "size": "700"} for i in range(20)]
+
+    def test_the_lead_is_the_audio_start_and_the_video_bytes_before_it(self):
+        first, ahead = fixturegen.late_audio_lead(self._packets(11.008), 0, 1)
+        self.assertAlmostEqual(first, 11.008, places=3)
+        # 24 fps, 1000 bytes a frame: frames at t < 11.008 are indices 0..264, i.e. 265 of them.
+        self.assertEqual(ahead, 265 * 1000)
+
+    def test_an_on_time_audio_track_has_no_video_ahead_of_it(self):
+        first, ahead = fixturegen.late_audio_lead(self._packets(0.0), 0, 1)
+        self.assertEqual((first, ahead), (0.0, 0))
+
+    def test_a_file_without_audio_or_a_timestamp_is_refused_not_zeroed(self):
+        with self.assertRaises(ValueError):
+            fixturegen.late_audio_lead(self._packets(11.0)[:-20], 0, 1)
+        broken = self._packets(11.0)
+        broken[-1] = {"stream_index": 1, "size": "700"}
+        with self.assertRaises(ValueError):
+            fixturegen.late_audio_lead(broken, 0, 1)
+
+    def test_the_shape_is_built_to_fill_the_video_lane_before_the_first_audio_packet(self):
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        (audio,) = spec["audio"]
+        self.assertAlmostEqual(audio["delay"], 11.008)
+        # The design arithmetic, written down where a change to either number trips it: the
+        # rate-targeted video must queue more than the lane's cap in the delay it sits behind,
+        # even at the verify() band's lower edge (0.70x), or the clip can not park the demuxer.
+        video_bytes_by_audio = spec["video"]["vbr"] * 1000 / 8 * audio["delay"] * 0.70
+        self.assertGreater(video_bytes_by_audio, fixturegen.AQ_VIDEO_BYTES)
+        self.assertEqual(spec["late_audio"]["min_video_bytes_before_audio"],
+                         fixturegen.AQ_VIDEO_BYTES)
+        self.assertLess(audio["delay"], fixturegen.PIPE_SECS - 20,
+                        "the audio must leave the case a long stretch to climb through")
+
+    def test_the_audio_input_is_offset_by_exactly_the_delay(self):
+        """`-itsoffset` must precede the delayed track's `-i` and no other input's."""
+        captured = []
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(fixturegen, "run",
+                                  side_effect=lambda argv, quiet=True: captured.append(list(argv)) or ""):
+            work = fixturegen.Path(d)
+            fixturegen.build_generic(
+                mock.Mock(markers=False), self.KEY, fixturegen.PIPE_SHAPES[self.KEY], 4, None,
+                work / "out.mkv", work)
+        argv = captured[0]
+        self.assertEqual(argv.count("-itsoffset"), 1, "only the delayed track is offset")
+        at = argv.index("-itsoffset")
+        self.assertEqual(argv[at + 1], "11.008")
+        self.assertEqual(argv[at + 2:at + 5], ["-t", "4", "-f"], "it must sit right before the audio -i")
+        self.assertIn("sine=", argv[at + 7], "and the input it offsets is the audio graph")
+
+    def test_the_case_grades_the_stalled_clock_and_the_unfed_audio_lane(self):
+        case = next(c for c in _manifest()["pipeline_cases"] if c["name"] == "pipe_late_audio_eac3")
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        self.assertEqual(case["fixture"], self.KEY + ".mkv")
+        for k in ("vcodec", "acodec", "fps"):
+            self.assertEqual(case["declare"][k], spec["declare"][k], f"declare.{k} drifted from the shape")
+        exp = case["expect"]
+        # The two stalls are separate failures: a stalled clock and an audio lane that never
+        # reached Starfish. A case that graded only the first would pass a fix for stall 1 alone.
+        self.assertTrue(exp["require_audio_feed_ready"])
+        self.assertGreaterEqual(exp["min_pos_climb_s"], 12)
+        self.assertEqual(exp["audio_stream_index"], 1)
+        self.assertEqual(exp["load_audio"], "AC3 PLUS")
+        self.assertLess(exp["min_pos_climb_s"] + 5, case["run_secs"])
+        self.assertLess(case["run_secs"], fixturegen.PIPE_SECS, "the clip must not end in the window")
+
+    def test_a_stalled_clock_and_a_silent_audio_lane_both_fail_the_case_assertions(self):
+        # What the broken player logs: heartbeat position pinned at 0, video fed, audio never.
+        stalled = [f"loop=100 fps=60 pos=0s stage=Playing" for _ in range(6)]
+        self.assertFalse(run.a_timeline_climb(stalled, 15, dense_only=True)[0])
+        climbing = [f"loop=100 fps=60 pos={t}s stage=Playing" for t in range(0, 20)]
+        self.assertTrue(run.a_timeline_climb(climbing, 15, dense_only=True)[0])
+        self.assertFalse(run.a_audio_feed_ready(["feed v#1 sz=9 fed=0 reply=O qbytes=1"])[0])
+
+
+class DoviRandomAccessFixture(unittest.TestCase):
+    @staticmethod
+    def packet(pts, kind, rpu=True):
+        nals = [kind, 62] if rpu else [kind]
+        data = b"".join(b"\x00\x00\x00\x02" + bytes([n << 1, 1]) for n in nals)
+        return {"pts_time": str(pts), "flags": "K_", "data": "00000000: " + data.hex() + "  .."}
+
+    def test_dovi_builder_preserves_the_requested_gop_mode(self):
+        key = "pipe_hevc_eac3_4k_dovi_p8"
+        original = fixturegen.PIPE_SHAPES[key]
+        spec = dict(original, video=dict(original["video"], x265_extra="open-gop=0"))
+        captured = {}
+
+        def capture(_ctx, _key, shape, *_args, **_kwargs):
+            captured.update(shape["video"])
+            raise RuntimeError("stop before fixture IO")
+
+        with mock.patch.object(fixturegen, "build_generic", side_effect=capture):
+            with self.assertRaisesRegex(RuntimeError, "stop before fixture IO"):
+                fixturegen.build_dovi(mock.Mock(), key, spec, 60, None,
+                                      fixturegen.Path("out.mkv"), fixturegen.Path("work"))
+        self.assertIn("open-gop=0", captured["x265_extra"])
+        self.assertIn("aud=1", captured["x265_extra"])
+
+    def test_the_pair_is_distinguished_by_read_back_nals_not_container_key_flags(self):
+        cra = fixturegen.hevc_random_access_packets([self.packet(0, 20), self.packet(2, 21)])
+        idr = fixturegen.hevc_random_access_packets([self.packet(0, 20), self.packet(2, 20)])
+        self.assertEqual(fixturegen.random_access_problems(cra, "cra", 60), [])
+        self.assertEqual(fixturegen.random_access_problems(idr, "idr", 60), [])
+        self.assertTrue(fixturegen.random_access_problems(idr, "cra", 60))
+        self.assertTrue(fixturegen.random_access_problems(cra, "idr", 60))
+        false_key = fixturegen.hevc_random_access_packets([self.packet(0, 1)])
+        self.assertTrue(fixturegen.random_access_problems(false_key, "cra", 60))
+
+    def test_a_missing_later_key_or_rpu_is_not_a_verified_fixture(self):
+        initial = fixturegen.hevc_random_access_packets([self.packet(0, 20)])
+        self.assertTrue(fixturegen.random_access_problems(initial, "cra", 60))
+        self.assertEqual(fixturegen.random_access_problems(initial, "cra", 1), [])
+        no_rpu = fixturegen.hevc_random_access_packets([self.packet(0, 20), self.packet(2, 21, rpu=False)])
+        self.assertTrue(fixturegen.random_access_problems(no_rpu, "cra", 60))
+        self.assertEqual(fixturegen.hevc_random_access_packets([self.packet("nan", 20)]), [])
+
+    def test_shared_packet_reader_retains_h264_and_accepts_hevc_annexb(self):
+        self.assertEqual(fixturegen.h264_nal_types(b"\x00\x00\x00\x01\x65\x80"), [5])
+        self.assertEqual(fixturegen._packet_nal_types(b"\x00\x00\x01\x2a\x01", True), [21])
+        self.assertEqual(fixturegen._packet_nal_types(b"\x00\x00\x00\x01\x2a", True), [])
+
+
+class AudioTailFixture(unittest.TestCase):
+    """The clip whose audio outlasts its picture and its case (#865): 20 s of video, 23 s of audio.
+
+    Static only. The clip is only worth anything if its audio really runs past the pump's
+    one-second tolerance, and the case is only worth anything if it names that clip and ends it.
+    """
+
+    KEY = "pipe_h264_ac3_audio_tail"
+
+    def _packets(self, video_end=20.0, audio_end=23.0):
+        v = [{"stream_index": 0, "pts_time": f"{i / 24.0:.3f}", "duration_time": "0.041667"}
+             for i in range(int(video_end * 24))]
+        a = [{"stream_index": 1, "pts_time": f"{i * 0.032:.3f}", "duration_time": "0.032000"}
+             for i in range(int(audio_end / 0.032))]
+        return v + a
+
+    def _argv(self, spec, dur):
+        captured = []
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(fixturegen, "run",
+                                  side_effect=lambda argv, quiet=True: captured.append(list(argv)) or ""):
+            work = fixturegen.Path(d)
+            fixturegen.build_generic(mock.Mock(markers=False), self.KEY, spec, dur, None,
+                                     work / "out.mkv", work)
+        return captured[0]
+
+    def test_the_streams_ends_are_the_last_packet_plus_its_duration(self):
+        video_end, audio_end = fixturegen.stream_ends(self._packets(), 0, 1)
+        self.assertAlmostEqual(video_end, 20.0, delta=0.05)
+        self.assertAlmostEqual(audio_end, 23.0, delta=0.05)
+
+    def test_a_missing_stream_or_timestamp_is_refused_not_zeroed(self):
+        with self.assertRaises(ValueError):
+            fixturegen.stream_ends([p for p in self._packets() if p["stream_index"] == 0], 0, 1)
+        broken = self._packets()
+        broken[-1] = {"stream_index": 1, "duration_time": "0.032"}
+        with self.assertRaises(ValueError):
+            fixturegen.stream_ends(broken, 0, 1)
+
+    def _verify(self, packets, spec=None):
+        spec = spec or fixturegen.PIPE_SHAPES[self.KEY]
+        streams = [{"codec_type": "video", "index": 0}, {"codec_type": "audio", "index": 1}]
+        rec, problems = {}, []
+        with mock.patch.object(fixturegen, "run",
+                               return_value=json.dumps({"packets": packets})):
+            fixturegen.verify_audio_tail("x.mkv", spec, streams, rec, problems)
+        return rec, problems
+
+    def test_a_clip_with_its_tail_verifies_and_records_both_ends(self):
+        rec, problems = self._verify(self._packets())
+        self.assertEqual(problems, [])
+        self.assertAlmostEqual(rec["audio_tail"]["tail_s"], 3.0, delta=0.1)
+
+    def test_a_clip_that_lost_its_tail_fails_the_build(self):
+        """The audio cut at the picture's end verifies clean on every other axis, and a player
+        without the #865 fix then ends it on the old arithmetic, so the case grades nothing."""
+        _, problems = self._verify(self._packets(audio_end=20.0))
+        self.assertTrue(any("wanted at least 2.0s" in p for p in problems), problems)
+
+    def test_a_tail_inside_the_pumps_tolerance_fails_even_if_declared(self):
+        """1.5 s past the picture is under the 2 s floor, whatever the shape asked for."""
+        spec = dict(fixturegen.PIPE_SHAPES[self.KEY], audio_tail_s=1.5)
+        _, problems = self._verify(self._packets(audio_end=21.5), spec)
+        self.assertTrue(any("wanted at least 2.0s" in p for p in problems), problems)
+
+    def test_a_tail_other_than_the_declared_one_fails_the_build(self):
+        _, problems = self._verify(self._packets(audio_end=25.0))
+        self.assertTrue(any("declares 3s" in p for p in problems), problems)
+
+    def test_the_picture_is_the_file_less_the_tail_and_no_other_shape_has_one(self):
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        self.assertEqual((spec["duration"], spec["audio_tail_s"]), (23, 3))
+        self.assertEqual(fixturegen.picture_secs(spec, spec["duration"]), 20)
+        others = [k for k, s in fixturegen.PIPE_SHAPES.items()
+                  if s.get("audio_tail_s") and k != self.KEY]
+        self.assertEqual(others, [], "a second audio-tail shape wants its own case")
+        short = fixturegen.PIPE_SHAPES["pipe_h264_ac3_short"]
+        self.assertEqual(fixturegen.picture_secs(short, short["duration"]), short["duration"])
+
+    def test_the_picture_input_ends_at_the_picture_and_everything_else_at_the_file(self):
+        """Video `-t` 20, audio `-t` 23 and the audio graph's own duration, output `-t` 23: the mux
+        has to run on to the audio's end, and the picture must not be padded to meet it."""
+        argv = self._argv(fixturegen.PIPE_SHAPES[self.KEY], 23)
+        v = next(i for i, a in enumerate(argv) if a.startswith("testsrc2="))
+        self.assertEqual(argv[v - 5:v - 1], ["-t", "20", "-f", "lavfi"])
+        a = next(i for i, a in enumerate(argv) if a.startswith("sine="))
+        self.assertEqual(argv[a - 5:a - 1], ["-t", "23", "-f", "lavfi"])
+        self.assertIn("duration=23", argv[a])
+        self.assertEqual(argv[-3:-1], ["-t", "23"], "the output cap must not cut the tail")
+
+    def test_a_shape_without_a_tail_builds_exactly_as_before(self):
+        short = fixturegen.PIPE_SHAPES["pipe_h264_ac3_short"]
+        argv = self._argv(short, short["duration"])
+        v = next(i for i, a in enumerate(argv) if a.startswith("testsrc2="))
+        self.assertEqual(argv[v - 5:v - 1], ["-t", "20", "-f", "lavfi"])
+        self.assertEqual(argv[-3:-1], ["-t", "20"])
+
+    def test_a_build_shorter_than_its_tail_has_no_picture_and_is_refused(self):
+        with self.assertRaises(fixturegen.Fail):
+            self._argv(fixturegen.PIPE_SHAPES[self.KEY], 3)
+
+    def test_the_burned_in_layout_states_the_pictures_length(self):
+        """verify() rebuilds this from the MEASURED file length, so the V0 line must come out the
+        same from the build's 23 and from the measured 23.005 rounded."""
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        line = fixturegen.layout_lines(self.KEY, spec, 23)[1]
+        self.assertTrue(line.endswith(" 20s"), line)
+        self.assertEqual(fixturegen.layout_lines(self.KEY, spec, round(23.005)),
+                         fixturegen.layout_lines(self.KEY, spec, 23))
+
+    def test_the_case_names_the_clip_and_declares_what_it_carries(self):
+        case = next(c for c in _manifest()["pipeline_cases"] if c["name"] == "pipe_finish_audio_tail")
+        spec = fixturegen.PIPE_SHAPES[self.KEY]
+        self.assertEqual(case["fixture"], self.KEY + ".mkv")
+        for k in ("vcodec", "acodec", "fps"):
+            self.assertEqual(case["declare"][k], spec["declare"][k], f"declare.{k} drifted from the shape")
+        self.assertTrue(case["expect"]["reaches_eos"])
+        self.assertEqual(case["expect"]["video_size"], spec["video"]["size"])
+        finish = next(c for c in _manifest()["pipeline_cases"] if c["name"] == "pipe_finish_eos")
+        self.assertEqual(case["expect"], finish["expect"],
+                         "same grading as pipe_finish_eos: the clip is the only thing that differs")
+        self.assertEqual(case["run_secs"], finish["run_secs"])
+        self.assertEqual(case["operations"], finish["operations"])
 
 
 class AbrResponseProfile(unittest.TestCase):
@@ -4015,7 +5420,7 @@ class TheAbrCommitLineMatchesTheHarnessRegex(unittest.TestCase):
     append silently retired a grader (`RE_ABR_UP` parses this line too).
     """
 
-    FF_RS = os.path.join(REPO_ROOT, "rust-modules", "src", "ff.rs")
+    FF_RS = os.path.join(REPO_ROOT, "rust-modules", "media", "src", "ff.rs")
 
     def commit_format(self):
         with open(self.FF_RS, encoding="utf-8") as fh:
@@ -4087,7 +5492,7 @@ class TheAbrCommitLineMatchesTheHarnessRegex(unittest.TestCase):
 class TheAbrWindowLineMatchesTheHarnessRegex(unittest.TestCase):
     """**The other half of a contract whose two sides never meet at runtime.**
 
-    The app formats `abr: window` on a television (`rust-modules/src/abr/window.rs`,
+    The app formats `abr: window` on a television (`rust-modules/media/src/abr/window.rs`,
     `AdmissionReadout::log_line`) and this harness parses it on a Mac. Nothing links them, so a
     field renamed on one side and not the other produces "no `abr: window` lines" -- which reads
     exactly like the feature never ran, i.e. like a total regression, on the one tier where the
@@ -4099,7 +5504,7 @@ class TheAbrWindowLineMatchesTheHarnessRegex(unittest.TestCase):
     the regex it is supposed to grade, and agree with it forever.
     """
 
-    WINDOW_RS = os.path.join(REPO_ROOT, "rust-modules", "src", "abr", "window.rs")
+    WINDOW_RS = os.path.join(REPO_ROOT, "rust-modules", "media", "src", "abr", "window.rs")
 
     @classmethod
     def wire_examples(cls):
@@ -4258,7 +5663,7 @@ class PostSeekSurvival(unittest.TestCase):
     """
 
     def _log(self, positions, tail=(), retired=True):
-        out = ["reload_transcode: fresh Load at offset 300s"]
+        out = ["autoseek: step → 300s (0 left)", "reload_transcode: fresh Load at offset 300s"]
         if retired:
             out.append("seek: retired previous encoder ok=1")
         out += [f"loop=60 fps=60 pos={t}s play=1000pm" for t in positions]
@@ -4275,7 +5680,7 @@ class PostSeekSurvival(unittest.TestCase):
 
     def test_a_stop_that_the_server_rejected_is_not_a_successful_retirement(self):
         lines = self._log(range(300, 480), retired=False)
-        lines.insert(1, "seek: retired previous encoder ok=0")
+        lines.insert(2, "seek: retired previous encoder ok=0")
         ok, why = run.op_seek_transcode(lines, 300, min_climb_after_s=45)
         self.assertFalse(ok, why)
         self.assertIn("ok=0", why)
@@ -4301,6 +5706,68 @@ class PostSeekSurvival(unittest.TestCase):
         """A short seek case may omit post-climb, never physical-session retirement."""
         ok, _ = run.op_seek_transcode(self._log(range(300, 315)), 300)
         self.assertTrue(ok)
+
+    def _pin_then_original_then_inplace_seek(self):
+        """`auto_pin_then_original_and_seek` on the v0.9.0 TV run, reduced: the 720p PIN rebuilt
+        the stream (`reload_transcode: fresh Load at offset 12s`), Original then restored direct
+        play and retired the pin's encoder, and the scheduled seek ~45 s later was an in-place
+        `av_seek` on the source file."""
+        pos = lambda t: f"loop=60 route=player overlay=none pos={t}s play=1000pm fps=60"
+        return ([pos(t) for t in range(0, 12)]
+                + ["quality: switch → 720p_4_mbps (1 left)",
+                   "route transition: user retranscode at 12s",
+                   "reload_transcode: fresh Load at offset 12s"]
+                + [pos(t) for t in range(12, 50)]
+                + ["quality: switch → original (0 left)", "reload_at: fresh Load at 50s",
+                   "abr: retired superseded encoder after Original handoff ok=1"]
+                + [pos(t) for t in range(50, 95)]
+                + ["autoseek: step → 300s (0 left)",
+                   "seek(in-place): av_seek t=300000000000 coalesced=0",
+                   "in-place seek: setTimeToDecode(296917000000) rv=0 setContentInfo=1 sendSegment=1"]
+                + [pos(t) for t in range(300, 339)])
+
+    def test_a_quality_switch_reload_before_the_seek_is_not_the_seeks_signal(self):
+        """The v0.9.0 failure: the grader grepped the WHOLE log, took the pin's own reload for the
+        seek's, and then failed it for not retiring an encoder the pin never replaced. Only the
+        lines after the seek was requested (`autoseek: step`) can be the seek's evidence."""
+        ok, why = run.op_seek_transcode(self._pin_then_original_then_inplace_seek(), 300,
+                                        min_climb_after_s=25)
+        self.assertFalse(ok, why)
+        self.assertIn("no transcode-seek signal", why)
+
+    def test_a_look_alike_before_the_seek_cannot_pass_it(self):
+        """The same trap in the passing direction: a switch's rebuild that DID retire its
+        predecessor must not grade a seek that never rebuilt anything."""
+        lines = self._pin_then_original_then_inplace_seek()
+        lines.insert(lines.index("reload_transcode: fresh Load at offset 12s") + 1,
+                     "seek: retired previous encoder ok=1")
+        ok, why = run.op_seek_transcode(lines, 300, min_climb_after_s=25)
+        self.assertFalse(ok, why)
+
+    def test_a_seek_that_was_never_requested_is_not_graded_from_other_reloads(self):
+        lines = [ln for ln in self._log(range(300, 480)) if not ln.startswith("autoseek:")]
+        ok, why = run.op_seek_transcode(lines, 300, min_climb_after_s=45)
+        self.assertFalse(ok, why)
+        self.assertIn("never requested", why)
+
+    def test_the_inplace_arm_grades_the_restored_source_and_its_survival(self):
+        lines = self._pin_then_original_then_inplace_seek()
+        ok, why = run.op_seek_inplace(lines, 300, min_climb_after_s=25)
+        self.assertTrue(ok, why)
+        ok, why = run.op_seek_inplace(lines[:-30], 300, min_climb_after_s=25)
+        self.assertFalse(ok, why)
+        self.assertIn("did not survive", why)
+
+    def test_the_case_states_its_inplace_assumption(self):
+        """After Original restores direct play the seek is an `av_seek`; the case says so (as its
+        sibling `original_then_auto_and_seek` does) instead of leaving the transcode arm to find a
+        reload that a direct play cannot emit."""
+        with open(run.MANIFEST) as f:
+            cases = json.load(f)["cases"]
+        case = next(c for c in cases if c["name"] == "auto_pin_then_original_and_seek")
+        seek = next(o for o in case["operations"] if o["op"] == "seek")
+        self.assertEqual(seek.get("mode"), "inplace")
+        self.assertTrue(seek.get("min_climb_after_s"))
 
 
 class DemuxFailureAssertion(unittest.TestCase):
@@ -4555,23 +6022,141 @@ class DepGates(unittest.TestCase):
 
     ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+    # Every path `ci/check-deps.sh` reads (it `cd`s to its own `..` first): the Rust sources it
+    # greps, its allowlists and helper, and the build configuration its `fpflags` rule scans.
+    # A self-test plants or mutates a file in a private copy of exactly these, never in the
+    # checkout, so the self-tests are independent of one another (they run in parallel, see
+    # `load_tests` at the bottom) and a failing or interrupted one cannot leave the working tree
+    # edited. `test_the_private_copy_grades_exactly_like_the_real_tree` (the grep inputs) and
+    # `test_the_private_copy_carries_every_fpflags_input` (the build configuration) fail if this
+    # list falls behind the script.
+    TREE_INPUTS = (
+        "ci",
+        "rust-modules/src",
+        # The layer crates split out of `src`: `ci/check-deps.sh` reads them as `SRC_BASE`,
+        # `SRC_MACHINE`, `SRC_NET`, `SRC_PLATFORM`, `SRC_GFX`, `SRC_UI`, `SRC_PLEX`, `SRC_TELEMETRY`, `SRC_DATA`, `SRC_SESSION` and `SRC_MEDIA`, so a copy without them grades a different
+        # tree than the checkout.
+        "rust-modules/base/src",
+        "rust-modules/machine/src",
+        "rust-modules/net/src",
+        "rust-modules/platform/src",
+        "rust-modules/gfx/src",
+        "rust-modules/ui/src",
+        "rust-modules/plex/src",
+        "rust-modules/telemetry/src",
+        "rust-modules/data/src",
+        "rust-modules/session/src",
+        "rust-modules/media/src",
+        "rust-modules/appkit/src",
+        "rust-modules/screens/src",
+        "rust-modules/Cargo.toml",
+        "rust-modules/build.rs",
+        "rust-modules/net/Cargo.toml",
+        "rust-modules/plex/Cargo.toml",
+        "rust-modules/telemetry/Cargo.toml",
+        "rust-modules/data/Cargo.toml",
+        "rust-modules/session/Cargo.toml",
+        "rust-modules/media/Cargo.toml",
+        "rust-modules/appkit/Cargo.toml",
+        "rust-modules/appkit/build.rs",
+        "rust-modules/screens/Cargo.toml",
+        "rust-modules/screens/build.rs",
+        "rust-modules/platform/Cargo.toml",
+        "rust-modules/platform/build.rs",
+        "rust-modules/gfx/Cargo.toml",
+        "rust-modules/gfx/build.rs",
+        "rust-modules/ui/Cargo.toml",
+        "rust-modules/ui/build.rs",
+        "rust-modules/storage/Cargo.toml",
+        "rust-modules/storage/build.rs",
+        "rust-modules/.cargo",
+        "Makefile",
+    )
+
+    @functools.cached_property
+    def tree(self):
+        """The private copy of the gate's inputs; removed when the test ends."""
+        root = tempfile.mkdtemp(prefix="_check_deps_tree_")
+        self.addCleanup(shutil.rmtree, root, True)
+        for rel in self.TREE_INPUTS:
+            source = os.path.join(self.ROOT, rel)
+            if not os.path.exists(source):
+                continue
+            target = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.isdir(source):
+                shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
+            else:
+                shutil.copy2(source, target)
+        return root
+
     def test_check_deps_is_green(self):
         r = subprocess.run([os.path.join(self.ROOT, "ci", "check-deps.sh")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def _plant(self, name, content):
+    def test_self_tests_never_touch_the_real_tree(self):
+        """Red-first for the parallel gate self-tests: every planting helper below edits a private
+        copy of the gate's inputs, never the checkout. A helper that wrote into the checkout
+        bumped the mtime of a file `cargo` watches, so the NEXT cargo invocation of a `make check`
+        recompiled the whole crate for nothing -- and made it impossible to run two self-tests at
+        once."""
+        real = os.path.join(self.ROOT, "rust-modules", "data", "src", "browse", "mod.rs")
+        before = os.stat(real).st_mtime_ns
+        self.assertEqual(self._prepend("browse/mod.rs", "\n").returncode, 0)
+        self.assertEqual(os.stat(real).st_mtime_ns, before, "a self-test wrote into the real tree")
+
+    def test_the_private_copy_grades_exactly_like_the_real_tree(self):
+        """The copy must carry every input `ci/check-deps.sh` reads: a missing one makes a gate see
+        nothing and pass (or fail) for a reason the real tree would not share."""
+        real = subprocess.run([os.path.join(self.ROOT, "ci", "check-deps.sh")], capture_output=True, text=True)
+        copy = subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")], capture_output=True, text=True)
+        self.assertEqual((copy.returncode, copy.stdout), (real.returncode, real.stdout), copy.stderr)
+
+    def test_the_private_copy_carries_every_fpflags_input(self):
+        """The untouched copy above cannot see an input that was left out of `TREE_INPUTS` -- a
+        gate that scans nothing is green. So plant what the `fpflags` rule looks for in each file
+        it scans, inside the copy, and require the rule to go red naming it.
+
+        All of them are planted at once and graded by ONE run: the rule prints one `path:line:text`
+        match per offending file, so a file the rule did not scan (or the copy did not carry)
+        is missing from the output and that input's subtest fails by name. Run one file at a
+        time this was 17 of the 73 `ci/check-deps.sh` runs in this class (about a quarter of
+        the module's CPU)."""
+        inputs = ("rust-modules/Cargo.toml", "rust-modules/build.rs", "rust-modules/net/Cargo.toml", "rust-modules/plex/Cargo.toml", "rust-modules/telemetry/Cargo.toml", "rust-modules/data/Cargo.toml", "rust-modules/session/Cargo.toml", "rust-modules/media/Cargo.toml", "rust-modules/appkit/Cargo.toml", "rust-modules/appkit/build.rs", "rust-modules/screens/Cargo.toml", "rust-modules/screens/build.rs", "rust-modules/platform/Cargo.toml",
+                  "rust-modules/platform/build.rs", "rust-modules/gfx/Cargo.toml",
+                  "rust-modules/gfx/build.rs", "rust-modules/ui/Cargo.toml", "rust-modules/ui/build.rs",
+                  "rust-modules/storage/Cargo.toml",
+                  "rust-modules/storage/build.rs", "rust-modules/.cargo/config.toml", "Makefile")
+        for rel in inputs:
+            target = os.path.join(self.tree, rel)
+            self.assertTrue(os.path.exists(target), f"{rel} is not in the private copy (TREE_INPUTS)")
+            with open(target, "a", encoding="utf-8") as f:
+                f.write("\nrustflags = [\"-C\", \"target-feature=+fma\"]\n")
+        r = subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")],
+                           capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("fpflags:", out)
+        reported = {line.split(":", 1)[0] for line in out.splitlines() if "target-feature=+fma" in line}
+        for rel in inputs:
+            with self.subTest(input=rel):
+                self.assertIn(rel, reported, out)
+
+    def _plant(self, name, content, crate_dir=None):
         """Write `content` to a temp file under rust-modules/src that no ci/allow/*.txt names,
-        run ci/check-deps.sh against the real tree with it present, and guarantee removal even if
+        run the private copy's ci/check-deps.sh with it present, and guarantee removal even if
         the assertion that follows fails. An orphan .rs file with no `mod` statement pointing at
         it is invisible to cargo (nothing declares it part of the crate) but not to `find … -name
         '*.rs'`, which is all these gates scan with — so this is the cheapest way to prove a gate
         catches a shape without touching a real, permanent source file."""
-        target = os.path.join(self.ROOT, "rust-modules", "src", name)
+        # `player/` and `route/` are the media layer crate's now (docs/module-layers.md, Split 11).
+        crate = crate_dir or ("media" if name.split("/")[0] in ("player", "route") else None)
+        target = os.path.join(self.tree, "rust-modules", *([crate] if crate else []), "src", name)
         self.assertFalse(os.path.exists(target), f"stale self-test artifact at {target} — remove it by hand")
         try:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content)
-            return subprocess.run([os.path.join(self.ROOT, "ci", "check-deps.sh")],
+            return subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")],
                                    capture_output=True, text=True)
         finally:
             if os.path.exists(target):
@@ -4583,34 +6168,78 @@ class DepGates(unittest.TestCase):
         assertion that follows fails. Unlike `_plant`'s orphan-file trick, `mutators-visibility`
         greps a DECLARATION LINE inside one of the seven specific legacy-store files by path, not
         a `find … -name '*.rs'` sweep, so an orphan file elsewhere in the tree is invisible to it
-        by design; a scratch mutation of the real file's own content is what "plants a
+        by design; a scratch mutation of the copied file's own content is what "plants a
         pub(crate) fn set_cur in a temp copy" (the D3 brief's own words) has to mean here."""
-        target = os.path.join(self.ROOT, "rust-modules", "src", relpath)
+        target = self._store_file(relpath)
         with open(target, encoding="utf-8") as f:
             original = f.read()
         self.assertEqual(original.count(needle), 1, f"{needle!r} not found exactly once in {relpath}")
         try:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(original.replace(needle, replacement, 1))
-            return subprocess.run([os.path.join(self.ROOT, "ci", "check-deps.sh")],
+            return subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")],
                                    capture_output=True, text=True)
         finally:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(original)
 
+    def _store_file(self, relpath):
+        """The private copy's path of a store module: the data layer's crate (`plx_data`, Split 9)
+        holds stores/, browse/, pms.rs, metadata.rs, search.rs, person.rs and viewstate.rs; any other
+        relative path is the application crate's. A path that exists in neither fails the caller's
+        open(), loudly."""
+        data = os.path.join(self.tree, "rust-modules", "data", "src", relpath)
+        return data if os.path.exists(data) else os.path.join(self.tree, "rust-modules", "src", relpath)
+
     def _prepend(self, relpath, content):
         """Temporarily prepend a valid module-level fixture to a scanned Rust file."""
-        target = os.path.join(self.ROOT, "rust-modules", "src", relpath)
+        target = self._store_file(relpath)
         with open(target, encoding="utf-8") as f:
             original = f.read()
         try:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content + original)
-            return subprocess.run([os.path.join(self.ROOT, "ci", "check-deps.sh")],
+            return subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")],
                                   capture_output=True, text=True)
         finally:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(original)
+
+    def _prepend_files(self, fixtures):
+        """`_prepend` for several files at once, graded by ONE `ci/check-deps.sh` run.
+
+        `fixtures` maps a store-relative path to the module-level text to prepend. Each variant
+        a self-test wants to prove is rejected gets its OWN declaration (a distinct name), so the
+        one run still shows which variants the gate caught: `_assert_flagged` requires every one
+        by name. Run one variant at a time these were 34 of the 73 gate runs in this class, and a
+        run is ~7 s of CPU."""
+        originals = {}
+        try:
+            for relpath, content in fixtures.items():
+                target = self._store_file(relpath)
+                with open(target, encoding="utf-8") as f:
+                    originals[target] = f.read()
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(content + originals[target])
+            return subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")],
+                                  capture_output=True, text=True)
+        finally:
+            for target, original in originals.items():
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(original)
+
+    def _assert_flagged(self, r, rule, flagged):
+        """The run failed, and the gate named `rule:` and printed, for each `(relpath, marker)`,
+        a `path:line:text` line of THAT file whose text holds `marker` -- so a variant the gate
+        missed fails by name even though the others were caught in the same run."""
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn(f"{rule}:", out)
+        for relpath, marker in flagged:
+            with self.subTest(file=relpath, flagged=marker):
+                self.assertTrue(
+                    any(f"/src/{relpath}:" in line and marker in line for line in out.splitlines()),
+                    f"{rule} did not flag {marker!r} in {relpath}\n{out}")
 
     def test_browse_owner_gate_rejects_a_republished_free_mutator(self):
         """A valid module-level declaration is rejected even without a call site."""
@@ -4621,28 +6250,22 @@ class DepGates(unittest.TestCase):
         self.assertIn("fn set_cur", out)
 
     def test_browse_owner_gate_rejects_all_free_declaration_modifiers(self):
-        for declaration in (
-            "    pub(super) fn set_cur(i: usize) {}\n",
-            "async fn set_cur(i: usize) {}\n",
-            "const fn set_cur(i: usize) {}\n",
-            "unsafe extern \"C\" fn set_cur(i: usize) {}\n",
-        ):
-            with self.subTest(declaration=declaration):
-                r = self._prepend("browse/mod.rs", "\n" + declaration)
-                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-                self.assertIn("browse-owner:", r.stdout + r.stderr)
+        declarations = (
+            ("set_cur", "    pub(super) fn set_cur(i: usize) {}\n"),
+            ("cur", "async fn cur(i: usize) {}\n"),
+            ("reset", "const fn reset(i: usize) {}\n"),
+            ("requery", "unsafe extern \"C\" fn requery(i: usize) {}\n"),
+        )
+        r = self._prepend_files({"browse/mod.rs": "".join("\n" + d for _, d in declarations)})
+        self._assert_flagged(r, "browse-owner", [("browse/mod.rs", f"fn {n}") for n, _ in declarations])
 
     def test_browse_owner_gate_rejects_attributes_and_split_free_declarations(self):
-        for declaration in (
-            "#[inline] pub(super) const fn set_cur(i: usize) {}\n",
-            "#[inline]\npub(super)\nconst fn\nset_cur(i: usize) {}\n",
-        ):
-            with self.subTest(declaration=declaration):
-                r = self._prepend("browse/mod.rs", "\n" + declaration)
-                out = r.stdout + r.stderr
-                self.assertNotEqual(r.returncode, 0, out)
-                self.assertIn("browse-owner:", out)
-                self.assertIn("set_cur", out)
+        declarations = (
+            ("set_cur", "#[inline] pub(super) const fn set_cur(i: usize) {}\n"),
+            ("cur", "#[inline]\npub(super)\nconst fn\ncur(i: usize) {}\n"),
+        )
+        r = self._prepend_files({"browse/mod.rs": "".join("\n" + d for _, d in declarations)})
+        self._assert_flagged(r, "browse-owner", [("browse/mod.rs", name) for name, _ in declarations])
 
     def test_browse_owner_gate_is_nonvacuous_for_indented_free_declarations(self):
         r = self._prepend("browse/mod.rs", "\n    pub fn set_cur(i: usize) {}\n")
@@ -4673,14 +6296,15 @@ class DepGates(unittest.TestCase):
             'const ESCAPED_SCOPE: &str = "\\\\\\\"{";\n',
             "const ESCAPED_CHAR_SCOPE: char = '\\\'';\nconst LABEL_SCOPE: &str = \"{\";\n",
         )
-        for prefix in fixtures:
-            with self.subTest(prefix=prefix):
-                r = self._prepend(
-                    "browse/mod.rs",
-                    "\n" + prefix + "    pub(super) unsafe extern \"C\" fn set_cur(i: usize) {}\n",
-                )
-                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-                self.assertIn("browse-owner:", r.stdout + r.stderr)
+        # One free fn per fixture, each under its own facade name, all in one file: a fixture the
+        # scanner mis-counts as an open scope hides its own fn (and so fails by name).
+        names = ("set_cur", "cur", "reset", "requery", "run", "pump", "sections", "sources", "states")
+        self.assertEqual(len(names), len(fixtures))
+        text = "".join(
+            "\n" + prefix + f"    pub(super) unsafe extern \"C\" fn {name}(i: usize) {{}}\n"
+            for prefix, name in zip(fixtures, names))
+        r = self._prepend_files({"browse/mod.rs": text})
+        self._assert_flagged(r, "browse-owner", [("browse/mod.rs", f"fn {n}(") for n in names])
 
     def test_browse_owner_gate_ignores_noncode_closing_braces_inside_an_impl(self):
         """A compiling impl fixture remains receiver-bound even when every Rust literal/comment
@@ -4705,30 +6329,23 @@ impl BrowseScopeFixture {
         self.assertIn("ok — browse-owner", r.stdout)
 
     def test_browse_owner_gate_rejects_retired_transport_declarations(self):
-        for relpath, declaration in (
-            ("browse/mod.rs", "    pub(crate) static LEGACY_ADAPTER: () = ();\n"),
-            ("stores/browse.rs", "    pub(super) static ACTIVE: () = ();\n"),
-            ("browse/mod.rs", "    static mut RETIRED_BROWSE: Option<BrowseState> = None;\n"),
-        ):
-            with self.subTest(declaration=declaration):
-                r = self._prepend(relpath, "\n" + declaration)
-                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-                self.assertIn("browse-owner:", r.stdout + r.stderr)
+        declarations = (
+            ("browse/mod.rs", "LEGACY_ADAPTER", "    pub(crate) static LEGACY_ADAPTER: () = ();\n"),
+            ("stores/browse.rs", "ACTIVE", "    pub(super) static ACTIVE: () = ();\n"),
+            ("browse/mod.rs", "RETIRED_BROWSE", "    static mut RETIRED_BROWSE: Option<BrowseState> = None;\n"),
+        )
+        by_file = {}
+        for relpath, _, declaration in declarations:
+            by_file[relpath] = by_file.get(relpath, "") + "\n" + declaration
+        r = self._prepend_files(by_file)
+        self._assert_flagged(r, "browse-owner", [(relpath, name) for relpath, name, _ in declarations])
 
     def test_browse_owner_gate_rejects_retired_thread_local_selectors(self):
-        for relpath, selector in (
-            ("browse/mod.rs", "LEGACY_ADAPTER"),
-            ("stores/browse.rs", "ACTIVE"),
-        ):
-            with self.subTest(selector=selector):
-                r = self._prepend(
-                    relpath,
-                    f"\nthread_local! {{\n    static {selector}: () = ();\n}}\n",
-                )
-                out = r.stdout + r.stderr
-                self.assertNotEqual(r.returncode, 0, out)
-                self.assertIn("browse-owner:", out)
-                self.assertIn(f"static {selector}", out)
+        selectors = (("browse/mod.rs", "LEGACY_ADAPTER"), ("stores/browse.rs", "ACTIVE"))
+        r = self._prepend_files({
+            relpath: f"\nthread_local! {{\n    static {selector}: () = ();\n}}\n"
+            for relpath, selector in selectors})
+        self._assert_flagged(r, "browse-owner", [(relpath, f"static {selector}") for relpath, selector in selectors])
 
     def test_browse_owner_gate_accepts_unrelated_thread_local_state(self):
         r = self._prepend(
@@ -4739,14 +6356,14 @@ impl BrowseScopeFixture {
         self.assertIn("ok — browse-owner", r.stdout)
 
     def test_browse_owner_gate_fails_closed_when_a_scanner_input_is_missing(self):
-        target = os.path.join(self.ROOT, "rust-modules", "src", "browse", "view.rs")
+        target = self._store_file(os.path.join("browse", "view.rs"))
         hidden = target + ".check-deps-selftest"
         self.assertTrue(os.path.exists(target), f"missing scanner fixture {target}")
         self.assertFalse(os.path.exists(hidden), f"stale self-test artifact at {hidden}")
         try:
             os.replace(target, hidden)
             r = subprocess.run(
-                [os.path.join(self.ROOT, "ci", "check-deps.sh")],
+                [os.path.join(self.tree, "ci", "check-deps.sh")],
                 capture_output=True,
                 text=True,
             )
@@ -4760,41 +6377,38 @@ impl BrowseScopeFixture {
 
     def test_browse_owner_gate_accepts_receiver_bound_owned_methods(self):
         """A BrowseState selector is safe when it requires an explicit receiver. GREEN:
-        temporarily widen the owned `cur(&self)` method to `pub`; the gate must still pass,
-        proving it rejects free/global facades rather than all methods with those names."""
+        re-declare the owned `cur(&self)` method (already `pub` since the data crate split, so the
+        mutation adds an attribute rather than widening); the gate must still pass, proving it
+        rejects free/global facades rather than all methods with those names."""
         r = self._mutate(
             os.path.join("browse", "mod.rs"),
-            "    pub(crate) fn cur(&self) -> usize {",
             "    pub fn cur(&self) -> usize {",
+            "    #[inline]\n    pub fn cur(&self) -> usize {",
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("ok — browse-owner", r.stdout)
 
     def test_viewstate_owner_gate_rejects_a_republished_free_state_facade(self):
         """A free pump can only reach process state; the owned spelling requires a receiver."""
-        for declaration in (
-            "pub(crate) fn pump() {}\n",
-            "#[inline]\npub(super)\nconst fn\nis_busy() -> bool { false }\n",
-        ):
-            with self.subTest(declaration=declaration):
-                r = self._prepend("viewstate.rs", "\n" + declaration)
-                out = r.stdout + r.stderr
-                self.assertNotEqual(r.returncode, 0, out)
-                self.assertIn("viewstate-owner:", out)
+        declarations = (
+            ("pump", "pub(crate) fn pump() {}\n"),
+            ("is_busy", "#[inline]\npub(super)\nconst fn\nis_busy() -> bool { false }\n"),
+        )
+        r = self._prepend_files({"viewstate.rs": "".join("\n" + d for _, d in declarations)})
+        self._assert_flagged(r, "viewstate-owner", [("viewstate.rs", name) for name, _ in declarations])
 
     def test_viewstate_owner_gate_rejects_storage_transport_and_selector_statics(self):
         fixtures = (
-            ("viewstate.rs", "static mut QUEUE: Vec<()> = Vec::new();\n"),
-            ("viewstate.rs", "static MAIL: std::sync::Mutex<Option<()>> = std::sync::Mutex::new(None);\n"),
-            ("stores/viewstate.rs", "static RETIRED: Option<ViewStateStore> = None;\n"),
-            ("stores/viewstate.rs", "thread_local! {\n    static ACTIVE: () = ();\n}\n"),
+            ("viewstate.rs", "QUEUE", "static mut QUEUE: Vec<()> = Vec::new();\n"),
+            ("viewstate.rs", "MAIL", "static MAIL: std::sync::Mutex<Option<()>> = std::sync::Mutex::new(None);\n"),
+            ("stores/viewstate.rs", "RETIRED", "static RETIRED: Option<ViewStateStore> = None;\n"),
+            ("stores/viewstate.rs", "ACTIVE", "thread_local! {\n    static ACTIVE: () = ();\n}\n"),
         )
-        for relpath, declaration in fixtures:
-            with self.subTest(declaration=declaration):
-                r = self._prepend(relpath, "\n" + declaration)
-                out = r.stdout + r.stderr
-                self.assertNotEqual(r.returncode, 0, out)
-                self.assertIn("viewstate-owner:", out)
+        by_file = {}
+        for relpath, _, declaration in fixtures:
+            by_file[relpath] = by_file.get(relpath, "") + "\n" + declaration
+        r = self._prepend_files(by_file)
+        self._assert_flagged(r, "viewstate-owner", [(relpath, name) for relpath, name, _ in fixtures])
 
     def test_viewstate_owner_gate_accepts_receiver_bound_owned_methods(self):
         fixture = """
@@ -4808,32 +6422,60 @@ impl ViewStateOwnerGateFixture {
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("ok — viewstate-owner", r.stdout)
 
+    def test_test_module_discovery_lexer_and_graph_regressions(self):
+        result = subprocess.run([sys.executable, os.path.join(self.ROOT, "ci", "test_rust_test_modules.py")],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def _module_path_fixture(self, production_reference):
+        source = os.path.join(self.tree, "rust-modules", "src")
+        with tempfile.TemporaryDirectory(prefix="_check_deps_cfg_", dir=source) as directory:
+            declaration = '#[cfg(test)]\n#[allow(dead_code)]\n#[path = "support.rs"]\npub(crate) mod checks;\n'
+            if production_reference:
+                declaration += '#[path = "support.rs"] mod production;\n'
+            with open(os.path.join(directory, "entry.rs"), "w", encoding="utf-8") as output:
+                output.write(declaration)
+            target = os.path.join(directory, "support.rs")
+            with open(target, "w", encoding="utf-8") as output:
+                output.write('pub fn helper() { std::thread::spawn(|| {}); let _ = 0.5f32.powf(2.4); }\n')
+            result = subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")],
+                                    capture_output=True, text=True)
+            return result, os.path.relpath(target, self.tree)
+
+    def test_cfg_test_path_modules_are_excluded_from_production_gates(self):
+        result, target = self._module_path_fixture(False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(target + ":", result.stdout)
+
+    def test_production_path_reference_prevents_test_file_exemption(self):
+        result, target = self._module_path_fixture(True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("threads:", result.stdout)
+        self.assertIn("libm:", result.stdout)
+        self.assertIn(target + ":", result.stdout)
+
     def test_person_owner_gate_rejects_free_read_and_mutation_facades(self):
-        for declaration in (
-            "pub(crate) fn current() -> Option<()> { None }\n",
-            "#[inline]\npub(super)\nfn\npump() -> bool { false }\n",
-            "pub(crate) fn apply() {}\n",
-        ):
-            with self.subTest(declaration=declaration):
-                r = self._prepend("person.rs", "\n" + declaration)
-                out = r.stdout + r.stderr
-                self.assertNotEqual(r.returncode, 0, out)
-                self.assertIn("person-owner:", out)
+        declarations = (
+            ("current", "pub(crate) fn current() -> Option<()> { None }\n"),
+            ("pump", "#[inline]\npub(super)\nfn\npump() -> bool { false }\n"),
+            ("apply", "pub(crate) fn apply() {}\n"),
+        )
+        r = self._prepend_files({"person.rs": "".join("\n" + d for _, d in declarations)})
+        self._assert_flagged(r, "person-owner", [("person.rs", name) for name, _ in declarations])
 
     def test_person_owner_gate_rejects_model_transport_and_selector_statics(self):
         fixtures = (
-            ("person.rs", "static mut CURRENT: Option<Person> = None;\n"),
-            ("person.rs", "static FETCH: Option<Fetch> = None;\n"),
-            ("person.rs", "static RETRY_CD: [u32; 1] = [0];\n"),
-            ("stores/person.rs", "static RETIRED: Option<PersonStore> = None;\n"),
-            ("stores/person.rs", "thread_local! {\n    static ACTIVE: () = ();\n}\n"),
+            ("person.rs", "CURRENT", "static mut CURRENT: Option<Person> = None;\n"),
+            ("person.rs", "FETCH", "static FETCH: Option<Fetch> = None;\n"),
+            ("person.rs", "RETRY_CD", "static RETRY_CD: [u32; 1] = [0];\n"),
+            ("stores/person.rs", "RETIRED", "static RETIRED: Option<PersonStore> = None;\n"),
+            ("stores/person.rs", "ACTIVE", "thread_local! {\n    static ACTIVE: () = ();\n}\n"),
         )
-        for relpath, declaration in fixtures:
-            with self.subTest(declaration=declaration):
-                r = self._prepend(relpath, "\n" + declaration)
-                out = r.stdout + r.stderr
-                self.assertNotEqual(r.returncode, 0, out)
-                self.assertIn("person-owner:", out)
+        by_file = {}
+        for relpath, _, declaration in fixtures:
+            by_file[relpath] = by_file.get(relpath, "") + "\n" + declaration
+        r = self._prepend_files(by_file)
+        self._assert_flagged(r, "person-owner", [(relpath, name) for relpath, name, _ in fixtures])
 
     def test_person_owner_gate_accepts_receiver_bound_owned_methods(self):
         fixture = """
@@ -4862,6 +6504,703 @@ impl PersonOwnerGateFixture {
         self.assertIn("threads:", out)
         self.assertIn("_check_deps_selftest_threads.rs", out)
 
+    def test_blocking_gate_catches_a_new_allow_blocking_site(self):
+        """A frame-thread blocking exception is a ledger entry in ci/allow/blocking.txt. RED: a new
+        production `allow_blocking(` that the list does not name must fail `blocking`, naming the
+        file and the enclosing fn."""
+        body = ("pub fn sneaky() {\n    let _b = plx_base::task::allow_blocking("
+                "const { &plx_base::task::BlockingLabel::new(\"x\") });\n}\n")
+        r = self._plant("_check_deps_selftest_blocking.rs", body)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("blocking:", out)
+        self.assertIn("_check_deps_selftest_blocking.rs::sneaky", out)
+
+    def test_blocking_gate_ignores_tests_comments_and_declarations(self):
+        """GREEN: the same call inside a `#[cfg(test)] mod`, in a comment, or as an `fn` declaration
+        is not a call site."""
+        r = self._plant(
+            "_check_deps_selftest_blocking_ok.rs",
+            "// allow_blocking(label) is documented here\n"
+            "pub fn allow_blocking(label: &str) {}\n"
+            "#[cfg(test)]\nmod tests {\n    fn t() { let _b = plx_base::task::allow_blocking(L); }\n}\n",
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ok — blocking", r.stdout)
+
+    def test_blocking_gate_catches_an_aliased_allow_blocking(self):
+        """The call-site grep cannot see `use ...::allow_blocking as x; x(..)` or `let f =
+        allow_blocking;`. RED: a production mention of the bare identifier that is not a call, the
+        `fn` definition or the listed re-export must fail `blocking`."""
+        body = ("use plx_base::task::allow_blocking as sneak;\n\npub fn sneaky() {\n"
+                "    let _f = sneak;\n}\n")
+        r = self._plant("_check_deps_selftest_blocking_alias.rs", body)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("blocking:", out)
+        self.assertIn("_check_deps_selftest_blocking_alias.rs:1", out)
+
+    def test_blocking_gate_catches_a_stale_entry(self):
+        """The ledger only shrinks: an entry whose site is gone must fail `blocking`, so a migration
+        has to delete its line (and a line cannot be left behind to excuse a later regrowth)."""
+        allow = os.path.join(self.tree, "ci", "allow", "blocking.txt")
+        with open(allow, encoding="utf-8") as f:
+            original = f.read()
+        try:
+            declared = int(original.splitlines()[0].split(":")[1])
+            stale = original.replace(f"# count: {declared}", f"# count: {declared + 1}", 1)
+            stale += "rust-modules/media/src/route/decision.rs::no_such_fn\tgone\n"
+            with open(allow, "w", encoding="utf-8") as f:
+                f.write(stale)
+            r = subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")], capture_output=True, text=True)
+        finally:
+            with open(allow, "w", encoding="utf-8") as f:
+                f.write(original)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("blocking:", out)
+        self.assertIn("decision.rs::no_such_fn", out)
+
+    # ---- the Sans-IO ledgers (docs/sans-io.md) ----------------------------------------------------
+    # `blocking` keeps ONE file; workers, globals, forks and fxlanes keep one file per AREA under
+    # ci/allow/<rule>/<area>.txt (the crate, or for data/ the top-level module), so two migrations
+    # in different areas never edit the same `# count:` header.
+    LEDGER_RULES = ("workers", "globals", "forks", "fxlanes")
+
+    def _deps(self):
+        return subprocess.run([os.path.join(self.tree, "ci", "check-deps.sh")], capture_output=True, text=True)
+
+    def _ledger_files(self, rule):
+        root = os.path.join(self.tree, "ci", "allow", rule)
+        return sorted(os.path.join(root, fn) for fn in os.listdir(root) if fn.endswith(".txt"))
+
+    def test_blocking_ledger_keeps_its_multiset_shape_after_the_refactor(self):
+        """`blocking` now runs on the shared ledger scanner and must grade as it always did: every
+        call is its own ledger line (two calls in one fn are two lines), a call in a closure
+        belongs to the fn around the closure, and a call on the same line as its `fn` belongs to
+        that fn. The same test passes on the pre-refactor script."""
+        name = "_check_deps_selftest_blocking_shapes.rs"
+        body = ("pub fn two() {\n    let _a = plx_base::task::allow_blocking(L1);\n"
+                "    let _b = plx_base::task::allow_blocking(L2);\n}\n"
+                "pub fn closure() {\n    let f = || { let _c = plx_base::task::allow_blocking(L3); };\n    f();\n}\n"
+                "pub fn one_liner() { let _d = plx_base::task::allow_blocking(L4); }\n")
+        r = self._plant(name, body)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        new = sorted(line.rsplit("::", 1)[1] for line in out.splitlines()
+                     if "new frame-thread blocking exception:" in line and name in line)
+        self.assertEqual(new, ["closure", "one_liner", "two", "two"], out)
+        self.assertIn("new: 4, stale: 0, aliased: 0", out)
+
+    def test_workers_ledger_catches_a_new_worker_start_in_a_machine(self):
+        """RED: a production worker start in a machine (a data/ store, a screen, the session owner ...)
+        that no ci/allow/workers/<area>.txt names must fail `workers`, keyed by file, enclosing fn
+        and spelling, in every spelling the base layer offers -- qualified, bare after a `use`, the
+        typed command worker's `submit_ticket` -- and naming the ledger file its area owns."""
+        name = "_check_deps_selftest_workers.rs"
+        body = ("use plx_base::task::spawn_off_frame;\nuse plx_base::storage_worker::submit;\n\n"
+                "pub fn qualified() {\n    let _ = plx_base::task::spawn_small(\"x\", || {});\n}\n"
+                "pub fn bare() {\n    let _ = spawn_off_frame(\"y\", |_| {});\n    let _ = submit(|| ());\n}\n"
+                "pub fn typed(w: &Worker) {\n    let _ = w.submit_ticket(1);\n}\n"
+                "pub fn task_spawn() {\n    let _ = plx_base::task::spawn(\"z\", || {});\n}\n")
+        r = self._plant(name, body, crate_dir="data")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("workers:", out)
+        key = f"rust-modules/data/src/{name}"
+        for site in ("qualified::spawn_small", "bare::spawn_off_frame", "bare::submit",
+                     "typed::submit_ticket", "task_spawn::task::spawn"):
+            with self.subTest(site=site):
+                self.assertIn(f"{key}::{site}", out)
+        self.assertIn("ci/allow/workers/data-_check_deps_selftest_workers.txt", out)
+
+    def test_globals_ledger_catches_a_new_registry_read_in_a_machine(self):
+        """RED: a production read of a process-global registry in a machine fails `globals`: the
+        getters, the qualified `session::peek`, and a bare `peek` only because this file imports it
+        from session -- `it.peek()` on any other value is not one."""
+        name = "_check_deps_selftest_globals.rs"
+        body = ("use plx_plex::plex::session::peek;\n\n"
+                "pub fn reads() {\n"
+                "    let _a = plx_plex::plex::client_for(plx_plex::plex::session::current_server());\n"
+                "    let _b = plx_plex::plex::session::peek();\n"
+                "    let _c = plx_net::net::keypin::revision();\n"
+                "    let _d = plx_plex::plex::grant::offers();\n"
+                "    let _e = peek();\n"
+                "    let _f = it.peek();\n"
+                "    let _g = plx_plex::plex::session::current_snapshot();\n"
+                "    let _h = plx_net::net::keypin::blocked_for(1);\n}\n")
+        r = self._plant(name, body, crate_dir="screens")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        key = f"rust-modules/screens/src/{name}::reads"
+        for spelling in ("client_for", "current_server", "session::peek", "keypin::revision",
+                         "grant::offers", "peek", "current_snapshot", "keypin::blocked_for"):
+            with self.subTest(spelling=spelling):
+                self.assertIn(f"{key}::{spelling}  (ledger: ", out)
+        self.assertEqual(out.count(f"{key}::peek  (ledger: "), 1, "`it.peek()` is not a registry read\n" + out)
+        self.assertIn("ci/allow/globals/screens.txt", out)
+
+    def test_forks_ledger_catches_a_new_production_test_fork(self):
+        """RED: a `#[cfg(not(test))]` / `cfg!(not(test))` / `not(feature = \"test-support\")` fork in
+        any machine crate (data/, plex/, media/, session/, screens/, ui/, appkit/, machine/) that no
+        ci/allow/forks/<area>.txt names fails `forks`, keyed by
+        the item it sits on, or the fn around a statement or an inline `cfg!`."""
+        name = "_check_deps_selftest_forks.rs"
+        body = ("#[cfg(not(test))]\npub fn real_only() {}\n\n"
+                "pub fn inline() -> bool {\n    cfg!(not(test))\n}\n\n"
+                "#[cfg(not(any(test, feature = \"test-support\")))]\nconst LIVE: u8 = 1;\n\n"
+                "#[cfg(not(feature = \"test-support\"))]\npub fn gated() {}\n\n"
+                "pub fn stmt() {\n    #[cfg(not(test))]\n    let _x = 1;\n}\n\n"
+                "pub struct S;\nimpl S {\n    #[cfg(all(target_os = \"linux\", not(test)))]\n"
+                "    pub fn method(&self) {}\n}\n")
+        r = self._plant(name, body, crate_dir="session")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("forks:", out)
+        key = f"rust-modules/session/src/{name}"
+        for item in ("real_only", "inline", "LIVE", "gated", "stmt", "method"):
+            with self.subTest(item=item):
+                self.assertIn(f"{key}::{item}  (ledger: ", out)
+        self.assertIn("ci/allow/forks/session.txt", out)
+
+    def test_forks_ledger_reads_every_machine_crate_not_only_the_four_that_own_the_data(self):
+        """RED: a machine in screens/, ui/, appkit/ or machine/ forks on `cfg(test)` as surely as one in data/ does
+        (`screens/src/legal.rs` `build_sha`, `screens/src/login.rs` `harness_driven` were the live cases), so the
+        `forks` scope is every machine crate. A production fork planted in each -- an attribute production can
+        satisfy and an inline `cfg!(test)` -- is a new site naming the area file its crate owns, and an item only
+        a test can see (`#[cfg(test)]`, `any(test, feature = \"test-support\")`) is still no fork there. A field under
+        a cfg has no fn around it, so it is keyed by its struct (`Holder`), never the unnamed `?`."""
+        body = ("#[cfg(not(any(test, feature = \"test-support\")))]\nfn production_only() {}\n\n"
+                "pub fn inline_test() -> bool {\n    if cfg!(test) { true } else { false }\n}\n\n"
+                "pub struct Holder {\n    kept: u8,\n    #[cfg(not(test))]\n    live: u8,\n}\n\n"
+                "#[cfg(test)]\nfn test_only() {}\n\n"
+                "#[cfg(any(test, feature = \"test-support\"))]\nfn support_only() {}\n")
+        name = "_check_deps_selftest_machine_forks.rs"
+        for crate in ("screens", "ui", "appkit", "machine"):
+            with open(os.path.join(self.tree, "rust-modules", crate, "src", name), "w", encoding="utf-8") as f:
+                f.write(body)
+        r = self._deps()
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("forks:", out)
+        for crate in ("screens", "ui", "appkit", "machine"):
+            key = f"rust-modules/{crate}/src/{name}"
+            for item in ("production_only", "inline_test", "Holder"):
+                with self.subTest(crate=crate, item=item):
+                    self.assertIn(f"{key}::{item}  (ledger: ci/allow/forks/{crate}.txt)", out)
+            for item in ("test_only", "support_only"):
+                with self.subTest(crate=crate, test_item=item):
+                    self.assertNotIn(f"{key}::{item}", out, "an item only a test can see is no fork\n" + out)
+
+    def test_fxlanes_ledger_fails_a_new_appfx_side_queue_but_not_a_deliver_arm(self):
+        """RED: in `Bridge::app_effect` an `AppFx` arm that pushes `Fx::Deliver(` rides the ordered
+        FIFO and costs nothing; an arm that parks its request on a side queue must be a ledger line,
+        so a NEW variant with a side queue fails `fxlanes` while a new Deliver arm does not."""
+        r = self._mutate(
+            "app/bridge.rs", "AppFx::Loop(req) => self.reqs.push(req),",
+            "AppFx::Loop(req) => self.reqs.push(req),\n"
+            "            AppFx::Sneaky(req) => self.sneaky_reqs.push(req),\n"
+            "            AppFx::Orderly(cmd) => out.push(Fx::Deliver(MachineId::Consent,\n"
+            "                Delivery::Machine(AppMsg::Consent(cmd)))),")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("fxlanes:", out)
+        self.assertIn("rust-modules/src/app/bridge.rs::AppFx::Sneaky", out)
+        self.assertNotIn("AppFx::Orderly", out)
+        self.assertIn("ci/allow/fxlanes/app.txt", out)
+
+    def test_ledgers_ignore_tests_comments_strings_and_declarations(self):
+        """GREEN: the same shapes inside a `#[cfg(test)] mod`, under a test-only `cfg(any(test, ..))`
+        item, in a comment, a doc line or a string literal, are no site of any ledger -- so all
+        three call-site ledgers stay exact -- and a test-only item is not a production fork."""
+        name = "_check_deps_selftest_ledgers_ok.rs"
+        body = ("// spawn_small(\"c\", f) and client_for(x) are documented here\n"
+                "/// `session::peek()` and keypin::revision() in a doc line\n"
+                "pub fn fine() {\n    let _s = \"spawn_small( client_for( keypin::revision( cfg!(not(test))\";\n}\n"
+                "#[cfg(test)]\nmod tests {\n    fn t() {\n        plx_base::task::spawn_small(\"t\", || {});\n"
+                "        let _ = client_for(plx_plex::plex::session::current_server());\n    }\n}\n"
+                "#[cfg(any(test, feature = \"test-support\"))]\npub fn seam() { let _ = client_for(1); }\n"
+                "#[cfg(test)]\nfn only_test() { let _ = cfg!(not(test)); }\n")
+        r = self._plant(name, body, crate_dir="data")
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        for rule in ("workers", "globals", "forks"):
+            with self.subTest(rule=rule):
+                self.assertRegex(r.stdout, rf"ok — {rule} \(\d+ sites\)")
+
+    def _plant_many(self, files, crate_dir):
+        """`_plant` for several orphan files of ONE crate, graded by a single gate run (a run is ~11 s):
+        each file isolates one import shape, because a `use` statement applies to its whole file."""
+        written = []
+        try:
+            for name, content in files.items():
+                target = os.path.join(self.tree, "rust-modules", crate_dir, "src", name)
+                self.assertFalse(os.path.exists(target), f"stale self-test artifact at {target} — remove it by hand")
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(content)
+                written.append(target)
+            return self._deps()
+        finally:
+            for target in written:
+                if os.path.exists(target):
+                    os.remove(target)
+
+    def _append_to(self, rel, text):
+        """Append `text` to a tracked file of THIS TEST'S private copy (the copy is nobody else's, so
+        nothing is restored) and return the gate's verdict. `_mutate` and `_prepend` know only the
+        data layer and the application crate; this one takes any repo-relative path."""
+        with open(os.path.join(self.tree, rel), "a", encoding="utf-8") as f:
+            f.write(text)
+        return self._deps()
+
+    def test_globals_ledger_sees_renamed_and_bare_keypin_and_grant_getters(self):
+        """RED: `keypin::revision`, `keypin::blocked_for` and `grant::offers` are registry reads like
+        `session::peek`, so the two ways to hide one from the call-site scan are shut the same way:
+        a rename (`use ... revision as rev;`) fails outright, and a bare name is a site in a file that
+        imports it -- singly, in a group that ends with it, or through a glob."""
+        crate = "screens"
+        r = self._plant_many({
+            "_check_deps_selftest_renamed.rs": (
+                "use plx_net::net::keypin::revision as rev;\n"
+                "use plx_net::net::keypin::blocked_for as blocked;\n"
+                "use plx_plex::plex::grant::offers as house_offers;\n\n"
+                "pub fn renamed() {\n    let _ = (rev(), blocked(1), house_offers());\n}\n"),
+            "_check_deps_selftest_bare.rs": (
+                "use plx_net::net::keypin::revision;\nuse plx_net::net::keypin::{self, blocked_for};\n"
+                "use plx_plex::plex::grant::offers;\n\n"
+                "pub fn bare() {\n    let _ = (revision(), blocked_for(1), offers());\n    let _ = it.revision();\n}\n"),
+            "_check_deps_selftest_globbed.rs": (
+                "use plx_net::net::keypin::*;\n\npub fn globbed() {\n    let _ = revision();\n}\n"),
+        }, crate)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        base = f"rust-modules/{crate}/src/_check_deps_selftest_"
+        for line in (1, 2, 3):
+            with self.subTest(rename_line=line):
+                self.assertIn(f"{base}renamed.rs:{line}\n", out + "\n")
+        for fn, spelling in (("bare", "revision"), ("bare", "blocked_for"), ("bare", "offers"),
+                             ("globbed", "revision")):
+            with self.subTest(fn=fn, spelling=spelling):
+                self.assertIn(f"{base}{fn}.rs::{fn}::{spelling}  (ledger: ", out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::revision  (ledger: "), 1,
+                         "`it.revision()` is not a registry read\n" + out)
+
+    def test_globals_ledger_sees_the_player_transport_readers_in_a_machine(self):
+        """RED: `transport::paused`, `transport::viewer_paused` and `preview::paused` read `TX.paused` behind
+        a function (Sans-IO lifecycle PR B), so a machine that calls one reads the registry as surely as
+        `client_for` does. Qualified, bare-after-an-import (singly, in a group, through a glob) and the
+        rename that would hide the calls are all caught; the writers (`set_paused`, `set_transport_paused`)
+        and a file that merely has a local named `paused` are not registry reads. An import that only
+        ENDS in one of the module names (`plx_appkit::scrub_preview::*`, `plx_ui::hud_transport::{..}`) is not
+        an import of `preview` / `transport`, so a `paused` local beside it is no site either."""
+        crate = "screens"
+        r = self._plant_many({
+            "_check_deps_selftest_qualified.rs": (
+                "pub fn qualified() {\n"
+                "    let _ = plx_media::player::transport::paused();\n"
+                "    let _ = plx_media::player::transport::viewer_paused();\n"
+                "    let _ = plx_media::player::preview::paused();\n}\n"),
+            "_check_deps_selftest_renamed.rs": (
+                "use plx_media::player::transport::paused as is_paused;\n"
+                "use plx_media::player::transport::viewer_paused as vp;\n"
+                "use plx_media::player::preview::paused as pv;\n\n"
+                "pub fn renamed() {\n    let _ = (is_paused(), vp(), pv());\n}\n"),
+            "_check_deps_selftest_bare.rs": (
+                "use plx_media::player::transport::{self, viewer_paused};\n"
+                "use plx_media::player::preview::paused;\n\n"
+                "pub fn bare() {\n    let _ = (viewer_paused(), paused());\n    let _ = it.paused();\n}\n"),
+            "_check_deps_selftest_globbed.rs": (
+                "use plx_media::player::transport::*;\n\npub fn globbed() {\n    let _ = paused();\n}\n"),
+            "_check_deps_selftest_writers.rs": (
+                "use plx_media::player::transport::{self, set_paused, set_transport_paused};\n\n"
+                "pub fn writes(paused: bool) {\n    set_paused(paused);\n    set_transport_paused(None, paused);\n}\n"),
+            "_check_deps_selftest_scrub_glob.rs": (
+                "use plx_appkit::scrub_preview::*;\n\n"
+                "pub fn scrub_glob(x: u8) -> bool {\n    let paused = x > 0;\n    paused\n}\n"),
+            "_check_deps_selftest_suffix_group.rs": (
+                "use plx_ui::hud_transport::{self, paused_label};\nuse plx_ui::my_preview::{paused};\n\n"
+                "pub fn suffix_group(x: u8) -> bool {\n    let paused = x > 0;\n    paused\n}\n"),
+        }, crate)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        base = f"rust-modules/{crate}/src/_check_deps_selftest_"
+        for spelling in ("transport::paused", "transport::viewer_paused", "preview::paused"):
+            with self.subTest(qualified=spelling):
+                self.assertIn(f"{base}qualified.rs::qualified::{spelling}  (ledger: ", out)
+        for line in (1, 2, 3):
+            with self.subTest(rename_line=line):
+                self.assertIn(f"{base}renamed.rs:{line}\n", out + "\n")
+        for fn, spelling in (("bare", "viewer_paused"), ("bare", "paused"), ("globbed", "paused")):
+            with self.subTest(fn=fn, spelling=spelling):
+                self.assertIn(f"{base}{fn}.rs::{fn}::{spelling}  (ledger: ", out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::paused  (ledger: "), 1,
+                         "`it.paused()` is not a registry read\n" + out)
+        self.assertNotIn(f"{base}writers.rs", out, "a writer is an IO call, not a registry read\n" + out)
+        for stem in ("scrub_glob", "suffix_group"):
+            with self.subTest(not_an_import_of_the_module=stem):
+                self.assertNotIn(f"{base}{stem}.rs", out,
+                                 "`..._preview::*` / `..._transport::{..}` is not `preview` / `transport`\n" + out)
+
+    def test_globals_ledger_sees_the_capability_answer_readers_in_a_machine(self):
+        """RED: `devcaps::caps()` is the device's capability answer, a process-wide registry read. It has been
+        write-once since #1047: it is the boot snapshot, a stored refusal never moves it, and the stored rows reach
+        a play only through `devcaps::start_caps` at the app's start edge. The zero-argument `is_dp_audio(` /
+        `is_dp_audio_track(` read it behind a function (the attempt-caps PR). A machine that calls one reads the
+        registry as surely as `client_for`
+        does: qualified, bare-after-an-import (singly, in a group, through a glob) and the rename that would hide
+        the calls are all caught. The `_with` forms take the value as an argument, so they are no read; neither
+        is a method named `caps` (`it.caps()`), a local named `caps`, or a `caps(` in a file that imports no
+        `devcaps::caps`. This is a coverage expansion: the repository itself seeds no line for it."""
+        crate = "screens"
+        r = self._plant_many({
+            "_check_deps_selftest_qualified.rs": (
+                "pub fn qualified() {\n"
+                "    let _ = plx_platform::devcaps::caps();\n"
+                "    let _ = plx_plex::plex::is_dp_audio(\"dca\", 6);\n"
+                "    let _ = plx_plex::plex::transcoder::is_dp_audio_track(\"dca\", 6, 48_000);\n"
+                "    let _ = plx_plex::plex::is_dp_audio_with(&c, \"dca\", 6);\n"
+                "    let _ = plx_plex::plex::is_dp_audio_track_with(&c, \"dca\", 6, 48_000);\n}\n"),
+            "_check_deps_selftest_renamed.rs": (
+                "use plx_platform::devcaps as dc;\n"
+                "use plx_platform::devcaps::caps as device_caps;\n"
+                "use plx_plex::plex::is_dp_audio as dp;\n\n"
+                "pub fn renamed() {\n    let _ = (dc::caps(), device_caps(), dp(\"dca\", 6));\n}\n"),
+            "_check_deps_selftest_bare.rs": (
+                "use plx_platform::devcaps::{self, caps};\n"
+                "use plx_plex::plex::{is_dp_audio_track, is_dp_audio_with};\n\n"
+                "pub fn bare() {\n    let _ = caps();\n    let _ = it.caps();\n"
+                "    let _ = is_dp_audio_track(\"dca\", 6, 0);\n    let _ = is_dp_audio_with(&c, \"dca\", 6);\n}\n"),
+            "_check_deps_selftest_globbed.rs": (
+                "use plx_platform::devcaps::*;\nuse plx_plex::plex::*;\n\n"
+                "pub fn globbed() {\n    let _ = (caps(), is_dp_audio(\"dca\", 6));\n}\n"),
+            "_check_deps_selftest_no_import.rs": (
+                "pub fn no_import(caps: &Caps) -> usize {\n    let n = caps.audio.len();\n    helper::caps(n)\n}\n"),
+            "_check_deps_selftest_taken.rs": (
+                "use plx_platform::devcaps::Caps;\n\n"
+                "pub fn taken(caps: &Caps) -> bool {\n    caps.hevc\n}\n"),
+        }, crate)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        base = f"rust-modules/{crate}/src/_check_deps_selftest_"
+        for spelling in ("devcaps::caps", "is_dp_audio", "is_dp_audio_track"):
+            with self.subTest(qualified=spelling):
+                self.assertIn(f"{base}qualified.rs::qualified::{spelling}  (ledger: ", out)
+        for line in (1, 2, 3):
+            with self.subTest(rename_line=line):
+                self.assertIn(f"{base}renamed.rs:{line}\n", out + "\n")
+        for fn, spelling in (("bare", "caps"), ("bare", "is_dp_audio_track"), ("globbed", "caps"),
+                             ("globbed", "is_dp_audio")):
+            with self.subTest(fn=fn, spelling=spelling):
+                self.assertIn(f"{base}{fn}.rs::{fn}::{spelling}  (ledger: ", out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::caps  (ledger: "), 1,
+                         "`it.caps()` is not a read of the capability answer\n" + out)
+        self.assertEqual(out.count(f"{base}qualified.rs::qualified::is_dp_audio  (ledger: "), 1,
+                         "`is_dp_audio_with(` takes the value; it is no read\n" + out)
+        self.assertEqual(out.count(f"{base}qualified.rs::qualified::is_dp_audio_track  (ledger: "), 1,
+                         "`is_dp_audio_track_with(` takes the value; it is no read\n" + out)
+        self.assertNotIn(f"{base}bare.rs::bare::is_dp_audio  (ledger: ", out,
+                         "`is_dp_audio_with(` takes the value; it is no read\n" + out)
+        for stem in ("no_import", "taken"):
+            with self.subTest(not_a_read=stem):
+                self.assertNotIn(f"{base}{stem}.rs", out,
+                                 "a `caps` parameter or an unimported `caps(` is not the capability answer\n" + out)
+
+    def test_globals_ledger_sees_the_registry_readers_the_old_closed_list_missed(self):
+        """RED: the server registry's roster readers (`server_ids`, `server_roster_gen`, `server_facts_gen`,
+        `server_probe_result`), the session cache's two readers (`session::peek_settled`, `session::current_gen`)
+        and the controlled-run switch `tape::active` read process-wide state behind a free function, as
+        surely as `client_for` does, and docs/sans-io.md listed them as the reads the rule did not see.
+        Planted in a store file (data/src/stores/) they are sites: qualified, bare after an import (singly, in a
+        group, through a glob), and the rename that would hide the calls fails outright. A method or a local of
+        the same name (`it.active()`, `it.server_ids()`, a struct field `active`, a local `fn active()`) is no
+        read; `active` and `current_gen` count only where the file imports them from `tape` / `session`.
+        `plex/src/plex/session.rs` calls its own `peek_settled()` / `current_gen()` with no `use` to say so, as
+        it always did for `peek`; a bare call planted there is a site. `data/src/stores/tape.rs` is the
+        registry the stores call through, not a machine, so its own bare `active()` is NOT one. All of it is
+        graded by ONE gate run (a run is ~14 s)."""
+        crate = "data"
+        session = "rust-modules/plex/src/plex/session.rs"
+        tape = "rust-modules/data/src/stores/tape.rs"
+        with open(os.path.join(self.tree, session), "a", encoding="utf-8") as f:
+            f.write("\nfn planted_settled() -> bool {\n    peek_settled().is_some() && current_gen() > 0\n}\n")
+        with open(os.path.join(self.tree, tape), "a", encoding="utf-8") as f:
+            # the `client_for` read gets the file past the candidate prefilter (a bare `active()` alone holds
+            # none of its tokens), so the scan really reads the file and the bare `active()` is graded
+            f.write("\nfn planted_active() -> bool {\n    let _ = it.active();\n    active()\n}\n"
+                    "pub fn real() { let _ = plx_plex::plex::client_for(0); }\n")
+        r = self._plant_many({
+            "stores/_check_deps_selftest_qualified.rs": (
+                "pub fn qualified() {\n"
+                "    let _ = plx_plex::plex::server_ids();\n"
+                "    let _ = plx_plex::plex::server_roster_gen();\n"
+                "    let _ = plx_plex::plex::server_facts_gen();\n"
+                "    let _ = plx_plex::plex::server_probe_result(1);\n"
+                "    let _ = plx_plex::plex::session::peek_settled();\n"
+                "    let _ = plx_plex::plex::session::current_gen();\n"
+                "    let _ = crate::stores::tape::active();\n}\n"),
+            "stores/_check_deps_selftest_renamed.rs": (
+                "use plx_plex::plex::server_ids as ids;\n"
+                "use plx_plex::plex::session::peek_settled as settled;\n"
+                "use plx_plex::plex::session::current_gen as generation;\n"
+                "use crate::stores::tape::active as armed;\n"
+                "use crate::stores::tape as controlled;\n\n"
+                "pub fn renamed() {\n    let _ = (ids(), settled(), generation(), armed());\n}\n"),
+            "stores/_check_deps_selftest_bare.rs": (
+                "use plx_plex::plex::{server_ids, server_probe_result};\n"
+                "use plx_plex::plex::session::{self, current_gen, peek_settled};\n"
+                "use crate::stores::tape::{self, active};\n\n"
+                "pub fn bare() {\n    let _ = (server_ids(), server_probe_result(1), current_gen(), peek_settled());\n"
+                "    let _ = active();\n    let _ = it.active();\n    let _ = it.server_ids();\n}\n"),
+            "stores/_check_deps_selftest_globbed.rs": (
+                "use crate::stores::tape::*;\nuse plx_plex::plex::session::*;\n\n"
+                "pub fn globbed() {\n    let _ = (active(), current_gen());\n}\n"),
+            "stores/_check_deps_selftest_no_import.rs": (
+                "use plx_media::player::claim_hold::active as _unused;\n"
+                "use plx_media::player::subside::{self, active};\n\n"
+                "pub struct Pane {\n    active: bool,\n}\nimpl Pane {\n"
+                "    pub fn active(&self) -> bool {\n        self.active\n    }\n}\n"
+                "fn local() -> bool {\n    true\n}\n"
+                "pub fn no_import(p: &Pane, current_gen: u32) -> bool {\n"
+                "    let _ = (p.active(), current_gen, helper::active(), local());\n    active()\n}\n"
+                "pub fn real() { let _ = plx_plex::plex::client_for(0); }\n"),
+            "stores/_check_deps_selftest_defines.rs": (
+                "fn active() -> bool {\n    true\n}\n\n"
+                "pub fn defines() -> bool {\n    active()\n}\n"
+                "pub fn real() { let _ = plx_plex::plex::client_for(0); }\n"),
+        }, crate)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        base = f"rust-modules/{crate}/src/stores/_check_deps_selftest_"
+        for spelling in ("server_ids", "server_roster_gen", "server_facts_gen", "server_probe_result",
+                         "session::peek_settled", "session::current_gen", "tape::active"):
+            with self.subTest(qualified=spelling):
+                self.assertIn(f"{base}qualified.rs::qualified::{spelling}  (ledger: ", out)
+        for line in (1, 2, 3, 4, 5):
+            with self.subTest(rename_line=line):
+                self.assertIn(f"{base}renamed.rs:{line}\n", out + "\n")
+        for fn, spelling in (("bare", "server_ids"), ("bare", "server_probe_result"), ("bare", "current_gen"),
+                             ("bare", "peek_settled"), ("bare", "active"),
+                             ("globbed", "active"), ("globbed", "current_gen")):
+            with self.subTest(fn=fn, spelling=spelling):
+                self.assertIn(f"{base}{fn}.rs::{fn}::{spelling}  (ledger: ", out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::active  (ledger: "), 1,
+                         "`it.active()` is not a registry read\n" + out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::server_ids  (ledger: "), 1,
+                         "`it.server_ids()` is not a registry read\n" + out)
+        for stem in ("no_import", "defines"):
+            with self.subTest(not_a_read=stem):
+                # each fixture also holds one real read, so the file reaches the scan and the only line that
+                # names it is that read: its `active` (a method, a field, a local, another module's) is no site
+                self.assertIn(f"{base}{stem}.rs::real::client_for  (ledger: ", out)
+                naming = [line for line in out.splitlines() if f"{base}{stem}.rs" in line]
+                self.assertEqual(len(naming), 1,
+                                 "a method, a field, a local or another module's `active` is no registry read\n"
+                                 + out)
+        self.assertIn(f"{session}::planted_settled::peek_settled  (ledger: ci/allow/globals/plex.txt)", out)
+        self.assertIn(f"{session}::planted_settled::current_gen  (ledger: ci/allow/globals/plex.txt)", out)
+        self.assertIn(f"{tape}::real::client_for  (ledger: ", out)
+        naming = [line for line in out.splitlines() if tape in line]
+        self.assertEqual(len(naming), 1,
+                         "`stores/tape.rs` is the registry, not a machine: its own bare `active()` is no site\n" + out)
+
+    def test_a_bare_name_that_ends_a_braced_import_is_still_imported(self):
+        """RED: `use plx_base::task::{self, spawn};` imports `spawn` as surely as `{spawn, self}` does, and
+        so for `submit` and `peek`; the import pattern used to eat the closing `}` of a group whose
+        LAST item was the name and then wanted another one, so every such call went unseen. A group
+        that merely contains a longer name (`{self, spawn_small}`) imports no bare `spawn`."""
+        crate = "data"
+        r = self._plant_many({
+            "_check_deps_selftest_last.rs": (
+                "use plx_base::task::{self, spawn};\n\npub fn last() {\n    let _ = spawn(\"x\", || {});\n}\n"),
+            "_check_deps_selftest_alone.rs": (
+                "use plx_base::task::{spawn};\n\npub fn alone() {\n    let _ = spawn(\"x\", || {});\n}\n"),
+            "_check_deps_selftest_submit.rs": (
+                "use plx_base::storage_worker::{self, submit};\n\npub fn queued() {\n    let _ = submit(|| ());\n}\n"),
+            "_check_deps_selftest_peek.rs": (
+                "use plx_plex::plex::session::{self, peek};\n\npub fn peeks() {\n    let _ = peek();\n}\n"),
+            "_check_deps_selftest_peek_alone.rs": (
+                "use plx_plex::plex::session::{peek};\n\npub fn peeks_alone() {\n    let _ = peek();\n}\n"),
+            "_check_deps_selftest_other.rs": (
+                "use plx_base::task::{self, spawn_small};\nuse plx_plex::plex::session::{self, peek_all};\n\n"
+                "pub fn other() {\n    let _ = spawn(\"x\", || {});\n    let _ = peek();\n}\n"),
+        }, crate)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        base = f"rust-modules/{crate}/src/_check_deps_selftest_"
+        for stem, fn, spelling in (("last", "last", "spawn"), ("alone", "alone", "spawn"),
+                                   ("submit", "queued", "submit"), ("peek", "peeks", "peek"),
+                                   ("peek_alone", "peeks_alone", "peek")):
+            with self.subTest(stem=stem):
+                self.assertIn(f"{base}{stem}.rs::{fn}::{spelling}  (ledger: ", out)
+        self.assertNotIn(f"{base}other.rs", out, "`{self, spawn_small}` imports no bare `spawn`\n" + out)
+
+    def test_fxlanes_ledger_sees_every_variant_of_an_arm_and_a_catch_all_arm(self):
+        """RED: an or-pattern arm (`AppFx::A(r) | AppFx::B(r) => ..`, on one line or wrapped) is a site
+        for EVERY variant on its head, and an arm with no `AppFx::` head (`other => ..`, `_ => ..`) is a
+        site of its own, keyed `AppFx::_`: both used to ride on the first variant's line, or on nothing.
+        An or-pattern arm that pushes `Fx::Deliver(` is on the ordered lane and costs nothing."""
+        r = self._mutate(
+            "app/bridge.rs", "AppFx::Loop(req) => self.reqs.push(req),",
+            "AppFx::Loop(req) | AppFx::PlantedOr(req) => self.reqs.push(req),\n"
+            "            AppFx::PlantedFirst(req)\n"
+            "                | AppFx::PlantedWrapped(req) => self.planted_reqs.push(req),\n"
+            "            AppFx::PlantedOk(cmd) | AppFx::PlantedOk2(cmd) => out.push(Fx::Deliver(MachineId::Consent,\n"
+            "                Delivery::Machine(AppMsg::Consent(cmd)))),\n"
+            "            other => self.misc_reqs.push(other),")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        key = "rust-modules/src/app/bridge.rs::AppFx::"
+        for variant in ("PlantedOr", "PlantedFirst", "PlantedWrapped", "_"):
+            with self.subTest(variant=variant):
+                self.assertIn(f"{key}{variant}  (ledger: ci/allow/fxlanes/app.txt)", out)
+        self.assertNotIn("PlantedOk", out)
+        self.assertNotIn(f"{key}Loop", out, "the variant the ledger already holds is not new")
+
+    def test_globals_ledger_sees_every_spelling_of_the_player_transport_in_lifecycle(self):
+        """RED: lifecycle.rs, the machine, reads no `crate::player::TX` (the transport contract lives in
+        player/transport.rs), and the spellings stay pinned there as a zero-guard: planting `super::TX`,
+        a bare `TX` and a renamed import reaches the same atomic from that file. The first two are sites
+        of their own, the rename fails outright (the calls through it are invisible)."""
+        rel = "rust-modules/media/src/player/lifecycle.rs"
+        with open(os.path.join(self.tree, rel), encoding="utf-8") as f:
+            before = f.read().count("\n")
+        appended = ("\nfn planted_super_tx() -> bool {\n    super::TX.paused.load(Relaxed)\n}\n"
+                    "use super::TX;\nfn planted_bare_tx() {\n    TX.commit_paused(true);\n}\n"
+                    "use super::TX as Transport2;\n")
+        r = self._append_to(rel, appended)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        self.assertIn(f"{rel}::planted_super_tx::super::TX  (ledger: ci/allow/globals/media.txt)", out)
+        self.assertIn(f"{rel}::planted_bare_tx::TX  (ledger: ci/allow/globals/media.txt)", out)
+        rename_line = before + appended.split("\n").index("use super::TX as Transport2;") + 1
+        self.assertIn(f"{rel}:{rename_line}\n", out + "\n")
+
+    def test_a_cfg_test_fn_with_a_where_clause_is_skipped_whole(self):
+        """RED: an item under `#[cfg(test)]` is skipped to the end of ITS body. A signature that spills
+        over several lines -- a long parameter list, a `where` clause whose bounds end in a comma -- used
+        to end the skip at the first such line, and the body was graded as production under the
+        unnamed fn `?`. The production fn after the test items is still graded."""
+        name = "_check_deps_selftest_where.rs"
+        body = ("#[cfg(test)]\nfn helper<T>(x: T)\nwhere\n    T: Clone,\n{\n"
+                "    plx_base::task::spawn_small(\"t\", || {});\n    let _ = cfg!(not(test));\n}\n\n"
+                "#[cfg(test)]\npub(crate) fn wrapped(\n    a: u8,\n) -> u8\nwhere\n    u8: Copy,\n{\n"
+                "    let _ = plx_plex::plex::client_for(1);\n    a\n}\n\n"
+                "#[cfg(test)]\nimpl<T> Marker for Vec<T>\nwhere\n    T: Clone,\n{\n"
+                "    fn method(&self) {\n        plx_base::task::spawn_small(\"i\", || {});\n    }\n}\n\n"
+                "pub fn production() {\n    plx_base::task::spawn_small(\"p\", || {});\n}\n")
+        r = self._plant(name, body, crate_dir="data")
+        out = r.stdout + r.stderr
+        key = f"rust-modules/data/src/{name}"
+        self.assertIn(f"{key}::production::spawn_small  (ledger: ", out)
+        self.assertNotIn(f"{key}::?", out, "a test fn's body was graded as production\n" + out)
+        self.assertEqual(out.count(key), 1, out)
+
+    def test_forks_ledger_names_a_path_qualified_macro_item_and_counts_an_inline_cfg_test(self):
+        """RED: `#[cfg(..)]` on `plx_base::devtrig::latched_flag!(..);` is an item named for its macro, like
+        an unqualified `cache!` is, not the unnamed `?`. And `cfg!(test)` still counts as a fork whatever it
+        evaluates to: `if cfg!(test) {..} else {..}` compiles an arm production runs and a test does not."""
+        name = "_check_deps_selftest_macro.rs"
+        body = ("#[cfg(not(test))]\nplx_base::devtrig::latched_flag!(\n    /// `/tmp/plxnative-planted`\n"
+                "    fn planted_armed = \"planted\";\n);\n\n"
+                "pub fn inline_test() -> bool {\n    if cfg!(test) { true } else { false }\n}\n")
+        r = self._plant(name, body, crate_dir="plex")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        key = f"rust-modules/plex/src/{name}"
+        self.assertIn(f"{key}::latched_flag!  (ledger: ci/allow/forks/plex.txt)", out)
+        self.assertIn(f"{key}::inline_test  (ledger: ci/allow/forks/plex.txt)", out)
+        self.assertNotIn("::?", out)
+
+    def test_no_ledger_key_is_unnamed(self):
+        """A ledger line keyed `<path>::?` names no site: the scan could not say what it found. Every
+        site has a name (a macro item is named for its macro), so none may be ledgered."""
+        for rule in self.LEDGER_RULES:
+            for path in self._ledger_files(rule):
+                with open(path, encoding="utf-8") as f:
+                    for line in f.read().splitlines():
+                        key = line.split("\t")[0]
+                        if line.strip() and not line.startswith("#"):
+                            self.assertFalse(key.endswith("::?") or "::?::" in key,
+                                             f"{os.path.relpath(path, self.tree)}: {key}")
+
+    def test_worker_and_global_aliases_fail_because_the_scan_cannot_count_them(self):
+        """RED: `use ...::spawn_small as go;` renames a worker start or a registry getter, so every
+        `go(..)` after it is invisible to the call-site scan: the `use ... as` line fails its rule
+        outright, naming file and line. A getter or worker named WITHOUT a call (`let f =
+        client_for;`) is no alias -- the name is on the line -- so it is a site of its own."""
+        name = "_check_deps_selftest_ledger_alias.rs"
+        body = ("use plx_base::task::spawn_small as go;\nuse plx_plex::plex::client_for as cf;\n\n"
+                "pub fn f() {\n    let _a = go;\n    let _b = plx_base::task::spawn_off_frame;\n"
+                "    let _c = plx_plex::plex::current_server;\n}\n")
+        r = self._plant(name, body, crate_dir="data")
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        path = f"rust-modules/data/src/{name}"
+        for rule, line in (("workers", 1), ("globals", 2)):
+            with self.subTest(rule=rule, line=line):
+                self.assertIn(f"{rule}:", out)
+                self.assertIn(f"{path}:{line}\n", out + "\n")
+        for site in ("f::spawn_off_frame", "f::current_server"):
+            with self.subTest(site=site):
+                self.assertIn(f"{path}::{site}  (ledger: ", out)
+
+    def test_ledger_files_must_be_exact_stale_lines_and_misfiled_lines_fail(self):
+        """Every ledger only shrinks: a line whose site is gone fails its rule (so a migration has to
+        delete it), and a line filed under the wrong area fails too, so the layout cannot drift."""
+        stale = {
+            "workers": "rust-modules/data/src/_selftest_stale.rs::gone::spawn_small",
+            "globals": "rust-modules/data/src/_selftest_stale.rs::gone::client_for",
+            "forks": "rust-modules/data/src/_selftest_stale.rs::gone",
+            "fxlanes": "rust-modules/src/app/bridge.rs::AppFx::Gone",
+        }
+        for rule, entry in stale.items():
+            path = os.path.join(self.tree, "ci", "allow", rule, "data-_selftest_stale.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# count: 1\n# selftest\n{entry}\tgone\n")
+        # a forks line for a crate the rule does not cover, filed in an area that is not its own
+        first = self._ledger_files("forks")[0]
+        with open(first, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        declared = int(lines[0].split(":")[1])
+        lines[0] = f"# count: {declared + 1}"
+        lines.append("rust-modules/gfx/src/_selftest_misfiled.rs::f\tmisfiled")
+        with open(first, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        r = self._deps()
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        for rule, entry in stale.items():
+            with self.subTest(rule=rule):
+                self.assertIn(f"{rule}:", out)
+                self.assertIn(f"{entry}  (in ci/allow/{rule}/data-_selftest_stale.txt)", out)
+        self.assertIn("misfiled ledger line: rust-modules/gfx/src/_selftest_misfiled.rs::f", out)
+        self.assertIn("belongs in ci/allow/forks/gfx.txt", out)
+
+    def test_ledger_count_header_must_equal_its_entries_in_every_area_file(self):
+        """The `# count:` header of every ci/allow/<rule>/<area>.txt is held to its entries, exactly
+        like the flat allowlists: a line added or deleted without moving the header fails by name."""
+        bumped = {}
+        for rule in self.LEDGER_RULES:
+            first = self._ledger_files(rule)[0]
+            with open(first, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            lines[0] = f"# count: {int(lines[0].split(':')[1]) + 1}"
+            with open(first, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            bumped[rule] = os.path.relpath(first, self.tree)
+        r = self._deps()
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        for rule, rel in bumped.items():
+            with self.subTest(rule=rule):
+                self.assertIn(f"{rel} declares count", out)
+
     def test_tmppath_gate_catches_a_path_built_on_one_line_and_opened_on_the_next(self):
         """The gate used to require the literal and a filesystem-open verb on the SAME line, so a
         value built on one line and opened on the next passed silently. RED: planting that split
@@ -4878,17 +7217,72 @@ impl PersonOwnerGateFixture {
 
     def test_tmppath_gate_exempts_a_log_message_mention(self):
         """D4's own exemption: a `/tmp/plxnative-` literal that is only message text passed to
-        `log`/`crate::log`/`log!` must not fail the gate. GREEN: planting one, including a nested
+        `log`/`crate::eventlog::log`/`log!` must not fail the gate. GREEN: planting one, including a nested
         `format!` the way most real call sites spell it, must leave `tmppath` (and the whole
         script) green."""
         r = self._plant(
             "_check_deps_selftest_tmppath_log.rs",
-            'pub fn mention_it(n: u32) {\n    crate::log(&format!(\n'
+            'pub fn mention_it(n: u32) {\n    crate::eventlog::log(&format!(\n'
             '        "selftest: see /tmp/plxnative-selftest ({n})"\n    ));\n}\n',
         )
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
         self.assertIn("ok — tmppath", out)
+
+    def test_cards_gate_catches_a_screen_assembling_its_own_strip(self):
+        """Shared-card-sections L1: a screen draws card sections with `plx_ui::cards::{Shelf, Grid}`.
+        `card_row` / `poster_grid` are `pub(crate)`, so the gate polices what `plx_ui::cards`
+        re-exports. RED: a file in `screens/` outside ci/allow/cards.txt that calls a tile painter
+        through the re-export surface (qualified, or imported by name), names an L0 type, or names
+        `AvatarRow` outside the profile picker must fail `cards`."""
+        r = self._plant(
+            "_check_deps_selftest_cards_strip.rs",
+            "pub fn draw_row() {\n    plx_ui::cards::paint_visible(p, rect, 1.0, true);\n}\n"
+            "use plx_ui::cards::{paint_visible, RowStyle};\n"
+            "pub struct Mine(CardRow);\n"
+            "pub struct Pop(GridPop);\n"
+            "pub struct Bands(GridBands);\n"
+            "pub fn scale() -> f32 { press::scale() }\n"
+            "pub struct Avatars(plx_ui::cards::AvatarRow);\n",
+            crate_dir="screens",
+        )
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("cards:", out)
+        for line in (2, 4, 5, 6, 7, 8, 9):
+            self.assertIn(f"_check_deps_selftest_cards_strip.rs:{line}", out)
+
+    def test_cards_gate_allows_the_shared_component(self):
+        r = self._plant(
+            "_check_deps_selftest_cards_ok.rs",
+            "pub struct Mine(plx_ui::cards::Shelf);\n",
+            crate_dir="screens",
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("ok — cards", out)
+
+    def test_sink_gate_catches_the_video_sink_named_outside_the_player(self):
+        """Step L15: the Starfish/ACB verbs are the player's alone. RED: a module outside
+        `player/`, `port.rs` and `tv/` that reaches `tv::sink::installed()` must fail `sink`."""
+        r = self._plant(
+            "_check_deps_selftest_sink_out.rs",
+            "pub fn pause_it() {\n    let _ = plx_platform::tv::sink::installed();\n}\n",
+        )
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("sink:", out)
+        self.assertIn("_check_deps_selftest_sink_out.rs", out)
+
+    def test_sink_gate_allows_the_player_to_name_the_video_sink(self):
+        """GREEN: the same call from a file under `player/` leaves `sink` (and the script) green."""
+        r = self._plant(
+            "player/_check_deps_selftest_sink_in.rs",
+            "pub fn pause_it() {\n    let _ = plx_platform::tv::sink::installed();\n}\n",
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("ok — sink", out)
 
     def test_textmeasure_gate_catches_a_bare_call_outside_the_seam(self):
         """Phase 12, D4: `textmeasure` went from an allowlist to zero-tolerance. RED: a raw
@@ -4915,7 +7309,7 @@ impl PersonOwnerGateFixture {
         r = self._plant(
             "_check_deps_selftest_textmeasure_impl.rs",
             "struct SelftestMeasure;\n\n"
-            "impl crate::ui::machine::Measure for SelftestMeasure {\n"
+            "impl plx_machine::machine::Measure for SelftestMeasure {\n"
             "    fn width(&self, s: &std::ffi::CStr, sz: i32, bold: bool) -> f32 {\n"
             "        crate::text::text_width(s.as_ptr(), sz, bold as i32)\n"
             "    }\n"
@@ -4927,7 +7321,7 @@ impl PersonOwnerGateFixture {
 
     def test_dt_gate_catches_a_raw_accumulator(self):
         """Phase 12, D4: `dt` went from a 12-file allowlist to zero-tolerance everywhere but
-        `ui/motion.rs`. RED: a `self.t += dt;`-shaped accumulator in a new file must fail — this
+        `machine/src/motion.rs`. RED: a `self.t += dt;`-shaped accumulator in a new file must fail — this
         is the exact pattern (a clock-driven animator summing a raw per-frame delta instead of
         reading `Tick.ms` through `motion::Ramp`/`motion::Phase`) the frozen-animator regression
         class comes from."""
@@ -4942,12 +7336,12 @@ impl PersonOwnerGateFixture {
         self.assertIn("_check_deps_selftest_dt_accum.rs", out)
 
     def test_dt_gate_catches_idle_dt_by_name(self):
-        """`idle::dt()` is deleted from `ui/idle.rs` — the accessor callers used to sum themselves.
+        """`idle::dt()` is deleted from `machine/src/idle.rs` — the accessor callers used to sum themselves.
         RED: a call spelled `idle::dt()` anywhere must fail even with no `+=`/`-=` beside it, since
         the function no longer exists to call."""
         r = self._plant(
             "_check_deps_selftest_dt_fn.rs",
-            "pub fn read_it() -> f32 {\n    crate::ui::idle::dt()\n}\n",
+            "pub fn read_it() -> f32 {\n    plx_machine::idle::dt()\n}\n",
         )
         out = r.stdout + r.stderr
         self.assertNotEqual(r.returncode, 0, out)
@@ -4955,31 +7349,276 @@ impl PersonOwnerGateFixture {
         self.assertIn("_check_deps_selftest_dt_fn.rs", out)
 
     def test_check_statics_is_green(self):
-        """Spec §0 done-criterion 1: `ci/check-statics.sh` — every `static mut` under ui/ and screens/
-        is a named render cache (ci/allow/statics.txt) or sits in a legacy module still awaiting its
-        phase (ci/allow/statics-migration.txt), and no allowlist entry is stale."""
+        """Spec §0 done-criterion 1: `ci/check-statics.sh` — every `static mut` in the gated
+        directories is named in ci/allow/statics.txt or sits in a legacy module still awaiting its
+        phase (ci/allow/statics-migration.txt), every heap-owning `static mut` anywhere under
+        rust-modules is named in ci/allow/statics.txt, and no allowlist entry is stale."""
         r = subprocess.run([os.path.join(self.ROOT, "ci", "check-statics.sh")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _heap_statics(self, files, lines=False):
+        """`{(path, NAME)}` that `ci/check-statics-heap.py` reports over a scratch checkout holding
+        `files` ({path under rust-modules/: Rust source}), plus a `target-fast` build tree full of
+        heap statics that must never be read. `lines=True` returns the whole report lines instead."""
+        with tempfile.TemporaryDirectory() as root:
+            files = dict(files)
+            files["target-fast/debug/build/dep/out.rs"] = "static mut BUILD_TREE: Vec<u8> = Vec::new();\n"
+            for rel, source in files.items():
+                path = os.path.join(root, "rust-modules", rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(source)
+            r = subprocess.run([sys.executable, "-I", os.path.join(self.ROOT, "ci", "check-statics-heap.py"), root],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            if lines:
+                return [line for line in r.stdout.splitlines() if line]
+            return {tuple(line.split("\t")[:2]) for line in r.stdout.splitlines() if line}
+
+    def test_heap_static_gate_refuses_a_static_mut_that_owns_heap_in_any_crate(self):
+        """The class behind `TAB_CACHE` (`plx_ui`'s test abort, 2026-10-20): a `static mut` that owns
+        heap and is replaced frees memory another thread is using. The gate reads the TYPE, so it
+        sees the heap through a struct the declaration only names (`KeyMemo`, `GroundProbe`), a
+        type alias, a multi-line declaration and a qualified path, in any crate, tests included."""
+        found = self._heap_statics({
+            "gfx/src/a.rs": (
+                "static mut CACHE: Option<HashMap<u64, String>> = None;\n"
+                "pub(crate) static mut QUEUE: Vec<String> = Vec::new();\n"
+                "static mut MEMO: Option<Memo> = None;\n"
+                "static mut PROBE: Probe<4> = Probe::new();\n"
+                "static mut ALIASED: Names = Names::new();\n"
+                "static mut SPLIT: Option<\n    plx_base::Holder,\n> = None;\n"
+                "static mut ARRAY: [Option<Memo>; 4] = [None, None, None, None];\n"
+                "struct Memo { map: HashMap<u32, Vec<u8>> }\n"
+                "struct Probe<const N: usize> { ready: Option<Vec<u8>> }\n"
+                "type Names = Vec<String>;\n"),
+            "src/b.rs": (
+                "mod tests {\n    static mut SCRATCH: Box<u32> = Box::new(0);\n}\n"
+                "pub struct Holder(Vec<u8>);\n"),
+            "src/c.rs": "static mut UNKNOWN: Option<Nowhere> = None;\n",
+        })
+        self.assertEqual(found, {
+            ("rust-modules/gfx/src/a.rs", n)
+            for n in ("CACHE", "QUEUE", "MEMO", "PROBE", "ALIASED", "SPLIT", "ARRAY")
+        } | {("rust-modules/src/b.rs", "SCRATCH"), ("rust-modules/src/c.rs", "UNKNOWN")})
+
+    def test_heap_static_gate_finds_the_other_spellings_of_the_same_static(self):
+        """Each of these slipped past a first version of the gate: a tree type that reuses a std name
+        (`screens` has its own `struct Cell` holding a `String`), an acronym alias, a declaration
+        that shares its line with an attribute or a fn body, one whose name is on the next line, and
+        one a `macro_rules!` writes."""
+        found = self._heap_statics({
+            "screens/src/a.rs": (
+                "struct Cell { thumb: String }\n"
+                "static mut SHADOW: Option<Cell> = None;\n"
+                "type LRU = Vec<u8>;\n"
+                "static mut ACRONYM: LRU = Vec::new();\n"
+                "#[allow(static_mut_refs)] static mut ATTR: Vec<u8> = Vec::new();\n"
+                "fn f() { static mut LOCAL: Vec<u8> = Vec::new(); }\n"
+                "pub static mut\n    NEXT: Vec<u8> = Vec::new();\n"
+                "macro_rules! cache { ($n:ident) => { static mut $n: u32 = 0; } }\n"),
+        })
+        self.assertEqual(found, {
+            ("rust-modules/screens/src/a.rs", n)
+            for n in ("SHADOW", "ACRONYM", "ATTR", "LOCAL", "NEXT", "cache!")
+        })
+
+    def test_heap_static_gate_leaves_plain_data_statics_alone(self):
+        """GL object names, uniform locations, function pointers, raw FFI handles, flags and
+        counters free nothing when written, so they are not the bug class and are not listed."""
+        found = self._heap_statics({
+            "gfx/src/a.rs": (
+                "static mut PROG: c_uint = 0;\n"
+                "static mut LOC: [c_int; 4] = [0; 4];\n"
+                "static mut FONTS: [*mut TtfFont; FONT_SLOTS] = [std::ptr::null_mut(); FONT_SLOTS];\n"
+                "static mut HOOK: Option<FnQuery> = None;\n"
+                "static mut IMAGE: Option<(c_uint, Uniforms, c_int)> = None;\n"
+                "static mut FENCE: Option<crate::egl::fence::Fence> = None;\n"
+                "static mut FLAG: bool = false;\n"
+                "static mut STAMP: Option<std::time::Instant> = None;\n"
+                "type FnQuery = unsafe extern \"C\" fn(*mut c_void) -> Vec2;\n"
+                "static mut CALLBACK: Option<fn(&str) -> String> = None;\n"
+                "static mut NAMER: Option<Namer> = None;\n"
+                "type Namer = fn(Vec<u8>, usize) -> String;\n"
+                "fn take(v: &'static mut Vec<u8>) -> &'static mut Vec<u8> { v }\n"
+                "struct Uniforms { rect: c_int, tint: c_int }\n"
+                "pub struct Fence { sync: usize }\n"
+                "// static mut NOTE: Vec<u8> = Vec::new();\n"
+                "const DOC: &str = \"static mut TEXT: Vec<u8> = Vec::new();\";\n"
+                "thread_local! { static CACHE: RefCell<HashMap<u64, String>> = Default::default(); }\n"
+                "static LOCKED: Mutex<Vec<String>> = Mutex::new(Vec::new());\n"
+                "struct Vec2(f32, f32);\n"
+                "pub enum TtfFont {}\n"),
+        })
+        self.assertEqual(found, set())
+
+    def test_heap_static_gate_does_not_resolve_a_name_to_an_associated_type(self):
+        """`type Item = String;` inside an `impl`/`trait` block is an ASSOCIATED type, reachable only
+        as `Self::Item`/`<T as Trait>::Item`; it is not what a bare `Item` names at module level. A
+        first version unioned it with `enum Item`, so a plain `Option<Item>` static read as owning a
+        `String`. Only module-level (and fn-local) definitions count; a `type` alias in a nested fn
+        body of an impl still does."""
+        found = self._heap_statics({
+            "ui/src/a.rs": (
+                "impl Iterator for Foo { type Item = String; fn next(&mut self) -> Option<String> { None } }\n"
+                "trait Source { type Output: Clone; type Error = Vec<u8>; }\n"
+                "unsafe impl<T: Copy> Marker for [T; 4] { type Target = Vec<u8>; }\n"
+                "enum Item { A }\n"
+                "enum Output { Left }\n"
+                "enum Error { Bad }\n"
+                "enum Target { Here }\n"
+                "static mut X: Option<Item> = None;\n"
+                "static mut Y: Option<Output> = None;\n"
+                "static mut Z: [Option<Error>; 2] = [None, None];\n"
+                "static mut W: Option<Target> = None;\n"
+                "impl Foo { fn local() { type Local = Vec<u8>; } }\n"
+                "static mut V: Option<Local> = None;\n"),
+        })
+        self.assertEqual(found, {("rust-modules/ui/src/a.rs", "V")})
+
+    def test_heap_static_gate_treats_std_plain_data_wrappers_as_plain(self):
+        """`Option<SystemTime>`, `Option<NonZeroU32>`, `RefCell<u32>` and `ManuallyDrop<u32>` own no
+        heap, and the failure message tells people to fix the detector rather than allowlist plain
+        data; a wrapper is plain only while its PARAMETER is, so `RefCell<Vec<u8>>` stays reported."""
+        found = self._heap_statics({
+            "gfx/src/a.rs": (
+                "static mut WHEN: Option<SystemTime> = None;\n"
+                "static mut WHEN2: Option<std::time::SystemTime> = None;\n"
+                "static mut SINCE: Option<Instant> = None;\n"
+                "static mut GAP: Duration = Duration::ZERO;\n"
+                "static mut NZ: Option<NonZeroU32> = None;\n"
+                "static mut NZ2: Option<std::num::NonZeroUsize> = None;\n"
+                "static mut NZ3: Option<NonZero<u16>> = None;\n"
+                "static mut WRAP: Wrapping<u32> = Wrapping(0);\n"
+                "static mut SAT: Saturating<u8> = Saturating(0);\n"
+                "static mut REF: RefCell<u32> = RefCell::new(0);\n"
+                "static mut CELL: Cell<u32> = Cell::new(0);\n"
+                "static mut UC: UnsafeCell<u32> = UnsafeCell::new(0);\n"
+                "static mut DROP: ManuallyDrop<u32> = ManuallyDrop::new(0);\n"
+                "static mut SLOT: MaybeUninit<[u8; 4]> = MaybeUninit::uninit();\n"
+                "static mut PH: PhantomData<u8> = PhantomData;\n"
+                "static mut HITS: AtomicUsize = AtomicUsize::new(0);\n"
+                "static mut HEAPY: RefCell<Vec<u8>> = RefCell::new(Vec::new());\n"
+                "static mut HEAPY2: ManuallyDrop<Option<String>> = ManuallyDrop::new(None);\n"
+                "static mut HEAPY3: Option<Cell<Box<u8>>> = None;\n"
+                "static mut HEAPY4: UnsafeCell<Holder> = UnsafeCell::new(Holder::new());\n"
+                "struct Holder { names: Vec<String> }\n"),
+        })
+        self.assertEqual(found, {("rust-modules/gfx/src/a.rs", n) for n in ("HEAPY", "HEAPY2", "HEAPY3", "HEAPY4")})
+
+    def test_heap_static_gate_does_not_read_enum_variant_names_as_types(self):
+        """A variant name (`Idle`, `Running`) is CamelCase but names no type, so it must not read as
+        "defined nowhere in the tree"; the payload of a variant is still a type (`Loaded(Vec<u8>)`)."""
+        found = self._heap_statics({
+            "appkit/src/a.rs": (
+                "#[derive(Clone, Copy)]\n"
+                "enum Phase { Idle, #[default] Running = 2, Done(u8), Moving { dx: i32, dy: i32 } }\n"
+                "enum Slot { Empty, Loaded(Vec<u8>) }\n"
+                "static mut PHASE: Phase = Phase::Idle;\n"
+                "static mut SLOT: Slot = Slot::Empty;\n"),
+        })
+        self.assertEqual(found, {("rust-modules/appkit/src/a.rs", "SLOT")})
+
+    def test_heap_static_gate_names_a_macro_static_by_its_macro_and_line(self):
+        """A `static mut $n` a `macro_rules!` declares has no name yet, and `$n` could never be
+        allowlisted (`$` anchors in `grep -E`). It is reported as `<macro>!`, with the line, so a
+        named entry in ci/allow/statics.txt can match it."""
+        report = self._heap_statics({
+            "screens/src/a.rs": (
+                "fn before() {}\n"
+                "macro_rules! cache {\n"
+                "    ($n:ident) => { static mut $n: u32 = 0; };\n"
+                "}\n"
+                "macro_rules! other { ($a:ident, $b:ident) => {\n"
+                "    static mut $a: u32 = 0;\n"
+                "    static mut $b: u32 = 0;\n"
+                "} }\n"),
+        }, lines=True)
+        fields = sorted(line.split("\t") for line in report)
+        self.assertEqual([(f[0], f[1]) for f in fields],
+                         [("rust-modules/screens/src/a.rs", "cache!"), ("rust-modules/screens/src/a.rs", "other!")])
+        self.assertIn("line 3", fields[0][2])
+        self.assertIn("line 6", fields[1][2])
+        for f in fields:
+            self.assertNotIn("$", f[1])
+
+    def test_check_statics_lets_a_named_entry_allow_a_macro_declared_static(self):
+        """End to end through `ci/check-statics.sh` on a scratch checkout: a heap static a
+        `macro_rules!` declares is refused until `ci/allow/statics.txt` names it `cache!`, then
+        passes, and the entry goes stale (fails) once the macro is gone."""
+        ci = os.path.join(self.ROOT, "ci")
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "ci", "allow"))
+            for fn in ("check-statics.sh", "check-statics-heap.py", "module_graph.py", "rust_test_modules.py"):
+                shutil.copy(os.path.join(ci, fn), os.path.join(root, "ci", fn))
+            mod = os.path.join(root, "rust-modules")
+            for d in ("ui/src", "appkit/src", "screens/src", "data/src/metadata", "data/src/stores",
+                      "data/src/search", "media/src/route", "media/src/player"):
+                os.makedirs(os.path.join(mod, d))
+            for f in ("data/src/person.rs", "data/src/metadata.rs", "data/src/pms.rs",
+                      "media/src/route/decision.rs", "media/src/player/engine.rs", "ui/src/press.rs"):
+                open(os.path.join(mod, f), "w").close()
+            source = os.path.join(mod, "gfx", "src", "a.rs")
+            os.makedirs(os.path.dirname(source))
+            allow = os.path.join(root, "ci", "allow")
+            with open(os.path.join(allow, "statics-migration.txt"), "w") as f:
+                f.write("# count: 0\n")
+
+            def run(macro, entry):
+                with open(source, "w") as f:
+                    f.write(macro)
+                with open(os.path.join(allow, "statics.txt"), "w") as f:
+                    f.write(f"# count: {len(entry)}\n" + "".join(entry))
+                r = subprocess.run([os.path.join(root, "ci", "check-statics.sh")], capture_output=True, text=True)
+                return r.returncode, r.stdout + r.stderr
+
+            macro = "macro_rules! cache { ($n:ident) => { static mut $n: Vec<u8> = Vec::new(); } }\n"
+            code, out = run(macro, [])
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("static mut cache! — Vec<u8> — is declared through macro `cache!` (line 1)", out)
+            self.assertIn("do not allowlist it", out)
+            entry = "rust-modules/gfx/src/a.rs\tcache!: boot-time table, owned by the main thread\n"
+            code, out = run(macro, [entry])
+            self.assertEqual(code, 0, out)
+            code, out = run("fn nothing() {}\n", [entry])
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("stale: rust-modules/gfx/src/a.rs cache!", out)
+
+    # The Sans-IO ledgers (docs/sans-io.md) live one directory per rule under ci/allow, one file per
+    # area: `ci/allow/<rule>/<area>.txt` (`LEDGER_RULES`, above). `allowed()` indexes the flat
+    # `ci/allow/*.txt` only, so a ledger directory cannot collide with a rule of that name.
+
+    def _allowlist_files(self):
+        """Every allowlist file under ci/allow, flat ones and the ledger areas, as repo-relative names."""
+        allow = os.path.join(self.ROOT, "ci", "allow")
+        found = [fn for fn in sorted(os.listdir(allow)) if os.path.isfile(os.path.join(allow, fn))]
+        for rule in self.LEDGER_RULES:
+            d = os.path.join(allow, rule)
+            if os.path.isdir(d):
+                found += [rule + "/" + fn for fn in sorted(os.listdir(d))]
+        return found
 
     def test_every_allowlist_declares_its_own_count(self):
         allow = os.path.join(self.ROOT, "ci", "allow")
         seen = 0
-        for fn in sorted(os.listdir(allow)):
+        for fn in self._allowlist_files():
             with open(os.path.join(allow, fn), encoding="utf-8") as f:
                 lines = f.read().splitlines()
             declared = int(lines[0].split(":")[1])
             entries = [l for l in lines if l.strip() and not l.startswith("#")]
             self.assertEqual(declared, len(entries), fn)
             for e in entries:
-                self.assertTrue(os.path.exists(os.path.join(self.ROOT, e.split("\t")[0])), e)
+                # `<path>::<fn>` keys (blocking.txt, store-seams.txt) name a file and a symbol in it
+                self.assertTrue(os.path.exists(os.path.join(self.ROOT, e.split("\t")[0].split("::")[0])), e)
             seen += 1
         self.assertGreaterEqual(seen, 3)
 
     # Phase 12 (P8-H): a per-file PIN, on top of the self-consistency check above. That check
     # only proves a file's own `# count: N` line matches its own entry count — it cannot see an
     # allowlist and its count grow TOGETHER, correctly, in the same edit, past the number this
-    # phase actually measured. This table is that second line of defence: growing any file below
-    # means also raising its number HERE, in the same diff, so a reviewer sees the move rather
+    # phase actually measured. This table is that second line of defence, and a raised number
+    # fails `ci/check-ledger-ratchet.py` against the base branch: growing any file below is the
+    # owner's call, made by merging past that check, so a reviewer sees the move rather
     # than an allowlist quietly absorbing a new violation. Shrinking is always allowed (update
     # the number down). The weave that merged P8-H also retired `ci/allow/statics-migration.txt`
     # to 0 — its one entry (ui/widgets.rs) was the 11 top-bar/glass-band statics named individually
@@ -4996,7 +7635,7 @@ impl PersonOwnerGateFixture {
     # `crate::text::(text_width|elide|cap_h)` call site now either threads a real `Measure`
     # capability down from its caller or sits inside the BODY of an `impl … Measure for …` block
     # (`check-deps.sh`'s `textmeasure` gate detects that structurally, not by allowlisted path),
-    # and `idle::dt()` is deleted from `ui/idle.rs` outright — every clock-driven animator that
+    # and `idle::dt()` is deleted from `machine/src/idle.rs` outright — every clock-driven animator that
     # used to accumulate a raw per-frame `dt` now advances through `motion::Ramp`/`motion::Phase`
     # off a real `Tick`, or (`ui/xfade.rs`, `ui/containers/transition.rs`, whose ramps are HASHED
     # replay state and already reported motion correctly through another mechanism) is spelled to
@@ -5004,21 +7643,102 @@ impl PersonOwnerGateFixture {
     # rules are absent from the table below on purpose, the same way a deleted allowlist's own
     # entry disappears rather than pinning at 0.
     PINNED_ALLOWLIST_COUNTS = {
-        "libm.txt": 5,
+        # The module-layer migration list (ci/check-module-layers.py, docs/module-layers.md): the
+        # upward references that existed when the target crate graph was declared, 2026-10-02 (231),
+        # less step L1's 72, which moved the event log out of lib.rs in the same change, less the
+        # remaining 159 that steps L2-L14 cleared: 231 - 72 - 159 = 0. Then `[port webos]` was
+        # declared (step L15), and the 42 (file, member) pairs that name it from outside became
+        # that step's entries: 0 + 42 = 42. Merging main brought main's system toast (#392) and its
+        # two callers: 42 + 2 = 44. Step L15 moved all 44 behind the `tv` interfaces and the port:
+        # 44 - 44 = 0.
+        "cards-conformance.txt": 0,  # card-screen Tier 2 expected failures (PR 0, 2026-10-07; Home and Detail added; Collection adopted Grid, PR 2b); only shrinks
+        "cards.txt": 0,  # screens still assembling card sections from the L0 primitives; empty since the profile picker adopted AvatarRow (2026-10-08)
+        "blocking.txt": 2,  # frame-thread allow_blocking sites, 2026-10-06; only shrinks
+        "language-lists.txt": 5,  # pinned reviewed-translation tables that list several languages (ci/check-language-lists.py)
+        "dump.txt": 9,  # files that may name the frame-dump switch (ci/check-dump-consumers.py); a new file fails the gate
+        "layers.txt": 0,
+        "libm.txt": 6,  # widgets.rs's existing test helper moved to widgets_test_support.rs
         "mutators.txt": 0,
         "nav.txt": 0,
         "sibling-migration.txt": 0,
         "statics-migration.txt": 0,
-        "statics.txt": 17,
+        "statics.txt": 5,  # the two data/search/recents.rs persistence-seam statics + the three gfx.rs GL-context heap statics (ci/check-statics-heap.py); every ui/ render cache, the elide memo, the key memo and the text-input queue are thread_local!
         "store-seams.txt": 0,
         "threads.txt": 0,
         "ticks.txt": 2,
-        "wall.txt": 2,
+        "wall.txt": 3,
     }
+
+    # The Sans-IO ledgers' pins, one number per RULE (the sum over its area files): a ledger only
+    # shrinks, and a raised number fails `ci/check-ledger-ratchet.py` against the base branch, so
+    # growing one is the owner's call, made by merging past that check. A migration PR lowers the
+    # number with the lines it deletes. Seeded 2026-10-24 from
+    # the tool's own output on the tree this table was written for.
+    PINNED_LEDGER_TOTALS = {
+        # Browse B-A (the section hubs' list and row reads leave as `StoreJob::BrowseHubs`): -2 here (`hubs_spawn`,
+        # `hubs_spawn_row` `spawn_small`), -3 on globals (their `client_for` reads and `hubs_land`'s).
+        # Browse B-B+C (the directory and listing-page reads leave as `StoreJob::BrowseDirectory` and
+        # `StoreJob::BrowsePage`): -2 here (`kick_directory`, `maybe_spawn_owned` `spawn_small`), -2 on globals
+        # (their `client_for` reads).
+        # Browse B-D (the source discovery leaves as `StoreJob::BrowseDiscovery`): -1 here (`spawn_discovery`
+        # `spawn_small`), -1 on globals (`maybe_discover_owned` `client_for`).
+        # Browse B-F (the pins take the session from the Bridge): -4 on globals (`pin_record_for`, `record_pins`,
+        # `resolve_pins`, `asks_for_sources` `session::peek`).
+        # Watchlist W-1 (the stores take the seated profile and its identity from the Bridge): -3 on globals
+        # (`capture` `current_snapshot` and `session::peek`, `is_current` `current_snapshot`).
+        # ViewState C3 (the household writes leave as `StoreJob::ViewWrite`): -1 here (`kick`'s `spawn_small`).
+        # Metadata M2 (the season switch and the episode-page window leave as `StoreJob::MetaSeason` /
+        # `StoreJob::MetaEpisodes`): -2 here (`load_season`, `want_episodes` `spawn_small`), -2 on globals
+        # (`fetch_episodes`, `fetch_episode_page` `client_for`).
+        # Metadata M3 (the Related tail window read leaves as `StoreJob::MetaRelated`): -1 here (`ask_related`'s
+        # `spawn_small`), -1 on globals (its `client_for`).
+        "workers": 7,  # production worker starts inside machines (`ci/allow/workers/`)
+        # Sans-IO lifecycle PR B moved the pin by nothing: -3 (the three `lifecycle.rs` `player::TX` lines left with the
+        # transport contract, `player/transport.rs`, the IO layer) and +3 (a relocation lowers no pin by itself, so the same
+        # diff widened the spellings to the transport readers `transport::paused`, `transport::viewer_paused` and
+        # `preview::paused`, and seeded the 3 `preview::paused` reads in screens/detail it found).
+        # ViewState C2 (the step decides from the borrowed `ClientKeys`): -2 on globals (`request` and
+        # `fan_out_origin_watched` no longer read the registry). C3 (the job lane) took the other 3: `kick`, and the
+        # fan-out's `fan_out` and `ask_sources`, which now reach the other servers through the key-checked `KeyedClients`.
+        # Attempt-caps (#1044) moved the pin by nothing: the spellings widened to `devcaps::caps` and the zero-argument
+        # `is_dp_audio` / `is_dp_audio_track` (a coverage expansion, not a shrink), and the planner reads none of them.
+        # Ledger widening (a one-time coverage expansion that RECORDS sites that already existed; no new code and no
+        # new read): the globals rule gained the registry readers its closed list had missed (`server_ids`,
+        # `server_roster_gen`, `server_facts_gen`, `server_probe_result`, `session::peek_settled`,
+        # `session::current_gen`, `tape::active`), +57 (57 -> 114); the forks rule gained the machine crates
+        # screens/, ui/, appkit/ and machine/ (it read only data/, plex/, media/, session/), +17 (58 -> 75).
+        "globals": 114,  # production process-global reads inside machines (`ci/allow/globals/`)
+        # Dolby Vision setting (#1156): -1 on forks (`build_stream` takes the DV probe from `ResolveEnv`, captured
+        # at the request, so its test/production read of `devcaps::dv::capability` is gone).
+        "forks": 74,  # production test/production forks in every machine crate: data/, plex/, media/, session/, screens/, ui/, appkit/, machine/ (`ci/allow/forks/`)
+        "fxlanes": 11,  # Bridge::app_effect arms that do not push Fx::Deliver (`ci/allow/fxlanes/`)
+    }
+
+    def test_ledger_totals_match_the_pinned_table(self):
+        allow = os.path.join(self.ROOT, "ci", "allow")
+        on_disk = sorted(d for d in os.listdir(allow) if os.path.isdir(os.path.join(allow, d)))
+        self.assertEqual(
+            set(on_disk) - set(self.PINNED_LEDGER_TOTALS), set(),
+            "a new ci/allow/<rule>/ ledger directory must add its own line to PINNED_LEDGER_TOTALS "
+            "(and its rule to check-deps.sh) deliberately",
+        )
+        for rule, pinned in self.PINNED_LEDGER_TOTALS.items():
+            total = 0
+            d = os.path.join(allow, rule)
+            # a rule whose last area file is gone has no directory left in git: its total is 0
+            for fn in (sorted(os.listdir(d)) if os.path.isdir(d) else []):
+                self.assertTrue(fn.endswith(".txt"), f"{rule}/{fn}: a ledger area file is <area>.txt")
+                with open(os.path.join(d, fn), encoding="utf-8") as f:
+                    total += int(f.readline().split(":")[1])
+            self.assertLessEqual(
+                total, pinned,
+                f"the {rule} ledger grew from the pinned {pinned} to {total} — a ledger only shrinks: "
+                "move the new site out of the machine instead of listing it (docs/sans-io.md)",
+            )
 
     def test_allowlist_counts_match_the_pinned_table(self):
         allow = os.path.join(self.ROOT, "ci", "allow")
-        on_disk = sorted(os.listdir(allow))
+        on_disk = sorted(fn for fn in os.listdir(allow) if os.path.isfile(os.path.join(allow, fn)))
         self.assertEqual(
             set(on_disk), set(self.PINNED_ALLOWLIST_COUNTS),
             "a new ci/allow/*.txt file (or a deleted one) must add (or remove) its own line in "
@@ -5029,10 +7749,1590 @@ impl PersonOwnerGateFixture {
                 declared = int(f.readline().split(":")[1])
             self.assertLessEqual(
                 declared, pinned,
-                f"{fn} grew from the pinned {pinned} to {declared} — if this growth is "
-                "deliberate (a real, reasoned new entry, not a workaround), raise the number in "
-                "PINNED_ALLOWLIST_COUNTS in the same change so a reviewer sees it move",
+                f"{fn} grew from the pinned {pinned} to {declared}: an allowlist only shrinks, and "
+                "ci/check-ledger-ratchet.py fails a raised pin as well as the new entry. Remove the "
+                "entry, or stop and explain in the PR why the site seems to need one (an exception "
+                "is the owner's call)",
             )
+
+
+class PosterGateCoverage(unittest.TestCase):
+    def test_device_manifest_has_settle_eviction_and_dive_workloads(self):
+        scenes = {s.get('poster_gate', {}).get('kind'): s for s in _manifest()['fps_scenes'] if s.get('poster_gate')}
+        self.assertEqual(set(scenes), {'settle', 'eviction', 'dive'})
+        for scene in scenes.values():
+            self.assertGreaterEqual(scene['poster_gate']['moving_fps_floor'], 55)
+            self.assertIn('plxnative-postergate', scene['triggers'])
+            # The app no longer declines a moving card by default; these scenes grade that decline.
+            self.assertEqual(scene['triggers'].get('plxnative-cardspeed'), '120')
+            # Nor is the settled window left unwarmed by default: the at-rest lookahead (3 rows)
+            # would answer the settle from art no draw has asked for, which proves nothing.
+            self.assertEqual(scene['triggers'].get('plxnative-lookahead'), '0')
+
+    def test_poster_grade_requires_real_work_and_complete_settle(self):
+        import poster_gate
+        def evidence(kind):
+            records = []
+            for phase in poster_gate.PHASES[kind]:
+                values = {k: 0 for k in poster_gate.FIELDS}
+                values.update(ms=1000, frames=60, draws=720, ready=720, moving=700,
+                              moving_frames=60, moving_ms=983, requested=12,
+                              refused_new=20, refused_evicted=10, rearmed=12,
+                              uploads=12, lost=12, last_draws=12, last_ready=12, complete=1)
+                if kind == 'dive':
+                    values.update(shelf_start_px=1500, shelf_end_px=1500,
+                                  snap_end_milli=0 if phase == 'hero' else 1000,
+                                  snap_begin_milli=0 if phase in ('warm','dive') else 1000)
+                records.append('poster-gate: kind='+kind+' phase='+phase+' '+' '.join(f'{k}={v}' for k,v in values.items()))
+            records.append('poster-gate: kind='+kind+' phase=done')
+            return records
+        for kind in poster_gate.PHASES:
+            scene = {'poster_gate': {'kind': kind, 'moving_fps_floor': 55}}
+            lines = evidence(kind)
+            self.assertTrue(run.grade_poster_gate(scene, lines)[0])
+            for bad, replacement in [('requested_moving=0','requested_moving=1'), ('uploads=12','uploads=0'),
+                                     ('last_ready=12','last_ready=0'), ('moving_frames=60','moving_frames=0'),
+                                     ('refused_new=20 refused_evicted=10','refused_new=0 refused_evicted=0')]:
+                broken = [line.replace(bad,replacement) for line in lines]
+                self.assertFalse(run.grade_poster_gate(scene, broken)[0], (kind,bad))
+            self.assertFalse(run.grade_poster_gate(scene, lines[:-1])[0])
+            self.assertFalse(run.grade_poster_gate(scene, ['loop=60 route=library fps=60'])[0])
+        dive = {'poster_gate': {'kind': 'dive', 'moving_fps_floor': 55}}
+        for bad,replacement in [('shelf_end_px=1500','shelf_end_px=0'), ('shelf_span_px=0','shelf_span_px=20'),
+                                ('shelf_v_milli=0','shelf_v_milli=2000'), ('snap_end_milli=1000','snap_end_milli=700')]:
+            self.assertFalse(run.grade_poster_gate(dive,[line.replace(bad,replacement) for line in evidence('dive')])[0])
+        scene = {'poster_gate': {'kind': 'eviction','moving_fps_floor':55}}
+        for bad in ('lost=12','rearmed=12','refused_evicted=10'):
+            self.assertFalse(run.grade_poster_gate(scene,[line.replace(bad,bad.split('=')[0]+'=0') for line in evidence('eviction')])[0])
+
+    def test_poster_grade_reads_the_sized_plan_and_names_an_unfit_catalog(self):
+        # The scene sizes its targets to the catalog it booted into and logs that plan; the plan
+        # line is context, not a phase. A catalog too small to prove anything is refused by the
+        # app by name, and the grade must say THAT rather than blame the renderer.
+        import poster_gate
+        values = {k: 0 for k in poster_gate.FIELDS}
+        values.update(ms=1000, frames=60, draws=720, ready=720, moving=700, moving_frames=60,
+                      moving_ms=983, requested=12, refused_new=20, refused_evicted=10, rearmed=12,
+                      uploads=12, lost=12, last_draws=12, last_ready=12, complete=1)
+        fields = ' '.join(f'{k}={v}' for k, v in values.items())
+        lines = ['poster-gate: kind=eviction phase=armed budget_mib=12',
+                 'poster-gate: kind=eviction phase=planned content=Grid { rows: 7, per_screen: 3 } '
+                 'stages=warm@row0,seed1@row3,seed2@row6,reverse@row6,settle@row0']
+        lines += [f'poster-gate: kind=eviction phase={p} {fields}' for p in poster_gate.PHASES['eviction']]
+        lines.append('poster-gate: kind=eviction phase=done')
+        scene = {'poster_gate': {'kind': 'eviction', 'moving_fps_floor': 55}}
+        self.assertTrue(run.grade_poster_gate(scene, lines)[0])
+        unfit = ['poster-gate: kind=eviction phase=armed budget_mib=12',
+                 'poster-gate: kind=eviction phase=unfit what=library-rows have=5 need=6']
+        ok, detail = run.grade_poster_gate(scene, unfit)
+        self.assertFalse(ok)
+        self.assertIn('UNFIT CATALOG', detail)
+        self.assertIn('library-rows >= 6', detail)
+        self.assertIn('has 5', detail)
+
+
+class StreamSelectionReset(unittest.TestCase):
+    """`pms_reset_streams` / `pms_default_audio_stream` -- the fix for a crashed run's live
+    subtitle pick persisting into the next run's starting state (`run_case` used to reset
+    viewOffset only, never the part's audio/subtitle selection). No network: `urllib.request
+    .urlopen` is mocked, so these exercise the URL-building and parsing logic only."""
+
+    def _metadata_response(self, streams, part_id=999):
+        body = json.dumps({"MediaContainer": {"Metadata": [
+            {"Media": [{"Part": [{"id": part_id, "Stream": streams}]}]}
+        ]}}).encode()
+        return io.BytesIO(body)
+
+    def test_default_audio_prefers_selected_over_default_over_first(self):
+        # selected=1 wins even when a different stream carries default=1.
+        streams = [
+            {"id": 1, "streamType": 2, "default": 1},
+            {"id": 2, "streamType": 2, "selected": 1},
+            {"id": 3, "streamType": 2},
+        ]
+        self.assertEqual(run.pms_default_audio_stream({"Stream": streams}), 2)
+
+    def test_default_audio_falls_back_to_file_default_then_first(self):
+        self.assertEqual(run.pms_default_audio_stream(
+            {"Stream": [{"id": 5, "streamType": 2, "default": 1}, {"id": 6, "streamType": 2}]}), 5)
+        self.assertEqual(run.pms_default_audio_stream(
+            {"Stream": [{"id": 7, "streamType": 2}, {"id": 8, "streamType": 2}]}), 7)
+
+    def test_default_audio_none_when_part_has_no_audio_stream(self):
+        self.assertIsNone(run.pms_default_audio_stream({"Stream": [{"id": 1, "streamType": 3}]}))
+
+    def _urlopen_ctx(self, resp):
+        cm = mock.MagicMock()
+        cm.__enter__ = mock.Mock(return_value=resp)
+        cm.__exit__ = mock.Mock(return_value=False)
+        return cm
+
+    def test_reset_streams_puts_subtitle_off_and_default_audio(self):
+        streams = [
+            {"id": 10, "streamType": 1},
+            {"id": 11, "streamType": 2, "selected": 1},
+            {"id": 12, "streamType": 3},
+        ]
+        calls = []
+
+        def fake_urlopen(req, timeout=15):
+            calls.append(req.full_url)
+            resp = self._metadata_response(streams) if len(calls) == 1 else io.BytesIO(b"")
+            resp.status = 200
+            return self._urlopen_ctx(resp)
+
+        with mock.patch.object(run.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok = run.pms_reset_streams("tv.example", 32400, "72", "TOKEN")
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2, calls)
+        meta_url, put_url = calls
+        self.assertIn("/library/metadata/72", meta_url)
+        self.assertIn("/library/parts/999", put_url)
+        self.assertIn("subtitleStreamID=0", put_url)
+        self.assertIn("audioStreamID=11", put_url)
+        self.assertIn("allParts=1", put_url)
+
+    def test_reset_streams_omits_audio_param_when_part_has_none(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=15):
+            calls.append(req.full_url)
+            resp = (self._metadata_response([{"id": 1, "streamType": 3}])
+                    if len(calls) == 1 else io.BytesIO(b""))
+            resp.status = 200
+            return self._urlopen_ctx(resp)
+
+        with mock.patch.object(run.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok = run.pms_reset_streams("tv.example", 32400, "72", "TOKEN")
+        self.assertTrue(ok)
+        self.assertNotIn("audioStreamID", calls[1])
+
+    def test_reset_streams_reports_failure_without_raising(self):
+        def fake_urlopen(req, timeout=15):
+            raise OSError("refused")
+
+        with mock.patch.object(run.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok = run.pms_reset_streams("tv.example", 32400, "72", "TOKEN")
+        self.assertFalse(ok)
+
+    def test_server_selected_subtitle_case_seeds_its_own_subtitle_after_the_reset(self):
+        """audio_enhancement_draws_server_selected_subtitle reads a SERVER-selected subtitle, and
+        `subtitle_text_srt` plays the same part -- its reset/pick leaves an explicit selection,
+        so relying on stream_reset: false made the case order-dependent. The case now declares
+        `setup.seed_subtitle`; `apply_stream_setup` must reset, THEN PUT a non-zero
+        subtitleStreamID resolved from live metadata (no id in the manifest)."""
+        case = {c["name"]: c for c in _manifest()["cases"]}[
+            "audio_enhancement_draws_server_selected_subtitle"]
+        case = {"rk": "72", **case}
+        self.assertTrue(case.get("stream_reset", True))
+        self.assertNotIn("stream_reset", case)
+        self.assertIn("seed_subtitle", case["setup"])
+        self.assertNotRegex(json.dumps(case["setup"]["seed_subtitle"]), r"\d{4}")
+        streams = [
+            {"id": 2694, "streamType": 1},
+            {"id": 2695, "streamType": 2, "selected": 1},
+            {"id": 2697, "streamType": 3, "languageCode": "eng"},
+            {"id": 2698, "streamType": 3, "languageCode": "deu"},
+        ]
+        calls = []
+
+        def fake_urlopen(req, timeout=15):
+            calls.append(req.full_url)
+            resp = (self._metadata_response(streams, part_id=749)
+                    if "/library/metadata/" in req.full_url else io.BytesIO(b""))
+            resp.status = 200
+            return self._urlopen_ctx(resp)
+
+        with mock.patch.object(run.urllib.request, "urlopen", side_effect=fake_urlopen):
+            run.apply_stream_setup("tv.example", 32400, case, "TOKEN")
+        puts = [u for u in calls if "/library/parts/749" in u]
+        self.assertEqual(len(puts), 2, calls)
+        self.assertIn("subtitleStreamID=0", puts[0])
+        self.assertIn("subtitleStreamID=2697", puts[1])
+        self.assertIn("allParts=1", puts[1])
+
+    def test_seed_subtitle_resolves_by_language_and_refuses_a_missing_track(self):
+        streams = [{"id": 5, "streamType": 3, "languageCode": "eng"},
+                   {"id": 6, "streamType": 3, "languageCode": "deu"}]
+        part = {"Stream": streams}
+        self.assertEqual(run.pms_resolve_subtitle_stream(part, {"language": "deu"}), 6)
+        self.assertEqual(run.pms_resolve_subtitle_stream(part, {"track": 1}), 6)
+        self.assertIsNone(run.pms_resolve_subtitle_stream(part, {"track": 2}))
+        self.assertIsNone(run.pms_resolve_subtitle_stream(part, {"language": "fra"}))
+
+    def test_run_case_guards_the_reset_on_stream_reset_key(self):
+        """The manifest key is only a convention unless `run_case` actually reads it -- inspect
+        the source (same trick as `abr_shape_keys` above) rather than driving the whole
+        (TV-calling) function, so this stays a host-only, network-free assertion."""
+        self.assertIn("apply_stream_setup(", inspect.getsource(run.run_case))
+        src = inspect.getsource(run.apply_stream_setup)
+        self.assertIn('case.get("stream_reset", True)', src)
+        self.assertIn("pms_reset_streams(", src)
+
+
+class _ParallelSuite(unittest.TestSuite):
+    """Runs its tests on a thread pool and replays each one's outcome into the real result.
+
+    Only for tests whose work is a subprocess and that share no state (`DepGates`: each runs
+    `ci/check-deps.sh` over its own private copy of the tree, about 11 s apiece (a few of them run it
+    several times),
+    which was 630 of the 645 s this module took when they ran one after another). Threads are
+    enough because the time is spent waiting on the child. A test runs against a private
+    `TestResult`, then its counters and failure lists are folded into the shared one on the
+    calling thread, so the shared result is only ever touched from one thread.
+
+    What parallel mode does not do: `-f` (failfast) and `-b` (buffer) are not honoured, and the
+    per-test progress characters are not printed -- the final count, the failure list and the exit
+    code are correct. Naming a dotted test or class on the command line bypasses this suite
+    entirely (see `load_tests`) and runs serially. An interrupt stops the tests not yet started
+    and waits only for the ones already running.
+    """
+
+    def run(self, result, debug=False):
+        jobs = min(8, os.cpu_count() or 1)
+        configured = os.environ.get("PLX_TEST_JOBS")
+        if configured:
+            try:
+                jobs = int(configured)
+            except ValueError:
+                print(f"PLX_TEST_JOBS={configured!r} is not an integer; using {jobs}", file=sys.stderr)
+        tests = list(self)
+        if jobs <= 1 or len(tests) <= 1:
+            return super().run(result, debug)
+
+        def one(test):
+            private = unittest.TestResult()
+            test.run(private)
+            return test, private
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=jobs)
+        try:
+            for future in [pool.submit(one, test) for test in tests]:
+                test, private = future.result()
+                result.startTest(test)
+                result.testsRun += private.testsRun - 1  # `startTest` counted this one
+                result.failures.extend(private.failures)
+                result.errors.extend(private.errors)
+                result.skipped.extend(private.skipped)
+                result.expectedFailures.extend(private.expectedFailures)
+                result.unexpectedSuccesses.extend(private.unexpectedSuccesses)
+                if not (private.failures or private.errors or private.skipped):
+                    result.addSuccess(test)
+                result.stopTest(test)
+        finally:
+            # Not `with`: its exit waits for EVERY queued test, so Ctrl-C would sit through the
+            # whole class. Cancel what has not started; a running test cleans up its own copy.
+            pool.shutdown(wait=True, cancel_futures=True)
+        return result
+
+
+import contextlib
+import copy
+import urllib.request
+
+
+class FpsMock(unittest.TestCase):
+    """`./tests/run.py --fps --mock` (#395): scene selection, the mock's arguments, the fail-closed
+    identity check, the paced walk and its window, and the CLI's refusals. No TV, no account."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(TESTS_DIR, "manifest.json")) as fh:
+            cls.scenes = {s["name"]: s for s in json.load(fh)["fps_scenes"]}
+        import mock_fps
+        cls.mf = mock_fps
+
+    PAGING_SURFACES = tuple(f"{b}-paging-held-{l}" for b in ("library-grid", "library-shelf", "search-row",
+                                                              "related-row", "collection", "long-season")
+                            for l in ("3g", "remote-wan"))
+
+    # --- scene selection --------------------------------------------------------------
+    def test_under_mock_only_scenes_with_a_mock_block_run(self):
+        # the #665 scene's generated fixtures live outside the repo (present on a dev host, absent
+        # on a CI runner): treat them as built so the selection does not depend on the host
+        with mock.patch.object(self.mf, "missing_mock_fixtures", return_value=None):
+            runnable, skipped = self.mf.partition_mock(list(self.scenes.values()), True)
+        names = {s["name"] for s in runnable}
+        self.assertEqual(names, {"home-grid", "home-grid-deep", "home-recent-paging", "home-recent-paging-held", "home-recent-paging-held-3g",
+                                 "home-recent-paging-held-remote-wan", "home-hint",
+                                 *self.PAGING_SURFACES,
+                                 "library-shelves-deep", "library-burst", "library-hold",
+                                 "library-recommended",
+                                 "hero-pong", "grid-pong", "home-idle", "item-menu", "library-scroll",
+                                 "library-idle", "collection-page", "person-page", "search-type",
+                                 "show-detail", "home-hold", "collection-hold", "home-tap",
+                                 "collection-tap", "watchlist-idle", "catalog-idle",
+                                 "fixed-480p-reencode-declaration",
+                                 "boost-remux-declares-source-rate"})
+        self.assertEqual(len(runnable) + len(skipped), len(self.scenes))
+        for _, why in skipped:
+            self.assertIn("real library content", why)
+
+    def test_without_mock_a_mock_only_scene_is_skipped_and_the_rest_unchanged(self):
+        runnable, skipped = self.mf.partition_mock(list(self.scenes.values()), False)
+        self.assertEqual([n for n, _ in skipped], ["home-grid-deep", "home-recent-paging",
+                                                   "home-recent-paging-held",
+                                                   "home-recent-paging-held-3g",
+                                                   "home-recent-paging-held-remote-wan",
+                                                   *self.PAGING_SURFACES,
+                                                   "library-shelves-deep", "library-burst",
+                                                   "library-hold",
+                                                   "fixed-480p-reencode-declaration",
+                                                   "boost-remux-declares-source-rate"])
+        self.assertIn("--mock", skipped[0][1])
+        self.assertIn("home-grid", {s["name"] for s in runnable})
+        self.assertEqual(len(runnable), len(self.scenes) - 10 - len(self.PAGING_SURFACES))
+
+    def test_a_mock_scene_naming_a_library_item_carries_its_own_rating_key(self):
+        # the overlay's ratingKey is the real server's; under --mock the scene opens `mock.rk`
+        for s in self.scenes.values():
+            if self.mf.scene_mock(s) is not None:
+                if s.get("item"):
+                    self.assertIsInstance(s["mock"].get("rk"), int, s["name"])
+                self.assertNotIn("needs_shared_server", s, s["name"])
+                # the one player-tier mock scene plays a served file and grades its own `expect`
+                want = ("player" if s["name"] in ("fixed-480p-reencode-declaration",
+                                                  "boost-remux-declares-source-rate") else "ui")
+                self.assertEqual(s.get("tier", "ui"), want, s["name"])
+
+    def test_the_press_scenes_drive_a_real_press_and_never_a_plain_ok(self):
+        # home-hold/collection-hold/home-tap/collection-tap (`plxnative-holdbench`): counted bench
+        # scenes graded off `bench: kind=hold` lines, mock-runnable, with the same trigger on
+        # a Home card and on the Collection page (a cards::Stack page, mock rk 50002).
+        for name, tap in (("home-hold", False), ("collection-hold", False),
+                          ("home-tap", True), ("collection-tap", True)):
+            s = self.scenes[name]
+            self.assertEqual(s["bench"], "hold", name)
+            self.assertEqual(s["route"], "home" if name.startswith("home") else "collection", name)
+            # limits measured on the television 2026-10-08 (fixed build); the unfixed 21 fps open
+            # (home-hold 525, collection-hold 498, home-tap 12 missed) must fail them
+            limits = {"home-hold": (110, 55, 525), "collection-hold": (60, 50, 498),
+                      "home-tap": (8, 40, 12), "collection-tap": (8, 40, None)}[name]
+            self.assertEqual(s["bench_missed_max"], limits[0], name)
+            self.assertEqual(s["bench_iv_max_ms"], limits[1], name)
+            if limits[2] is not None:
+                self.assertLess(s["bench_missed_max"], limits[2], name)
+            if not tap:
+                self.assertLess(s["bench_missed_max"], 30 * 16, name)
+            self.assertEqual(s.get("bench_drift_ms"), 4.0 if tap else None, name)
+            self.assertNotIn("PROVISIONAL", s["comment"], name)
+            self.assertIn("2026-10-08", s["comment"], name)
+            if not tap:
+                self.assertIn("#561", s["comment"], name)
+            value = s["triggers"]["plxnative-holdbench"]
+            self.assertEqual(value.endswith(",tap"), tap, name)
+            # the press itself is the bench's: no separate press/itemmenu trigger may ride along
+            self.assertNotIn("plxnative-press", s["triggers"], name)
+            self.assertNotIn("plxnative-itemmenu", s["triggers"], name)
+            # the bench ends on its own `done` line, with room to finish its cycles
+            n, period = int(value.split(",")[0]), (350 if tap else 1500)
+            self.assertGreater(s["run_secs"] - s["warmup_s"], n * 2 * period / 1000, name)
+        collection = self.mf.mock_scene(self.scenes["collection-hold"])
+        self.assertEqual(collection["rk"], 50002)
+        self.assertEqual(collection["triggers"]["plxnative-collection"], "$rk")
+        self.assertEqual(self.mf.mock_server_args(self.scenes["collection-hold"]), ["--movies", "240"])
+        self.assertIn("plxnative-grid", self.scenes["home-hold"]["triggers"])
+        with open(os.path.join(TESTS_DIR, "run.py")) as fh:
+            self.assertIn('"plxnative-holdbench"', fh.read(), "run.py clears the trigger between cases")
+
+    def test_a_hold_bench_cycle_that_pressed_nothing_or_opened_no_menu_fails_the_grade(self):
+        scene = {"bench": "hold", "bench_missed_max": 0}
+
+        def line(i, target, missed=0):
+            return (f"bench: kind=hold cycle={i}/2 target={target} worst_ms=18.0 frames=40 dur_ms=3000 "
+                    f"rss_kb=1000 first_ms=17.0 missed={missed} open=first:17.0,worst:18.0@3,iv:17.0,missed:0 "
+                    f"close=first:17.0,worst:18.0@3,iv:17.0,missed:0")
+        done = "bench: kind=hold done cycles=2"
+        ok, detail = run.grade_bench(scene, [line(1, "home"), line(2, "home"), done])
+        self.assertTrue(ok, detail)
+        ok, detail = run.grade_bench(scene, [line(1, "home"), line(2, "home-nomenu"), done])
+        self.assertFalse(ok)
+        self.assertIn("did not exercise the animation", detail)
+        ok, detail = run.grade_bench(scene, [line(1, "collection-nocard"), line(2, "collection"), done])
+        self.assertFalse(ok)
+        ok, detail = run.grade_bench(scene, [line(1, "home", 1), line(2, "home"), done])
+        self.assertFalse(ok, "a missed refresh in the press window fails the zero budget")
+
+    def test_mock_server_args(self):
+        self.assertEqual(self.mf.mock_server_args(self.scenes["home-grid"]), [])
+        self.assertEqual(self.mf.mock_server_args(self.scenes["home-grid-deep"]),
+                         ["--home-hubs", "170"])
+        self.assertEqual(self.mf.mock_server_args(self.scenes["library-shelves-deep"]),
+                         ["--section-hubs", "170", "--section-hubs-linked", "40"])
+        self.assertEqual(self.mf.mock_server_args({"mock": {"section_hubs": 9}}),
+                         ["--section-hubs", "9"])
+        with self.assertRaises(ValueError):
+            self.mf.mock_server_args({"name": "x", "mock": {"home_hubs": -1}})
+        with self.assertRaises(ValueError):
+            self.mf.mock_server_args({"name": "x", "mock": {"section_hubs": 3, "section_hubs_linked": 4}})
+        with self.assertRaises(ValueError):
+            self.mf.mock_server_args({"name": "x", "mock": {"section_hubs": -1}})
+
+    def test_mock_scene_substitutes_rk_and_trigger_values_on_a_copy(self):
+        page = self.scenes["collection-page"]
+        ran = self.mf.mock_scene(page)
+        self.assertEqual(ran["rk"], 50002)
+        self.assertNotIn("rk", page)
+        self.assertEqual(run.fps_trigger_files(ran), [("plxnative-collection", "50002")])
+        self.assertEqual(self.mf.mock_server_args(page), ["--movies", "240"])
+        search = self.mf.mock_scene(self.scenes["search-type"])
+        self.assertEqual(search["triggers"]["plxnative-search"], "sb")
+        self.assertTrue(search["triggers"]["plxnative-searchosc"])  # the rest is kept
+        self.assertEqual(self.scenes["search-type"]["triggers"]["plxnative-search"], "th")
+        with self.assertRaises(ValueError):
+            self.mf.mock_server_args({"name": "x", "mock": {"movies": 1001}})
+
+    def test_an_item_scene_without_mock_rk_is_skipped_under_mock(self):
+        scene = {"name": "x", "item": "movie", "mock": {}}
+        runnable, skipped = self.mf.partition_mock([scene], True)
+        self.assertEqual(runnable, [])
+        self.assertIn("mock.rk", skipped[0][1])
+
+    def test_new_mock_scenes_resolve_to_content_the_mock_serves(self):
+        """Each card-screen scene, as it runs under --mock, points at a ratingKey / query the
+        synthetic library really answers with realistically sized content."""
+        def get(port, path):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as r:
+                return json.load(r)["MediaContainer"]
+
+        def check(name, fn):
+            scene = self.mf.mock_scene(self.scenes[name])
+            port = self._free_port()
+            with self.mf.MockPms("127.0.0.1", port, self.mf.mock_server_args(scene)):
+                with self.subTest(scene=name):
+                    fn(port, scene, dict(run.fps_trigger_files(scene)))
+
+        def collection(port, scene, trig):
+            rk = trig["plxnative-collection"]
+            head = get(port, f"/library/metadata/{rk}")["Metadata"]
+            self.assertEqual(head[0]["type"], "collection")
+            kids = get(port, f"/library/collections/{rk}/children")["Metadata"]
+            self.assertGreaterEqual(len(kids), 18)  # several poster rows
+            self.assertTrue(all(k.get("thumb") for k in kids))
+
+        def person(port, scene, trig):
+            movie = get(port, f"/library/metadata/{trig['plxnative-detail']}")["Metadata"][0]
+            self.assertEqual(movie["type"], "movie")
+            pid = movie["Role"][0]["id"]  # detailsec=1 + detailok opens cast[0]
+            titles = get(port, f"/library/people/{pid}/media")["Metadata"]
+            self.assertGreaterEqual(len({t["type"] for t in titles}), 2)  # two shelves
+            self.assertGreaterEqual(len(titles), 6)
+
+        def search(port, scene, trig):
+            hubs = get(port, f"/hubs/search?query={trig['plxnative-search']}&limit=8")["Hub"]
+            filled = [h for h in hubs if h["size"] > 0]
+            self.assertGreaterEqual(len(filled), 4)
+            self.assertGreaterEqual(sum(h["size"] for h in filled), 12)
+
+        def show(port, scene, trig):
+            rk = trig["plxnative-detail"]
+            self.assertEqual(get(port, f"/library/metadata/{rk}")["Metadata"][0]["type"], "show")
+            seasons = get(port, f"/library/metadata/{rk}/children")["Metadata"]
+            self.assertGreaterEqual(len(seasons), 2)
+            eps = get(port, f"/library/metadata/{seasons[0]['ratingKey']}/children")["Metadata"]
+            self.assertGreaterEqual(len(eps), 6)
+            self.assertGreaterEqual(len(get(port, f"/library/metadata/{rk}/related")["Hub"]), 1)
+
+        check("collection-page", collection)
+        check("person-page", person)
+        check("search-type", search)
+        check("show-detail", show)
+
+    def test_an_exact_scene_name_selects_only_that_scene(self):
+        scenes = list(self.scenes.values())
+        self.assertEqual([s["name"] for s in run.fps_for_tiers(scenes, False, "home-grid")],
+                         ["home-grid"])
+        both = [s["name"] for s in run.fps_for_tiers(scenes, False, "home-gri")]
+        self.assertEqual(sorted(both), ["home-grid", "home-grid-deep"])
+
+    # --- fixed-480p-reencode-declaration (#665) ----------------------------------------
+    def test_fixed_480p_scene_pins_the_rung_and_grades_the_declaration(self):
+        sc = self.scenes["fixed-480p-reencode-declaration"]
+        self.assertEqual(sc["quality"], "480p_720_kbps")
+        self.assertEqual(sc["expect"]["load_max"], "1920x1080@60")  # not the source's 3840x2160@60
+        self.assertEqual(sc["expect"]["sink_echo"], "1920x1080@60")
+        self.assertTrue(sc["mock"]["only"])
+        ran = self.mf.mock_scene(sc)
+        self.assertEqual(dict(run.fps_trigger_files(ran))["plxnative-play"], "990001")
+        args = self.mf.mock_server_args(sc)
+        self.assertEqual(args[0], "--extra-media")
+        self.assertTrue(args[1].endswith("bug665/src-4k-h264-aac.mkv"))
+        self.assertEqual(args[2], "--transcode-fixture")
+        self.assertTrue(args[3].endswith("bug665/transcode-480p-h264-aac.mkv"))
+
+    # --- boost-remux-declares-source-rate (#832) ---------------------------------------
+    def test_boost_remux_scene_forces_boost_on_and_grades_the_source_rate(self):
+        sc = self.scenes["boost-remux-declares-source-rate"]
+        self.assertTrue(sc["mock"]["only"])
+        ran = self.mf.mock_scene(sc)
+        files = dict(run.fps_trigger_files(ran))
+        self.assertEqual(files["plxnative-play"], "990001")
+        self.assertEqual(files["plxnative-audioenh"], "boost")
+        self.assertEqual(sc["expect"]["load_fps"], 24.0)
+        self.assertEqual(sc["expect"]["load_max"], "3840x2160@24")
+        self.assertTrue(sc["expect"]["presented_rate"])
+        args = self.mf.mock_server_args(sc)
+        self.assertTrue(args[1].endswith("boost-remux/src-4k24-h264-ac3.mkv"))
+        self.assertTrue(args[3].endswith("boost-remux/remux-4k24-h264-ac3.mkv"))
+
+    def test_boost_remux_scene_fails_the_pre_fix_declaration(self):
+        sc = self.scenes["boost-remux-declares-source-rate"]
+
+        def log(fps, mx):
+            return [
+                "enhancement: boost_dialog=true normalize_loudness=false \u2014 direct play becomes an enhanced remux",
+                "stream: path=/video/:/transcode/universal/start.mkv?x=1",
+                "ff: v=#0 codec=h264 codec_id=27 3840x2160 a=#1",
+                f'load: v=H264 a="AC3" fps={fps} dv=present:0 P0/0 el:0 atmos:0 max={mx}',
+                f"smp_cb type=5 num=0 str=video/x-h264 (null) (null) 3840 2160 (null) {mx.split('@')[1]}.000000",
+                "SMP loadCompleted", "player: pos=2s", "player: pos=15s"]
+        with mock.patch.object(run, "a_timeline_climb", return_value=(True, "climbed")), \
+                mock.patch.object(run, "a_presented_rate", return_value=(True, "ok")):
+            good, why = run.grade_scene_expect(sc, log("24.000", "3840x2160@24"))
+            self.assertTrue(good, why)
+            # the declaration #832 fixed: a remux declared no rate and the 60 fps ceiling
+            bad, why = run.grade_scene_expect(sc, log("0.000", "3840x2160@60"))
+            self.assertFalse(bad)
+            self.assertIn("declared fps=0.000", why)
+        # and the sink's presented rate is graded when the scene opts in (unmocked: no counter lines)
+        with mock.patch.object(run, "a_timeline_climb", return_value=(True, "climbed")):
+            bad, why = run.grade_scene_expect(sc, log("24.000", "3840x2160@24"))
+            self.assertFalse(bad)
+            self.assertIn("presented_rate", why)
+
+    def test_mock_fixture_names_must_be_relative_and_inside_the_root(self):
+        for bad in ("/etc/x.mkv", "../x.mkv", "a/../../x.mkv", ""):
+            with self.assertRaises(ValueError, msg=bad):
+                self.mf.mock_server_args({"name": "x", "mock": {"transcode_fixture": bad}})
+
+    def test_a_scene_with_unbuilt_mock_fixtures_is_skipped_with_the_reason(self):
+        sc = {"name": "x", "mock": {"extra_media": ["nope/absent.mkv"]}}
+        runnable, skipped = self.mf.partition_mock([sc], True)
+        self.assertEqual(runnable, [])
+        self.assertIn("nope/absent.mkv", skipped[0][1])
+
+    def test_scene_expect_grades_the_load_declaration(self):
+        sc = self.scenes["fixed-480p-reencode-declaration"]
+        log = lambda mx: [
+            "stream: path=/video/:/transcode/universal/start.mkv?x=1",
+            "ff: v=#0 codec=h264 codec_id=27 854x480 a=#1",
+            f'load: v=H264 a="AAC" fps=30.000 dv=present:0 P0/0 el:0 atmos:0 max={mx}',
+            "smp_cb type=5 num=0 str=video/x-h264 (null) (null) 1920 1080 (null) 60.000000",
+            "SMP loadCompleted",
+            "player: pos=2s", "player: pos=15s"]
+        with mock.patch.object(run, "a_timeline_climb", return_value=(True, "climbed")):
+            good, why = run.grade_scene_expect(sc, log("1920x1080@60"))
+            self.assertTrue(good, why)
+            # the pre-4f11c1aff declaration: the SOURCE raster, ignoring the 480p ceiling
+            bad, why = run.grade_scene_expect(sc, log("3840x2160@60"))
+            self.assertFalse(bad)
+            self.assertIn("declared max=3840x2160@60", why)
+            typo = dict(sc, expect={"load_mx": "1920x1080@60"})
+            self.assertFalse(run.grade_scene_expect(typo, log("1920x1080@60"))[0])
+        self.assertEqual(run.grade_scene_expect({"name": "y"}, []), (True, ""))
+
+    def test_fixed_480p_scene_is_served_by_the_mock_when_built(self):
+        sc = self.mf.mock_scene(self.scenes["fixed-480p-reencode-declaration"])
+        if self.mf.missing_mock_fixtures(sc):
+            self.skipTest(self.mf.missing_mock_fixtures(sc))
+        port = self._free_port()
+        with self.mf.MockPms("127.0.0.1", port, self.mf.mock_server_args(sc)):
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/library/metadata/{sc['rk']}", timeout=10) as r:
+                media = json.load(r)["MediaContainer"]["Metadata"][0]["Media"][0]
+            self.assertEqual((media["width"], media["height"], media["videoCodec"]),
+                             (3840, 2160, "h264"))
+            self.assertEqual(media["audioCodec"], "aac")
+            self.assertGreater(media["bitrate"], 9000)
+
+    # --- the deep scene's definition ---------------------------------------------------
+    def test_deep_scene_is_modelled_on_home_grid_and_walks(self):
+        deep, grid = self.scenes["home-grid-deep"], self.scenes["home-grid"]
+        self.assertEqual(deep["route"], "home")
+        self.assertEqual(deep["loop_floor"], grid["loop_floor"])
+        self.assertEqual(deep["fps_floor"], grid["fps_floor"])
+        self.assertTrue(deep["mock"]["only"])
+        self.assertEqual(deep["mock"]["home_hubs"], 170)
+        self.assertNotIn("plxnative-homeosc", deep["triggers"])  # the walk is the stimulus
+        # the heartbeat carries frame_n/frame_gt33/... only while the frame-drop detector is armed
+        self.assertIn("plxnative-framedrop", deep["triggers"])
+        self.assertLessEqual(deep["walk"]["max_rows"], deep["mock"]["home_hubs"])
+
+    def test_every_walk_scene_has_run_secs_for_its_whole_walk(self):
+        for s in self.scenes.values():
+            if s.get("walk"):
+                self.assertLessEqual(self.mf.walk_secs_needed(s), s["run_secs"], s["name"])
+
+    # --- the row walk (home-recent-paging) ---------------------------------------------
+    def test_recent_paging_scene_is_a_mock_only_row_walk_of_the_deep_scenes_pace(self):
+        sc, deep = self.scenes["home-recent-paging"], self.scenes["home-grid-deep"]
+        self.assertEqual((sc["tier"], sc["route"]), ("ui", "home"))
+        self.assertEqual(sc["mock"], {"movies": 300, "only": True})
+        self.assertEqual(self.mf.mock_server_args(sc), ["--movies", "300"])
+        self.assertEqual(sc["triggers"], deep["triggers"])
+        self.assertEqual(sc["walk"]["key_gap_s"], deep["walk"]["key_gap_s"])
+        self.assertEqual((sc["walk"]["row_down"], sc["walk"]["cards"]), (1, 96))
+        self.assertEqual((sc["loop_floor"], sc["fps_floor"]), (deep["loop_floor"], deep["fps_floor"]))
+        self.assertIn("./tests/run.py --fps --mock --filter home-recent-paging", sc["comment"])
+
+    def test_row_walk_plan_is_down_right_left_and_nothing_else(self):
+        walk = self.scenes["home-recent-paging"]["walk"]
+        plan = self.mf.row_walk_plan(walk)
+        self.assertEqual(plan, ["down"] + ["right"] * 96 + ["left"] * 96)
+        self.assertEqual(self.mf.row_walk_plan({"row_down": 2, "cards": 3}),
+                         ["down", "down", "right", "right", "right", "left", "left", "left"])
+        self.assertTrue(set(plan) <= set(self.mf.ROW_WALK_KEYS))
+        for banned in ("ok", "enter", "back", "up"):
+            self.assertNotIn(banned, plan)
+        # the walker and the grader take the plan from the same place; the rest is at the turn
+        sc = self.scenes["home-recent-paging"]
+        steps = self.mf.walk_steps(sc, 5)
+        self.assertEqual([k for k, _ in steps], plan)
+        self.assertEqual(self.mf.walk_expected_keys(sc, 5), len(plan))
+        self.assertEqual(self.mf.walk_expected_keys(sc, 0), 0)
+        gap, rest = sc["walk"]["key_gap_s"], sc["walk"].get("rest_s", 4)
+        self.assertEqual([i for i, (_, d) in enumerate(steps) if d > gap], [1 + 96 - 1])
+        self.assertAlmostEqual(steps[96][1], gap + rest)
+
+    def test_row_walk_run_secs_covers_the_walk(self):
+        sc = self.scenes["home-recent-paging"]
+        self.assertTrue(self.mf.is_row_walk(sc["walk"]))
+        self.assertGreaterEqual(sc["run_secs"], self.mf.walk_secs_needed(sc))
+        self.assertAlmostEqual(
+            self.mf.walk_secs_needed(sc),
+            self.mf.LAUNCH_WAIT_S + 5 + 15 + 3 + 193 * 0.33 + 4 + 5)
+        self.assertFalse(self.mf.is_row_walk(self.scenes["home-grid-deep"]["walk"]))
+
+    def test_the_surface_paging_scenes_walk_a_list_and_are_graded_on_how_deep_focus_got(self):
+        # one pair (3g, remote-wan) per surface; the walk is the Home row walk with its own keys, and
+        # `walk.reach` replaces the `hubs: landed` grading only Home logs
+        self.assertEqual(sorted(n for n in self.scenes if "-paging-held-" in n
+                                and not n.startswith("home-")), sorted(self.PAGING_SURFACES))
+        for name in self.PAGING_SURFACES:
+            sc = self.scenes[name]
+            w = sc["walk"]
+            self.assertTrue(sc["mock"]["only"] and sc["mock"]["link"], name)
+            self.assertIn("plxnative-focusx", sc["triggers"], name)
+            self.assertTrue(self.mf.is_row_walk(w), name)
+            plan = self.mf.row_walk_plan(w)
+            self.assertEqual(plan, ["down"] * w["row_down"] + [w["key"]] * w["cards"] + [w["back"]] * w["cards"])
+            self.assertTrue(set(plan) <= set(self.mf.ROW_WALK_KEYS))
+            for banned in ("ok", "enter", "back"):
+                self.assertNotIn(banned, plan)
+            self.assertLessEqual(self.mf.walk_secs_needed(sc), sc["run_secs"], name)
+            self.assertEqual(w["reach"]["route"], sc["route"], name)
+            self.assertIn(f"--filter {name}", sc["comment"])
+            args = self.mf.mock_server_args(sc)
+            self.assertIn("--link", args)
+            self.assertEqual(args[args.index("--link") + 1], sc["mock"]["link"][0])
+
+    FOCUSX = ("focus route=library pill=-1 card=1 menu=0 region=grid row=4 col=2 sid=0 rk=77 cdx={x} cdy=300 "
+              "cdw=255 cdi=2 cdn=36 cdg={g} cda=1 cdr=0 cdk={k} cdc=100 cdcw=140 press=0")
+
+    def test_describe_reach_fails_a_walk_that_never_paged_and_counts_frames_off_the_canvas(self):
+        reach = {"route": "library", "region": "grid", "min_global": 120}
+        deep = [self.FOCUSX.format(x=90, g=6, k=77), self.FOCUSX.format(x=-300, g=130, k=130), self.FOCUSX.format(x=1800, g=131, k=131),
+                "focus route=detail region=grid cdx=1 cdy=1 cdw=1 cdg=9999"]
+        fail, detail = self.mf.describe_reach(deep, "library", reach)
+        self.assertIsNone(fail)
+        self.assertIn("reached item 131 (3 drawn frames, 2 partly off the canvas, 3 distinct cards focused)", detail)
+        fail, _ = self.mf.describe_reach(deep[:1], "library", reach)
+        self.assertIn("paging did not happen", fail)
+        self.assertIn("reached item 6", fail)
+        fail, _ = self.mf.describe_reach([], "library", reach)
+        self.assertIn("reached item none", fail)
+        # a different region's lines do not count towards a region's reach
+        fail, _ = self.mf.describe_reach([self.FOCUSX.format(x=90, g=500, k=500).replace("region=grid", "region=shelf")],
+                                         "library", reach)
+        self.assertIn("paging did not happen", fail)
+
+    def test_describe_reach_names_the_distinct_cards_so_a_stalled_cdg_is_visible(self):
+        """A probe that reports the window slot as `cdg` (the defect behind six TV scenes failing
+        at "item 23") stalls `cdg` while the cards keep changing: the failure must say so."""
+        reach = {"route": "library", "region": "shelf", "min_global": 48}
+        stalled = [self.FOCUSX.format(x=90, g=i % 24, k=1000 + i).replace("region=grid", "region=shelf")
+                   for i in range(75)]
+        fail, detail = self.mf.describe_reach(stalled, "library", reach)
+        self.assertIn("reached item 23", fail)
+        self.assertIn("75 distinct cards were focused", fail)
+        self.assertIn("probe's `cdg` is wrong", fail)
+        self.assertIn("75 distinct cards focused", detail)
+        healthy = [self.FOCUSX.format(x=90, g=i, k=1000 + i).replace("region=grid", "region=shelf") for i in range(75)]
+        fail, detail = self.mf.describe_reach(healthy, "library", reach)
+        self.assertIsNone(fail)
+        self.assertIn("reached item 74 (75 drawn frames, 0 partly off the canvas, 75 distinct cards focused)", detail)
+
+    def test_a_reach_walk_is_up_once_its_first_fingerprint_is_logged(self):
+        sc = self.scenes["search-row-paging-held-3g"]
+        self.assertIsNone(self.mf.landed_shelves(sc, ["hubs: landed — 24 items, 3 shelves (merge 1 us)"]))
+        self.assertEqual(self.mf.landed_shelves(sc, ["focus route=search zone=Field row=-1"]), 1)
+        self.assertEqual(self.mf.landed_lands(sc, ["focus route=search zone=Field row=-1"]), 1)
+        self.assertEqual(self.mf.landed_lands(sc, []), 0)
+
+    LANDED = "hubs: landed — 24 items, 3 shelves (merge 10 us, catalog ~5 KB)"
+
+    def test_page_landings_counts_forward_and_total_inside_the_window(self):
+        win = [self.KEY, self.LANDED, self.KEY, self.LANDED, self.KEY, self.LANDED,
+               self.KEY, self.LANDED]
+        self.assertEqual(self.mf.page_landings(win, 3), (3, 4))
+        self.assertEqual(self.mf.page_landings(win, None), (4, 4))
+        self.assertEqual(self.mf.page_landings(win, 99), (4, 4))
+        self.assertEqual(self.mf.page_landings([], 3), (0, 0))
+
+    def _paging_log(self, landings, keys=7):
+        """A synthetic row-walk log: the initial landing BEFORE the first key, then `keys` key
+        lines of which the first `keys - 2` are the forward half; `landings` land in it."""
+        out = [self.SYN, self.LANDED] + [self._beat(fps=1)] * 3
+        for i in range(keys):
+            out += [self.KEY, self._beat(fps=40)]
+            if i < landings:
+                out.append(self.LANDED)
+        return out + [self._beat(fps=40)] * 2 + [self._beat(fps=1)] * 5
+
+    def _paging_scene(self):
+        s = copy.deepcopy(self.scenes["home-recent-paging"])
+        s["walk"].update(row_down=1, cards=4, min_page_landings=3)  # 1 down, 4 right, 4 left
+        return s
+
+    def test_row_walk_prints_the_landings_and_frame_stats(self):
+        ok, detail = self._run_scene(self._paging_scene(), self._paging_log(4, keys=9),
+                                     {"rows": 3, "sent": 9, "error": None})
+        self.assertTrue(ok, detail)
+        self.assertIn("page landings in window: 4 forward, 4 total", detail)
+        self.assertIn("gt33=", detail)
+        self.assertIn("worst=", detail)
+        self.assertIn("p99max=", detail)
+        self.assertIn("median=", detail)
+
+    def test_row_walk_fails_when_the_forward_half_did_not_page(self):
+        # 2 landings in the forward half (keys 1..5) against a required 3: paging did not happen
+        ok, detail = self._run_scene(self._paging_scene(), self._paging_log(2, keys=9),
+                                     {"rows": 3, "sent": 9, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("paging did not happen", detail)
+        self.assertIn("2 page landing(s)", detail)
+        # landings only AFTER the turn-around do not count toward the forward half
+        log = self._paging_log(0, keys=9) + [self.KEY, self.LANDED] * 0
+        late = [ln for ln in log]
+        idx = [i for i, ln in enumerate(late) if ln == self.KEY]
+        for i in reversed(idx[6:]):
+            late.insert(i + 2, self.LANDED)
+        ok, detail = self._run_scene(self._paging_scene(), late,
+                                     {"rows": 3, "sent": 9, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("paging did not happen", detail)
+
+    def test_row_walk_fails_when_it_sent_fewer_keys_than_its_plan(self):
+        ok, detail = self._run_scene(self._paging_scene(), self._paging_log(4, keys=9),
+                                     {"rows": 3, "sent": 5, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("never ran to completion", detail)
+
+    def test_walk_secs_needed_counts_the_launch_wait(self):
+        # KeyWalk sleeps `LAUNCH_WAIT_S` before it looks at the log; the sleep is part of run_secs
+        scene = {"warmup_s": 5, "walk": {"key_gap_s": 1.0, "max_rows": 10, "land_wait_s": 15,
+                                         "settle_s": 3, "rest_s": 4, "tail_s": 5}}
+        self.assertEqual(self.mf.walk_secs_needed(scene),
+                         self.mf.LAUNCH_WAIT_S + 5 + 15 + 3 + 20 + 4 + 5)
+        self.assertGreaterEqual(self.mf.LAUNCH_WAIT_S, 10)
+
+    def test_library_deep_scene_walks_the_section_shelves_and_the_grid(self):
+        deep = self.scenes["library-shelves-deep"]
+        self.assertEqual(deep["route"], "library")
+        self.assertTrue(deep["mock"]["only"])
+        self.assertEqual((deep["mock"]["section_hubs"], deep["mock"]["section_hubs_linked"]), (170, 40))
+        self.assertEqual(deep["walk"]["landed"], "library")
+        # the Recommended page seats its first shelf on arrival and has no toolbar to cross
+        self.assertEqual(deep["walk"]["extra_rows"], 0)
+        self.assertEqual(deep["walk"]["fingerprint_region"], "shelf")
+        for t in ("plxnative-library", "plxnative-framedrop", "plxnative-focus"):
+            self.assertIn(t, deep["triggers"])
+        self.assertNotIn("plxnative-libosc", deep["triggers"])  # the walk is the stimulus
+        self.assertEqual(deep["walk"]["min_landed"], 150)  # the cap is gone: 12 is a failure now
+        # room for every shelf at its worst: all of them, a second stop per linked one, the extras
+        self.assertGreaterEqual(deep["walk"]["max_rows"], 170 + 40 + deep["walk"]["extra_rows"])
+        self.assertEqual((deep["loop_floor"], deep["fps_floor"]), (50, 30))
+
+    # Words a page's `probe_viewport` prints that are not somewhere a walk goes: no focus at all
+    # (`none`), focus on something the page does not classify (`library`) and the retry button of a
+    # listing that failed (`status`). A scene that waits for one of them waits for the page to be
+    # broken or empty, so the check below does not count them as regions a scene may name.
+    _NOT_A_WALK_TARGET = frozenset({"none", "library", "status"})
+
+    @classmethod
+    def _regions_printed_by(cls, *path):
+        """The `region=` words a walk can reach on the page at `path`: the string literals of its
+        `probe_viewport`, the one function the focus fingerprint's `region=` comes from, less the
+        words that are not somewhere a walk goes (`_NOT_A_WALK_TARGET`)."""
+        with open(os.path.join(REPO_ROOT, *path), encoding="utf-8") as fh:
+            body = re.search(r"pub fn probe_viewport\b.*?\n    \}\n", fh.read(), re.S)
+        return set(re.findall(r'"([a-z]+)"', body.group(0))) - cls._NOT_A_WALK_TARGET if body else set()
+
+    def test_a_scene_grades_a_fingerprint_region_its_page_actually_prints(self):
+        """A scene's `walk.fingerprint_region` / `walk.reach.region` is a promise that the page prints
+        that `focus route=... region=...` word. #843 gave `library-shelves-deep` the Recommended
+        page (`plxnative-libtype: recommended`) and left it waiting for the Library page's
+        `region=grid`, which that page never printed (its probe line was empty), so the scene
+        failed on every run and nothing said why. Both pages answer one fingerprint grammar, so the
+        words each can print are read from the page's own `probe_viewport`."""
+        library = self._regions_printed_by("rust-modules", "screens", "src", "library", "mod.rs")
+        recommended = self._regions_printed_by("rust-modules", "screens", "src", "library", "recommended.rs")
+        self.assertIn("grid", library)
+        self.assertIn("shelf", recommended)
+        self.assertNotIn("grid", recommended, "the Recommended page mounts no grid")
+        self.assertNotIn("shelf", library, "the Library page mounts no shelves")
+        checked = 0
+        for name, scene in sorted(self.scenes.items()):
+            walk = scene.get("walk") or {}
+            wanted = {w for w in (walk.get("fingerprint_region"), (walk.get("reach") or {}).get("region")) if w}
+            if not wanted:
+                continue
+            with self.subTest(scene=name):
+                self.assertEqual(scene["route"], "library",
+                                 "teach this test which page prints the regions of the scene's route")
+                recommended_page = scene.get("triggers", {}).get("plxnative-libtype") == "recommended"
+                printed = recommended if recommended_page else library
+                for word in wanted:
+                    self.assertIn(word, printed,
+                                  f"{name} waits for `region={word}`, which its "
+                                  f"{'Recommended' if recommended_page else 'Library'} page never prints")
+                checked += 1
+        self.assertGreaterEqual(checked, 7, "the scenes that declare a region were not found")
+
+    # --- the expected key count --------------------------------------------------------
+    def test_walk_downs_for_home_is_one_per_landed_row(self):
+        deep = self.scenes["home-grid-deep"]
+        self.assertEqual(self.mf.walk_downs(deep, 21), 21)
+
+    def test_walk_downs_for_a_library_counts_extra_rows_and_linked_shelves_twice(self):
+        deep = self.scenes["library-shelves-deep"]
+        # a 12-shelf landing (CW + Recently Added + 10 padding hubs): 10 * 40 // 168 = 2 linked
+        self.assertEqual(self.mf.linked_landed(deep, 12), 2)
+        self.assertEqual(self.mf.walk_downs(deep, 12), 12 + 2)
+        # a fully landed 170 carries every linked shelf: 170 + 40
+        self.assertEqual(self.mf.linked_landed(deep, 170), 40)
+        self.assertEqual(self.mf.walk_downs(deep, 170), 170 + 40)
+        self.assertEqual(self.mf.linked_landed(deep, 500), 40)
+        self.assertEqual(self.mf.linked_landed(deep, 1), 0)
+        plain = {"walk": {"landed": "library", "extra_rows": 2}, "mock": {"section_hubs": 50}}
+        self.assertEqual(self.mf.walk_downs(plain, 7), 9)
+
+    # --- the burst walk (library-burst) -------------------------------------------------
+    def test_burst_scene_is_an_ungraded_instrument_on_the_library_grid(self):
+        b = self.scenes["library-burst"]
+        self.assertEqual(b["route"], "library")
+        self.assertTrue(b["mock"]["only"])
+        self.assertEqual(b["mock"]["movies"], 1000)
+        self.assertEqual(self.mf.mock_server_args(b), ["--movies", "1000"])
+        for t in ("plxnative-library", "plxnative-framedrop", "plxnative-focus", "plxnative-phcount"):
+            self.assertIn(t, b["triggers"])
+        self.assertNotIn("plxnative-libosc", b["triggers"])  # the walk is the stimulus
+        # nothing is graded on rates or frame times: it prints, it does not gate
+        for k in ("loop_floor", "fps_floor", "fps_ceiling", "worst_ceiling_ms", "stall_ceiling_ms",
+                  "upload_per_frame_min", "upload_late_share_max", "upload_frames_min"):
+            self.assertNotIn(k, b, k)
+        self.assertEqual(b["walk"]["fingerprint_region"], "grid")
+        self.assertTrue(self.mf.is_burst(b))
+        self.assertFalse(self.mf.is_burst(self.scenes["library-shelves-deep"]))
+
+    def test_burst_plan_is_bursts_of_down_with_rests_then_the_same_of_up(self):
+        w = {"burst": 3, "bursts": 2, "key_ms": 100, "rest_ms": 1500, "max_rows": 40}
+        steps = self.mf.burst_plan(2, w)
+        self.assertEqual([k for k, _ in steps], ["down"] * 2 + ["down"] * 6 + ["up"] * 6)
+        # the prelude is paced at key_ms and rests after its last key before the first burst
+        self.assertEqual([d for _, d in steps[:2]], [0.1, 1.5])
+        # inside a burst the keys are key_ms apart, each burst's last is followed by the rest
+        self.assertEqual([d for _, d in steps[2:8]], [0.1, 0.1, 1.5, 0.1, 0.1, 1.5])
+        self.assertEqual([d for _, d in steps[8:]], [0.1, 0.1, 1.5, 0.1, 0.1, 1.5])
+        self.assertEqual(set(k for k, _ in steps), set(self.mf.WALK_KEYS))
+        # the prelude is capped at max_rows, like every other walk
+        capped = self.mf.burst_plan(500, dict(w, max_rows=7))
+        self.assertEqual(sum(1 for k, _ in capped if k == "down"), 7 + 6)
+        for bad in (dict(w, burst=0), dict(w, bursts=0), dict(w, key_ms=0), dict(w, rest_ms=-1)):
+            with self.assertRaises(ValueError):
+                self.mf.burst_plan(2, bad)
+
+    def test_burst_scene_key_count_and_timing(self):
+        b = self.scenes["library-burst"]
+        w = b["walk"]
+        # the Library page mounts no shelves and logs no landing: `walk.reach` lands the walk as
+        # one "row", so the prelude is 1 + extra_rows Downs from the header into the grid, then
+        # 8 bursts of 4 each way
+        self.assertIn("reach", w)
+        self.assertNotIn("landed", w)
+        self.assertEqual(self.mf.walk_downs(b, 1), 1 + w["extra_rows"])
+        steps = self.mf.walk_steps(b, 1)
+        self.assertEqual(len(steps), 3 + 2 * 8 * 4)
+        self.assertEqual(self.mf.walk_expected_keys(b, 1), len(steps))
+        self.assertEqual(self.mf.walk_expected_keys(b, 0), 0)
+        keys = [k for k, _ in steps]
+        self.assertEqual((keys.count("down"), keys.count("up")), (3 + 32, 32))
+        # first press to last press: 2 prelude gaps and its rest, then 16 bursts of three gaps
+        # and a rest, less the final rest (nothing is pressed after the last key)
+        want = 2 * 0.125 + 1.5 + 16 * (3 * 0.125 + 1.5) - 1.5
+        self.assertAlmostEqual(sum(d for _, d in steps[:-1]), want, places=6)
+        # and the scene's run_secs covers the worst case (the generic test also holds it)
+        self.assertLessEqual(self.mf.walk_secs_needed(b), b["run_secs"])
+
+    def test_hold_scene_is_the_burst_scene_with_a_longer_held_scroll(self):
+        b, h = self.scenes["library-burst"], self.scenes["library-hold"]
+        # the same instrument: mock, triggers, route and walk parameters differ only in the shape
+        for k in ("tier", "route", "warmup_s", "triggers", "mock"):
+            self.assertEqual(h[k], b[k], k)
+        shape = ("burst", "bursts", "rest_ms")
+        self.assertEqual({k: v for k, v in h["walk"].items() if k not in shape},
+                         {k: v for k, v in b["walk"].items() if k not in shape})
+        self.assertEqual((h["walk"]["burst"], h["walk"]["bursts"], h["walk"]["rest_ms"]), (16, 3, 2000))
+        self.assertTrue(self.mf.is_burst(h))
+        self.assertEqual(self.mf.mock_server_args(h), ["--movies", "1000"])
+        for k in ("loop_floor", "fps_floor", "fps_ceiling", "worst_ceiling_ms", "stall_ceiling_ms",
+                  "upload_per_frame_min", "upload_late_share_max", "upload_frames_min"):
+            self.assertNotIn(k, h, k)
+
+    def test_hold_scene_key_count_and_timing(self):
+        h = self.scenes["library-hold"]
+        # a reach landing (one "row"): 1 + extra_rows Downs into the grid, 3 bursts of 16 each way
+        steps = self.mf.walk_steps(h, 1)
+        self.assertEqual(len(steps), 3 + 2 * 3 * 16)
+        self.assertEqual(self.mf.walk_expected_keys(h, 1), len(steps))
+        self.assertEqual(self.mf.walk_expected_keys(h, 0), 0)
+        keys = [k for k, _ in steps]
+        self.assertEqual((keys.count("down"), keys.count("up")), (3 + 48, 48))
+        # the library is deep enough for the held scroll: 48 rows down past the prelude
+        cols = 6
+        self.assertGreaterEqual(-(-h["mock"]["movies"] // cols), 3 + 48)
+        # first press to last press: 2 prelude gaps and its rest, then 6 bursts of fifteen gaps
+        # and a rest, less the final rest (nothing is pressed after the last key)
+        want = 2 * 0.125 + 2.0 + 6 * (15 * 0.125 + 2.0) - 2.0
+        self.assertAlmostEqual(sum(d for _, d in steps[:-1]), want, places=6)
+        self.assertAlmostEqual(want, 23.5, places=6)
+        # inside a burst the keys are key_ms apart; every burst ends in the 2 s rest
+        self.assertEqual([d for _, d in steps[3:3 + 16]], [0.125] * 15 + [2.0])
+        # and the scene's run_secs covers the worst case (the generic test also holds it)
+        self.assertLessEqual(self.mf.walk_secs_needed(h), h["run_secs"])
+
+    def test_a_plain_walk_still_paces_like_it_always_did(self):
+        deep = self.scenes["home-grid-deep"]
+        steps = self.mf.walk_steps(deep, 5)
+        self.assertEqual([k for k, _ in steps], ["down"] * 5 + ["up"] * 5)
+        gap, rest = deep["walk"]["key_gap_s"], deep["walk"]["rest_s"]
+        self.assertEqual([d for _, d in steps], [gap] * 4 + [gap + rest] + [gap] * 5)
+        self.assertEqual(self.mf.walk_expected_keys(deep, 5), 10)
+
+    PH = "phcount: frames=40 ph_frames=9 draws=240 ph=12"
+
+    @staticmethod
+    def _ph(ph, frames=40, ph_frames=3, draws=240):
+        return f"phcount: frames={frames} ph_frames={ph_frames} draws={draws} ph={ph}"
+
+    def test_phcount_line_parses_only_in_the_format_the_app_writes(self):
+        win = [self.KEY, self.PH, "phcount: armed", "phcount: frames=1 ph=2", self._beat()]
+        self.assertEqual(self.mf.phcount_samples(win), [(1, 40, 9, 240, 12)])
+        self.assertEqual(self.mf.phcount_samples([]), [])
+
+    def test_placeholders_are_attributed_to_the_burst_of_the_last_key(self):
+        w = {"burst": 2, "bursts": 2, "key_ms": 100, "rest_ms": 1000, "max_rows": 40}
+        # a 3-key prelude, then bursts: down{k4,k5} down{k6,k7} up{k8,k9} up{k10,k11}
+        win = [self.KEY, self._ph(1), self.KEY, self.KEY, self._ph(2),            # prelude
+               self.KEY, self.KEY, self._ph(10), self._ph(20),                    # burst 0
+               self.KEY, self.KEY, self._ph(100),                                 # burst 1
+               self.KEY, self.KEY, self._ph(1000),                                # burst 2
+               self.KEY, self.KEY, self._ph(5), self._beat()]                     # burst 3
+        t = self.mf.placeholder_tally(win, w, 3)
+        self.assertEqual(t["per_burst"], [30, 100, 1000, 5])
+        self.assertEqual((t["prelude"], t["ph"], t["lines"]), (3, 1138, 7))
+        self.assertEqual((t["frames"], t["ph_frames"], t["draws"]), (7 * 40, 7 * 3, 7 * 240))
+        self.assertIsNone(self.mf.placeholder_tally([self.KEY, self._beat()], w, 3))
+
+    def test_describe_burst_prints_totals_per_burst_median_fps_and_uploads(self):
+        w = {"burst": 2, "bursts": 2, "key_ms": 100, "rest_ms": 1000, "max_rows": 40}
+        beat = self._beat(fps=50) + " pupf=4 pupf_ge22=1 pup=6"
+        win = [self.KEY, self.KEY, self._ph(2), self.KEY, self.KEY, self._ph(7), beat,
+               self._beat(fps=60) + " pupf=2 pupf_ge22=0 pup=3"]
+        text = self.mf.describe_burst(win, "home", w, 2)
+        self.assertIn("ph=9 tile-frames in 2 s", text)
+        self.assertIn("per burst down [7, 0] up [0, 0]", text)
+        self.assertIn("prelude ph=2", text)
+        self.assertIn("median fps 60 (min 50, max 60, n=2)", text)
+        self.assertIn("pupf=6 pupf_ge22=1 pup=9", text)
+        self.assertIn("not graded", text)
+        # an unarmed instrument is "n/a", never a reassuring zero
+        quiet = self.mf.describe_burst([self.KEY, self._beat()], "home", w, 1)
+        self.assertIn("placeholders: n/a", quiet)
+        self.assertIn("pupf/pup n/a", quiet)
+
+    def _burst_run(self, tail, sent=None, landed=1):
+        b = self.scenes["library-burst"]
+        want = self.mf.walk_expected_keys(b, landed)
+        w = type("W", (), {"error": None, "rows": landed, "sent": want if sent is None else sent})
+        # the Library page logs no `libhubs` landing: `walk.reach` lands on the focus fingerprint
+        lines = [self.SYN, self.KEY, self._beat()] + tail
+        return b, want, lines, w
+
+    def test_grade_walk_prelude_grades_only_keys_and_the_grid_fingerprint_for_a_burst_walk(self):
+        b, want, lines, w = self._burst_run([self.GRID_FP, self._ph(4)])
+        fail, window, detail = run.grade_walk_prelude(b, lines, w)
+        self.assertIsNone(fail, fail)
+        self.assertIn("1 row(s) landed", detail)
+        self.assertIn("burst: placeholders: ph=4 tile-frames", detail)
+        self.assertIn("(recorded, not graded)", detail)
+        self.assertIn(self._ph(4), window)
+        # fewer keys than the plan: not a finished walk
+        b, want, lines, w = self._burst_run([self.GRID_FP], sent=want - 1)
+        fail, _, _ = run.grade_walk_prelude(b, lines, w)
+        self.assertIn(f"sent {want - 1} of {want}", fail)
+        # no grid fingerprint in the window: the keys never carried focus into the grid
+        b, _, lines, w = self._burst_run([self._ph(4)])
+        fail, _, _ = run.grade_walk_prelude(b, lines, w)
+        self.assertIn("region=grid", fail)
+        # an unarmed build still grades: the count reads n/a, not a pass on zero
+        b, _, lines, w = self._burst_run([self.GRID_FP])
+        fail, _, detail = run.grade_walk_prelude(b, lines, w)
+        self.assertIsNone(fail, fail)
+        self.assertIn("placeholders: n/a", detail)
+
+    GRID_FP = "focus route=library pill=-1 card=1 menu=0 region=grid row=0 col=0 viewport_x=0.000"
+
+    @staticmethod
+    def _shelf_fp(row):
+        return f"focus route=library pill=-1 card=1 menu=0 region=shelf row={row} col=0 viewport_x=0.000"
+
+    # a walk that reached the deepest shelf ON SCREEN (row 169 of 170): the Recommended page has no grid
+    DEEP_TAIL = [_shelf_fp.__func__(3), _shelf_fp.__func__(169)]
+
+    def _library_walk(self, tail, sent=None, landed=170):
+        deep = self.scenes["library-shelves-deep"]
+        want = 2 * min(self.mf.walk_downs(deep, landed), deep["walk"]["max_rows"])
+        w = type("W", (), {"error": None, "rows": landed, "sent": want if sent is None else sent})
+        lines = [self.SYN, f"libhubs: section 0 landed {landed} shelves, {landed * 12} items",
+                 self.KEY, self._beat()] + tail
+        return deep, want, lines, w
+
+    def test_grade_walk_prelude_expects_the_library_key_count(self):
+        deep, want, lines, w = self._library_walk(self.DEEP_TAIL)
+        fail, _, detail = run.grade_walk_prelude(deep, lines, w)
+        self.assertIsNone(fail, fail)
+        self.assertIn("170 shelf(s) landed", detail)
+        # the Home arithmetic (2 * 170 keys) would have called this complete
+        deep, want, lines, w = self._library_walk(self.DEEP_TAIL, sent=2 * 170)
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIn(f"sent 340 of {want}", fail)
+
+    def test_grade_walk_prelude_fails_when_fewer_shelves_landed_than_min_landed(self):
+        # a complete, fast walk over 12 shelves is still a failed scene once the cap is gone
+        deep, _, lines, w = self._library_walk(self.DEEP_TAIL, landed=12)
+        self.assertEqual(deep["walk"]["min_landed"], 150)
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIn("only 12 shelf(s) landed", fail)
+        self.assertIn("min_landed 150", fail)
+        self.assertIn("short or failed fetch", fail)
+        # a scene that declares no minimum is unchanged
+        plain = dict(deep, walk={k: v for k, v in deep["walk"].items() if k != "min_landed"})
+        fail, _, _ = run.grade_walk_prelude(plain, lines, w)
+        self.assertIsNone(fail, fail)
+        # and the full landing passes it
+        deep, _, lines, w = self._library_walk(self.DEEP_TAIL)
+        fail, _, detail = run.grade_walk_prelude(deep, lines, w)
+        self.assertIsNone(fail, fail)
+        self.assertIn("170 shelf(s) landed", detail)
+
+    def test_grade_walk_prelude_needs_the_deep_shelf_on_screen(self):
+        # the store published 170, but the screen only built 12 rows
+        deep, _, lines, w = self._library_walk([self._shelf_fp(11)])
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIn("region=shelf row=11", fail)
+        self.assertIn("minimum row 149", fail)
+        self.assertIn("SCREEN", fail)
+        # no shelf fingerprint at all: the walk never carried focus onto a shelf
+        deep, _, lines, w = self._library_walk([self.GRID_FP])
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIn("region=shelf", fail)
+        # the deepest of several counts, wherever it falls in the window
+        deep, _, lines, w = self._library_walk([self._shelf_fp(169), self._shelf_fp(4)])
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIsNone(fail, fail)
+        # row min_landed - 1 is enough, one less is not
+        deep, _, lines, w = self._library_walk([self._shelf_fp(149)])
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIsNone(fail, fail)
+        deep, _, lines, w = self._library_walk([self._shelf_fp(148)])
+        fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+        self.assertIn("region=shelf row=148", fail)
+        # without min_landed a library walk needs no particular shelf, only the region
+        deep, _, lines, w = self._library_walk([self._shelf_fp(4)])
+        plain = dict(deep, walk={k: v for k, v in deep["walk"].items() if k != "min_landed"})
+        fail, _, _ = run.grade_walk_prelude(plain, lines, w)
+        self.assertIsNone(fail, fail)
+
+    def test_deepest_shelf_row_reads_the_library_fingerprints(self):
+        self.assertIsNone(self.mf.deepest_shelf_row([self.GRID_FP, "focus route=home region=shelf row=9"], "library"))
+        self.assertEqual(self.mf.deepest_shelf_row(
+            [self._shelf_fp(3), self._shelf_fp(169), self._shelf_fp(40)], "library"), 169)
+
+    def test_grade_walk_prelude_needs_the_scenes_region_fingerprint(self):
+        # the Recommended page's walk is graded on its shelves; the grid (the Library page's region)
+        # and another route's shelf do not stand in for them
+        for tail in ([], [self.GRID_FP], ["focus route=home region=shelf row=9 col=0"]):
+            deep, _, lines, w = self._library_walk(tail)
+            fail, _, _ = run.grade_walk_prelude(deep, lines, w)
+            self.assertIn("region=shelf", fail)
+
+    def test_walk_plan_is_down_then_up_and_only_those_keys(self):
+        plan = self.mf.walk_plan(21, {"max_rows": 170})
+        self.assertEqual(plan, ["down"] * 21 + ["up"] * 21)
+        self.assertEqual(self.mf.walk_plan(500, {"max_rows": 170}).count("down"), 170)
+        self.assertEqual(set(self.mf.WALK_KEYS), {"down", "up"})
+
+    # --- the log: identity, landing, window --------------------------------------------
+    SYN = "pms: server 0 version=1.41.0.0000-synthetic plexPass=true"
+
+    def test_identity_accepts_only_the_synthetic_server(self):
+        ok, _ = self.mf.check_synthetic_identity(["boot", self.SYN])
+        self.assertTrue(ok)
+
+    def test_identity_fails_closed(self):
+        for lines in ([], ["install: id=x", "hubs: landed — 1 items, 1 shelves"],
+                      ["pms: server 0 version=1.41.9.9799-abcdef plexPass=true"],
+                      [self.SYN, "pms: server 1 version=1.40.0.7998-xyz plexPass=false"]):
+            ok, why = self.mf.check_synthetic_identity(lines)
+            self.assertFalse(ok, lines)
+            self.assertTrue(why)
+
+    def test_landed_reads_the_last_line_and_counts_refreshes(self):
+        lines = ["hubs: landed — 216 items, 18 shelves", "x", "hubs: landed — 300 items, 21 shelves"]
+        self.assertEqual(self.mf.landed(lines), (300, 21))
+        self.assertEqual(self.mf.landed_count(lines), 2)
+        # the fields the app appends after the shelf count (merge time, catalog size) must not break it
+        self.assertEqual(self.mf.landed(["hubs: landed — 2040 items, 170 shelves (merge 900 us, catalog ~800 KB)"]), (2040, 170))
+        self.assertIsNone(self.mf.landed(["nothing"]))
+
+    @staticmethod
+    def _beat(fps=40, gt33=1, mx=40.0):
+        return (f"loop=60 route=home fps={fps} worstframe=1.0ms carried=0 dropped=0 budget=0/0 "
+                f"evicted_hot=0 frame_n={fps} frame_gt16=10 frame_gt33={gt33} frame_gt50=0 "
+                f"frame_gt100=0 frame_max={mx}ms frame_p95=20.0ms frame_p99={mx}ms")
+
+    KEY = "[1] key type=0x300 raw=00"
+
+    def test_window_runs_first_key_to_last_plus_two_beats(self):
+        pre = [self._beat(fps=1)] * 3
+        mid = [self.KEY, self._beat(), self.KEY, self._beat()]
+        tail = [self._beat(), self._beat(), self._beat(fps=1)]
+        win = self.mf.walk_window(pre + mid + tail)
+        # the beat after the last key is the first of the two tail beats
+        self.assertEqual(win, mid + tail[:1])
+        self.assertIsNone(self.mf.walk_window(pre))
+
+    def test_frame_stats_sum_and_report_drops(self):
+        win = [self._beat(fps=50, gt33=2, mx=70.0), self._beat(fps=60, gt33=1, mx=20.0)]
+        st = self.mf.frame_stats(win)
+        self.assertEqual((st["beats"], st["frames"], st["gt33"], st["peak_fps"]), (2, 110, 3, 60))
+        self.assertEqual(st["max_ms"], 70.0)
+
+    def test_library_landed_reads_the_section_the_scene_seats(self):
+        lines = ["libhubs: section 1 landed 3 shelves", "libhubs: section 0 landed 12 shelves",
+                 "libhubs: section 1 landed 4 shelves"]
+        movies = {"triggers": {"plxnative-library": True}, "walk": {"landed": "library"}}
+        shows = {"triggers": {"plxnative-library": "1"}, "walk": {"landed": "library"}}
+        self.assertEqual(self.mf.library_section_index(movies), 0)
+        self.assertEqual(self.mf.library_section_index(shows), 1)
+        self.assertEqual(self.mf.library_section_index({"triggers": {"plxnative-library": "0"}}), 0)
+        # not the last matching line (that is the Shows section's 4)
+        self.assertEqual(self.mf.landed_library(lines, 0), 12)
+        self.assertEqual(self.mf.landed_library(lines, 1), 4)
+        self.assertIsNone(self.mf.landed_library(["libhubs: section 0 failed (1 in a row)"], 0))
+        self.assertEqual(self.mf.landed_library(lines + ["libhubs: section 0 landed 15 shelves"], 0), 15)
+        self.assertEqual(self.mf.landed_library_count(lines, 0), 1)
+        # the scene's `walk.landed` picks the regex; Home's own line is not a library landing
+        self.assertEqual(self.mf.landed_shelves(movies, lines), 12)
+        self.assertIsNone(self.mf.landed_shelves(movies, ["hubs: landed — 9 items, 3 shelves"]))
+        self.assertEqual(self.mf.landed_shelves({"walk": {}}, ["hubs: landed — 9 items, 3 shelves"]), 3)
+        self.assertIsNone(self.mf.landed_shelves({"walk": {}}, lines))
+        self.assertEqual(self.mf.LIBHUBS_RE.pattern, r"^libhubs: section (\d+) landed (\d+) shelves")
+
+    # --- the mock process and the configured address -----------------------------------
+    def _config(self, host, port):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "config.local.h")
+        with open(path, "w") as fh:
+            fh.write(f'#define PMS_HOST "{host}"\n#define PMS_PORT {port}\n#define PMS_TOKEN "SECRET"\n')
+        return path
+
+    def test_configured_endpoint_reads_host_and_port_only(self):
+        self.assertEqual(self.mf.configured_endpoint(self._config("127.0.0.1", 32499)),
+                         ("127.0.0.1", 32499))
+        with self.assertRaises(SystemExit):
+            self.mf.configured_endpoint("/nonexistent/config.local.h")
+
+    @staticmethod
+    def _free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_mock_pms_serves_the_scenes_hubs_and_the_guest_resolves_against_it(self):
+        port = self._free_port()
+        with self.mf.MockPms("127.0.0.1", port, ["--home-hubs", "7", "--section-hubs", "9"]):
+            token = self.mf.resolve_mock_token(self._config("127.0.0.1", port))
+            self.assertEqual(token, "plxnative-mock-guest")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/hubs", timeout=10) as r:
+                self.assertEqual(len(json.load(r)["MediaContainer"]["Hub"]), 7)
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/hubs/sections/1", timeout=10) as r:
+                self.assertEqual(len(json.load(r)["MediaContainer"]["Hub"]), 9)
+        # stopped on exit: the address is free again
+        with socket.socket() as s:
+            self.assertNotEqual(s.connect_ex(("127.0.0.1", port)), 0)
+
+    def test_mock_refuses_a_busy_address(self):
+        with socket.socket() as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen(1)
+            with self.assertRaises(SystemExit) as cm:
+                self.mf.MockPms("127.0.0.1", busy.getsockname()[1]).start()
+            self.assertIn("already answers", str(cm.exception))
+
+    def test_guest_refuses_a_server_that_is_not_the_synthetic_mock(self):
+        import http.server
+
+        class Real(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = json.dumps({"MediaContainer": {"version": "1.41.9.9799-real"}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Real)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        with self.assertRaises(SystemExit) as cm:
+            self.mf.resolve_mock_token(self._config("127.0.0.1", srv.server_address[1]))
+        self.assertIn("refusing to run", str(cm.exception))
+
+    # --- run_fps_scene: the identity gate and the walk window grade the right thing ------
+    def _run_scene(self, scene, log, walker, *, cfg=None, extra_triggers=(), patches=(), out=None, on_make=None,
+                   capture=None):
+        class P:
+            stdout, stderr = "\n".join(log), ""
+
+        def make(args, **kw):
+            if on_make:
+                on_make(args[0])  # the target: `kill`, `run`
+            return P
+
+        class FakeWalk:
+            def __init__(self, *a, **k):
+                self.__dict__.update(walker)
+                self.cancel = threading.Event()
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        cfg = {"tv": "tv.invalid", "inject_token": True, "mock": {"host": "h", "port": 1}, **(cfg or {})}
+        with contextlib.ExitStack() as stack:
+            for patch in (mock.patch.object(run, "make", side_effect=make),
+                          mock.patch.object(run, "apply_triggers"),
+                          mock.patch.object(run, "require_install"),
+                          mock.patch.object(run, "save_case_log"),
+                          mock.patch.object(run, "RUNDIR", "/r"),
+                          mock.patch.object(run, "EVENTLOG", "/r/e.log"),
+                          mock.patch.object(run.mock_fps, "KeyWalk", FakeWalk),
+                          contextlib.redirect_stdout(out or io.StringIO()),
+                          *patches):  # `patches` come last, so they win over the defaults above
+                stack.enter_context(patch)
+            return run.run_fps_scene(scene, cfg, "tok", extra_triggers=extra_triggers, capture=capture)
+
+    # --- --save-logs keeps the GPU counters, which the harness otherwise wipes ----------
+    # `plxnative-hwcnt.jsonl` lives in the runtime root that every scene's trigger wipe and the
+    # harness's teardown empty, and `save_case_log` keeps only the event log: a card-attribution leg
+    # (`--extra-trigger plxnative-hwcnt=frame.ui`) used to lose the one file that holds its answer.
+    HWCNT_ARMED = (("plxnative-hwcnt", "frame.ui"),)
+    PROFILE_ARMED = (("plxnative-profile", "frame.ui"),)
+
+    def _run_saving(self, tmp, *, armed=HWCNT_ARMED, save=True, on_tv=None, capture=None):
+        """`library-switch` through the real `run_fps_scene` with a fake television: returns the
+        harness's ordered dealings with it (`kill`, `wipe`, `run`, `pull <file>`), what it printed, and
+        the `--save-logs` directory's files."""
+        events, tv_files, out = [], dict(on_tv or {}), io.StringIO()
+        legs = os.path.join(tmp, "legs")
+
+        def ssh(tv, cmd, timeout=30):
+            name = cmd.split("/r/", 1)[1].split()[0]
+            events.append(f"pull {name}")
+            return mock.Mock(stdout=tv_files.get(name, ""), returncode=0)
+
+        ok, detail = self._run_scene(
+            copy.deepcopy(self.scenes["library-switch"]), self._switch_log(self.SWITCH_SERIES["H3"]), {},
+            cfg={"save_logs": legs if save else None}, extra_triggers=armed, on_make=events.append, out=out,
+            capture=capture,
+            patches=(mock.patch.object(run, "apply_triggers", side_effect=lambda *a, **k: events.append("wipe")),
+                     mock.patch.object(run, "ssh", side_effect=ssh)))
+        self.assertTrue(ok, detail)
+        return events, out.getvalue(), sorted(os.listdir(legs)) if os.path.isdir(legs) else []
+
+    def test_save_logs_keeps_the_hwcnt_jsonl_between_the_app_run_and_the_next_wipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # the GL-timer file is on the set too: a leg that armed hwcnt is not asked for it
+            events, out, kept = self._run_saving(
+                tmp, on_tv={"plxnative-hwcnt.jsonl": '{"phase":"frame.ui"}\n', "plxnative-gputime.jsonl": "g\n"})
+            self.assertEqual(events, ["kill", "wipe", "run", "pull plxnative-hwcnt.jsonl"])
+            self.assertEqual(kept, ["fps-library-switch.plxnative-hwcnt.jsonl"])
+            with open(os.path.join(tmp, "legs", kept[0])) as fh:
+                self.assertEqual(fh.read(), '{"phase":"frame.ui"}\n')
+            self.assertIn("kept fps-library-switch.plxnative-hwcnt.jsonl", out)
+
+    def test_save_logs_keeps_the_gputime_jsonl_of_a_plxnative_profile_leg(self):
+        # `plxnative-profile` (the GL timer) writes plxnative-gputime.jsonl and never the hwcnt file
+        with tempfile.TemporaryDirectory() as tmp:
+            events, out, kept = self._run_saving(
+                tmp, armed=self.PROFILE_ARMED, on_tv={"plxnative-hwcnt.jsonl": "h\n", "plxnative-gputime.jsonl": "g\n"})
+            self.assertEqual(events, ["kill", "wipe", "run", "pull plxnative-gputime.jsonl"])
+            self.assertEqual(kept, ["fps-library-switch.plxnative-gputime.jsonl"])
+            with open(os.path.join(tmp, "legs", kept[0])) as fh:
+                self.assertEqual(fh.read(), "g\n")
+            self.assertIn("kept fps-library-switch.plxnative-gputime.jsonl", out)
+
+    def test_save_logs_says_so_when_an_armed_leg_left_no_counters(self):
+        for armed, fname in ((self.HWCNT_ARMED, "plxnative-hwcnt.jsonl"), (self.PROFILE_ARMED, "plxnative-gputime.jsonl")):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, out, kept = self._run_saving(tmp, armed=armed)
+                self.assertEqual(kept, [])
+                self.assertIn(f"{armed[0][0]} was armed but the set holds no {fname}", out)
+
+    def test_save_logs_leaves_the_set_alone_unless_a_profiler_is_armed_and_logs_are_wanted(self):
+        on_tv = {"plxnative-hwcnt.jsonl": "h\n", "plxnative-gputime.jsonl": "g\n"}
+        for leg in ({"armed": ()}, {"save": False}):
+            with tempfile.TemporaryDirectory() as tmp:
+                events, out, kept = self._run_saving(tmp, on_tv=on_tv, **leg)
+                self.assertEqual((events, kept, "profiler" in out), (["kill", "wipe", "run"], [], False), leg)
+
+    def test_one_pull_of_the_counters_serves_save_logs_and_the_graphics_profile(self):
+        # `run_graphics_profile` reads the hwcnt leg's file out of `capture`: with --save-logs on it
+        # shares the pull that wrote the copy on disk, and with it off the scene still pulls once
+        for save in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                capture = {}
+                events, _, kept = self._run_saving(tmp, save=save, capture=capture, on_tv={"plxnative-hwcnt.jsonl": "h\n"})
+                self.assertEqual(events, ["kill", "wipe", "run", "pull plxnative-hwcnt.jsonl"], f"save={save}")
+                self.assertEqual(capture["profiler"], {"plxnative-hwcnt": "h\n"})
+                self.assertEqual(kept, ["fps-library-switch.plxnative-hwcnt.jsonl"] if save else [])
+
+    def test_the_graphics_profile_bundles_the_hwcnt_leg_it_was_handed_and_pulls_nothing_itself(self):
+        legs = []
+
+        def fake_scene(scene, cfg, token, *, extra_triggers=(), capture=None, **kw):
+            legs.append(extra_triggers)
+            capture.update({"lines": ["beat"], "warmup": 5, "run_secs": 18, "route": "library", "overlay": None,
+                            "profiler": {"plxnative-hwcnt": "h\n"} if extra_triggers else {}})
+            return True, "ok"
+
+        pacing = {"n": 0, "p50": 0.0, "p10": 0.0, "p95": 0.0, "min": 0.0, "max": 0.0, "drift": 0.0}
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.multiple(run, MaliIrqSampler=mock.MagicMock(), make=mock.Mock(), run_fps_scene=fake_scene,
+                                    parse_irq_snapshots=mock.Mock(return_value=[{}]), write_irq_jsonl=mock.Mock(),
+                                    summarize_irq=mock.Mock(return_value={}), format_irq=mock.Mock(return_value=[]),
+                                    _pacing_profile=mock.Mock(return_value=pacing),
+                                    ssh=mock.Mock(side_effect=AssertionError("the profile pulled the file itself"))), \
+                mock.patch.object(run.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")):
+            bundle = os.path.join(tmp, "bundle")
+            self.assertEqual(run.run_graphics_profile({"name": "library-switch"}, {"tv": "tv.invalid"}, "tok", "frame.ui", output=bundle), 0)
+            with open(os.path.join(bundle, "plxnative-hwcnt.jsonl")) as fh:
+                self.assertEqual(fh.read(), "h\n")
+        self.assertEqual(legs, [(), (("plxnative-hwcnt", "frame.ui"),)])
+
+    def _deep_scene(self):
+        s = copy.deepcopy(self.scenes["home-grid-deep"])
+        s["walk"]["max_rows"] = 3
+        return s
+
+    # --- library-switch: the draw-rate floor does not flip on the phase of the switch cycle ---
+    # The scene's own heartbeats (`fps=` per 1 s window, route=library) on the television, 2026-10-19,
+    # one tuple per build of the same tree (phase H, built and run by the collections-redesign
+    # lane). The grader skips the first `warmup_s` (6) and grades the rest, so the graded window is
+    # the back half of the 14-step switch cycle plus the idle tail where the cycle is spent
+    # (`0 1 0 1 0 1`: the keepalive). Which steps land in which second moves between boots, so the
+    # graded MEDIAN read 7-11 for the same animation and failed fps_floor 8 on H7 (median 7).
+    SWITCH_SERIES = {
+        "H3": [49, 57, 42, 33, 17, 12, 21, 30, 11, 11, 33, 18, 11, 10, 0, 1, 0, 1, 0, 1],
+        "H5": [49, 56, 41, 32, 18, 12, 21, 31, 11, 11, 33, 18, 11, 11, 0, 1, 0, 1, 0, 1, 50],
+        "H7": [47, 57, 39, 33, 21, 8, 21, 35, 12, 5, 32, 22, 7, 10, 0, 1, 0, 1, 0, 1],
+        "H9": [48, 57, 41, 34, 19, 11, 21, 32, 12, 8, 32, 19, 10, 9, 0, 1, 0, 1, 0, 1],
+        # the lowest-total healthy run on record (tuck-E) and one with the idle steps elsewhere
+        "tuck-E": [56, 34, 3, 33, 20, 10, 20, 16, 6, 9, 31, 19, 10, 9, 0, 1, 0, 1, 0, 1],
+        "tv3-847-L1b": [49, 33, 3, 33, 19, 11, 20, 16, 9, 32, 32, 20, 10, 3, 1, 6, 13, 0, 1, 0],
+    }
+
+    @staticmethod
+    def _library_beat(fps):
+        return f"loop=60 route=library fps={fps} worstframe=1.0ms carried=0 dropped=0 budget=0/0"
+
+    def _switch_log(self, series):
+        return [self.SYN] + [self._library_beat(n) for n in series]
+
+    def _run_switch(self, series):
+        return self._run_scene(copy.deepcopy(self.scenes["library-switch"]), self._switch_log(series), {})
+
+    def test_library_switch_passes_every_phase_of_the_cycle(self):
+        for build, series in self.SWITCH_SERIES.items():
+            ok, detail = self._run_switch(series)
+            self.assertTrue(ok, f"{build} {series}: {detail}")
+
+    def test_library_switch_still_fails_a_frozen_animator(self):
+        # a frozen animator draws the keepalive alone, ~0.5 swaps/s, for the whole run
+        for frozen in ([1, 0] * 10, [0, 1] * 10, [1] * 20, [0] * 20):
+            ok, detail = self._run_switch(frozen)
+            self.assertFalse(ok, f"{frozen}: {detail}")
+            self.assertIn("fps_floor", detail)
+
+    def test_library_switch_fails_an_animator_that_freezes_partway(self):
+        # the keepalive tail of a SPENT cycle reads 0 1 0 1; a frozen animator reads it from the freeze
+        # on, so the graded windows (the first six are warmup) end in the same tail either way. A mean
+        # over them cannot tell the two apart (H3 4.07, H7 4.43, H9 4.21 after two live graded seconds,
+        # against 10.4-10.6 healthy); the number of windows that were LIVE can.
+        warmup = 6
+        for build in ("H3", "H5", "H7", "H9"):
+            healthy = self.SWITCH_SERIES[build]
+            for live in (0, 1, 2, 3, 4, 5):
+                froze = healthy[:warmup + live] + [0, 1] * ((len(healthy) - warmup - live + 1) // 2)
+                froze = froze[:len(healthy)]
+                ok, detail = self._run_switch(froze)
+                self.assertFalse(ok, f"{build} frozen after {live} graded seconds {froze}: {detail}")
+                self.assertIn("fps_floor", detail)
+
+    def test_library_switch_fails_a_frozen_animator_with_one_burst(self):
+        # a frozen run plus one 50-60 fps window (a teardown flush, a stray repaint) is not an animation
+        for burst in (50, 60):
+            for at in (7, 12, 19):
+                series = [0, 1] * 10
+                series[at] = burst
+                ok, detail = self._run_switch(series)
+                self.assertFalse(ok, f"{series}: {detail}")
+
+    def test_library_switch_still_fails_an_animator_at_a_quarter_of_the_rate(self):
+        slow = [round(n / 4) for n in self.SWITCH_SERIES["H3"]]
+        ok, detail = self._run_switch(slow)
+        self.assertFalse(ok, f"{slow}: {detail}")
+
+    def test_fps_floor_stat_defaults_to_the_median_and_names_a_known_statistic(self):
+        # every scene that grades fps_floor on something else says so with a statistic the grader knows
+        for name, scene in self.scenes.items():
+            stat = scene.get("fps_floor_stat")
+            if stat is not None:
+                self.assertIn(stat, run.FPS_FLOOR_STATS, name)
+                self.assertIsNotNone(scene.get("fps_floor"), f"{name}: a statistic without a floor")
+            self.assertEqual("fps_floor_windows" in scene, stat == "live",
+                             f"{name}: fps_floor_windows belongs to the live statistic and only to it")
+            if stat == "live":
+                self.assertIsInstance(scene["fps_floor_windows"], int, name)
+                self.assertGreaterEqual(scene["fps_floor_windows"], 1, name)
+        # the opt-in is the library-switch scene and nothing else: every other scene keeps the median
+        self.assertEqual({n for n, sc in self.scenes.items() if sc.get("fps_floor_stat")}, {"library-switch"})
+        ok, detail = run.fps_floor_verdict([5, 5, 5, 5, 5, 40, 40], 10)
+        self.assertFalse(ok)
+        self.assertIn("median=5 fps (min=5, max=40, n=7) vs fps_floor 10", detail)
+        # live: a window is live at >= the floor, and the count must reach `windows`
+        ok, detail = run.fps_floor_verdict([5, 5, 5, 3, 0, 1, 40], 4, "live", 4)
+        self.assertTrue(ok)
+        self.assertIn("live=4 of n=7 windows at >= 4 fps (need 4;", detail)
+        self.assertFalse(run.fps_floor_verdict([5, 5, 5, 3, 0, 1, 40], 4, "live", 5)[0])
+        with self.assertRaises(ValueError):
+            run.fps_floor_verdict([1, 2, 3, 4, 5], 1, "p95")
+        with self.assertRaises(ValueError):
+            run.fps_floor_verdict([1, 2, 3, 4, 5], 1, "live")
+        with self.assertRaises(ValueError):
+            run.fps_floor_verdict([1, 2, 3, 4, 5], 1, "mean")
+
+    def _walk_log(self, server=None, fps=40, keys=6):
+        out = [server or self.SYN, "hubs: landed — 90 items, 3 shelves"] + [self._beat(fps=1)] * 3
+        for _ in range(keys):
+            out += [self.KEY, self._beat(fps=fps)]
+        return out + [self._beat(fps=fps)] * 2 + [self._beat(fps=1)] * 5
+
+    OKWALK = {"rows": 3, "sent": 6, "error": None}
+
+    def test_walk_scene_passes_on_the_window_and_reports_drops(self):
+        ok, detail = self._run_scene(self._deep_scene(), self._walk_log(), self.OKWALK)
+        self.assertTrue(ok, detail)
+        self.assertIn("3 row(s) landed", detail)
+        self.assertIn("gt33=", detail)
+        self.assertIn("not graded", detail)
+
+    def test_walk_scene_fails_when_the_window_is_slow_even_if_the_idle_is_fine(self):
+        ok, detail = self._run_scene(self._deep_scene(), self._walk_log(fps=5), self.OKWALK)
+        self.assertFalse(ok)
+        self.assertIn("fps_floor", detail)
+
+    def test_walk_scene_fails_when_it_did_not_finish_or_no_key_arrived(self):
+        ok, detail = self._run_scene(self._deep_scene(), self._walk_log(),
+                                     {"rows": 3, "sent": 2, "error": None})
+        self.assertFalse(ok)
+        self.assertIn("never ran to completion", detail)
+        ok, detail = self._run_scene(self._deep_scene(), self._walk_log(keys=0), self.OKWALK)
+        self.assertFalse(ok)
+        self.assertIn("key type=0x300", detail)
+        ok, detail = self._run_scene(self._deep_scene(), self._walk_log(),
+                                     {"rows": None, "sent": 0, "error": "never landed"})
+        self.assertFalse(ok)
+        self.assertIn("never landed", detail)
+
+    def test_a_non_synthetic_server_in_the_log_fails_before_grading(self):
+        bad = "pms: server 0 version=1.41.9.9799-real plexPass=true"
+        ok, detail = self._run_scene(self._deep_scene(), self._walk_log(server=bad), self.OKWALK)
+        self.assertFalse(ok)
+        self.assertIn("non-synthetic", detail)
+
+    def test_an_app_that_never_named_a_server_fails_closed(self):
+        log = [ln for ln in self._walk_log() if not ln.startswith("pms:")]
+        ok, detail = self._run_scene(self._deep_scene(), log, self.OKWALK)
+        self.assertFalse(ok)
+        self.assertIn("never identified a server", detail)
+
+    # --- the CLI --------------------------------------------------------------------
+    def _cli(self, *argv):
+        return subprocess.run([sys.executable, os.path.join(TESTS_DIR, "run.py"), *argv],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_cli_refuses_mock_outside_the_fps_tier_and_with_identities(self):
+        for argv, needle in ((["--mock"], "--fps"), (["--mock", "--server"], "--fps"),
+                             (["--mock", "--fps", "--owner"], "--owner"),
+                             (["--mock", "--fps", "--shared-server"], "--shared-server"),
+                             (["--mock", "--fps", "--graphics-profile"], "--graphics-profile"),
+                             (["--mock", "--print-test-token"], "--mock")):
+            p = self._cli(*argv)
+            self.assertNotEqual(p.returncode, 0, argv)
+            self.assertIn(needle, p.stdout + p.stderr, argv)
+
+    def test_cli_lists_the_mock_tags(self):
+        p = self._cli("--fps", "--mock", "--list")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        deep = [ln for ln in p.stdout.splitlines() if ln.startswith("fps:home-grid-deep")]
+        self.assertEqual(len(deep), 1)
+        self.assertIn("[mock-only]", deep[0])
+        grid = [ln for ln in p.stdout.splitlines() if ln.startswith("fps:home-grid ")]
+        self.assertIn("[mock ok]", grid[0])
+
+
+def load_tests(loader, tests, pattern):
+    """Whole-module runs (`python3 tests/test_harness.py`, `make check`) run `DepGates` in
+    parallel; naming a test on the command line still runs it alone, in the foreground.
+    `PLX_TEST_JOBS=1` forces the one-at-a-time order."""
+    suite = unittest.TestSuite()
+    module = sys.modules[__name__]
+    # The same walk `loadTestsFromModule` does (every TestCase class the module can see, in name
+    # order), minus its `load_tests` hook, which is this function.
+    for name in dir(module):
+        obj = getattr(module, name)
+        if isinstance(obj, type) and issubclass(obj, unittest.TestCase):
+            case = loader.loadTestsFromTestCase(obj)
+            suite.addTest(_ParallelSuite(case) if obj is DepGates else case)
+    return suite
 
 
 if __name__ == "__main__":

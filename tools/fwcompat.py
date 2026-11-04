@@ -23,6 +23,7 @@ plane. Do not read a green matrix as "it works on webOS 5"; read it as "it start
 USAGE
     tools/fwcompat.py                          # grade pkg/plxnative against every release
     tools/fwcompat.py --release 5.3.1          # one release, with the full missing list
+    tools/fwcompat.py --shipped pkg pkg/libavformat-plx.so.63   # a bundled library, siblings shipped
     tools/fwcompat.py --lib libSDL2-2.0.so.0 --grep webOS      # what does that library export?
     tools/fwcompat.py --inventory libAcbAPI libavformat        # which releases carry these?
 
@@ -38,15 +39,15 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import urllib.request
 from pathlib import Path
 
-# Pinned so a database refresh is a visible commit rather than a silent change of verdict.
-FWSYM_TAG = "v20260731-e1bb0c0"
-FWSYM_DEB = "webosbrew-toolbox-fw-symbols_0.4.0-1_arm64.deb"
-FWSYM_URL = f"https://github.com/webosbrew/dev-toolbox-cli/releases/download/{FWSYM_TAG}/{FWSYM_DEB}"
-
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "ci"))
+import deps  # noqa: E402  (the one fetch-and-verify routine)
+
+# Pinned (release, URL, sha256) in ci/dependencies.json, entry `webosbrew-toolbox`, so a database
+# refresh is a visible commit rather than a silent change of verdict.
+FWSYM = deps.entry("webosbrew-toolbox")
 DEFAULT_BINARY = REPO / "pkg" / "plxnative"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "plxnative" / "fwsym"
 
@@ -73,14 +74,13 @@ def ensure_db(db_arg):
     if data.is_dir() and any(data.iterdir()):
         return data
     CACHE.mkdir(parents=True, exist_ok=True)
-    deb = CACHE / FWSYM_DEB
-    if not deb.exists():
-        print(f"fetching firmware symbol databases (~25 MB) -> {deb}", file=sys.stderr)
-        try:
-            urllib.request.urlretrieve(FWSYM_URL, deb)
-        except Exception as e:  # noqa: BLE001 - any failure here is the same user-facing problem
-            die(f"could not download {FWSYM_URL}: {e}\n"
-                f"        Fetch it by hand and re-run, or pass --db <extracted data dir>.")
+    asset = deps.assets_of(FWSYM)["fw-symbols"]
+    print(f"fetching firmware symbol databases (~25 MB) -> {CACHE}", file=sys.stderr)
+    try:
+        deb = deps.fetch(FWSYM, CACHE, keys={"fw-symbols"}, label="fwcompat")["fw-symbols"]
+    except (ValueError, OSError) as e:
+        die(f"could not fetch {asset['url']}: {e}\n"
+            f"        Fetch it by hand and re-run, or pass --db <extracted data dir>.")
     print("extracting...", file=sys.stderr)
     work = CACHE / "unpack"
     shutil.rmtree(work, ignore_errors=True)
@@ -208,13 +208,52 @@ def elf_facts(binary):
     return sorted(needed), sorted(undef)
 
 
+def defined_symbols(lib):
+    """Names a shared library exports: its defined (non-UND) dynamic symbols, versions stripped."""
+    out = set()
+    syms = subprocess.run([readelf(), "--dyn-syms", "-W", str(lib)], capture_output=True, text=True,
+                          check=True).stdout
+    for line in syms.splitlines():
+        f = line.split()
+        if len(f) < 8 or not f[0].endswith(":") or f[6] == "UND":
+            continue
+        name = f[7].split("@")[0]
+        if name:
+            out.add(name)
+    return out
+
+
+def split_shipped(needed, shipped_dir):
+    """(DT_NEEDED the firmware must provide, symbols the package's own libraries export).
+
+    The bundled FFmpeg libraries need each other (`libavformat-plx` -> `libavcodec-plx`,
+    `libavutil-plx`), and no firmware carries those names, so grading one of them bare reports every
+    firmware as FAIL and says nothing. With `--shipped DIR`, a DT_NEEDED name that is a file in DIR
+    is the package's own and is taken off the firmware's list, and what that file exports counts as
+    resolved; everything else still has to come from the television. Each shipped library is graded
+    on its own run, so its dependencies are not skipped, only not graded twice.
+
+    DIR is trusted to be the payload: a name is "shipped" because a file of that name sits there,
+    not because the .ipk carries it. CI's `pkg/` is exactly the staged payload; a local `pkg/` with
+    leftovers from another build (a debug `libswscale-plx` beside a RELEASE=1 build) would credit a
+    library the package does not ship.
+    """
+    if not shipped_dir:
+        return needed, set()
+    own = [n for n in needed if (Path(shipped_dir) / n).is_file()]
+    exported = set()
+    for n in own:
+        exported |= defined_symbols(Path(shipped_dir) / n)
+    return [n for n in needed if n not in own], exported
+
+
 # ---------------------------------------------------------------- reporting
 
 
-def grade(fw, needed, undef):
+def grade(fw, needed, undef, shipped_exports=frozenset()):
     """(missing libraries, missing symbols) for one firmware."""
     records, missing_libs = fw.closure(needed)
-    exported = set()
+    exported = set(shipped_exports)
     for rec in records:
         for s in rec.get("symbols", ()):
             exported.add(s.split("@")[0])
@@ -227,7 +266,9 @@ def cmd_grade(args, db):
     if not binary.exists():
         die(f"{binary} not found — run `make` first, or pass a path.")
     needed, undef = elf_facts(binary)
-    print(f"{binary}: {len(needed)} DT_NEEDED, {len(undef)} undefined dynamic symbols\n")
+    needed, shipped_exports = split_shipped(needed, args.shipped)
+    own = f" (after dropping the package's own libraries in {args.shipped})" if args.shipped else ""
+    print(f"{binary}: {len(needed)} DT_NEEDED, {len(undef)} undefined dynamic symbols{own}\n")
 
     every = load_firmwares(db)
     fws = every
@@ -239,17 +280,17 @@ def cmd_grade(args, db):
     floor = relver(args.min_release) if args.min_release else None
     # Graded ONCE per firmware. The detail block below used to re-grade the selected release, so
     # the table and the detail could in principle disagree about the same binary.
-    rows = [(fw, *grade(fw, needed, undef)) for fw in fws]
+    rows = [(fw, *grade(fw, needed, undef, shipped_exports)) for fw in fws]
     print(f"{'release':<9} {'verdict':<8} {'missing libraries':<52} symbols")
     print("-" * 96)
     worst = 0
     for fw, mlibs, msyms in rows:
         ok = not mlibs and not msyms
-        # Releases below the floor are graded and PRINTED but do not set the exit status. The five
-        # oldest (webOS 1.2.0 through 3.9.2) fail permanently and for reasons nobody intends to
-        # fix — they predate the C++11 std::string ABI, so StarfishMediaAPIs::Feed has a different
-        # mangling — so counting them would make this tool useless as a gate while hiding the
-        # regression it exists to catch.
+        # Releases below the floor are graded and PRINTED but do not set the exit status. The
+        # oldest releases predate the C++11 std::string ABI, so StarfishMediaAPIs::Feed carries a
+        # different mangling there; src/starfish.c now resolves either name at runtime and
+        # 3.4.3 has run on hardware, but webOS 1.x/2.x were never tried, so counting them would
+        # make this tool useless as a gate while hiding the regression it exists to catch.
         counts = floor is None or relver(fw.release) >= floor
         if counts and not ok:
             worst = 1
@@ -325,6 +366,13 @@ def main():
         metavar="REL",
         help="exit non-zero only for failures at or above this release (e.g. 4.4.2). "
         "Everything is still graded and printed; this decides what counts as a regression.",
+    )
+    ap.add_argument(
+        "--shipped",
+        metavar="DIR",
+        help="a DT_NEEDED name that is a file in DIR ships in the package: resolve it, and the "
+        "symbols it exports, from there rather than the firmware (e.g. --shipped pkg for the "
+        "bundled FFmpeg libraries)",
     )
     ap.add_argument("--lib", help="dump one library's presence and symbols across releases")
     ap.add_argument("--grep", help="with --lib, filter symbols by this regex")

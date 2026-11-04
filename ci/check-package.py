@@ -15,7 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mkipk import storage_archive_errors
+import deps  # noqa: E402  — ci/deps.py, the manifest reader (ci/dependencies.json pins the FFmpeg tarball)
 import flavor  # noqa: E402  — ci/flavor.py, which DECIDES a flavour's id and title
+import version_rule  # noqa: E402  — ci/version_rule.py, the shared "next X.Y.Z" arithmetic
 
 ROOT = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -38,51 +40,50 @@ def build_configuration(stamp: str) -> "str | None":
 
     THE FEATURE FLAGS ARE ONE FIELD OF SEVERAL, and reading the stamp as a whole string is what
     silently switched every gate that depends on this off. `RUST_CFG` is `features:$(RUST_FEATFLAGS)`,
-    then `+symbols` when SYMBOLS=1, then always `+tel:<hash>` — so the real stamp for an ordinary
-    dev build is `features:+tel:98c4b7d3`, which equals neither of the two literals this was once
-    written against. It matched when it was written; the telemetry field was added later, and from
-    that day the answer was None for EVERY build this project makes. Nothing failed — the callers
-    print "SKIP — neither shipped configuration" and move on — so the dev-trigger gate, the
-    dev-only-library gate and the reported-version gate all graded nothing on every CI run. Exactly
-    the defect class DEV_WITNESS is commented against, a witness that cannot fail, reached by
-    another route. The release cut carries `SYMBOLS=1`, which adds a THIRD field, so repairing the
-    two literals by hand would have left the release job ungraded anyway.
+    then `+symbols` when SYMBOLS=1, then `+nightly:<date>` when FLAVOR=nightly, then always
+    `+tel:<hash>` — and `+profile:tvdev` right after the flags when the local ARM profile is in
+    use (the Makefile's ARM_PROFILE; absent for `release`, so every shipped stamp is unchanged) —
+    so the real stamp for an ordinary dev build is `features:+tel:98c4b7d3` under CI and
+    `features:+profile:tvdev+tel:98c4b7d3` for a plain local build, which equals
+    neither of the two literals this was once written against. It matched when it was
+    written; the telemetry field was added later, and from that day the answer was None for EVERY
+    build this project makes. Nothing failed — the callers print "SKIP — neither shipped
+    configuration" and move on — so the dev-trigger gate, the dev-only-library gate and the
+    reported-version gate all graded nothing on every CI run. Exactly the defect class DEV_WITNESS
+    is commented against, a witness that cannot fail, reached by another route. The release cut
+    carries `SYMBOLS=1`, which adds a THIRD field, so repairing the two literals by hand would have
+    left the release job ungraded anyway.
 
     Only the FEATURE half is decoded, and matched WHOLE rather than by substring: the "shots"
     recipe in the Makefile's header is `--no-default-features --features devtriggers`, which a
     substring test would grade as a release build and then fail for carrying exactly the surface it
-    asked for. `+tel:` and `+symbols` are optional so a stamp written by an older Makefile still
-    decodes, and the feature flags are lazy so they cannot swallow a trailing field.
+    asked for. `+tel:`, `+symbols`, `+nightly:` and `+rc:` are all optional so a stamp written by an older
+    Makefile still decodes, and the feature flags are lazy so they cannot swallow a trailing field.
+    `nightly_stamp_date` and `rc_stamp_number` read the `+nightly:` and `+rc:` fields' VALUES
+    separately — this function only has to not choke on their presence.
     """
-    fields = re.fullmatch(r"features:(?P<flags>.*?)(?:\+symbols)?(?:\+tel:[0-9a-f]+)?", stamp.strip())
+    fields = re.fullmatch(
+        r"features:(?P<flags>.*?)(?:\+profile:[a-z]+)?(?:\+symbols)?(?:\+nightly:[0-9]{8})?(?:\+rc:[0-9]+)?(?:\+tel:[0-9a-f]+)?",
+        stamp.strip())
     if not fields:
         return None
     return {"": "dev", "--no-default-features": "release"}.get(fields.group("flags").strip())
 
 
 def parse_release_line(content: str) -> "tuple[int, int] | None":
-    """Mirror `rust-modules/src/release_line.rs::parse_release_line` exactly: `"X.Y"` (with or
-    without a trailing newline) into its two integers, or `None` for anything else that is not
-    that shape — `"0.6.1"` included, since splitting on the FIRST `.` leaves `"6.1"` for the minor
-    half and that does not parse as one integer either. Malformed content degrades to "absent"
-    (trunk) rather than a build failure, because `RELEASE_LINE` is hand-edited and a bad edit
-    should read as trunk for everyone on the checkout, not as a broken gate.
+    """Mirror `rust-modules/src/release_line.rs::parse_release_line` exactly. Kept as a thin
+    re-export of `ci/version_rule.py`'s copy — the one this file used to own — so nothing else in
+    this module has to change its import.
     """
-    line = content.strip()
-    if "." not in line:
-        return None
-    major, _, minor = line.partition(".")
-    try:
-        return int(major), int(minor)
-    except ValueError:
-        return None
+    return version_rule.parse_release_line(content)
 
 
 def expected_dev_version(appinfo_version: str, release_line_content: "str | None") -> "tuple[str | None, str | None]":
     """The `X.Y.Z-dev` string (no `plxnative@` prefix) `rust-modules/build.rs::emit_version`
     reports for a build that is not `RELEASE=1`, derived by the SAME rule build.rs documents —
     the two must never drift, which is exactly what going and re-deriving it separately here
-    would risk.
+    would risk. The arithmetic itself lives in `ci/version_rule.py::next_version_triplet`, shared
+    with `ci/flavor.py`'s nightly package-version arm; this function only adds the `-dev` suffix.
 
     Trunk (`release_line_content is None` — no tracked `RELEASE_LINE`, matching
     `release_line()`'s "absent means trunk", which also covers a marker present but malformed)
@@ -100,18 +101,206 @@ def expected_dev_version(appinfo_version: str, release_line_content: "str | None
     floating patches for the line it claims to be on, and reporting a plausible-looking dev
     version for it would be worse than refusing.
     """
-    major, minor, patch = (int(x) for x in appinfo_version.split("."))
-    line = parse_release_line(release_line_content) if release_line_content is not None else None
-    if line is None:
-        return f"{major}.{minor + 1}.0-dev", None
-    line_major, line_minor = line
-    if (line_major, line_minor) != (major, minor):
-        return None, (
-            f"RELEASE_LINE names {line_major}.{line_minor} but appinfo.json is at "
-            f"{major}.{minor}.{patch} — mis-cut line (RELEASE_LINE's X.Y must equal "
-            "appinfo.json's major.minor)"
-        )
-    return f"{line_major}.{line_minor}.{patch + 1}-dev", None
+    triplet, err = version_rule.next_version_triplet(appinfo_version, release_line_content)
+    if triplet is None:
+        return None, err
+    return "{}.{}.{}-dev".format(*triplet), None
+
+
+def expected_nightly_package_version(cargo_version: str, release_line_content: "str | None",
+                                     date: "str | None") -> str:
+    """The nightly package's OWN `appinfo.json`/control `version` (three integers, no suffix),
+    computed from `rust-modules/Cargo.toml`'s TRACKED version and the build's cut date: the
+    next-minor-or-next-patch `major.minor` with the date as the patch
+    (`ci/version_rule.py::nightly_package_triplet`, the arithmetic `ci/flavor.py::appinfo_for`
+    applies when it moves `version` for the nightly flavour ONLY). A build failure (`SystemExit`)
+    on a mis-cut `RELEASE_LINE`, same as `expected_dev_version`, and on a missing or malformed
+    date — there is no plausible fallback number to grade a nightly package against.
+
+    `date` is `nightly_stamp_date`'s read of `pkg/.build-config`, deliberately NOT read back out of
+    the appinfo under test: the package must agree with the date the build recorded, and a version
+    graded against itself would pass whatever it said.
+    """
+    if date is None:
+        raise SystemExit("pkg/.build-config carries no +nightly:<8 digit date> field, so the "
+                         "nightly package version has nothing to be graded against")
+    triplet, err = version_rule.nightly_package_triplet(cargo_version, release_line_content, date)
+    if err:
+        raise SystemExit(err)
+    return "{}.{}.{}".format(*triplet)
+
+
+def expected_nightly_reported_version(cargo_version: str, release_line_content: "str | None",
+                                      date: "str | None") -> str:
+    """The version a nightly BINARY reports — `X.Y.Z-nightly-YYYYMMDD`, no `plxnative@` prefix —
+    where `X.Y.Z` is the release the build is heading to (`version_rule.next_version_triplet`, the
+    number `rust-modules/build.rs::emit_version` reads). It is NOT the package version plus a
+    suffix any more: the package version carries the cut date as its patch
+    (`expected_nightly_package_version`, `X.Y.<date>`), so the two share only `X.Y`. Same failure
+    modes as the package version: a mis-cut `RELEASE_LINE` or a missing/malformed date is a
+    `SystemExit`, not a guess."""
+    if date is None or len(date) != 8 or not date.isascii() or not date.isdigit():
+        raise SystemExit(f"nightly date must be exactly 8 digits (YYYYMMDD), got {date!r}")
+    triplet, err = version_rule.next_version_triplet(cargo_version, release_line_content)
+    if err:
+        raise SystemExit(err)
+    return "{}.{}.{}-nightly-{}".format(*triplet, date)
+
+
+def nightly_stamp_date(stamp: str) -> "str | None":
+    """The `YYYYMMDD` the Makefile wrote into `pkg/.build-config`'s `+nightly:<date>` field when it
+    built with `FLAVOR=nightly` — `None` when the field is absent or is not exactly 8 digits.
+
+    THE DATE IS GRADED BY VALUE, not by shape. An earlier version of this gate accepted any
+    `[0-9]{8}` in the binary's own `plxnative@X.Y.Z-nightly-YYYYMMDD` string, first with a
+    trailing `\\b` and then with `(?![0-9])` in its place — and BOTH failed against a real nightly
+    build (`0.7.0-nightly-202609192m4m6m8m10m12m14m1`), because `concat!`'s output in `.rodata` is
+    packed back to back with no NUL separator: the very next packed string literal in that build
+    happened to start with more digits, so no amount of "assert a boundary" or "assert not-a-
+    digit" on the SHAPE of the date can ever be relied on to stop where the date actually stops.
+    There is no shape rule that survives an adjacent literal chosen by the linker.
+    So this stops guessing where the date ends from the bytes alone, and reads it instead from the
+    one place the build ACTUALLY recorded it under its own control: the Makefile's own stamp,
+    where `+` is a delimiter WE chose and control, not a byte sequence the linker assembled.
+    Read `PLX_NIGHTLY_DATE` there, then grade the binary the same way `stable` is graded — an exact
+    substring, no boundary assumed either side, because the substring itself is now precise.
+    """
+    m = re.search(r"\+nightly:([0-9]{8})(?=\+|$)", stamp.strip())
+    return m.group(1) if m else None
+
+
+def rc_stamp_number(stamp: str) -> "str | None":
+    """The candidate number the Makefile wrote into `pkg/.build-config`'s `+rc:<n>` field when it
+    built with `RC=<n>` — `None` when the field is absent or is not a positive integer without a
+    leading zero (`build.rs::is_rc_number`'s rule, which refuses to build anything else).
+
+    Read from the stamp rather than from the binary for exactly the reason `nightly_stamp_date`
+    gives: `concat!`'s output is packed against whatever literal the linker put next, so
+    `plxnative@0.8.0-rc.1` followed by a digit is indistinguishable from `-rc.12` by shape alone.
+    """
+    m = re.search(r"\+rc:([1-9][0-9]{0,3})(?=\+|$)", stamp.strip())
+    return m.group(1) if m else None
+
+
+# ---- the dev-trigger catalog, derived from dev.rs and devtrig.rs themselves ----------------------
+#
+# #138 taught a RELEASE build to fold every `/tmp` trigger away at compile time (`devtrig::flag`/
+# `devtrig::read` are `false`/`None` without `devtriggers`, so the branches behind them vanish), and
+# gave `ci/check-package.py` ONE witness of that: `DEV_WITNESS = b"plxnative-noidle"`, a name
+# `dev.rs`'s own `DIAG` array carries as a full, literal `"plxnative-noidle"` string. That witness
+# proves DIAG-as-a-whole is gated — but it names only one member of it, and every OTHER
+# `plxnative-*` name `dev.rs` (or a sibling module) treats as part of the trigger surface could
+# still leak into a release binary with nothing here to notice. `dev_trigger_catalog` generalises
+# the single witness to the WHOLE vocabulary those two arrays actually declare:
+#
+#   * `CONTROLLED` — the bare names a controlled/recorded boot may carry (`devtrig.rs`'s own comment:
+#     "a full trigger name in the release binary is exactly what `ci/check-package.py` grades as
+#     'dev triggers compiled in'").
+#   * `DIAG` — already-prefixed full names, `#[cfg(any(feature = "devtriggers", test))]`-gated at
+#     the array itself, so every genuine member is compile-time absent from `--no-default-features`
+#     unless something ELSE outside that gate spells the same string (which is exactly the class of
+#     leak this project has now shipped twice: `ui/anim.rs`'s log sink and `dev/scenarios.rs`'s
+#     disabled-both diagnostic both spelled a DIAG name in code the feature never touched).
+#
+# PARSED, not hand-copied: a literal Python list here would rot exactly the way `DEV_WITNESS` did —
+# silently, the day somebody renames or adds a trigger and does not think to update a second file.
+# Regexing the two array bodies out of the CURRENT `dev.rs` and `devtrig.rs` means this check is
+# always grading the vocabulary the source actually declares this commit, never a stale snapshot.
+DEV_RS = ROOT / "rust-modules/src/dev.rs"
+# `CONTROLLED` moved with the trigger primitives (`flag`/`read`/`controlled_trigger`) to the base
+# layer, so the catalog's two arrays now live in two files: `DIAG` in `dev.rs`, `CONTROLLED` here.
+DEVTRIG_RS = ROOT / "rust-modules/base/src/devtrig.rs"
+
+# Names that are real `plxnative-*` bytes in every configuration ON PURPOSE, so a hit here is not a
+# leak — allowlisted once, with the reason, rather than excluded from the catalog silently.
+RELEASE_LEGITIMATE_TRIGGER_NAMES = {
+    # The unconditional runtime sinks `dev.rs`'s own module doc calls out: they are CREATES, never
+    # READS, so nothing can arm them as a behaviour switch by writing one. The first three are the
+    # C shim's private logs; `plxnative-diag.log` is the storage worker's group-readable snapshot.
+    "plxnative-events.log", "plxnative-crash.log", "plxnative-stderr.log",
+    "plxnative-diag.log",
+    # The remote-key FIFO (`remote.rs`) is a shipped PRODUCTION feature, not a dev trigger, even
+    # though `DIAG` also lists it (so that its presence does not suppress the who's-watching
+    # picker the way an actual trigger file would).
+    "plxnative-remote",
+    # `ui/rec.rs:65`'s erasure list — a STABLE/nightly install deletes these leftovers from a
+    # devtriggers install that shared the same system `/tmp` (AGENTS.md: `/tmp` is shared across
+    # installs in both jail profiles). Deleting a name is not carrying its trigger surface.
+    "plxnative-rec", "plxnative-recplay", "plxnative-app-init", "plxnative-recordings",
+    # `app/input.rs`'s `delete_all_local_data` erasure list — the SAME rationale as rec.rs's, for
+    # the diagnostic sinks a coexisting devtriggers install could have left in the shared `/tmp`:
+    # a "delete all my data" action has to clean these up regardless of which build wrote them, so
+    # release code names them on purpose.
+    "plxnative-gputime.jsonl", "plxnative-gst.log", "plxnative-hwcnt.jsonl",
+    "plxnative-anim.log",
+    # Explicit local playback-diagnostic export; a create-only sink, also in privacy erasure.
+    "plxnative-playback.log",
+}
+
+
+def _catalog_name_in_binary(
+    name: str, blob: bytes, legitimate: "set[str]" = RELEASE_LEGITIMATE_TRIGGER_NAMES
+) -> bool:
+    """Is the full trigger name `name` present as its OWN string constant in `blob`, rather than
+    merely as a byte-run that happens to start a longer, allowlisted name?
+
+    Rust `&str` constants are fat pointers (data + length), not NUL-terminated C strings, so the
+    compiler is free to lay adjacent literals back to back with no separator at all — and it does:
+    a real ARM release build was observed to contain literally
+    `...jsonlplxnative-hwcnt.jsonlloginonboardli...` as one contiguous byte run, no gap anywhere.
+    A plain `name.encode() in blob` substring test cannot tell "the bare trigger name
+    `plxnative-hwcnt` is compiled in" from "the ALWAYS-legitimate log filename
+    `plxnative-hwcnt.jsonl` (allowlisted above) happens to start with those same bytes" — every
+    catalog name that is a string-prefix of an allowlisted longer name would misgrade as a leak
+    forever, with no source change able to turn the check green. `plxnative-anim` /
+    `plxnative-anim.log` is the same trap in the other direction.
+
+    A trailing word-boundary check (reject the match if the next byte looks like an identifier
+    character) does NOT work here, because the packing above proves the byte right after a
+    legitimate string's own end is whatever unrelated literal happens to sit next — `l` from
+    `login`, not a separator — so a boundary check would reject the LEGITIMATE occurrence too.
+    The only fact this can lean on is the exact allowlist itself: an occurrence of `name` is
+    innocent if, and only if, it is immediately followed by exactly the bytes that would make it
+    read as one particular allowlisted longer name (`name` plus that name's own extra suffix,
+    e.g. `.jsonl`) — checked by slicing the blob, not by asking what comes after in the abstract.
+    If a later occurrence of the same bare `name` is NOT explained that way, it is a real hit.
+    """
+    needle = name.encode()
+    extensions = [n.encode() for n in legitimate if n != name and n.startswith(name)]
+    start = 0
+    while True:
+        i = blob.find(needle, start)
+        if i == -1:
+            return False
+        if not any(blob[i : i + len(ext)] == ext for ext in extensions):
+            return True
+        start = i + 1
+
+
+def parse_dev_trigger_catalog(dev_rs_text: str) -> "set[str]":
+    """Every full `plxnative-<name>` string the `CONTROLLED` (devtrig.rs) and `DIAG` (dev.rs) arrays declare,
+    parsed out of the given source text (a parameter, not a file read, so this can be pinned
+    against a fixture independently of whatever `dev.rs` says today — see `_selftest`).
+    """
+    names: "set[str]" = set()
+    controlled = re.search(r"const CONTROLLED: &\[&str\] = &\[(.*?)\];", dev_rs_text, re.S)
+    if controlled:
+        names.update(f'plxnative-{n}' for n in re.findall(r'"([a-z0-9_.-]+)"', controlled.group(1)))
+    diag = re.search(r"const DIAG: \[&str; \d+\] = \[(.*?)\];", dev_rs_text, re.S)
+    if diag:
+        names.update(re.findall(r'"(plxnative-[a-z0-9_.-]+)"', diag.group(1)))
+    return names
+
+
+def dev_trigger_catalog() -> "set[str]":
+    """[`parse_dev_trigger_catalog`] against the real `dev.rs` (`DIAG`) and `devtrig.rs`
+    (`CONTROLLED`), minus the release-legitimate
+    allowlist — the set `ci/check-package.py` actually grades a packaged binary against.
+    """
+    return (
+        parse_dev_trigger_catalog(DEV_RS.read_text() + "\n" + DEVTRIG_RS.read_text())
+        - RELEASE_LEGITIMATE_TRIGGER_NAMES
+    )
 
 
 def _selftest() -> int:
@@ -143,6 +332,13 @@ def _selftest() -> int:
         "features:--no-default-features+tel:98c4b7d37a4c": "release",
         "features:--no-default-features+symbols+tel:98c4b7d37a4c": "release",   # the release cut
         "features:+symbols+tel:98c4b7d37a4c": "dev",
+        # the local ARM profile (Makefile ARM_PROFILE=tvdev): only a plain dev build ever carries it
+        "features:+profile:tvdev+tel:98c4b7d37a4c": "dev",
+        "features:--no-default-features+profile:tvdev+tel:98c4b7d37a4c": "release",
+        # the nightly cut: RELEASE=1 (so --no-default-features), SYMBOLS=1, and the dated field
+        "features:--no-default-features+symbols+nightly:20260919+tel:98c4b7d37a4c": "release",
+        # a release candidate: the release cut plus the candidate number
+        "features:--no-default-features+symbols+rc:2+tel:98c4b7d37a4c": "release",
         # older stamps, from before the telemetry and symbols fields existed
         "features:": "dev",
         "features:--no-default-features": "release",
@@ -184,12 +380,296 @@ def _selftest() -> int:
                   f"= ({got_version!r}, {got_err!r}), want version={want_version!r} err={want_err}")
     print(f"check-package: expected_dev_version {len(dev_cases) - dev_bad}/{len(dev_cases)} cases correct")
 
-    bad += maintainer_bad + dev_bad
+    # `nightly_stamp_date` against a real stamp, a stamp from a build that never got the field (an
+    # older Makefile, or a non-nightly flavour that ran through here by mistake), and a corrupted
+    # date of the wrong length — all three must be told apart, because the caller's rule is
+    # "require it, FAIL if absent or malformed" and a silent `None` reads as "absent" either way.
+    nightly_date_cases = {
+        "features:--no-default-features+symbols+nightly:20260919+tel:98c4b7d37a4c": "20260919",
+        "features:--no-default-features+symbols+tel:98c4b7d37a4c": None,                    # no field
+        "features:--no-default-features+symbols+nightly:2026091+tel:98c4b7d37a4c": None,    # 7 digits
+        "features:--no-default-features+symbols+nightly:202609190+tel:98c4b7d37a4c": None,  # 9 digits
+    }
+    nightly_date_bad = 0
+    for stamp, want in nightly_date_cases.items():
+        got = nightly_stamp_date(stamp)
+        if got != want:
+            nightly_date_bad += 1
+            print(f"  FAIL — nightly_stamp_date({stamp!r}) = {got!r}, want {want!r}")
+    print(f"check-package: nightly_stamp_date "
+          f"{len(nightly_date_cases) - nightly_date_bad}/{len(nightly_date_cases)} cases correct")
+
+    # `--print-nightly-date` is the CLI wrapper build-package.yml calls instead of its own `sed`.
+    # Run it as an actual subprocess rather than calling the dispatch code directly — the argv
+    # parsing and the stdout shape (bare date, or nothing) are exactly what the shell caller's
+    # `nightly_date=$(...)` depends on, and none of that is exercised by calling
+    # `nightly_stamp_date` in-process.
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        good = Path(td) / "good.build-config"
+        good.write_text("features:--no-default-features+symbols+nightly:20260919+tel:98c4b7d37a4c")
+        good_proc = subprocess.run([sys.executable, __file__, "--print-nightly-date", str(good)],
+                                    capture_output=True, text=True)
+        good_ok = good_proc.returncode == 0 and good_proc.stdout.strip() == "20260919"
+        if not good_ok:
+            print(f"  FAIL — --print-nightly-date {good.name} = (rc={good_proc.returncode}, "
+                  f"stdout={good_proc.stdout!r}), want (0, '20260919')")
+
+        # A stable stamp has no `+nightly:` field at all — exit 0 with empty stdout, same as the
+        # `sed -n` this replaces, NOT an error: `label="$version${nightly_date:+-nightly-...}"`
+        # relies on an empty capture meaning "no suffix".
+        missing = Path(td) / "missing.build-config"
+        missing.write_text("features:--no-default-features+symbols+tel:98c4b7d37a4c")
+        missing_proc = subprocess.run(
+            [sys.executable, __file__, "--print-nightly-date", str(missing)],
+            capture_output=True, text=True)
+        missing_ok = missing_proc.returncode == 0 and missing_proc.stdout.strip() == ""
+        if not missing_ok:
+            print(f"  FAIL — --print-nightly-date {missing.name} = (rc={missing_proc.returncode}, "
+                  f"stdout={missing_proc.stdout!r}), want (0, '')")
+    cli_bad = (0 if good_ok else 1) + (0 if missing_ok else 1)
+    print(f"check-package: --print-nightly-date CLI {2 - cli_bad}/2 cases correct")
+
+    # ...and the actual grade, once a date is in hand: an EXACT substring, the same shape stable's
+    # own `plxnative@X.Y.Z` check already uses, no boundary assumed on either side. This is the
+    # case that defeated both earlier shape rules (`\b`, then `(?![0-9])`): a real nightly binary's
+    # own bytes, `plxnative@0.7.0-nightly-20260919` immediately followed by more digits from the
+    # next packed literal with no separator at all. Graded by VALUE, that adjacency is no longer
+    # ambiguous — it either is that exact string, or it reports some other date, which must fail.
+    nightly_blob = b"plxnative@0.7.0-nightly-202609192m4m6m8m10m12m14m1"
+    nightly_blob_cases = {
+        ("0.7.0", "20260919"): True,   # the adjacent-literal case above, graded by the real date
+        ("0.7.0", "20260920"): False,  # a date one day off must not pass
+    }
+    nightly_blob_bad = 0
+    for (version, date), want in nightly_blob_cases.items():
+        got = f"plxnative@{version}-nightly-{date}".encode() in nightly_blob
+        if got != want:
+            nightly_blob_bad += 1
+            print(f"  FAIL — plxnative@{version}-nightly-{date} in nightly_blob = {got!r}, want {want!r}")
+    print(f"check-package: nightly exact-substring grading "
+          f"{len(nightly_blob_cases) - nightly_blob_bad}/{len(nightly_blob_cases)} cases correct")
+
+    # `parse_dev_trigger_catalog` against a FIXTURE, independent of whatever the real `dev.rs`
+    # says today — this is the regression test for the regex itself, so a change to the two
+    # arrays' shape (a renamed const, a reformatted literal) fails HERE instead of silently
+    # parsing zero names out of the real file and making the binary-grading check vacuous, which
+    # is exactly the failure class `DEV_WITNESS` itself shipped as (`build_configuration`'s own
+    # docstring above).
+    catalog_fixture = '''
+const CONTROLLED: &[&str] = &[
+    "rec", "recplay", "focus", "noidle", "token",
+];
+
+const DIAG: [&str; 6] = [
+    "plxnative-events.log",
+    "plxnative-diag.log",
+    "plxnative-remote",
+    "plxnative-noidle",
+    "plxnative-overdraw",
+    "plxnative-rec",
+];
+'''
+    got_catalog = parse_dev_trigger_catalog(catalog_fixture)
+    want_catalog = {
+        "plxnative-rec", "plxnative-recplay", "plxnative-focus", "plxnative-noidle",
+        "plxnative-token", "plxnative-events.log", "plxnative-diag.log", "plxnative-remote",
+        "plxnative-overdraw",
+    }
+    catalog_bad = 0 if got_catalog == want_catalog else 1
+    if catalog_bad:
+        print(f"  FAIL — parse_dev_trigger_catalog(fixture) = {sorted(got_catalog)}, "
+              f"want {sorted(want_catalog)}")
+    print(f"check-package: parse_dev_trigger_catalog fixture "
+          f"{'1/1' if not catalog_bad else '0/1'} correct")
+
+    unconditional_sinks = {
+        "plxnative-events.log", "plxnative-crash.log", "plxnative-stderr.log",
+        "plxnative-diag.log",
+    }
+    missing_sinks = unconditional_sinks - RELEASE_LEGITIMATE_TRIGGER_NAMES
+    sinks_bad = int(bool(missing_sinks))
+    if sinks_bad:
+        print(f"  FAIL — unconditional runtime sinks missing from the release allowlist: "
+              f"{sorted(missing_sinks)}")
+    print(f"check-package: unconditional runtime sink allowlist "
+          f"{len(unconditional_sinks) - len(missing_sinks)}/{len(unconditional_sinks)} correct")
+
+    # And a live sanity check against the REAL `dev.rs` and `devtrig.rs`: the catalog must not have
+    # gone empty (a regex that silently stopped matching would make the binary-grading check pass
+    # on EVERY release, vacuously — the exact failure `DEV_WITNESS` shipped as, generalised to a
+    # whole set instead of one string), and the historic witness must still be a member of it. Each
+    # file is checked on its own: `noidle` is in BOTH arrays, so the witness alone would not notice
+    # one of the two regexes going blind.
+    real_catalog = dev_trigger_catalog()
+    diag_part = parse_dev_trigger_catalog(DEV_RS.read_text())
+    controlled_part = parse_dev_trigger_catalog(DEVTRIG_RS.read_text())
+    catalog_vacuous = (not real_catalog or "plxnative-noidle" not in real_catalog
+                       or not diag_part or not controlled_part)
+    if catalog_vacuous:
+        print(f"  FAIL — dev_trigger_catalog() against the real dev.rs/devtrig.rs is "
+              f"{sorted(real_catalog) or 'EMPTY'} (wants plxnative-noidle, and names from BOTH "
+              f"dev.rs's DIAG ({len(diag_part)}) and devtrig.rs's CONTROLLED ({len(controlled_part)}))")
+    print(f"check-package: dev_trigger_catalog() against the real dev.rs and devtrig.rs "
+          f"{'is non-vacuous' if not catalog_vacuous else 'WENT VACUOUS'}")
+
+    # `_catalog_name_in_binary` against the exact adjacency a real ARM release build produced
+    # (2026-09-19): `...jsonlplxnative-hwcnt.jsonlloginonboardli...`, `plxnative-hwcnt.jsonl`
+    # (allowlisted, legitimate) packed with NO separator on either side — the next byte after its
+    # own end is `l` from an unrelated `login`, not a boundary. A plain substring test grades the
+    # bare name `plxnative-hwcnt` "found" forever with no source change able to turn it green; a
+    # trailing-boundary-character test rejects the legitimate occurrence too, for the same reason.
+    # This fixture is that literal adjacency, using a small legitimate-name set independent of the
+    # real allowlist so the case pins the ALGORITHM rather than today's contents of `dev.rs`.
+    boundary_blob = b"...jsonlplxnative-hwcnt.jsonlloginonboardli..." \
+                    b"...r.logplxnative-anim.logplxnative-gst.logplx..." \
+                    b"...standaloneplxnative-hwcnt!bare-occurrence-with-no-extension..."
+    boundary_legit = {"plxnative-hwcnt.jsonl", "plxnative-anim.log", "plxnative-gst.log"}
+    boundary_cases = {
+        # every occurrence of the bare name is fully explained by an allowlisted longer name at
+        # that exact position: not a hit, even though the byte-run is present in the blob.
+        "plxnative-anim": False,
+        # one occurrence is explained (inside `.jsonl`) but a SECOND, later one is not (it is
+        # followed by `!bare-occurrence…`, not any allowlisted extension) — that second one must
+        # still be caught: a name is not safe just because it ALSO appears as someone else's
+        # prefix somewhere else in the binary.
+        "plxnative-hwcnt": True,
+        # the allowlisted longer names themselves really are present.
+        "plxnative-hwcnt.jsonl": True,
+        "plxnative-anim.log": True,
+        "plxnative-gst.log": True,
+        # absent from the fixture entirely.
+        "plxnative-noidle": False,
+    }
+    boundary_bad = 0
+    for name, want in boundary_cases.items():
+        got = _catalog_name_in_binary(name, boundary_blob, boundary_legit)
+        if got != want:
+            boundary_bad += 1
+            print(f"  FAIL — _catalog_name_in_binary({name!r}, …) = {got!r}, want {want!r}")
+    print(f"check-package: _catalog_name_in_binary boundary handling "
+          f"{len(boundary_cases) - boundary_bad}/{len(boundary_cases)} cases correct")
+
+    # The nightly PACKAGE version: next minor (or next patch's line) + the cut date as the patch.
+    pkgver_cases = [
+        (("0.7.0", None, "20260919"), "0.8.20260919"),
+        (("0.7.0", None, "20260920"), "0.8.20260920"),
+        (("0.6.1", "0.6\n", "20260919"), "0.6.20260919"),
+    ]
+    pkgver_bad = 0
+    for args, want in pkgver_cases:
+        got = expected_nightly_package_version(*args)
+        if got != want:
+            pkgver_bad += 1
+            print(f"  FAIL — expected_nightly_package_version{args!r} = {got!r}, want {want!r}")
+    for args in (("0.7.0", None, None), ("0.7.0", None, "2026091"), ("0.7.0", "0.6\n", "20260919")):
+        try:
+            got = expected_nightly_package_version(*args)
+        except SystemExit:
+            continue
+        pkgver_bad += 1
+        print(f"  FAIL — expected_nightly_package_version{args!r} = {got!r}, want SystemExit")
+    print(f"check-package: expected_nightly_package_version "
+          f"{len(pkgver_cases) + 3 - pkgver_bad}/{len(pkgver_cases) + 3} cases correct")
+
+    # The REPORTED version: heading-to X.Y.Z with the full date as its suffix — never the package
+    # version plus a suffix (that was true only while the package patch was 0).
+    rep_cases = [
+        (("0.7.0", None, "20260919"), "0.8.0-nightly-20260919"),
+        (("0.6.1", "0.6\n", "20260919"), "0.6.2-nightly-20260919"),
+    ]
+    rep_bad = 0
+    for args, want in rep_cases:
+        got = expected_nightly_reported_version(*args)
+        if got != want:
+            rep_bad += 1
+            print(f"  FAIL — expected_nightly_reported_version{args!r} = {got!r}, want {want!r}")
+    pkg, rep = (expected_nightly_package_version("0.7.0", None, "20260919"),
+                expected_nightly_reported_version("0.7.0", None, "20260919"))
+    if rep.startswith(pkg):
+        rep_bad += 1
+        print(f"  FAIL — the reported version {rep!r} must not be the package version {pkg!r} plus a suffix")
+    if pkg.rsplit(".", 1)[0] != rep.split("-nightly-")[0].rsplit(".", 1)[0]:
+        rep_bad += 1
+        print(f"  FAIL — package {pkg!r} and reported {rep!r} must share X.Y")
+    for args in (("0.7.0", None, None), ("0.7.0", None, "2026"), ("0.7.0", "0.6\n", "20260919")):
+        try:
+            got = expected_nightly_reported_version(*args)
+        except SystemExit:
+            continue
+        rep_bad += 1
+        print(f"  FAIL — expected_nightly_reported_version{args!r} = {got!r}, want SystemExit")
+    print(f"check-package: expected_nightly_reported_version {len(rep_cases) + 5 - rep_bad}/{len(rep_cases) + 5} cases correct")
+
+    # `rc_stamp_number` against a real candidate stamp, a stable one without the field, and the
+    # shapes `build.rs::is_rc_number` refuses (zero, a leading zero), which must read as absent.
+    rc_cases = {
+        "features:--no-default-features+symbols+rc:2+tel:98c4b7d37a4c": "2",
+        "features:--no-default-features+symbols+rc:12+tel:98c4b7d37a4c": "12",
+        "features:--no-default-features+symbols+tel:98c4b7d37a4c": None,
+        "features:--no-default-features+symbols+rc:0+tel:98c4b7d37a4c": None,
+        "features:--no-default-features+symbols+rc:01+tel:98c4b7d37a4c": None,
+        "features:--no-default-features+symbols+rc:2": "2",
+    }
+    rc_bad = 0
+    for stamp, want in rc_cases.items():
+        got = rc_stamp_number(stamp)
+        if got != want:
+            rc_bad += 1
+            print(f"  FAIL — rc_stamp_number({stamp!r}) = {got!r}, want {want!r}")
+    print(f"check-package: rc_stamp_number {len(rc_cases) - rc_bad}/{len(rc_cases)} cases correct")
+
+    bad += (maintainer_bad + dev_bad + nightly_date_bad + cli_bad + nightly_blob_bad + rc_bad
+            + catalog_bad + sinks_bad + int(catalog_vacuous) + boundary_bad + pkgver_bad + rep_bad)
     return 1 if bad else 0
 
 
 if "--selftest" in sys.argv:
     sys.exit(_selftest())
+
+# A single CLI entry point onto `nightly_stamp_date`, so a caller outside this file (currently only
+# build-package.yml's source-tarball-naming step) reads `pkg/.build-config`'s `+nightly:<date>`
+# field the same way the packaging gate above does, rather than re-deriving the regex with its own
+# `sed`. Two copies of that pattern is exactly how the workflow's copy could go blind to the
+# adjacent-literal case `nightly_stamp_date`'s own docstring describes — a `sed` one-liner has no
+# selftest to catch it drifting.
+#
+# Prints the date and nothing else when the field is present, prints nothing (exit 0) when it is
+# absent — same as the `sed -n` it replaces. Absence is a NORMAL outcome here, not a failure: a
+# stable build's stamp never carries this field, and the caller's own `label` construction already
+# treats an empty date as "no `-nightly-` suffix". A malformed or missing date on a build that
+# actually needed one is instead caught downstream, by the caller's regex guard on the final label.
+if len(sys.argv) > 2 and sys.argv[1] == "--print-nightly-date":
+    stamp_path = Path(sys.argv[2])
+    date = nightly_stamp_date(stamp_path.read_text())
+    if date is not None:
+        print(date)
+    sys.exit(0)
+
+# `--print-nightly-label <stamp>`: the REPORTED version a nightly build carries,
+# `X.Y.Z-nightly-YYYYMMDD` — the label `ci/nightly.py plan` names the release and the `.ipk` by and
+# the one the LGPL source bundle must be named for. Empty (exit 0) for a stamp with no
+# `+nightly:` field, i.e. every non-nightly build, so a caller falls back to its own label. It
+# exists because the package version is no longer a prefix of this: the ipk's filename says
+# `X.Y.<date>`, and appending `-nightly-<date>` to that names a version nothing reports.
+if len(sys.argv) > 2 and sys.argv[1] == "--print-nightly-label":
+    date = nightly_stamp_date(Path(sys.argv[2]).read_text())
+    if date is not None:
+        _cargo = re.search(r'^version = "([^"]+)"', (ROOT / "rust-modules/Cargo.toml").read_text(), re.M)
+        _rl = ROOT / "RELEASE_LINE"
+        print(expected_nightly_reported_version(
+            _cargo.group(1), _rl.read_text() if _rl.exists() else None, date))
+    sys.exit(0)
+
+# The same entry point onto `rc_stamp_number`, for the same caller and the same reason: the source
+# bundle of a release candidate is named `plxnative-source-X.Y.Z-rc.N`, and the number comes from
+# the stamp. Empty output (exit 0) when the build was not a candidate.
+if len(sys.argv) > 2 and sys.argv[1] == "--print-rc":
+    rc = rc_stamp_number(Path(sys.argv[2]).read_text())
+    if rc is not None:
+        print(rc)
+    sys.exit(0)
 
 # ---- the two release documents -----------------------------------------------------------------
 #
@@ -210,7 +690,7 @@ if "--selftest" in sys.argv:
 SENTINELS = ("__IPK_SHA256__", "__COMMIT__", "__RUN_URL__", "__IPK_SIZE__", "__INSTALLED_SIZE__")
 # The one a note cannot do without: it is the only tamper check a user of an unsigned binary has.
 REQUIRED_SENTINEL = "__IPK_SHA256__"
-FFMPEG_TARBALL_SHA = "7f607a00dd0d28a729d5a4811205812eef01cf6ef6155025febb6f36a9062d52"
+FFMPEG_TARBALL_SHA = deps.get(deps.entry("ffmpeg"), "sha256")
 AUDIT_BEGIN = "<!-- BEGIN GENERATED"
 AUDIT_END = "<!-- END GENERATED -->"
 # Sections that were in the note and are now the audit's. Named so a regression to the old shape
@@ -396,6 +876,12 @@ def lint_audit(path) -> None:
     unknown = unknown_firmwares(authored)
     check(not unknown, f"every webOS version {path.name}'s authored half names has evidence"
                        + (f" (no evidence for {', '.join(unknown)})" if unknown else ""))
+    # No CI step substitutes anything in the authored half — `gen-release-audit.py` only replaces
+    # the generated block — so a `__PLACEHOLDER__` left there publishes literally, in place of the
+    # evidence it stood for. The v0.7.0 audit carried one through review.
+    left = sorted(set(re.findall(r"__[A-Z0-9_]+__", authored)))
+    check(not left, f"{path.name}'s authored half carries no unfilled placeholder"
+                    + (f" (found {', '.join(left)})" if left else ""))
 
 
 # Lint one document without a package, which is how a note or an audit is graded while it is
@@ -490,8 +976,10 @@ def font_family(p: Path) -> str:
             count, stroff = struct.unpack(">HH", b[toff + 2:toff + 6])
             for r in range(count):
                 ro = toff + 6 + 12 * r
-                pid, _enc, _lang, nid, ln, no = struct.unpack(">HHHHHH", b[ro:ro + 12])
-                if nid == 1:
+                pid, _enc, lang, nid, ln, no = struct.unpack(">HHHHHH", b[ro:ro + 12])
+                # An English record only: the subtitle aliases ("PlxSubs", "Inter" on the Noto
+                # faces, tools/plxsubs_names.py) are extra ID 1 records under other languages.
+                if nid == 1 and (pid != 3 or (lang & 0x3FF) == 0x009):
                     raw = b[toff + stroff + no: toff + stroff + no + ln]
                     # platform 0 (Unicode) and 3 (Windows) are both UTF-16BE; 1 (Mac) is not.
                     enc = "latin-1" if pid == 1 else "utf-16-be"
@@ -588,6 +1076,16 @@ PACKAGED_ID = staged[0]
 FLAVOR = next((f for f in flavor.FLAVORS if flavor.app_id(f) == PACKAGED_ID), None)
 check(FLAVOR is not None, f"the staged id is a known flavour ({PACKAGED_ID})")
 IS_STABLE = FLAVOR == "stable"
+IS_NIGHTLY = FLAVOR == "nightly"
+# Read ONCE, here, so every check below that needs "what does RELEASE_LINE say" — the nightly
+# package version's agreement with Cargo.toml, and the dev/nightly reported-version checks further
+# down — reads the same content rather than re-opening the file per check.
+_RELEASE_LINE_PATH = ROOT / "RELEASE_LINE"
+RELEASE_LINE_CONTENT = _RELEASE_LINE_PATH.read_text() if _RELEASE_LINE_PATH.exists() else None
+# The cut date a nightly package's version is graded against: the Makefile's own record of the
+# `PLX_NIGHTLY_DATE` the build ran with (see `nightly_stamp_date`). `None` for any other flavour.
+_NIGHTLY_DATE = (nightly_stamp_date((ROOT / "pkg/.build-config").read_text())
+                 if IS_NIGHTLY and (ROOT / "pkg/.build-config").exists() else None)
 # The staged payload directory — written down ONCE, here, because everything below reads through
 # it: the descriptor, the build-machine-path scan, the binary and the icons.
 PAYLOAD = APPS / PACKAGED_ID
@@ -600,7 +1098,7 @@ appinfo = json.loads((PAYLOAD / "appinfo.json").read_text())
 # rather than widening the equality into something that cannot fail.
 control = dict(
     line.split(": ", 1)
-    for line in flavor.control_for((ROOT / "ipkroot/ctl/control").read_text(), FLAVOR or "stable").splitlines()
+    for line in flavor.control_for((ROOT / "ipkroot/ctl/control").read_text(), FLAVOR or "stable", _NIGHTLY_DATE).splitlines()
     if ": " in line
 )
 check(appinfo["id"] == PACKAGED_ID,
@@ -617,16 +1115,31 @@ if IS_STABLE:
 check(appinfo["version"] == control["Version"],
       f'appinfo version == control Version ({appinfo["version"]})')
 # Cargo.toml is the FOURTH witness, and the one with a user-visible consequence: the diagnostics
-# read-out prints `plex::identity::VERSION`, which is derived from this number, and that panel is
+# read-out prints `plex::identity::version()`, which the app hands in and derives from this number, and that panel is
 # designed to be photographed into a bug report. A bump that missed Cargo.toml would ship a package
 # labelled 0.2.1 whose own on-screen version says 0.2.0 — precisely the disagreement `identity`
 # exists to make impossible, and nothing checked it until a release nearly went out that way.
 # (Derived, not copied: `rust-modules/build.rs` reports the next minor with a `-dev` suffix for
 # anything but a RELEASE build, which the binary check further down grades on the bytes.)
+#
+# NIGHTLY IS THE EXCEPTION, and the only one: its PACKAGE version is already the next minor ahead
+# of Cargo.toml's tracked one with the cut date as its patch (`ci/flavor.py::appinfo_for`'s whole
+# reason for moving `version`), so equality here would fail by construction. Graded against the
+# SAME arithmetic instead, via `expected_nightly_package_version` — which is
+# `ci/version_rule.py`'s `nightly_package_triplet`, the one thing both `ci/flavor.py` and this
+# file must agree on.
 cargo = (ROOT / "rust-modules/Cargo.toml").read_text()
 m = re.search(r'^version = "([^"]+)"', cargo, re.M)
-check(m is not None and m.group(1) == appinfo["version"],
-      f'Cargo.toml version == appinfo version ({appinfo["version"]})')
+if IS_NIGHTLY:
+    expected_pkg_version = m and expected_nightly_package_version(
+        m.group(1), RELEASE_LINE_CONTENT, _NIGHTLY_DATE)
+    check(m is not None and expected_pkg_version == appinfo["version"],
+          f'nightly appinfo version ({appinfo["version"]}) is the next minor/patch after '
+          f'Cargo.toml ({m and m.group(1)}) with the build stamp\'s date ({_NIGHTLY_DATE}) as its '
+          f'patch — expected {expected_pkg_version}')
+else:
+    check(m is not None and m.group(1) == appinfo["version"],
+          f'Cargo.toml version == appinfo version ({appinfo["version"]})')
 
 # No build machine's directory layout may ship inside the package.
 #
@@ -718,7 +1231,8 @@ if IS_STABLE and audit.exists():
 # in one shot so they never see that; a by-hand run on a stale tree can, and the disagreement it
 # then reports is true — repackage before believing anything else about that tree.
 _stamp = ROOT / "pkg/.build-config"
-BUILD = build_configuration(_stamp.read_text() if _stamp.exists() else "")
+STAMP_TEXT = _stamp.read_text() if _stamp.exists() else ""
+BUILD = build_configuration(STAMP_TEXT)
 
 # THIRD-PARTY-NOTICES must name exactly the libraries that ship. RELEASE=1 drops swscale, and the
 # notices claimed it for two releases — an LGPL document describing a file that is not in the box.
@@ -756,18 +1270,23 @@ if shipped:
 # The witness has to be a string only a `devtriggers` build emits, and almost none are: `dev.rs`
 # composes every trigger path as `paths::in_runtime_dir(format!("plxnative-{name}"))` — a bare name
 # joined to a root resolved at RUNTIME, which since the flavour split is not even always `/tmp` — so
-# no full trigger path is a literal anywhere. The previous witness here was b"plxnative-autoplay" and it matched NOTHING —
-# in EITHER configuration — so from the day it was written this printed "ok — the packaged binary
-# is a RELEASE build" over CI's dev build on every run, while release.yml's stamp grep carried the
-# property alone. `dev.rs`'s DIAG list is the one place the full names are literals, it is
-# `#[cfg(feature = "devtriggers")]`, and `plxnative-noidle` is not one of the four logs `main.c`
-# writes unconditionally. Measured on the two shipped artifacts — published v0.3.0 .ipk: 0
-# occurrences; CI's dev .ipk for 8827d32c: 2.
+# no full trigger path is a literal anywhere BY THAT ROUTE. The previous witness here was
+# b"plxnative-autoplay" and it matched NOTHING — in EITHER configuration — so from the day it was
+# written this printed "ok — the packaged binary is a RELEASE build" over CI's dev build on every
+# run, while release.yml's stamp grep carried the property alone. `dev.rs`'s DIAG list is the one
+# place the full names are literals, it is `#[cfg(feature = "devtriggers")]`, and `plxnative-noidle`
+# is not one of the unconditional create-only sinks allowlisted above. Measured on the two shipped
+# artifacts — published v0.3.0 .ipk: 0 occurrences; CI's dev .ipk for 8827d32c: 2.
 #
-# GRADED FROM BOTH SIDES, which is the repair for the defect class rather than for the one string:
-# a witness that cannot fail is not a gate. The dev leg asserts the marker is still emitted, so the
-# day DIAG is renamed CI fails on the next push instead of quietly going vacuous again.
-DEV_WITNESS = b"plxnative-noidle"
+# ONE WITNESS NAMES ONLY ITSELF, though: every OTHER `plxnative-*` name `CONTROLLED`/`DIAG` declare
+# could leak by a route the `format!` argument never takes — a literal spelled directly in code
+# that sits outside the `devtriggers` gate. Two shipped that way before this check existed to catch
+# it: `ui/anim.rs`'s log sink hard-coded `"plxnative-anim.log"` in a function gated only by a
+# runtime flag (always `false` without the feature, but still COMPILED, still IN THE BYTES), and
+# `dev/scenarios.rs`'s disabled-both diagnostic spelled `plxnative-profile`/`plxnative-hwcnt` in an
+# ungated function for the same reason. `dev_trigger_catalog()` (above) generalises the single
+# witness to the whole vocabulary `CONTROLLED`/`DIAG` name, so a THIRD leak like those two fails
+# here instead of shipping.
 binary = PAYLOAD / "plxnative"
 check(binary.exists(), f"the staged payload carries the binary ({binary.name})")
 
@@ -782,7 +1301,7 @@ check(binary.exists(), f"the staged payload carries the binary ({binary.name})")
 #
 # It must not sit under `if BUILD:` — `BUILD` is `None` for any stamp that is neither shipped
 # configuration, and the Makefile itself documents a third (`RUST_FEATFLAGS="--no-default-features
-# --features devtriggers"`, the README-screenshot recipe). Nested, that combination would satisfy
+# --features devtriggers"`, the on-device screenshot recipe). Nested, that combination would satisfy
 # `release-guard` (RELEASE is non-empty), print "SKIP — neither shipped configuration", and package
 # a dev-trigger binary under the released id on a green run. "This package carries no dev-trigger
 # surface" is a property of the BYTES and needs no stamp to grade.
@@ -804,15 +1323,30 @@ if binary.exists():
     blob = binary.read_bytes()
     check(BUILD_ID_NOTE in blob,
           "the packaged binary carries a GNU build id (-Wl,--build-id=sha1 is still on the link)")
-    has_dev = DEV_WITNESS in blob
-    if IS_STABLE:
-        check(not has_dev,
-              f"the {PACKAGED_ID} package carries no dev-trigger surface — that id is what users install")
+    DEV_CATALOG = dev_trigger_catalog()
+    dev_hits = sorted(name for name in DEV_CATALOG if _catalog_name_in_binary(name, blob))
+    if IS_STABLE or IS_NIGHTLY:
+        # Nightly joins stable here rather than getting a branch of its own: it is a THIRD id a
+        # stranger's television installs, and the Makefile's release-guard already refuses to
+        # BUILD it without RELEASE=1 — this is the same rule graded on the bytes, for the reason
+        # `release-guard`'s own comment gives (a reviewer reaching for a documented hatch and
+        # forgetting is exactly the failure a bytes-level gate survives).
+        check(not dev_hits,
+              f"the {PACKAGED_ID} package carries no dev-trigger surface — that id is installed "
+              "beside the app users get, on a television, unattended"
+              + (f" (found {', '.join(dev_hits)})" if dev_hits else ""))
     if BUILD == "release":
-        check(not has_dev, "the packaged binary is a RELEASE build (no dev triggers compiled in)")
+        check(not dev_hits, "the packaged binary is a RELEASE build (no dev triggers compiled in)"
+                            + (f" (found {', '.join(dev_hits)})" if dev_hits else ""))
     elif BUILD:
-        check(has_dev, "the packaged binary is the DEV build the stamp records — which is also what"
-                       f" proves `{DEV_WITNESS.decode()}` still witnesses the trigger surface")
+        # GRADED FROM BOTH SIDES, which is the repair for the defect class rather than for one
+        # string: a witness that cannot fail is not a gate. The dev leg asserts the catalog is
+        # still emitted at ALL, so the day `CONTROLLED`/`DIAG` are renamed or emptied CI fails on
+        # the next push instead of quietly grading the release leg against nothing forever.
+        check(bool(dev_hits),
+              "the packaged binary is the DEV build the stamp records — which is also what proves "
+              "dev.rs's DIAG / devtrig.rs's CONTROLLED catalog still witnesses the trigger surface"
+              + ("" if dev_hits else " (0 catalog names found in the bytes)"))
     else:
         print("  SKIP — pkg/.build-config is neither shipped configuration; not grading the binary")
 
@@ -839,42 +1373,118 @@ if binary.exists():
     # MATCHED WITH THE `plxnative@` PREFIX, not as a bare number, and that is the difference
     # between grading `PLX_VERSION` and grading whatever digits happen to be in .rodata: the About
     # page and any release note text carry the version too, so a bare-number search was satisfiable
-    # by a page the version mechanism never touched. `telemetry::{crashreport,native,playback}`
-    # compose `concat!("plxnative@", env!("PLX_VERSION"))` in every configuration — telemetry is
-    # ungated on purpose — so this witnesses the emitted value itself.
-    _release_line_path = ROOT / "RELEASE_LINE"
-    _release_line_content = _release_line_path.read_text() if _release_line_path.exists() else None
-    _dev_version_str, _dev_version_err = expected_dev_version(appinfo["version"], _release_line_content)
-    check(_dev_version_err is None,
-          _dev_version_err or "RELEASE_LINE (if tracked) agrees with appinfo.json's major.minor")
-    if _dev_version_err is not None:
-        # Mis-cut line: already failed above. Fall back to trunk's rule so the checks below still
-        # have a string to grade against, rather than crashing on a None this branch already
-        # reported as broken.
-        _major, _minor, _ = (int(x) for x in appinfo["version"].split("."))
-        _dev_version_str = f"{_major}.{_minor + 1}.0-dev"
-    DEV_VERSION = f"plxnative@{_dev_version_str}".encode()
+    # by a page the version mechanism never touched. `enter_application`
+    # composes `concat!("plxnative@", env!("PLX_VERSION"))` in the application crate and hands it to
+    # `plx_telemetry::telemetry::set_release`, which every report reads, in every configuration —
+    # telemetry is ungated on purpose — so this witnesses the emitted value itself. (The telemetry
+    # crate cannot compose it: a `cargo:rustc-env` reaches the application crate only.)
     #
-    # The id is a rule of its own here too, so it sits BESIDE the stamp branch rather than inside
-    # it: whatever configuration produced it, the package users install may not claim a version no
-    # release will ever carry.
-    says_dev = DEV_VERSION in blob
-    if IS_STABLE:
-        check(not says_dev,
-              f"the {PACKAGED_ID} binary reports a released version, not {DEV_VERSION.decode()}"
-              " (build.rs adds the suffix unless PLX_RELEASE is set — RELEASE=1 exports it)")
-        check(f'plxnative@{appinfo["version"]}'.encode() in blob,
-              f'the {PACKAGED_ID} binary reports the packaged version ({appinfo["version"]})')
-    # ...and the configuration is the other half. A `RELEASE=1` build of ANY flavour reports the
-    # exact version — `make FLAVOR=debug RELEASE=1 ipk` is a real combination, the submission
-    # candidate is built that way — so the suffix is graded against the stamp, not against the id.
-    if BUILD == "release":
-        check(not says_dev,
-              f"the RELEASE binary reports {appinfo['version']} exactly, not {DEV_VERSION.decode()}")
-    elif BUILD == "dev":
-        check(says_dev,
-              f"the dev binary says it is one ({DEV_VERSION.decode()}) — which is also what proves"
-              " the suffix still reaches the bytes")
+    # NIGHTLY IS GRADED SEPARATELY. Its package version is `X.Y.<cut date>` (checked against
+    # Cargo.toml and the stamp above), while its REPORTED version is `X.Y.Z-nightly-<date>` with
+    # `X.Y.Z` the release it is heading to — the same `X.Y` as the package, a small patch instead
+    # of the date. So the two are no longer "package version, plus a suffix": the reported version
+    # is recomputed from Cargo.toml by `expected_nightly_reported_version` (the arithmetic
+    # `build.rs` uses), dated by whatever `PLX_NIGHTLY_DATE` the build actually ran with, and the
+    # two are cross-checked on `X.Y`.
+    #
+    # THE DATE IS GRADED BY VALUE, READ FROM THE STAMP — not guessed from the binary's own bytes by
+    # shape. Two earlier versions of this gate tried exactly that: first a trailing `\b`, then
+    # `(?![0-9])` in its place, both trying to say "8 digits, then the date is over" from inside
+    # the blob alone. Both failed on a real nightly build (0.7.0's first run, then again on
+    # 0.7.0-nightly-202609192m4m6m8m10m12m14m1) because `concat!`'s output in `.rodata` is packed
+    # back to back with NO separator — the very next packed literal can start with more digits, and
+    # there is no regex that can tell "the date's 9th digit" from "the first digit of an unrelated
+    # string right after it" from the bytes alone. So the date is no longer inferred from the
+    # binary at all: `nightly_stamp_date` reads it from `pkg/.build-config`'s own `+nightly:<date>`
+    # field — the Makefile's OWN record of the value it built with, where `+` is a delimiter this
+    # project controls rather than one the linker assembled — and the binary is graded the exact
+    # same way `stable`'s plain version is above: a precise substring, no boundary assumed on
+    # either side, because the substring itself is now exact rather than shape-only.
+    if IS_NIGHTLY:
+        nightly_date = nightly_stamp_date(STAMP_TEXT)
+        check(nightly_date is not None,
+              "pkg/.build-config carries a +nightly:<8 digit date> field "
+              f"(stamp was {STAMP_TEXT.strip()!r})")
+        if nightly_date is not None:
+            _cargo_text = (ROOT / "rust-modules/Cargo.toml").read_text()
+            _cargo_m = re.search(r'^version = "([^"]+)"', _cargo_text, re.M)
+            nightly_expect = (
+                f"plxnative@{expected_nightly_reported_version(_cargo_m.group(1), RELEASE_LINE_CONTENT, nightly_date)}"
+            ).encode()
+            check(_cargo_m is not None
+                  and nightly_expect.decode().split("-nightly-")[0].split("@")[1].rsplit(".", 1)[0]
+                  == appinfo["version"].rsplit(".", 1)[0],
+                  "the nightly binary's reported X.Y matches the package version's X.Y "
+                  f"(reported {nightly_expect.decode()}, package {appinfo['version']})")
+            nightly_found = nightly_expect in blob
+            nightly_msg = (f"the {PACKAGED_ID} binary reports {nightly_expect.decode()} "
+                            "(build.rs's PLX_CHANNEL=nightly arm, dated by the pkg/.build-config "
+                            "+nightly: stamp)")
+            if not nightly_found:
+                # Self-explaining on failure: list what the binary DOES carry after `plxnative@`,
+                # rather than leaving the next person to go re-derive it from a raw `strings` dump.
+                seen = [m.decode("utf-8", errors="replace")
+                        for m in re.findall(rb"plxnative@[0-9A-Za-z.\-]{1,40}", blob)[:5]]
+                nightly_msg += f" — plxnative@ strings actually present: {seen}"
+            check(nightly_found, nightly_msg)
+        # Nightly is always RELEASE=1 (release-guard refuses otherwise) — grade that on the stamp
+        # too, the same way the dev-trigger witness above grades it on the bytes.
+        check(BUILD == "release",
+              f"the {PACKAGED_ID} package is a RELEASE build stamp (pkg/.build-config decoded as "
+              f"{BUILD!r}) — nightly never ships a dev build")
+    else:
+        _dev_version_str, _dev_version_err = expected_dev_version(appinfo["version"], RELEASE_LINE_CONTENT)
+        check(_dev_version_err is None,
+              _dev_version_err or "RELEASE_LINE (if tracked) agrees with appinfo.json's major.minor")
+        if _dev_version_err is not None:
+            # Mis-cut line: already failed above. Fall back to trunk's rule so the checks below
+            # still have a string to grade against, rather than crashing on a None this branch
+            # already reported as broken.
+            _major, _minor, _ = (int(x) for x in appinfo["version"].split("."))
+            _dev_version_str = f"{_major}.{_minor + 1}.0-dev"
+        DEV_VERSION = f"plxnative@{_dev_version_str}".encode()
+        #
+        # The id is a rule of its own here too, so it sits BESIDE the stamp branch rather than
+        # inside it: whatever configuration produced it, the package users install may not claim a
+        # version no release will ever carry.
+        says_dev = DEV_VERSION in blob
+        # A RELEASE CANDIDATE is the stable package with one string changed: the binary reports
+        # `X.Y.Z-rc.N`, numbered by the stamp's `+rc:` field (`build.rs`'s PLX_CHANNEL=rc arm).
+        # Graded from both sides, like the dev suffix: a candidate must say it is one, and a build
+        # that is not a candidate must not — that second half is what keeps an `RC=` left in a
+        # shell from quietly shipping as the release itself.
+        rc_number = rc_stamp_number(STAMP_TEXT)
+        rc_prefix = f'plxnative@{appinfo["version"]}-rc.'.encode()
+        if rc_number is not None:
+            check(IS_STABLE,
+                  f"a release candidate (+rc:{rc_number}) is a build of the stable id, not {PACKAGED_ID}")
+            check(BUILD == "release",
+                  f"the release candidate is a RELEASE build stamp (pkg/.build-config decoded as {BUILD!r})")
+            rc_expect = rc_prefix + rc_number.encode()
+            check(rc_expect in blob,
+                  f"the {PACKAGED_ID} binary reports {rc_expect.decode()} (build.rs's PLX_CHANNEL=rc "
+                  "arm, numbered by the pkg/.build-config +rc: stamp)")
+        else:
+            check(rc_prefix not in blob,
+                  f"the {PACKAGED_ID} binary does not report a release candidate "
+                  f"({rc_prefix.decode()}…) without a +rc: stamp")
+        if IS_STABLE:
+            check(not says_dev,
+                  f"the {PACKAGED_ID} binary reports a released version, not {DEV_VERSION.decode()}"
+                  " (build.rs adds the suffix unless PLX_RELEASE is set — RELEASE=1 exports it)")
+            check(f'plxnative@{appinfo["version"]}'.encode() in blob,
+                  f'the {PACKAGED_ID} binary reports the packaged version ({appinfo["version"]})')
+        # ...and the configuration is the other half. A `RELEASE=1` build of ANY flavour reports
+        # the exact version — `make FLAVOR=debug RELEASE=1 ipk` is a real combination, the
+        # submission candidate is built that way — so the suffix is graded against the stamp, not
+        # against the id.
+        if BUILD == "release":
+            check(not says_dev,
+                  f"the RELEASE binary reports {appinfo['version']} exactly, not {DEV_VERSION.decode()}")
+        elif BUILD == "dev":
+            check(says_dev,
+                  f"the dev binary says it is one ({DEV_VERSION.decode()}) — which is also what"
+                  " proves the suffix still reaches the bytes")
 
 # The checksum file has to verify where a USER stands: they download it beside the .ipk, so a
 # `pkg/` prefix in the line makes `shasum -a 256 -c` fail for everyone. It did, through v0.2.1.
@@ -902,12 +1512,20 @@ check(re.fullmatch(r"\d+\.\d+\.\d+", appinfo["version"]) is not None,
 check(appinfo["type"] == "native", 'appinfo type == "native"')
 check(not appinfo["id"].startswith(("com.palm", "com.webos", "com.lge", "com.palmdts")),
       "app id avoids LG's reserved prefixes")
-# The crate version is a THIRD copy of the same number: plex/identity.rs sends it to both Plex
+# The crate version is a THIRD copy of the same number: plex/identity.rs reports it (handed in by the app) to both Plex
 # services as X-Plex-Version (through `PLX_VERSION`, which `build.rs` derives from it), so a build
 # whose Cargo.toml disagreed with appinfo.json would report a version no release ever had.
+# Nightly again the exception, and graded the same way as the first Cargo.toml witness above.
 cargo_ver = re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / "rust-modules/Cargo.toml").read_text(), re.M)
-check(cargo_ver is not None and cargo_ver.group(1) == appinfo["version"],
-      f'rust-modules/Cargo.toml version == appinfo version ({appinfo["version"]})')
+if IS_NIGHTLY:
+    expected_pkg_version = cargo_ver and expected_nightly_package_version(
+        cargo_ver.group(1), RELEASE_LINE_CONTENT, _NIGHTLY_DATE)
+    check(cargo_ver is not None and expected_pkg_version == appinfo["version"],
+          f'rust-modules/Cargo.toml next-minor/patch + stamp date ({expected_pkg_version}) == '
+          f'nightly appinfo version ({appinfo["version"]})')
+else:
+    check(cargo_ver is not None and cargo_ver.group(1) == appinfo["version"],
+          f'rust-modules/Cargo.toml version == appinfo version ({appinfo["version"]})')
 
 # Control-file provenance. None of this is read by opkg, and that is the point: it is what a
 # human — a webosbrew reviewer, or a user running `opkg info` — sees about who ships this and
@@ -959,21 +1577,24 @@ if corner is not None:
 
 check(png_size(PAYLOAD / "splash.png") == (1920, 1080),
       "splash.png is exactly 1920x1080 (splashBackground accepts no other size)")
-# The badged set is a tracked artwork source (`tools/mkicons.py --out-dir=pkg/dev --badge=DEV`), so
-# it is graded whether or not this run happens to be packaging it — otherwise a regression in it
-# would only ever be found by whoever next built a debug package.
-if (ROOT / "pkg/dev").is_dir():
-    check(png_size(ROOT / "pkg/dev/icon.png") == (80, 80), "pkg/dev/icon.png is 80x80")
-    check(png_size(ROOT / "pkg/dev/largeIcon.png") == (130, 130), "pkg/dev/largeIcon.png is 130x130")
+# The badged sets are tracked artwork sources (`tools/mkicons.py --out-dir=pkg/dev --badge=DEV`,
+# `--out-dir=pkg/nightly --badge=NIGHTLY`), so they are graded whether or not this run happens to be
+# packaging them — otherwise a regression in one would only ever be found by whoever next built
+# that flavour's package.
+for badged in ("pkg/dev", "pkg/nightly"):
+    if not (ROOT / badged).is_dir():
+        continue
+    check(png_size(ROOT / badged / "icon.png") == (80, 80), f"{badged}/icon.png is 80x80")
+    check(png_size(ROOT / badged / "largeIcon.png") == (130, 130), f"{badged}/largeIcon.png is 130x130")
     if corner is not None:
         # Same rule as above, and the same failure it prevents: iconColor paints the launcher tile
         # BEHIND the icon, so a badge that changed the tile's own background without moving
         # iconColor would draw the debug icon as a hard-edged rectangle in a differently-coloured
         # tile. The badge is a BOTTOM bar for this reason — pixel (1,1) is untouched, so one
         # iconColor stays correct for both flavours.
-        dbg_corner = Image.open(ROOT / "pkg/dev/largeIcon.png").convert("RGB").getpixel((1, 1))
+        dbg_corner = Image.open(ROOT / badged / "largeIcon.png").convert("RGB").getpixel((1, 1))
         check(max(abs(a - b) for a, b in zip(dbg_corner, declared)) <= 2,
-              f"the badged tile keeps iconColor {appinfo['iconColor']} at its corner rgb{dbg_corner}")
+              f"{badged}'s badged tile keeps iconColor {appinfo['iconColor']} at its corner rgb{dbg_corner}")
 check(appinfo.get("splashBackground") == "splash.png",
       "appinfo declares splashBackground: splash.png")
 
@@ -981,8 +1602,10 @@ print("== shipped fonts ==")
 # Landed 2026-08-01: Inter (SIL OFL 1.1). This is now a REAL gate, not an XFAIL — its job is to
 # stop Monotype Arial coming back through a stale local copy, which is exactly how it would
 # return (the files are named appfont*.ttf, so nothing about the filename reveals the swap).
-ALLOWED = {"Inter", "Arimo", "Roboto", "Noto Sans", "Source Sans 3", "Noto Sans CJK KR"}
-for f in ("pkg/appfont.ttf", "pkg/appfont-bold.ttf", "pkg/appfont-cjk.ttf"):
+ALLOWED = {"Inter", "Arimo", "Roboto", "Noto Sans", "Source Sans 3", "Noto Sans CJK KR", "Noto Emoji",
+           "Noto Kufi Arabic", "Noto Sans Hebrew"}
+for f in ("pkg/appfont.ttf", "pkg/appfont-bold.ttf", "pkg/appfont-cjk.ttf", "pkg/appfont-emoji.ttf",
+          "pkg/appfont-arabic.ttf", "pkg/appfont-arabic-bold.ttf", "pkg/appfont-hebrew.ttf", "pkg/appfont-hebrew-bold.ttf"):
     fam = font_family(ROOT / f)
     check(fam in ALLOWED, f"{f} family={fam!r} is redistributable (allowed: {sorted(ALLOWED)})")
 # The fallback face, checked for PRESENCE separately: the payload assertion below only runs when
@@ -990,8 +1613,8 @@ for f in ("pkg/appfont.ttf", "pkg/appfont-bold.ttf", "pkg/appfont-cjk.ttf"):
 # rendering as tofu. The floor is deliberately crude — a subsetted or truncated stand-in is caught
 # properly by `fontcov.rs`'s cmap gate in `make check`; this only catches "it is not there".
 _cjk = ROOT / "pkg/appfont-cjk.ttf"
-check(_cjk.exists() and _cjk.stat().st_size > 15_000_000,
-      "pkg/appfont-cjk.ttf present and whole — the CJK fallback face (see rust-modules/src/fontcov.rs)")
+check(_cjk.exists() and _cjk.stat().st_size > 10_000_000,
+      "pkg/appfont-cjk.ttf present and whole — the CJK fallback face (see rust-modules/base/src/fontcov.rs)")
 check((ROOT / "pkg/OFL.txt").exists(),
       "pkg/OFL.txt present — the OFL requires the licence to travel with the font")
 # One OFL text covers both faces: Inter's and Noto CJK's licence bodies are byte-identical after
@@ -999,6 +1622,45 @@ check((ROOT / "pkg/OFL.txt").exists(),
 # and in each font's own name table (ID 0/7/13/14, asserted by tools/cut-noto-cjk.py).
 check("Noto Sans CJK" in (ROOT / "THIRD-PARTY-NOTICES.md").read_text(),
       "THIRD-PARTY-NOTICES.md attributes Noto Sans CJK (OFL 1.1 §2 wants the notice to travel)")
+# The subtitle faces (tools/cut-noto-subs.py): libass finds them by family name, so a missing or
+# renamed one is a script that silently draws as tofu. `rust-modules/media/src/player/ass/fonts.rs`
+# holds the coverage; this holds that every face the manifest names exists, is whole, and is
+# attributed.
+import hashlib as _hashlib
+SUBS_DIR = ROOT / "pkg/fonts/subs"
+_subs_manifest = json.loads((SUBS_DIR / "manifest.json").read_text(encoding="utf-8"))
+_subs_notices = (ROOT / "THIRD-PARTY-NOTICES.md").read_text()
+check(len(_subs_manifest["faces"]) >= 20, f"manifest names {len(_subs_manifest['faces'])} subtitle faces")
+for _face in _subs_manifest["faces"]:
+    _path = SUBS_DIR / _face["file"]
+    check(_path.is_file() and _hashlib.sha256(_path.read_bytes()).hexdigest() == _face["sha256"],
+          f"pkg/fonts/subs/{_face['file']} is the manifest's face (same SHA-256)")
+    check(font_family(_path) == _face["family"] and _face["family"].startswith("Noto Sans "),
+          f"{_face['file']} family={font_family(_path)!r} is a Noto Sans face")
+check("Noto Sans Thai" in _subs_notices and "pkg/fonts/subs" in _subs_notices,
+      "THIRD-PARTY-NOTICES.md attributes the Noto Sans subtitle faces (OFL 1.1 §2)")
+
+print("== shipped roots bundle ==")
+# `pkg/le-roots.pem` is a TRUST ANCHOR set, so what it holds is graded by content, not by presence:
+# exactly the four public ISRG roots (SHA-256 of each DER, from letsencrypt.org/certificates), and
+# nothing else — a stray extra root here would widen what a `*.plex.direct` host may chain to.
+# `rust-modules/net/src/net_roots_tests.rs` pins the same four and verifies a real YR/YE chain.
+import base64 as _b64, hashlib as _hashlib, re as _re
+_LE_ROOTS = {
+    "96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6": "ISRG Root X1",
+    "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470": "ISRG Root X2",
+    "e57b7e6f150c419102e8d5c055729ff967b9d1a829bf00cec89ca604ebf4a86f": "ISRG Root YR",
+    "e14ffcad5b0025731006caa43a121a22d8e9700f4fb9cf852f02a708aa5d5666": "ISRG Root YE",
+}
+_roots_pem = ROOT / "pkg/le-roots.pem"
+check(_roots_pem.exists(), "pkg/le-roots.pem present — the roots-mode fallback bundle (rust-modules/net/src/net.rs, keypin)")
+if _roots_pem.exists():
+    _got = [_hashlib.sha256(_b64.b64decode("".join(m.split())))
+            .hexdigest() for m in _re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----",
+                                              _roots_pem.read_text(), _re.S)]
+    check(sorted(_got) == sorted(_LE_ROOTS),
+          "pkg/le-roots.pem holds exactly ISRG Root X1, X2, YR and YE (by SHA-256 of each certificate)"
+          + ("" if sorted(_got) == sorted(_LE_ROOTS) else f" — saw {_got}"))
 
 print("== compliance artifacts ==")
 # LGPL-2.1 §6 requires the notice AND the licence text to travel with the BINARY, so these are
@@ -1020,7 +1682,14 @@ NEEDED_LICENCES = {
     "Apache-2.0.txt": "Material Icons, moxcms, pxfm, compiler_builtins",
     "LLVM-exception.txt": "compiler_builtins",
     "Unicode-3.0.txt": "the Unicode tables inside Rust core",
-    "Zlib.txt": "nanosvg — vendored and compiled into the binary",
+    "Zlib.txt": "nanosvg — fetched at a pinned commit and compiled into the binary",
+    "ICU4X.txt": "ICU4X locale code/data — Unicode and IBM adaptation notices",
+    "libm.txt": "registry libm — complete upstream math attributions",
+    "qrcodegen.txt": "Project Nayuki QR code generator — upstream MIT notice",
+    "libass-ISC.txt": "the bundled native ASS renderer",
+    "FreeType.txt": "FreeType's elected FTL and its contributed modules",
+    "HarfBuzz-Old-MIT.txt": "the bundled text shaper",
+    "libunibreak-Zlib.txt": "the bundled Unicode line-breaking library",
 }
 for name, why in NEEDED_LICENCES.items():
     p = ROOT / "licenses" / name
@@ -1054,10 +1723,19 @@ for loc in staged_locales:
 
 print("== ipk payload ==")
 expected = {
-    "plxnative", "sentry-crash", "appinfo.json", "icon.png", "largeIcon.png", "splash.png",
+    "plxnative", "sentry-crash", "libass-plx.so.0", "appinfo.json", "icon.png", "largeIcon.png", "splash.png",
     # appfont-cjk.ttf is the fallback face. Its absence is not a cosmetic loss: every Korean,
     # Japanese and Chinese title in the library becomes tofu, which is LG checklist #6 and #48.
     "appfont.ttf", "appfont-bold.ttf", "appfont-cjk.ttf", "OFL.txt",
+    # appfont-emoji.ttf is the emoji face: without it an emoji in a library name is a box.
+    "appfont-emoji.ttf",
+    # The Arabic and Hebrew faces (Noto Kufi Arabic, Noto Sans Hebrew), shaped by libass-plx's UI
+    # text surface: without them every Arabic, Persian, Urdu and Hebrew title is a row of boxes.
+    "appfont-arabic.ttf", "appfont-arabic-bold.ttf", "appfont-hebrew.ttf", "appfont-hebrew-bold.ttf",
+    # le-roots.pem is the roots-mode fallback bundle (`net::keypin::Mode::Roots`): without it a
+    # `*.plex.direct` server whose certificate chains to a 2025 Let's Encrypt root is unreachable on
+    # a 2020 firmware, silently — the fallback just never engages.
+    "le-roots.pem",
     "THIRD-PARTY-NOTICES.md", "LICENSE", "LICENSING.md", "TRADEMARKS.md", *NEEDED_LICENCES,
 }
 data_blob = None
@@ -1080,7 +1758,31 @@ if data_blob is not None:
         modes = {Path(m.name).name: m.mode & 0o777 for m in members}
         paths = {m.name.lstrip("./") for m in members}
         owners = {(m.uname, m.gname) for m in members}
+        shipped_roots = [t.extractfile(m).read() for m in members if Path(m.name).name == "le-roots.pem"]
+        _shipped_subs = {Path(m.name).name: t.extractfile(m).read() for m in members
+                         if Path(m.name).parent.as_posix().endswith("/fonts/subs")}
     check(expected <= names, f"payload carries all {len(expected)} app files")
+    # The subtitle faces sit in fonts/subs/ of the app directory, and every one the manifest names
+    # must be there byte for byte: libass finds a script's face by family name, so a missing one is
+    # tofu on the television and nothing else notices.
+    _subs_names = {f["file"] for f in _subs_manifest["faces"]} | {"manifest.json"}
+    check(set(_shipped_subs) == _subs_names,
+          f"payload carries fonts/subs/ manifest.json and all {len(_subs_manifest['faces'])} faces")
+    check(all(_hashlib.sha256(_shipped_subs[f["file"]]).hexdigest() == f["sha256"] for f in _subs_manifest["faces"]
+              if f["file"] in _shipped_subs),
+          "the ipk's subtitle faces are byte-identical to pkg/fonts/subs (same SHA-256)")
+    # The roots bundle is graded in the REPO above, but what a television trusts is the member of
+    # the BUILT archive: a stale or hand-edited copy staged by the Makefile would pass every check of
+    # `pkg/le-roots.pem`. Same four roots, and byte-identical to the repo file.
+    check(len(shipped_roots) == 1 and _roots_pem.exists()
+          and _hashlib.sha256(shipped_roots[0]).hexdigest() == _hashlib.sha256(_roots_pem.read_bytes()).hexdigest(),
+          "the ipk's le-roots.pem is byte-identical to pkg/le-roots.pem (same SHA-256)")
+    if len(shipped_roots) == 1:
+        _member_got = [_hashlib.sha256(_b64.b64decode("".join(m.split()))).hexdigest()
+                       for m in _re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----",
+                                            shipped_roots[0].decode("ascii", "replace"), _re.S)]
+        check(sorted(_member_got) == sorted(_LE_ROOTS),
+              "the ipk's le-roots.pem holds exactly ISRG Root X1, X2, YR and YE (by SHA-256 of each certificate)")
     check(modes.get("plxnative") == 0o755,
           "native app is executable by its jailed runtime uid")
     check(modes.get("sentry-crash") == 0o755,

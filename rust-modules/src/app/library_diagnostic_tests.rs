@@ -7,26 +7,26 @@ use super::test_support::{frame, frame_with_tap};
 
 #[test]
 fn keyboard_rail_ok_down_up_returns_without_arming_or_requesting_a_card() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-rail-key-return");
+    let session = plx_plex::plex::session::TempSession::new("library-rail-key-return");
     session.watching("u-library-rail-key-return");
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test("rail-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("rail-own", "127.0.0.1", 9, "synthetic", "fixture");
     let shared =
-        crate::plex::register_for_test("rail-shared", "127.0.0.1", 10, "synthetic", "fixture");
-    crate::plex::set_current(sid);
+        plx_plex::plex::register_for_test("rail-shared", "127.0.0.1", 10, "synthetic", "fixture");
+    plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     {
         let mut browse = rig.stores.browse.borrow_mut();
         browse.seed_items_for_test(120);
@@ -35,7 +35,7 @@ fn keyboard_rail_ok_down_up_returns_without_arming_or_requesting_a_card() {
     frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
     Bridge::library_command(
         &mut d,
-        crate::screens::registry::LibraryCmd::FocusGrid { row: 2, col: 5 },
+        plx_screens::registry::LibraryCmd::FocusGrid { row: 2, col: 5 },
     );
     for i in 1..80 {
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
@@ -54,14 +54,14 @@ fn keyboard_rail_ok_down_up_returns_without_arming_or_requesting_a_card() {
         .unwrap()
         .as_any()
         .unwrap()
-        .downcast_ref::<crate::screens::library::LibraryScreen>()
+        .downcast_ref::<plx_screens::library::LibraryScreen>()
         .unwrap();
     assert_eq!(page.probe_viewport(d.focus()).0, "rail");
     rig.take_library_reqs();
     #[derive(Default)]
     struct PressTap(usize);
-    impl crate::ui::dispatch::Tap<AppHost> for PressTap {
-        fn effect(&mut self, _: u64, effect: &crate::ui::machine::Stamped<AppHost>) {
+    impl plx_ui::dispatch::Tap<AppHost> for PressTap {
+        fn effect(&mut self, _: u64, effect: &plx_machine::machine::Stamped<AppHost>) {
             if matches!(effect.fx, Fx::Press(_)) {
                 self.0 += 1;
             }
@@ -106,22 +106,24 @@ fn keyboard_rail_ok_down_up_returns_without_arming_or_requesting_a_card() {
 
 #[test]
 fn library_switch_menu_steps_drive_the_input_owning_menu_and_genre_return() {
-    use crate::screens::registry::{LibraryCmd, LibraryMenuArg, LibraryMenuKind};
-    let _guard = crate::testlock::serial();
+    use plx_screens::registry::{LibraryCmd, LibraryMenuArg, LibraryMenuKind};
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
     let host = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
-    d.nav.next_style = crate::ui::containers::modal::Style::Compact;
+    d.nav.next_style = plx_ui::containers::modal::Style::Compact;
     d.request(
         MachineId::Nav,
         NavOp::Present(AppArg::LibraryMenu(LibraryMenuArg {
             host,
             kind: LibraryMenuKind::Filter,
             anchor: [0; 4],
-            target: crate::stores::browse::SectionAddress {
+            folded: Vec::new(),
+            opener: None,
+            target: plx_data::stores::browse::SectionAddress {
                 epoch: 1,
-                sid: crate::plex::ServerId::from_raw(0),
+                sid: plx_plex::plex::ServerId::from_raw(0),
                 section: 1,
             },
         })),
@@ -150,7 +152,7 @@ fn library_switch_menu_steps_drive_the_input_owning_menu_and_genre_return() {
         let parts = CxParts {
             tick: tick(85),
             press: Default::default(),
-            focus: crate::ui::machine::FocusRead { current: d.focus(), ..Default::default() },
+            focus: plx_machine::machine::FocusRead { current: d.focus(), ..Default::default() },
             owner: InputOwner::Entry(menu_entry),
         };
         let split = rig.split();
@@ -183,30 +185,30 @@ fn library_switch_menu_steps_drive_the_input_owning_menu_and_genre_return() {
 
 #[test]
 fn library_sweep_visits_the_whole_document_and_reverses_at_its_ends() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-diagnostic-sweep");
+    let session = plx_plex::plex::session::TempSession::new("library-diagnostic-sweep");
     session.watching("u-library-diagnostic-sweep");
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test("sweep-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("sweep-own", "127.0.0.1", 9, "synthetic", "fixture");
     let shared =
-        crate::plex::register_for_test("sweep-shared", "127.0.0.1", 10, "synthetic", "fixture");
-    crate::plex::set_current(sid);
+        plx_plex::plex::register_for_test("sweep-shared", "127.0.0.1", 10, "synthetic", "fixture");
+    plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::ApplyPins(vec![
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::ApplyPins(vec![
         (0, true),
         (2, true),
     ]));
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     {
         let mut browse = rig.stores.browse.borrow_mut();
         browse.seed_items_for_test(120);
@@ -224,9 +226,9 @@ fn library_sweep_visits_the_whole_document_and_reverses_at_its_ends() {
         MachineId::Nav,
         Fx::Deliver(
             MachineId::Instance(instance),
-            Delivery::Screen(ScreenEvent::Enter(crate::ui::screen::Enter::Fresh {
-                focus: crate::ui::screen::FocusTarget::ContainerGroup(
-                    crate::screens::library::LIBRARY_GROUP,
+            Delivery::Screen(ScreenEvent::Enter(plx_ui::screen::Enter::Fresh {
+                focus: plx_ui::screen::FocusTarget::ContainerGroup(
+                    plx_screens::library::LIBRARY_GROUP,
                 ),
             })),
         ),
@@ -243,7 +245,7 @@ fn library_sweep_visits_the_whole_document_and_reverses_at_its_ends() {
             .unwrap()
             .as_any()
             .unwrap()
-            .downcast_ref::<crate::screens::library::LibraryScreen>()
+            .downcast_ref::<plx_screens::library::LibraryScreen>()
             .unwrap();
         let (region, row, _, _, _) = page.probe_viewport(d.focus());
         path.push((region, row));
@@ -258,17 +260,15 @@ fn library_sweep_visits_the_whole_document_and_reverses_at_its_ends() {
             returned = true;
             break;
         }
-        Bridge::library_command(&mut d, crate::screens::registry::LibraryCmd::Sweep);
+        Bridge::library_command(&mut d, plx_screens::registry::LibraryCmd::Sweep);
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
     }
     assert_eq!(
         visited,
-        ["library", "shelf", "toolbar", "grid"]
-            .into_iter()
-            .collect(),
+        ["library", "grid"].into_iter().collect(),
         "{path:?}"
     );
-    assert_eq!(shelves, (0..12).collect());
+    assert!(shelves.is_empty(), "the production page mounts without shelves");
     assert_eq!(grid_rows, (0..20).collect());
     assert!(
         returned,

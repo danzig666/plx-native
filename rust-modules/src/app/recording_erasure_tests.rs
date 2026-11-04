@@ -1,12 +1,12 @@
 //! Real Session/Bridge erasure ACK and private files; unrelated host sweeps are substituted.
 use super::*;
 use crate::app::{bootstrap, recorder, run};
-use crate::plex::session::{self, Session};
+use plx_plex::plex::session::{self, Session};
 
 #[test]
 fn owned_recording_files_are_erased_after_quiescence_and_leftovers_are_acked() {
-    let _serial = crate::testlock::serial();
-    let mt = unsafe { crate::task::MainThread::assume() };
+    let _serial = plx_base::testlock::serial();
+    let mt = unsafe { plx_base::task::MainThread::assume() };
     for partial in [false, true] {
         let temp = session::TempSession::new(if partial {
             "recording-erase-partial"
@@ -19,7 +19,7 @@ fn owned_recording_files_are_erased_after_quiescence_and_leftovers_are_acked() {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("sentinel"), b"synthetic sentinel").unwrap();
         let recording = root.join("plxnative-recordings");
-        let sink = crate::ui::rec::DirSink::create(&recording.join("latest")).unwrap();
+        let sink = plx_ui::rec::DirSink::create(&recording.join("latest")).unwrap();
         let initial = bootstrap::Initial::synthetic_home(17, 32517, None).unwrap();
         let mut rec = recorder::Recplay::recording_with_sink(&initial, Box::new(sink)).unwrap();
         rec.tick(0, 0.0); // deliberately still buffered when the confirmed command arrives
@@ -38,10 +38,11 @@ fn owned_recording_files_are_erased_after_quiescence_and_leftovers_are_acked() {
             std::fs::write(root.join("plxnative-rec"), b"").unwrap();
         }
 
-        let mut bridge = Bridge::for_session_test(crate::auth::SessionInit::captured(Session {
+        let mut bridge = Bridge::for_session_test(plx_session::auth::SessionInit::captured(Session {
             client_id: "synthetic-erasure".into(),
             ..Default::default()
         }));
+        rec.arm_landgate(bridge.landgate());
         bridge.session_adapter =
             super::super::adapters::session::SessionAdapter::live_recording_resources_for_test(
                 &mt,
@@ -70,7 +71,8 @@ fn owned_recording_files_are_erased_after_quiescence_and_leftovers_are_acked() {
             &mut rec,
             false,
         );
-        assert_eq!(bridge.auth_read().0.phase, crate::auth::Phase::Deleted);
+        bridge.settle_session_io_for_test(&mut pages);
+        assert_eq!(bridge.auth_read().0.phase, plx_session::auth::Phase::Deleted);
         assert_eq!(bridge.auth_read().0.delete_leftovers, usize::from(partial));
         assert!(bridge
             .take_reqs()
@@ -99,25 +101,25 @@ fn owned_recording_files_are_erased_after_quiescence_and_leftovers_are_acked() {
         );
         rec.tick(1, 0.016);
         rec.end_frame(&|| 0);
-        assert!(!rec.finish());
+        assert!(!rec.finish(plx_machine::landgate::fixture_gate()));
         assert!(
             !recording.exists(),
             "subsequent frames and shutdown cannot recreate erased data"
         );
         assert_eq!(
-            crate::ui::rec::erase_owned_artifacts(&root).len(),
+            plx_ui::rec::erase_owned_artifacts(&root, crate::app::input::remove_or_prove_absent).len(),
             usize::from(partial),
             "missing files are idempotent; an unremoved control directory remains reported"
         );
-        session::ProfilePublisher::new(&mt).publish(None, 0);
-        crate::plex::reset_servers_for_test();
+        session::ProfilePublisher::new(&mt).publish(None, 0, String::new());
+        plx_plex::plex::reset_servers_for_test();
     }
 }
 
 #[test]
 fn replay_cannot_authorize_erasure_of_a_recording_target() {
-    let _serial = crate::testlock::serial();
-    let mt = unsafe { crate::task::MainThread::assume() };
+    let _serial = plx_base::testlock::serial();
+    let mt = unsafe { plx_base::task::MainThread::assume() };
     let temp = session::TempSession::new("replay-no-erasure");
     temp.assert_only_target();
     let before = std::fs::read(temp.path()).unwrap();

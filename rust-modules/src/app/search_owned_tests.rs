@@ -1,15 +1,15 @@
 //! Search as an owned page: lifecycle, retention and leave events.
 
 use super::*;
-use crate::ui::machine::Chrome;
-use crate::ui::screen::ScreenArg;
+use plx_machine::machine::Chrome;
+use plx_ui::screen::{Focusable, ScreenArg};
 #[allow(unused_imports)]
 use super::test_support::*;
 use super::test_support::frame;
 
 fn owned_search_probe(d: &Dispatcher<AppHost>) -> String {
     let screen = d.top_screen().expect("Search mounted");
-    assert!(screen.as_any().unwrap().is::<crate::screens::search::SearchScreen>());
+    assert!(screen.as_any().unwrap().is::<plx_screens::search::SearchScreen>());
     let mut probe = String::new();
     screen.state().probe(&mut probe);
     probe
@@ -25,19 +25,19 @@ impl OwnedLeaveTrace {
     }
 }
 
-impl crate::ui::dispatch::Tap<AppHost> for OwnedLeaveTrace {
-    fn effect(&mut self, _frame: u64, stamped: &crate::ui::machine::Stamped<AppHost>) {
+impl plx_ui::dispatch::Tap<AppHost> for OwnedLeaveTrace {
+    fn effect(&mut self, _frame: u64, stamped: &plx_machine::machine::Stamped<AppHost>) {
         let Fx::Deliver(MachineId::Instance(instance), Delivery::Screen(event)) = &stamped.fx
             else { return };
         let name = match event {
             ScreenEvent::Mount => "mount",
-            ScreenEvent::Enter(crate::ui::screen::Enter::Fresh { .. }) => "enter-fresh",
-            ScreenEvent::Enter(crate::ui::screen::Enter::Restored) => "enter-restored",
+            ScreenEvent::Enter(plx_ui::screen::Enter::Fresh { .. }) => "enter-fresh",
+            ScreenEvent::Enter(plx_ui::screen::Enter::Restored) => "enter-restored",
             ScreenEvent::RestoreMemory(_) => "restore-memory",
             ScreenEvent::Cover => "cover",
             ScreenEvent::Uncover => "uncover",
-            ScreenEvent::WillLeave(crate::ui::machine::Leave::Deeper) => "will-leave-deeper",
-            ScreenEvent::WillLeave(crate::ui::machine::Leave::ForGood) => "will-leave-for-good",
+            ScreenEvent::WillLeave(plx_machine::machine::Leave::Deeper) => "will-leave-deeper",
+            ScreenEvent::WillLeave(plx_machine::machine::Leave::ForGood) => "will-leave-for-good",
             ScreenEvent::Unmount => "unmount",
             _ => return,
         };
@@ -52,10 +52,10 @@ impl crate::ui::dispatch::Tap<AppHost> for OwnedLeaveTrace {
 /// oracle; the dispatcher records the lifecycle it actually delivered.
 #[test]
 fn every_back_reachable_owned_page_is_retained_and_restored_by_identity() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-leave-retention");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-leave-retention");
     session.watching("synthetic-leave-retention");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     // Search is owned per-Bridge now; each iteration below constructs its own `rig`, so there is
     // no process-wide state left to reset here.
 
@@ -96,10 +96,10 @@ fn every_back_reachable_owned_page_is_retained_and_restored_by_identity() {
         assert_eq!(screen.name(), host);
         let any = screen.as_any().expect("product screen downcast seam");
         assert!(match host {
-            "home" => any.is::<crate::screens::home::HomeScreen>(),
-            "library" => any.is::<crate::screens::library::LibraryScreen>(),
-            "detail" => any.is::<crate::screens::detail::DetailScreen>(),
-            "person" => any.is::<crate::screens::person::PersonScreen>(),
+            "home" => any.is::<plx_screens::home::HomeScreen>(),
+            "library" => any.is::<plx_screens::library::LibraryScreen>(),
+            "detail" => any.is::<plx_screens::detail::DetailScreen>(),
+            "person" => any.is::<plx_screens::person::PersonScreen>(),
             _ => false,
         }, "{host} must be its real owned screen type, not a fixture body");
         let child = match host {
@@ -139,7 +139,7 @@ fn every_back_reachable_owned_page_is_retained_and_restored_by_identity() {
         assert!(d.nav.entry(child_entry).is_none(), "the for-good child entry must be pruned");
     }
 
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
 }
 
 /// Search is retained while a result is above it, but selecting Home retires Search for good.
@@ -147,10 +147,10 @@ fn every_back_reachable_owned_page_is_retained_and_restored_by_identity() {
 /// keyboard calls are the teardown side effect the old route table carried by hand.
 #[test]
 fn owned_search_is_covered_for_a_result_then_unmounted_for_good_at_home() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-leave-contract");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-leave-contract");
     session.watching("synthetic-search-leave-contract");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
 
@@ -165,7 +165,7 @@ fn owned_search_is_covered_for_a_result_then_unmounted_for_good_at_home() {
     let search_entry = d.nav.top_page().unwrap().id;
     let search_instance = d.nav.instance_of(search_entry).unwrap();
     assert!(d.top_screen().unwrap().as_any().unwrap()
-        .is::<crate::screens::search::SearchScreen>());
+        .is::<plx_screens::search::SearchScreen>());
 
     super::frame(&mut d, &mut rig, tick(2), script_key(Key::Ok, tick(2)));
     assert!(d.input.keyboard);
@@ -208,24 +208,24 @@ fn owned_search_is_covered_for_a_result_then_unmounted_for_good_at_home() {
     assert!(!d.input.keyboard);
     assert_eq!(rig.keyboard_calls, [true, false, true, false]);
 
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
 }
 
 #[test]
 fn owned_search_external_departure_never_submits_the_draft() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-external-leave");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-external-leave");
     session.watching("synthetic-external-leave");
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("unfinished draft".into()));
-    rig.search = rig.stores.search_snapshot(rig.directory.view());
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("unfinished draft".into()));
+    rig.search = rig.stores.search_snapshot(rig.directory.view(), &Bridge::household_ids());
     let parts = CxParts { tick: tick(0), press: Default::default(), focus: Default::default(),
         owner: InputOwner::Entry(EntryId(1)) };
     let split = rig.split();
     let cx = parts.cx::<AppHost>(split.views, split.measure);
     for event in [ScreenEvent::Suspend, ScreenEvent::Cover, ScreenEvent::Unmount,
-        ScreenEvent::WillLeave(crate::ui::machine::Leave::Deeper)] {
-        let mut screen = crate::screens::search::SearchScreen::new(EntryId(1), InstanceId(1));
+        ScreenEvent::WillLeave(plx_machine::machine::Leave::Deeper)] {
+        let mut screen = plx_screens::search::SearchScreen::new(EntryId(1), InstanceId(1));
         let mut out = Vec::new();
         let mut present = Present::new();
         {
@@ -239,20 +239,20 @@ fn owned_search_external_departure_never_submits_the_draft() {
             Fx::Deliver(_, Delivery::Keyboard { up: false }))));
         assert!(!out.iter().any(|effect| matches!(&effect.fx,
             Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(
-                crate::stores::search::SearchCmd::RememberRecent { .. }))))),
+                plx_data::stores::search::SearchCmd::RememberRecent { .. }))))),
             "external lifecycle events are not search submissions");
     }
 }
 
 #[test]
 fn owned_search_ticks_request_search_work_once_after_step() {
-    let _serial = crate::testlock::serial();
+    let _serial = plx_base::testlock::serial();
     let mut rig = Bridge::for_test(|| 0);
     let parts = CxParts { tick: tick(0), press: Default::default(), focus: Default::default(),
         owner: InputOwner::Entry(EntryId(1)) };
     let split = rig.split();
     let cx = parts.cx::<AppHost>(split.views, split.measure);
-    let mut screen = crate::screens::search::SearchScreen::new(EntryId(1), InstanceId(1));
+    let mut screen = plx_screens::search::SearchScreen::new(EntryId(1), InstanceId(1));
     let mut out = Vec::new();
     let mut present = Present::new();
     {
@@ -264,21 +264,21 @@ fn owned_search_ticks_request_search_work_once_after_step() {
         Fx::App(AppFx::StoreWork(work)) if work.store() == StoreId::Search)).count(), 1,
         "each owned tick owes the Search debounce/landing pass");
     assert_eq!(out.iter().filter(|effect| matches!(&effect.fx,
-        Fx::App(AppFx::StoreWork(crate::stores::StoreWork::BrowseDiscovery)))).count(), 1);
+        Fx::App(AppFx::StoreWork(plx_data::stores::StoreWork::BrowseDiscovery)))).count(), 1);
 }
 
 #[test]
 fn owned_search_wheel_scrolls_without_moving_focus_and_dpad_reveals_again() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-wheel");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-wheel");
     session.watching("synthetic-wheel");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("wheel".into()));
-    rig.stores.search.publish_shelves_for_test([crate::search::Kind::Movie, crate::search::Kind::Show,
-        crate::search::Kind::Episode].into_iter().map(|kind| crate::search::Shelf { kind,
-            items: vec![crate::search::Item::Media(crate::pms::PmsMovie {
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("wheel".into()));
+    rig.stores.search.publish_shelves_for_test([plx_data::search::Kind::Movie, plx_data::search::Kind::Show,
+        plx_data::search::Kind::Episode].into_iter().map(|kind| plx_data::search::Shelf { epoch: 0, window: Default::default(), kind,
+            items: vec![plx_data::search::Item::Media(plx_data::pms::PmsMovie {
                 rk: format!("synthetic-{kind:?}"), title: "Synthetic wheel result".into(), ..Default::default()
             })] }).collect());
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -286,8 +286,7 @@ fn owned_search_wheel_scrolls_without_moving_focus_and_dpad_reveals_again() {
     let field_y = |d: &Dispatcher<AppHost>, rig: &Bridge| {
         let parts = CxParts { tick: tick(0), press: Default::default(),
             focus: d.input.engine.read(InputOwner::Entry(field.entry)), owner: InputOwner::Entry(field.entry) };
-        let cx = parts.cx::<AppHost>(AppViews { auth: rig.session.read(), hubs: rig.hubs.view(), listing: rig.listing.view(),
-directory: rig.directory.view(), section_hubs: rig.section_hubs.view(), search: rig.search.view(), person: rig.stores.person_view(), session: crate::route::idle_session_for_test() }, &rig.measure);
+        let cx = parts.cx::<AppHost>(rig.views_with(plx_media::route::idle_session_for_test()), &rig.measure);
         d.top_screen().unwrap().place(&field.elem, &cx, At::Drawn).unwrap().rest_rect.y
     };
     let before = field_y(&d, &rig);
@@ -302,7 +301,7 @@ directory: rig.directory.view(), section_hubs: rig.section_hubs.view(), search: 
         let split = rig.split();
         let cx = parts.cx::<AppHost>(split.views, split.measure);
         let placed = d.top_screen().unwrap().place(&field.elem, &cx, At::Drawn).unwrap();
-        assert_eq!(placed.clip.y, crate::ui::widgets::TOP_BAR_BOTTOM,
+        assert_eq!(placed.clip.y, plx_ui::widgets::TOP_BAR_BOTTOM,
             "scrolling under the tab track must not leave an active page hit above its floor");
     }
     frame(&mut d, &mut rig, AppArg::Search, tick(80), script_key(Key::Down, tick(80)));
@@ -319,13 +318,13 @@ directory: rig.directory.view(), section_hubs: rig.section_hubs.view(), search: 
 
 #[test]
 fn owned_search_dispatch_advances_debounce_once_and_only_while_page_updates() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-debounce");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-debounce");
     session.watching("synthetic-debounce");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("not sent to any server".into()));
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("not sent to any server".into()));
     let step = |ms| Tick { ms, dt_us: 100_000 };
     frame(&mut d, &mut rig, AppArg::Search, Tick { ms: 0, dt_us: 0 }, vec![]);
     frame(&mut d, &mut rig, AppArg::Search, step(100), vec![]);
@@ -337,25 +336,25 @@ fn owned_search_dispatch_advances_debounce_once_and_only_while_page_updates() {
     frame(&mut d, &mut rig, AppArg::Search, step(300), vec![]);
     assert!(!rig.stores.search.settling(), "the owned page must release the debounce");
     frame(&mut d, &mut rig, AppArg::Home, step(400), vec![]);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("another pending query".into()));
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("another pending query".into()));
     for ms in [500, 600, 700, 800] { frame(&mut d, &mut rig, AppArg::Home, step(ms), vec![]); }
     assert!(rig.stores.search.settling(), "a hidden Search entry must not keep pumping");
 }
 
 #[test]
 fn owned_search_carried_work_keeps_the_originating_tick_delta() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-carried-pump");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-carried-pump");
     session.watching("synthetic-carried-pump");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("carried search".into()));
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("carried search".into()));
     frame(&mut d, &mut rig, AppArg::Search, Tick { ms: 0, dt_us: 0 }, vec![]);
     for ms in [100, 200] { frame(&mut d, &mut rig, AppArg::Search, Tick { ms, dt_us: 100_000 }, vec![]); }
     assert!((rig.stores.search.debounce_elapsed_for_test() - 0.2).abs() < 0.000001);
     let instance = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
-    for _ in 0..(crate::ui::dispatch::MAX_STEPS_PRE + crate::ui::dispatch::MAX_STEPS_POST) {
+    for _ in 0..(plx_ui::dispatch::MAX_STEPS_PRE + plx_ui::dispatch::MAX_STEPS_POST) {
         d.emit(MachineId::Nav, Fx::Deliver(MachineId::Instance(instance),
             Delivery::Screen(ScreenEvent::StoreChanged(StoreId::Browse.ord(), 0))));
     }
@@ -370,10 +369,10 @@ fn owned_search_carried_work_keeps_the_originating_tick_delta() {
 
 #[test]
 fn owned_search_observed_keyboard_dismissal_releases_native_latch_and_reopens() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-observed-dismissal");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-observed-dismissal");
     session.watching("synthetic-observed-dismissal");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -389,15 +388,15 @@ fn owned_search_observed_keyboard_dismissal_releases_native_latch_and_reopens() 
 
 #[test]
 fn owned_search_adopts_panel_text_without_restarting_or_losing_the_commit() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-adopt");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-adopt");
     session.watching("synthetic-adopt-profile");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("ab".into()));
-    rig.stores.search.publish_shelves_for_test(vec![crate::search::Shelf { kind: crate::search::Kind::Movie,
-        items: vec![crate::search::Item::Media(crate::pms::PmsMovie {
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("ab".into()));
+    rig.stores.search.publish_shelves_for_test(vec![plx_data::search::Shelf { epoch: 0, window: Default::default(), kind: plx_data::search::Kind::Movie,
+        items: vec![plx_data::search::Item::Media(plx_data::pms::PmsMovie {
             rk: "adopt-result".into(), title: "Synthetic result".into(), ..Default::default()
         })] }]);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -424,15 +423,15 @@ fn owned_search_adopts_panel_text_without_restarting_or_losing_the_commit() {
 
 #[test]
 fn owned_search_opens_edits_and_closes_in_one_input_batch_in_order() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-ingress-order");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-ingress-order");
     session.watching("synthetic-ingress-order");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     let text = |s: &str, at| InputEvent { at, source: Source::Script,
-        kind: InputKind::Text(crate::ui::machine::TextEdit::Commit(s.into())) };
+        kind: InputKind::Text(plx_machine::machine::TextEdit::Commit(s.into())) };
     let mut events = script_key(Key::Ok, tick(1));
     events.push(text("a", tick(1)));
     events.extend(script_key(Key::Left, tick(1)));
@@ -449,10 +448,10 @@ fn owned_search_opens_edits_and_closes_in_one_input_batch_in_order() {
 
 #[test]
 fn an_old_search_keyboard_request_cannot_close_the_new_instances_keyboard() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-keyboard-owner");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-keyboard-owner");
     session.watching("synthetic-keyboard-owner");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -482,16 +481,16 @@ fn an_old_search_keyboard_request_cannot_close_the_new_instances_keyboard() {
 
 #[test]
 fn covering_owned_search_releases_its_native_keyboard() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-covered-keyboard");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-covered-keyboard");
     session.watching("synthetic-covered-search");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Search, tick(1), script_key(Key::Ok, tick(1)));
     assert_eq!(rig.keyboard_calls, [true]);
-    d.request(MachineId::Nav, NavOp::Present(AppArg::Settings(crate::screens::family::SettingsPage::Root)));
+    d.request(MachineId::Nav, NavOp::Present(AppArg::Settings(plx_screens::family::SettingsPage::Root)));
     frame(&mut d, &mut rig, AppArg::Search, tick(2), vec![]);
     assert!(!d.input.keyboard, "the system keyboard cannot trap input above a new application modal");
     assert!(d.input.keyboard_owner.is_none());
@@ -500,17 +499,17 @@ fn covering_owned_search_releases_its_native_keyboard() {
 
 #[test]
 fn owned_search_unrelated_store_notice_cannot_ack_a_net_zero_edit_batch() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-ack");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-ack");
     session.watching("synthetic-ack-profile");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     let target = MachineId::Instance(d.nav.top_page().unwrap().inst.as_ref().unwrap().id);
     for kind in [InputKind::SystemKeyboard(true),
-        InputKind::Text(crate::ui::machine::TextEdit::Commit("a".into())),
-        InputKind::Text(crate::ui::machine::TextEdit::Backspace)] {
+        InputKind::Text(plx_machine::machine::TextEdit::Commit("a".into())),
+        InputKind::Text(plx_machine::machine::TextEdit::Backspace)] {
         d.emit(MachineId::Input, Fx::Deliver(target, Delivery::Screen(ScreenEvent::Input(InputEvent {
             at: tick(1), source: Source::Script, kind,
         }))));
@@ -527,10 +526,10 @@ fn owned_search_unrelated_store_notice_cannot_ack_a_net_zero_edit_batch() {
 
 #[test]
 fn owned_search_keeps_several_commits_while_the_frame_view_is_frozen() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-text");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-text");
     session.watching("synthetic-search-profile");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -538,7 +537,7 @@ fn owned_search_keeps_several_commits_while_the_frame_view_is_frozen() {
     let retained = rig.search.clone();
     let mut input = vec![InputEvent { at: tick(1), source: Source::Script, kind: InputKind::SystemKeyboard(true) }];
     input.extend(["s", "u", "m", "summer "].map(|text| InputEvent {
-        at: tick(1), source: Source::Script, kind: InputKind::Text(crate::ui::machine::TextEdit::Commit(text.into())),
+        at: tick(1), source: Source::Script, kind: InputKind::Text(plx_machine::machine::TextEdit::Commit(text.into())),
     }));
     frame(&mut d, &mut rig, AppArg::Search, tick(1), input);
     assert_eq!(rig.stores.search.query(), "summer ", "the real store received every committed edit");
@@ -553,10 +552,10 @@ fn owned_search_keeps_several_commits_while_the_frame_view_is_frozen() {
 
 #[test]
 fn owned_search_opens_system_ownership_and_empty_down_keeps_editing() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-keyboard");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-keyboard");
     session.watching("synthetic-empty-search-profile");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -572,32 +571,32 @@ fn owned_search_opens_system_ownership_and_empty_down_keeps_editing() {
     assert!(owned_search_probe(&d).contains("editing=false"));
     assert_eq!(d.nav.tabs.stack.depth(), 1);
     frame(&mut d, &mut rig, AppArg::Search, tick(4), script_key(Key::Up, tick(4)));
-    assert_eq!(d.focus().unwrap().elem, crate::ui::dispatch::STRIP_BASE + 3,
+    assert_eq!(d.focus().unwrap().elem, plx_ui::dispatch::STRIP_BASE + 3,
         "UP from the field chooses Search's own shared-strip pill");
 }
 
 #[test]
 fn owned_search_result_keys_are_server_scoped_and_survive_same_query_reordering() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-results");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-results");
     session.watching("synthetic-result-profile");
     // This test grades navigation, not disk workers. The accepted term is already first, so
     // RememberRecent remains the production no-op and no detached save can outlive the fixture.
-    crate::plex::session::update(|s| {
+    plx_plex::plex::session::update(|s| {
         let mut next = s.clone();
         next.set_recents_for("synthetic-result-profile", vec!["synthetic".into()]);
         Some(next)
     });
-    crate::plex::reset_servers_for_test();
-    let a = crate::plex::register_for_test("search-a", "127.0.0.1", 1, "a", "search");
-    let b = crate::plex::register_for_test("search-b", "127.0.0.1", 2, "b", "search");
-    let item = |sid| crate::search::Item::Media(crate::pms::PmsMovie {
+    plx_plex::plex::reset_servers_for_test();
+    let a = plx_plex::plex::register_for_test("search-a", "127.0.0.1", 1, "a", "search");
+    let b = plx_plex::plex::register_for_test("search-b", "127.0.0.1", 2, "b", "search");
+    let item = |sid| plx_data::search::Item::Media(plx_data::pms::PmsMovie {
         sid, rk: "same-local-key".into(), title: "Synthetic movie".into(), ..Default::default()
     });
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("synthetic".into()));
-    rig.stores.search.publish_shelves_for_test(vec![crate::search::Shelf { kind: crate::search::Kind::Movie,
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("synthetic".into()));
+    rig.stores.search.publish_shelves_for_test(vec![plx_data::search::Shelf { epoch: 0, window: Default::default(), kind: plx_data::search::Kind::Movie,
         items: vec![item(a), item(b)] }]);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Search, tick(1), script_key(Key::Down, tick(1)));
@@ -605,54 +604,60 @@ fn owned_search_result_keys_are_server_scoped_and_survive_same_query_reordering(
     frame(&mut d, &mut rig, AppArg::Search, tick(2), script_key(Key::Right, tick(2)));
     let second = d.focus().unwrap();
     assert_ne!(first, second);
-    rig.stores.search.publish_shelves_for_test(vec![crate::search::Shelf { kind: crate::search::Kind::Movie,
+    rig.stores.search.publish_shelves_for_test(vec![plx_data::search::Shelf { epoch: 0, window: Default::default(), kind: plx_data::search::Kind::Movie,
         items: vec![item(b), item(a)] }]);
     frame(&mut d, &mut rig, AppArg::Search, tick(3), vec![]);
     assert_eq!(d.focus(), Some(second), "identity survives the changed catalog order");
     frame(&mut d, &mut rig, AppArg::Search, tick(4), script_key(Key::Ok, tick(4)));
     for i in 5..35 { frame(&mut d, &mut rig, AppArg::Search, tick(i), vec![]); }
     assert!(rig.search_reqs.iter().any(|(_, req, _)| matches!(req,
-        crate::screens::registry::SearchReq::Detail { sid, rk } if *sid == b && rk == "same-local-key")));
+        plx_screens::registry::SearchReq::Detail { sid, rk } if *sid == b && rk == "same-local-key")));
     assert!(!rig.search_reqs.iter().any(|(_, req, _)| matches!(req,
-        crate::screens::registry::SearchReq::Detail { sid, .. } if *sid == a)));
+        plx_screens::registry::SearchReq::Detail { sid, .. } if *sid == a)));
     let requests = rig.take_search_reqs();
     assert!(!requests.is_empty());
     assert!(rig.take_search_reqs().is_empty(), "requests execute only once");
     let (_, _, ret) = requests.iter().find(|(_, req, _)| matches!(req,
-        crate::screens::registry::SearchReq::Detail { .. })).unwrap();
+        plx_screens::registry::SearchReq::Detail { .. })).unwrap();
     let entry = d.nav.top_page().unwrap().id;
     let (selected, opener) = rig.search_selection(&d, entry, ret.focus).unwrap();
-    assert!(matches!(selected, crate::search::Item::Media(item) if item.sid == b));
-    assert!(opener.rect.is_some(), "the menu anchor belongs to the captured selection");
+    assert!(matches!(selected, plx_data::search::Item::Media(item) if item.sid == b));
+    let page = d.nav.entry(entry).unwrap().inst.as_ref().unwrap().screen.as_any().unwrap()
+        .downcast_ref::<plx_screens::search::SearchScreen>().unwrap();
+    let parts = CxParts { tick: Tick::default(), press: Default::default(),
+        focus: plx_machine::machine::FocusRead { current: ret.focus, ..Default::default() }, owner: InputOwner::Entry(entry) };
+    let cx = parts.cx::<AppHost>(rig.views(), &rig.measure);
+    let placed = page.place(&ret.focus.unwrap().elem, &cx, At::Drawn).unwrap();
+    assert_eq!(opener.rect, Some(placed.rest_rect), "the anchor is the settled rect `place` answers, as the downcast path read it");
     let mut foreign = ret.focus.unwrap();
     foreign.entry = EntryId(entry.0 + 100);
     assert!(rig.search_selection(&d, entry, Some(foreign)).is_none());
     frame(&mut d, &mut rig, AppArg::Search, tick(35), script_key(Key::Back, tick(35)));
     assert!(rig.take_search_reqs().iter().any(|(_, req, _)| matches!(req,
-        crate::screens::registry::SearchReq::Back)), "BACK differs from selecting the Home pill");
-    crate::plex::reset_servers_for_test();
+        plx_screens::registry::SearchReq::Back)), "BACK differs from selecting the Home pill");
+    plx_plex::plex::reset_servers_for_test();
 }
 
 #[test]
 fn owned_search_rejects_a_queued_query_from_the_departing_profile() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-profile");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-profile");
     session.watching("synthetic-departing-profile");
-    crate::plex::reset_servers_for_test();
-    let old_generation = crate::plex::session::current_gen();
+    plx_plex::plex::reset_servers_for_test();
+    let old_generation = plx_plex::plex::session::current_gen();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     d.emit(MachineId::Input, Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(
-        crate::stores::search::SearchCmd::SetQueryScoped { profile_generation: old_generation, query: "departing text".into() }))));
+        plx_data::stores::search::SearchCmd::SetQueryScoped { profile_generation: old_generation, query: "departing text".into() }))));
     session.watching("synthetic-replacement-profile");
-    rig.search_run(crate::stores::search::SearchCmd::Reset);
+    rig.search_run(plx_data::stores::search::SearchCmd::Reset);
     frame(&mut d, &mut rig, AppArg::Search, tick(1), vec![]);
     assert_eq!(rig.stores.search.query(), "");
     assert!(owned_search_probe(&d).contains("caret=0"));
-    let next_generation = crate::plex::session::current_gen();
+    let next_generation = plx_plex::plex::session::current_gen();
     d.emit(MachineId::Input, Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(
-        crate::stores::search::SearchCmd::SetQueryScoped { profile_generation: next_generation, query: "replacement text".into() }))));
+        plx_data::stores::search::SearchCmd::SetQueryScoped { profile_generation: next_generation, query: "replacement text".into() }))));
     frame(&mut d, &mut rig, AppArg::Search, tick(2), vec![]);
     assert_eq!(rig.stores.search.query(), "replacement text");
     frame(&mut d, &mut rig, AppArg::Search, tick(3), vec![]);
@@ -661,17 +666,17 @@ fn owned_search_rejects_a_queued_query_from_the_departing_profile() {
 
 #[test]
 fn owned_search_return_memory_reconstructs_positions_with_a_query_guard() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-return");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-return");
     session.watching("synthetic-return-profile");
-    crate::plex::reset_servers_for_test();
-    let catalog = || vec![crate::search::Shelf { kind: crate::search::Kind::Movie,
-        items: (0..8).map(|i| crate::search::Item::Media(crate::pms::PmsMovie {
+    plx_plex::plex::reset_servers_for_test();
+    let catalog = || vec![plx_data::search::Shelf { epoch: 0, window: Default::default(), kind: plx_data::search::Kind::Movie,
+        items: (0..8).map(|i| plx_data::search::Item::Media(plx_data::pms::PmsMovie {
             rk: format!("item-{i}"), title: format!("Synthetic {i}"), ..Default::default()
         })).collect() }];
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("memory".into()));
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("memory".into()));
     rig.stores.search.publish_shelves_for_test(catalog());
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Search, tick(1), script_key(Key::Down, tick(1)));
@@ -682,22 +687,20 @@ fn owned_search_return_memory_reconstructs_positions_with_a_query_guard() {
     let memory = match &ret.memory { PageMemory::Search(memory) => memory, _ => panic!("Search must supply entry memory") };
     let parts = CxParts { tick: tick(100), press: Default::default(), focus: d.input.engine.read(InputOwner::Entry(key.entry)), owner: InputOwner::Entry(key.entry) };
     let old_rect = {
-        let cx = parts.cx::<AppHost>(AppViews { auth: rig.session.read(), hubs: rig.hubs.view(), listing: rig.listing.view(),
-            directory: rig.directory.view(), section_hubs: rig.section_hubs.view(), search: rig.search.view(), person: rig.stores.person_view(), session: crate::route::idle_session_for_test() }, &rig.measure);
+        let cx = parts.cx::<AppHost>(rig.views_with(plx_media::route::idle_session_for_test()), &rig.measure);
         d.top_screen().unwrap().place(&key.elem, &cx, At::Drawn).unwrap().rest_rect
     };
     assert!(old_rect.x < 1800.0, "the last card must have scrolled into view: {old_rect:?}");
     for changed in [false, true] {
         if changed {
-            rig.search_run(crate::stores::search::SearchCmd::SetQuery("replacement".into()));
+            rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("replacement".into()));
             rig.stores.search.publish_shelves_for_test(catalog());
-            rig.search = rig.stores.search_snapshot(rig.directory.view());
+            rig.search = rig.stores.search_snapshot(rig.directory.view(), &Bridge::household_ids());
         }
-        let cx = parts.cx::<AppHost>(AppViews { auth: rig.session.read(), hubs: rig.hubs.view(), listing: rig.listing.view(),
-            directory: rig.directory.view(), section_hubs: rig.section_hubs.view(), search: rig.search.view(), person: rig.stores.person_view(), session: crate::route::idle_session_for_test() }, &rig.measure);
-        let mut restored = crate::screens::search::SearchScreen::new(key.entry, InstanceId(900));
+        let cx = parts.cx::<AppHost>(rig.views_with(plx_media::route::idle_session_for_test()), &rig.measure);
+        let mut restored = plx_screens::search::SearchScreen::new(key.entry, InstanceId(900));
         restored.restore(memory);
-        let mut present = crate::ui::present::Present::new();
+        let mut present = plx_machine::present::Present::new();
         let mut commands = Vec::new();
         let mut fx = Effects::new(&mut commands, MachineId::Instance(InstanceId(900)), &mut present);
         restored.step(&ScreenEvent::Mount, &cx, &mut fx);
@@ -721,15 +724,15 @@ fn owned_search_return_memory_reconstructs_positions_with_a_query_guard() {
 /// underflow it, ▶ comes back onto the first pill, and ▼ off the bar is the field again.
 #[test]
 fn owned_search_walks_the_shared_strip_to_the_chip_and_back_to_the_field() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-strip");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-strip");
     session.watching("synthetic-strip");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
     let field = d.focus().unwrap();
-    let base = crate::ui::dispatch::STRIP_BASE;
+    let base = plx_ui::dispatch::STRIP_BASE;
 
     frame(&mut d, &mut rig, AppArg::Search, tick(1), script_key(Key::Up, tick(1)));
     assert_eq!(d.focus().map(|key| key.elem), Some(base + 3),
@@ -762,7 +765,7 @@ fn owned_search_walks_the_shared_strip_to_the_chip_and_back_to_the_field() {
 /// now fails here. **What this still cannot see is the one line above it in
 /// that arm itself** (`if let Some(q) = super::read("search")`): driving the real trigger-FILE
 /// read needs a full `App`/SDL frame, which this suite does not construct (see `dev.rs`'s own
-/// tests for host coverage of `dev::read`'s file-reading half in isolation).
+/// tests for host coverage of `devtrig::read`'s file-reading half in isolation).
 ///
 /// The draft is `pub(crate)` to `screens::search` alone, so this cannot read it directly — the
 /// proof goes through the same observable the wheel/scroll tests already use: a query the draft
@@ -771,16 +774,16 @@ fn owned_search_walks_the_shared_strip_to_the_chip_and_back_to_the_field() {
 /// exactly the same evidence "the draft holds the query" would be, one layer down.
 #[test]
 fn a_seeded_boot_query_survives_the_freshly_mounted_screens_first_sync() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-boot-seed");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-boot-seed");
     session.watching("synthetic-boot-seed");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     crate::dev::scenarios::apply_search_boot_trigger("dune", &mut d, &mut rig);
-    rig.stores.search.publish_shelves_for_test([crate::search::Kind::Movie].into_iter()
-        .map(|kind| crate::search::Shelf { kind, items: vec![crate::search::Item::Media(
-            crate::pms::PmsMovie { rk: "synthetic-boot-seed".into(), title: "Dune".into(), ..Default::default() })] })
+    rig.stores.search.publish_shelves_for_test([plx_data::search::Kind::Movie].into_iter()
+        .map(|kind| plx_data::search::Shelf { epoch: 0, window: Default::default(), kind, items: vec![plx_data::search::Item::Media(
+            plx_data::pms::PmsMovie { rk: "synthetic-boot-seed".into(), title: "Dune".into(), ..Default::default() })] })
         .collect());
     // Mirror the loop's own next step: the first frame mounts the page the trigger just rooted the
     // container on.
@@ -814,10 +817,10 @@ fn a_seeded_boot_query_survives_the_freshly_mounted_screens_first_sync() {
 /// no observable behaviour — it deleted a call that was never the one doing the work.
 #[test]
 fn leaving_owned_search_through_a_real_route_change_releases_its_keyboard() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-real-nav-teardown");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-real-nav-teardown");
     session.watching("synthetic-real-nav-teardown");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -844,7 +847,7 @@ fn leaving_owned_search_through_a_real_route_change_releases_its_keyboard() {
 ///
 /// **This drives `Bridge::draws_chrome_for` directly** — the exact predicate `draw_chrome` calls
 /// as its guard — rather than re-deriving the same condition inline: `draw_chrome`'s own body
-/// calls into real text measurement (`crate::text::text_width`, off `self.chrome.labels()`'s real
+/// calls into real text measurement (`plx_gfx::text::text_width`, off `self.chrome.labels()`'s real
 /// strings) with no font loaded on a host test, so a test cannot drive the paint itself end to end
 /// and must instead pin the exact decision the guard makes. The fix derives that guard FROM the
 /// one chrome predicate instead of listing pages a second time (the drift this bug was), so a
@@ -879,16 +882,16 @@ fn every_route_wearing_the_shared_bar_reaches_the_chrome_paint_guard() {
 /// condition inline with a route literal. That is exactly the shape the original bug shipped in
 /// (`if !matches!(arg.route(), Some(Route::Home | Route::Library)) { return; }`), and it is the
 /// SECOND time this guard drifted from the one chrome predicate silently — with
-/// `#![allow(dead_code)]` on `ui/mod.rs` meaning a stranded `draws_chrome_for` would not even draw
+/// `#![allow(dead_code)]` on `plx_ui`'s `lib.rs` meaning a stranded `draws_chrome_for` would not even draw
 /// a compiler warning. `draw_chrome`'s body calls into real text measurement with no font loaded
 /// on a host test, so this cannot be driven end to end here; instead it reads the guard's own
-/// source text, the same idiom `diag::scrub`'s `no_log_call_site_interpolates_viewing_content`
+/// source text, the same idiom `eventlog::scrub`'s `no_log_call_site_interpolates_viewing_content`
 /// uses to pin a call-site property no runtime assertion can see.
 ///
 /// Observed RED against the reintroduced bug: reverting only `draw_chrome`'s guard line to the
 /// literal `matches!(arg.route(), Some(Route::Home | Route::Library))` (leaving
 /// `draws_chrome_for` itself untouched) makes both assertions below fail, while
-/// `cargo +nightly test --lib` on that same mutation reports every OTHER test passing — which is
+/// `cargo test --lib` on that same mutation reports every OTHER test passing — which is
 /// the exact blind spot this test exists to close.
 #[test]
 fn draw_chromes_guard_calls_the_named_predicate_and_names_no_page_literal() {
@@ -921,62 +924,65 @@ fn draw_chromes_guard_calls_the_named_predicate_and_names_no_page_literal() {
     );
 }
 
-/// **Pins the `AppArg::Search` arm of `app::run::update` that keeps the shared top strip's springs
-/// and hit rects live while Search is on screen.**
+/// **Pins the arm of `app::run::update` that keeps the shared top strip's springs and hit rects
+/// live while ANY page that wears the bar is on screen** — Search among them.
 ///
 /// `SearchScreen::tick` steps only this screen's OWN rows/springs — it never touches the strip's
 /// travelling capsules, its scroll spring or the profile chip's unfurl, which all live in
 /// `Bridge`'s own `strip: StripRender` field and are stepped by `Bridge::update_home_chrome`.
-/// Home and Library each get an arm in `update` that calls it every frame they are on screen; if
-/// Search's mirroring arm (added alongside the owned cutover) were ever deleted, those springs
-/// would freeze at whatever the previously-drawn page left them, and `ChromeSnapshot::members`'s
-/// published strip rects (read by pointer hit-testing and by focus) would go stale under Search —
-/// exactly the regression `search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale`
-/// (this file, above) proves `update_home_chrome` FIXES once it is actually called.
+/// `update` calls it every frame a bar-wearing page is on screen, on ONE arm whose condition is
+/// `bridge::wears_tab_bar` — the same predicate `capture_chrome` publishes the strip on. If that
+/// arm were ever deleted, or narrowed back to a list of route names, those springs would freeze at
+/// whatever the previously-drawn page left them, and `ChromeSnapshot::members`'s published strip
+/// rects (read by pointer hit-testing and by focus) would go stale — exactly the regression
+/// `search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale` (this file, above)
+/// proves `update_home_chrome` FIXES once it is actually called, and the one Collections and
+/// Recommended had until the predicate was shared (they wore the bar and nobody stepped it).
 ///
 /// That test cannot see the arm itself: it calls `Bridge::update_home_chrome` directly, never
-/// `app::run::update`, so it stays green whether or not `update`'s `AppArg::Search` branch exists
-/// at all — which is exactly how this arm could vanish with every test still passing. And
+/// `app::run::update`, so it stays green whether or not `update`'s arm exists at all. And
 /// `app::run::update` cannot be driven end to end from a host test either: it is `unsafe fn
 /// update(app: &mut App, fr: &mut Frame)`, and `App`/`Frame` carry the live SDL/GL window state
 /// boot creates — there is no host constructor for either. So, like
 /// `draw_chromes_guard_calls_the_named_predicate_and_names_no_page_literal` above (the same
 /// shape of gap, one function over), this reads the source text of the arm itself rather than
-/// running it.
+/// running it. `the_strip_is_published_exactly_when_the_route_wears_the_tab_bar`
+/// (`page_regions_tests.rs`) grades the publication half over every route.
 ///
-/// Observed RED: commenting out the `else if !host_frozen(&app.pages) && matches!(app.route(),
-/// AppArg::Search) { ... }` block in `run.rs` (leaving the Home/Library arms above it and the
-/// `search_osc` block below it untouched) makes this test fail with "update must still branch on
-/// AppArg::Search to step the shared strip", while `cargo +nightly test --lib` on that same
-/// mutation reports every other test passing — the disabled-arm-passes-every-test blind spot the
-/// finding named directly.
+/// Observed RED: commenting out the `if !host_frozen(&app.pages) && wears_tab_bar(&app.route())
+/// { ... }` block in `run.rs` (leaving the `search_osc` block below it untouched) makes this test
+/// fail with "update must still step the strip on the shared predicate", while `cargo test --lib`
+/// on that same mutation reports every other test passing — the disabled-arm-passes-every-test
+/// blind spot the finding named directly.
 #[test]
-fn update_still_steps_the_shared_strip_on_search_the_way_home_and_library_do() {
+fn update_steps_the_shared_strip_on_every_route_that_wears_the_bar() {
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/run.rs"),
     ).expect("read run.rs");
     let fn_start = src.find("unsafe fn update(app: &mut App, fr: &mut Frame)")
         .expect("app::run::update must exist with its documented signature");
-    // `page_of(app.route)` until restructure phase 10, when the two popover routes it resolved
-    // were deleted and `page_of` became the identity function and went with them.
-    let needle = "matches!(app.route(), AppArg::Search)";
+    let needle = "wears_tab_bar(&app.route())";
     let arm_at = src[fn_start..].find(needle).map(|i| fn_start + i).expect(
-        "update must still branch on AppArg::Search to step the shared strip — no arm of this \
-         shape was found after fn update's own start",
+        "update must still step the strip on the shared predicate — no arm of this shape was \
+         found after fn update's own start",
     );
     let body_start = src[arm_at..].find('{').map(|i| arm_at + i)
-        .expect("the AppArg::Search condition must open a block");
+        .expect("the bar-wearing condition must open a block");
     // Bounded by this arm's OWN closing statement rather than a raw character window, so the
     // search cannot spill into the unrelated `search_osc` block right after it (which mentions
     // neither `update_home_chrome` nor `scoped_motion`) and read that as a false pass.
     let body_end = src[body_start..].find("fr.underlay_moving |= moving;").map(|i| body_start + i)
-        .expect("the AppArg::Search arm must still report underlay motion the way Home/Library do");
+        .expect("the bar-wearing arm must still report underlay motion");
     let body = &src[body_start..body_end];
     assert!(
         body.contains("update_home_chrome"),
-        "the AppArg::Search arm must call Bridge::update_home_chrome — without it the shared \
-         strip's springs and published hit rects freeze while Search is on screen — got: {body:?}"
+        "the bar-wearing arm must call Bridge::update_home_chrome — without it the shared \
+         strip's springs and published hit rects freeze while the page is on screen — got: {body:?}"
     );
+    // …and no route is named in the condition: the arm is the predicate's, not a list's.
+    let cond = &src[arm_at.saturating_sub(120)..arm_at + needle.len()];
+    assert!(!cond.contains("AppArg::Search") && !cond.contains("AppArg::Watchlist"),
+        "the arm's condition names a page; it must be `wears_tab_bar` alone — got: {cond:?}");
 }
 
 /// **Finding 1 — the Search focus fingerprint (`app::bridge::content_probe`'s Search arm) reports
@@ -1001,15 +1007,15 @@ fn update_still_steps_the_shared_strip_on_search_the_way_home_and_library_do() {
 /// pressed — the exact "grades nothing about Search" gap the finding named.
 #[test]
 fn owned_search_content_probe_reports_zone_row_col_pill_and_card_as_focus_moves() {
-    let _serial = crate::testlock::serial();
-    let session = crate::plex::session::TempSession::new("owned-search-fingerprint");
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-fingerprint");
     session.watching("synthetic-fingerprint");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.search_run(crate::stores::search::SearchCmd::SetQuery("fingerprint".into()));
-    rig.stores.search.publish_shelves_for_test(vec![crate::search::Shelf { kind: crate::search::Kind::Movie,
-        items: vec![crate::search::Item::Media(crate::pms::PmsMovie {
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("fingerprint".into()));
+    rig.stores.search.publish_shelves_for_test(vec![plx_data::search::Shelf { epoch: 0, window: Default::default(), kind: plx_data::search::Kind::Movie,
+        items: vec![plx_data::search::Item::Media(plx_data::pms::PmsMovie {
             rk: "fp-result".into(), title: "Fingerprint result".into(), ..Default::default()
         })] }]);
     frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
@@ -1039,14 +1045,55 @@ fn owned_search_content_probe_reports_zone_row_col_pill_and_card_as_focus_moves(
 
     // Up again, from the field itself, reaches the shared strip's Search pill — the same
     // transition `tests/keytable.json`'s Search "up" row records. With no library tabs seeded
-    // here the strip holds only Home (index 0) and Search (index 1), so the pill lands at 1
-    // rather than the real 4-slot device's 3 — the field is a POSITION, not a fixed constant,
+    // here the strip holds only Home (index 0), Watchlist (index 1) and Search (index 2), so the
+    // pill lands at 2 rather than the real 5-slot device's 4 — the field is a POSITION, not a fixed constant,
     // and this asserts it moved off -1 onto the strip's own answer rather than hardcoding a
     // count this test's fixture does not seed.
     frame(&mut d, &mut rig, AppArg::Search, tick(20), script_key(Key::Up, tick(20)));
     for i in 21..30 { frame(&mut d, &mut rig, AppArg::Search, tick(i), vec![]); }
     let on_strip = content_probe(&d, &rig);
     assert!(on_strip.contains("zone=Strip"), "Up from the field must reach the shared strip: {on_strip}");
-    assert!(on_strip.contains(" row=-1 col=-1 recent=-1 pill=1 card=0 "),
-        "the Search pill (Home, Search — no library tabs seeded here) sits at index 1, off this screen's own groups: {on_strip}");
+    assert!(on_strip.contains(" row=-1 col=-1 recent=-1 pill=2 card=0 "),
+        "the Search pill (Home, Watchlist, Search — no library tabs seeded here) sits at index 2, off this screen's own groups: {on_strip}");
+}
+
+/// OK on a Collections-shelf tile asks for the COLLECTION page with the hit's identity, and the
+/// app layer turns that request into `ContentArg::Collection` from the retained selection — not
+/// the item detail a bare ratingKey would open.
+#[test]
+fn owned_search_ok_on_a_collection_requests_its_collection_page() {
+    let _serial = plx_base::testlock::serial();
+    let session = plx_plex::plex::session::TempSession::new("owned-search-collection");
+    session.watching("synthetic-collection-profile");
+    plx_plex::plex::session::update(|s| {
+        let mut next = s.clone();
+        next.set_recents_for("synthetic-collection-profile", vec!["synthetic".into()]);
+        Some(next)
+    });
+    plx_plex::plex::reset_servers_for_test();
+    let a = plx_plex::plex::register_for_test("search-coll", "127.0.0.1", 1, "a", "search");
+    let hit = plx_data::search::Item::Collection(plx_data::search::CollectionHit {
+        item: plx_data::pms::PmsMovie { sid: a, rk: "50007".into(), sec: 1, title: "Synthetic set".into(),
+            kind: plx_data::pms::KIND_COLLECTION, ..Default::default() },
+        tag: 7 });
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    rig.search_run(plx_data::stores::search::SearchCmd::SetQuery("synthetic".into()));
+    rig.stores.search.publish_shelves_for_test(vec![plx_data::search::Shelf { epoch: 0, window: Default::default(),
+        kind: plx_data::search::Kind::Collection, items: vec![hit] }]);
+    frame(&mut d, &mut rig, AppArg::Search, tick(0), vec![]);
+    frame(&mut d, &mut rig, AppArg::Search, tick(1), script_key(Key::Down, tick(1)));
+    frame(&mut d, &mut rig, AppArg::Search, tick(2), script_key(Key::Ok, tick(2)));
+    for i in 3..33 { frame(&mut d, &mut rig, AppArg::Search, tick(i), vec![]); }
+    let requests = rig.take_search_reqs();
+    let (_, _, ret) = requests.iter().find(|(_, req, _)| matches!(req,
+        plx_screens::registry::SearchReq::Collection { sid, rk, tag }
+            if *sid == a && rk == "50007" && *tag == 7))
+        .expect("OK on a collection requests its page");
+    assert!(!requests.iter().any(|(_, req, _)| matches!(req,
+        plx_screens::registry::SearchReq::Detail { .. })), "never an item detail");
+    let entry = d.nav.top_page().unwrap().id;
+    let (selected, _) = rig.search_selection(&d, entry, ret.focus).unwrap();
+    assert!(matches!(selected, plx_data::search::Item::Collection(c) if c.item.rk == "50007"));
+    plx_plex::plex::reset_servers_for_test();
 }

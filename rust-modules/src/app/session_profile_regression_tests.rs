@@ -4,10 +4,10 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use crate::auth::owner::{SessionEvent, SessionWork};
-    use crate::plex::account::{AccountClient, Resource, SwitchOutcome};
-    use crate::auth::{Phase, SessionCmd, ProfileWorkIo};
-    use crate::auth::owner::{RegistryPlan, SessionEnvelope};
+    use plx_session::auth::owner::{SessionEvent, SessionWork};
+    use plx_plex::plex::account::{AccountClient, Resource, SwitchOutcome};
+    use plx_session::auth::{Phase, SessionCmd, ProfileWorkIo};
+    use plx_session::auth::owner::{RegistryPlan, SessionEnvelope};
 
     // Resource snapshots below deliberately grade private patch/order policy. They are not native
     // Client identity/token-generation or filesystem atomic-write/unlink assertions (see lane report).
@@ -30,14 +30,14 @@ mod tests {
     fn profile_rig(protected: bool) -> Bridge {
         let mut stored = cached_fixture();
         if protected {
-            stored.profiles[0].pin = Some(crate::plex::session::PinVerifier::new("4821"));
+            stored.profiles[0].pin = Some(plx_plex::plex::session::PinVerifier::new("4821"));
         }
-        let mut init = crate::auth::SessionInit::captured(stored);
+        let mut init = plx_session::auth::SessionInit::captured(stored);
         init.epoch = u64::from(u32::MAX) + 20;
         init.phase = Phase::Profiles;
         init.users = vec![
-            crate::auth::UserTile { uuid: "synthetic-kid".into(), title: "Kid".into(), protected, ..Default::default() },
-            crate::auth::UserTile { uuid: "synthetic-admin".into(), title: "Admin".into(), ..Default::default() },
+            plx_session::auth::UserTile { uuid: "synthetic-kid".into(), title: "Kid".into(), protected, ..Default::default() },
+            plx_session::auth::UserTile { uuid: "synthetic-admin".into(), title: "Admin".into(), ..Default::default() },
         ];
         Bridge::for_session_test(init)
     }
@@ -49,8 +49,8 @@ mod tests {
             std::thread::spawn(move || {
                 let SessionWork::ProfileSwitch { session, tile, pin, recently_unreachable, .. } = input
                     else { panic!("wrong worker family") };
-                let expected = crate::auth::SessionIdentity::of(&session);
-                crate::auth::profile_switch_worker_with_io(epoch, expected, session, tile, pin,
+                let expected = plx_session::auth::SessionIdentity::of(&session);
+                plx_session::auth::profile_switch_worker_with_io(epoch, expected, session, tile, pin,
                     recently_unreachable, &output, &mut { io });
             }).join().expect("profile worker panicked");
         });
@@ -61,13 +61,36 @@ mod tests {
         fn switch(&mut self, _: &AccountClient, _: &str, _: Option<&str>) -> SwitchOutcome {
             SwitchOutcome::Refused(403)
         }
-        fn resources(&mut self, _: &AccountClient) -> Option<Vec<Resource>> { panic!("refusal cannot discover") }
-        fn probe(&mut self, _: &Resource, _: &[i64]) -> (Option<crate::plex::session::SourceRef>, crate::auth::SettledProbe) { panic!("refusal cannot probe") }
+        fn resources(&mut self, _: &AccountClient) -> Result<Vec<Resource>, plx_plex::plex::account::CallEvidence> { panic!("refusal cannot discover") }
+        fn probe(&mut self, _: &Resource, _: &[i64]) -> (Option<plx_plex::plex::session::SourceRef>, plx_session::auth::SettledProbe) { panic!("refusal cannot probe") }
         fn gap(&mut self) { panic!("refusal cannot wait") }
+    }
+
+    /// **A profile switch that never commits changes no identity.** The grant a person's consent
+    /// minted stays live while a switch is attempted and refused: the identity moves at the switch's
+    /// COMMIT (`RegistryPlan::Install` with `RosterCommit::Switch`), never at its launch.
+    #[test]
+    fn a_refused_profile_switch_leaves_the_live_plaintext_grant_alone() {
+        let _g = plx_base::testlock::serial();
+        plx_plex::plex::reset_servers_for_test();
+        plx_plex::plex::grant::reset_for_test();
+        let origin = plx_plex::plex::Origin::http("192.168.0.10", 32400);
+        plx_plex::plex::grant::mint(plx_plex::plex::grant::scope(), "lan-http", &origin,
+            &plx_plex::plex::grant::eligible_evidence_for_test()).unwrap();
+        let mut rig = profile_rig(false);
+        let mut d = Dispatcher::<AppHost>::new();
+        inject(&mut rig, RefusedIo);
+        command(&mut rig, &mut d, SessionCmd::SelectProfile { index: 0, pin: None });
+        let records = rig.session_adapter.take_results();
+        frame(&mut rig, &mut d, records);
+        assert_eq!(plx_plex::plex::grant::granted_origin("lan-http"), Some(origin));
+        plx_plex::plex::grant::reset_for_test();
+        plx_plex::plex::reset_servers_for_test();
     }
 
     #[test]
     fn r2a_offline_worker_completion_waits_for_main_application() {
+        let _serial = plx_base::testlock::serial();
         let mut rig = profile_rig(false);
         let mut d = Dispatcher::<AppHost>::new();
         let before = resources(&mut rig);
@@ -147,6 +170,7 @@ mod tests {
 
     #[test]
     fn a_late_profile_observation_cannot_replace_a_newer_flow() {
+        let _serial = plx_base::testlock::serial();
         let mut rig = profile_rig(true);
         let mut d = Dispatcher::<AppHost>::new();
         inject(&mut rig, RefusedIo);
@@ -178,32 +202,32 @@ mod tests {
     impl ProfileWorkIo for OnlineIo {
         fn switch(&mut self, _: &AccountClient, uuid: &str, _: Option<&str>) -> SwitchOutcome {
             assert_eq!(uuid, "synthetic-kid");
-            SwitchOutcome::Switched(crate::plex::account::SwitchedUser {
+            SwitchOutcome::Switched(plx_plex::plex::account::SwitchedUser {
                 uuid: uuid.into(), title: "Kid".into(), auth_token: "synthetic-switched-account".into(),
                 ..Default::default()
             })
         }
-        fn resources(&mut self, _: &AccountClient) -> Option<Vec<Resource>> {
-            Some(vec![
+        fn resources(&mut self, _: &AccountClient) -> Result<Vec<Resource>, plx_plex::plex::account::CallEvidence> {
+            Ok(vec![
                 serde_json::from_str(r#"{"clientIdentifier":"synthetic-server","name":"Synthetic server","provides":"server","owned":true,"accessToken":"synthetic-kid-token"}"#).unwrap(),
                 serde_json::from_str(r#"{"clientIdentifier":"synthetic-share","name":"Synthetic share","provides":"server","owned":false,"accessToken":"synthetic-share-token"}"#).unwrap(),
             ])
         }
-        fn probe(&mut self, resource: &Resource, _: &[i64]) -> (Option<crate::plex::session::SourceRef>, crate::auth::SettledProbe) {
+        fn probe(&mut self, resource: &Resource, _: &[i64]) -> (Option<plx_plex::plex::session::SourceRef>, plx_session::auth::SettledProbe) {
             let expected = if self.probes == 0 { "synthetic-server" } else { "synthetic-share" };
             assert_eq!(resource.client_identifier, expected);
             assert!(self.probes < 2);
             self.probes += 1;
             let address = if resource.owned { "127.0.0.2" } else { "127.0.0.3" };
-            let source = crate::plex::session::SourceRef {
+            let source = plx_plex::plex::session::SourceRef {
                 machine_id: resource.client_identifier.clone(), name: resource.name.clone(),
                 owned: resource.owned, token: resource.access_token.clone(), address: address.into(),
                 port: 32400, origin_url: format!("http://{address}:32400"),
                 ..Default::default()
             };
-            (Some(source), crate::auth::settled_probe(
-                &crate::plex::probe::plan(resource, crate::plex::CredentialPolicy::HttpsOnly),
-                crate::plex::probe::Outcome::Reachable, Some(crate::plex::probe::Location::Local),
+            (Some(source), plx_session::auth::settled_probe(
+                &plx_plex::plex::probe::plan(resource, plx_plex::plex::CredentialPolicy::HttpsOnly),
+                plx_plex::plex::probe::Outcome::Reachable, Some(plx_plex::plex::probe::Location::Local),
                 Some(address.into())))
         }
         fn gap(&mut self) {
@@ -232,6 +256,7 @@ mod tests {
 
     #[test]
     fn successful_profile_stream_preserves_handoff_preferences_and_erase_order() {
+        let _serial = plx_base::testlock::serial();
         // Separate legal request histories: a stream permits one terminal roster, not the several
         // terminal ProfileRoster values the legacy mailbox test manufactured on one epoch.
         for roster_before_take in [true, false] {
@@ -244,7 +269,7 @@ mod tests {
                 // Both valid observations are ingested in the same ordinary dispatcher batch. The
                 // second reaches the owner while the first observation's commit ACK is queued.
                 records.push(roster);
-                for _ in 0..crate::ui::dispatch::MAX_STEPS_PRE + crate::ui::dispatch::MAX_STEPS_POST {
+                for _ in 0..plx_ui::dispatch::MAX_STEPS_PRE + plx_ui::dispatch::MAX_STEPS_POST {
                     execute_session_command(&mut d, SessionCmd::NoteDeleteLeftovers(0));
                 }
                 let results = records.into_iter().map(|record|
@@ -264,17 +289,17 @@ mod tests {
                 command(&mut rig, &mut d, SessionCmd::TakeReady);
                 let disk = &mut rig.session_adapter.fixture_resources().disk;
                 assert_eq!(disk.user.uuid, "synthetic-kid");
-                disk.recent_searches.push(crate::plex::session::RecentSearches {
+                disk.recent_searches.push(plx_plex::plex::session::RecentSearches {
                     user: "synthetic-kid".into(), terms: vec!["newer preference".into()],
                     extensions: Default::default(),
                 });
-                disk.playback_quality = Some(crate::plex::session::PlaybackQuality::Original);
+                disk.prefs.playback_quality = Some(plx_plex::plex::session::PlaybackQuality::Original);
                 assert!(!disk.sources.iter().any(|source| source.machine_id == "synthetic-share" && source.dialable()));
                 frame(&mut rig, &mut d, vec![roster]);
                 drain_carried(&mut rig, &mut d);
                 let disk = &rig.session_adapter.fixture_resources().disk;
                 assert_eq!(disk.recent_searches[0].terms, ["newer preference"]);
-                assert_eq!(disk.playback_quality, Some(crate::plex::session::PlaybackQuality::Original));
+                assert_eq!(disk.prefs.playback_quality, Some(plx_plex::plex::session::PlaybackQuality::Original));
             }
             assert!(rig.take_session_ready().is_some());
             assert!(rig.take_session_ready().is_none());
@@ -315,21 +340,21 @@ mod tests {
         }
     }
 
-    impl crate::auth::ProfileWorkIo for OfflineIo {
+    impl plx_session::auth::ProfileWorkIo for OfflineIo {
         fn switch(&mut self, _: &AccountClient, _: &str, _: Option<&str>) -> SwitchOutcome {
             SwitchOutcome::Unreachable
         }
-        fn resources(&mut self, _: &AccountClient) -> Option<Vec<Resource>> {
+        fn resources(&mut self, _: &AccountClient) -> Result<Vec<Resource>, plx_plex::plex::account::CallEvidence> {
             panic!("offline seating must not fetch resources")
         }
-        fn probe(&mut self, _: &Resource, _: &[i64]) -> (Option<crate::plex::session::SourceRef>, crate::auth::SettledProbe) {
+        fn probe(&mut self, _: &Resource, _: &[i64]) -> (Option<plx_plex::plex::session::SourceRef>, plx_session::auth::SettledProbe) {
             panic!("offline seating must not probe")
         }
         fn gap(&mut self) { panic!("offline seating has no probe gap") }
     }
 
-    fn cached_fixture() -> crate::plex::session::Session {
-        use crate::plex::session::{ProfileCreds, ServerRef, Session, SourceRef, UserRef};
+    fn cached_fixture() -> plx_plex::plex::session::Session {
+        use plx_plex::plex::session::{ProfileCreds, ServerRef, Session, SourceRef, UserRef};
         let source = SourceRef { machine_id: "synthetic-server".into(), name: "Synthetic server".into(),
             address: "127.0.0.1".into(), port: 32400, origin_url: "http://127.0.0.1:32400".into(),
             token: "synthetic-kid-token".into(), owned: true, ..Default::default() };
@@ -349,22 +374,23 @@ mod tests {
 
     #[test]
     fn real_profile_worker_injection_reaches_owner_and_handoff_without_global_state() {
-        let mut init = crate::auth::SessionInit::captured(cached_fixture());
-        init.phase = crate::auth::Phase::Profiles;
-        init.users = vec![crate::auth::UserTile { uuid: "synthetic-kid".into(), title: "Kid".into(),
+        let _serial = plx_base::testlock::serial();
+        let mut init = plx_session::auth::SessionInit::captured(cached_fixture());
+        init.phase = plx_session::auth::Phase::Profiles;
+        init.users = vec![plx_session::auth::UserTile { uuid: "synthetic-kid".into(), title: "Kid".into(),
             ..Default::default() }];
         let mut rig = Bridge::for_session_test(init);
         rig.session_adapter.inject_fixture_work(1, |output, input| {
             let SessionWork::ProfileSwitch { session, tile, pin, recently_unreachable, .. } = input
                 else { panic!("selection launched another worker family") };
-            let expected = crate::auth::SessionIdentity::of(&session);
-            crate::auth::profile_switch_worker_with_io(2, expected, session, tile, pin,
+            let expected = plx_session::auth::SessionIdentity::of(&session);
+            plx_session::auth::profile_switch_worker_with_io(2, expected, session, tile, pin,
                 recently_unreachable, &output, &mut OfflineIo);
         });
         let mut d = Dispatcher::<AppHost>::new();
-        execute_session_command(&mut d, crate::auth::SessionCmd::SelectProfile { index: 0, pin: None });
+        execute_session_command(&mut d, plx_session::auth::SessionCmd::SelectProfile { index: 0, pin: None });
         d.frame_with(&mut rig, Tick::default(), Vec::new(), Vec::new(), &mut NoTap, false);
-        assert_eq!(rig.auth_read().0.phase, crate::auth::Phase::Switching);
+        assert_eq!(rig.auth_read().0.phase, plx_session::auth::Phase::Switching);
         assert_eq!(rig.session_adapter.fixture_resources().disk.user.uuid, "synthetic-admin");
         assert!(rig.session_adapter.fixture_resources().registry_writes.is_empty());
         let records = rig.session_adapter.take_results();
@@ -372,11 +398,11 @@ mod tests {
         assert!(records[0].terminal, "actual offline worker completes with terminal Ready");
         let results = records.into_iter().map(|record| (record.addr, AppMsg::Session(SessionEvent::Result(record)))).collect();
         d.frame_with(&mut rig, Tick { ms: 16, dt_us: 16_000 }, Vec::new(), results, &mut NoTap, false);
-        assert_eq!(rig.auth_read().0.phase, crate::auth::Phase::Ready);
+        assert_eq!(rig.auth_read().0.phase, plx_session::auth::Phase::Ready);
         assert_eq!(rig.session.snapshot_init().persisted.user.uuid, "synthetic-kid");
         assert_eq!(rig.session_adapter.fixture_resources().disk.user.uuid, "synthetic-admin",
             "Ready is not the credential-save handoff");
-        execute_session_command(&mut d, crate::auth::SessionCmd::TakeReady);
+        execute_session_command(&mut d, plx_session::auth::SessionCmd::TakeReady);
         d.frame_with(&mut rig, Tick { ms: 32, dt_us: 16_000 }, Vec::new(), Vec::new(), &mut NoTap, false);
         assert!(rig.take_session_ready().is_some());
         assert!(rig.take_session_ready().is_none());

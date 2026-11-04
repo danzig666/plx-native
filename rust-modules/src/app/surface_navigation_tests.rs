@@ -1,17 +1,23 @@
 //! Route/chrome identity and the surface architecture: profile/card menus, Settings and
 //! player panels, and the heartbeat word each mounted screen reports.
+//!
+//! The tests marked `#[cfg(feature = "hostsim")]` below (the item-menu opener-lift ones) run ONLY
+//! with that feature: `make test-crate C=app T=<filter>` filters them out and exits 0. Run them with
+//! `CARGO_INCREMENTAL=0 PATH="$HOME/.cargo/bin:$PATH" cargo test --lib -p plxnative-modules --features hostsim -- <filter>`
+//! from `rust-modules/`.
 
 use super::*;
-use crate::ui::machine::Chrome;
-use crate::ui::screen::ScreenArg;
+use plx_machine::machine::Chrome;
+use plx_ui::screen::ScreenArg;
+use plx_screens::player::HudPolicy;
 #[allow(unused_imports)]
 use super::test_support::*;
 use super::test_support::{frame, every_route};
 
 #[test]
 fn content_instances_compare_item_identity_and_keep_distinct_entries() {
-    let a = AppArg::Content(ContentArg::Detail { sid: crate::plex::ServerId::UNSET, rk: "1001".into() });
-    let b = AppArg::Content(ContentArg::Detail { sid: crate::plex::ServerId::UNSET, rk: "1002".into() });
+    let a = AppArg::Content(ContentArg::Detail { sid: plx_plex::plex::ServerId::UNSET, rk: "1001".into() });
+    let b = AppArg::Content(ContentArg::Detail { sid: plx_plex::plex::ServerId::UNSET, rk: "1002".into() });
     assert_eq!(a.id(), b.id());
     assert!(!a.same_instance(&b));
     assert!(a.same_instance(&a.clone()));
@@ -21,7 +27,7 @@ fn content_instances_compare_item_identity_and_keep_distinct_entries() {
 #[test]
 fn a_page_arg_wears_the_chrome_its_own_table_says() {
     for r in every_route() {
-        let want = if matches!(r, AppArg::Home | AppArg::Library | AppArg::Search) {
+        let want = if matches!(r, AppArg::Home | AppArg::Search | AppArg::Watchlist) || r.is_library_family() {
             Chrome::TabBar
         } else {
             Chrome::None
@@ -44,10 +50,10 @@ fn a_page_arg_wears_the_chrome_its_own_table_says() {
 /// route. It is graded against `route_word(r)` and not against `route_word(page_of(r))`
 /// because `page_of` is gone with the two routes that made it more than the identity: since
 /// phase 10 the profile and card menus are SURFACES, their words are the overlay alphabet's
-/// (`overlay_word`), and `every_route()` is nine pages with nothing to fold.
+/// (`overlay_word`), and `every_route()` is every page argument with nothing to fold.
 #[test]
 fn every_route_mounts_a_screen_that_names_the_heartbeat_word() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     for r in every_route() {
         let mut d = Dispatcher::<AppHost>::new();
         let mut rig = Bridge::for_test(|| 0);
@@ -64,10 +70,10 @@ fn every_route_mounts_a_screen_that_names_the_heartbeat_word() {
 
 #[test]
 fn a_store_command_through_the_dispatcher_steps_the_store_and_notifies_the_page() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    let _ = crate::stores::take_notices();
+    let _ = rig.stores.take_notices();
     // **This used to also assert the retired route-word page's generic notice COUNTER, and
     // cannot any more.** Search left that population with the phase 7 cutover
     // and `Player` with phase 9, and `Account`/`ItemMenu` never had a page of their own —
@@ -82,7 +88,7 @@ fn a_store_command_through_the_dispatcher_steps_the_store_and_notifies_the_page(
     let before = rig.stores.gen(StoreId::Search);
     d.emit(
         MachineId::Nav,
-        Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(crate::stores::search::SearchCmd::Reset))),
+        Fx::App(AppFx::Store(StoreId::Search, StoreCmd::Search(plx_data::stores::search::SearchCmd::Reset))),
     );
     frame(&mut d, &mut rig, route.clone(), tick(1), vec![]);
     assert_eq!(rig.stores.gen(StoreId::Search), before + 1, "the store was stepped in the drain");
@@ -93,7 +99,7 @@ fn a_store_command_through_the_dispatcher_steps_the_store_and_notifies_the_page(
         MachineId::Nav,
         Fx::Deliver(
             MachineId::Store(StoreId::Browse.ord()),
-            Delivery::Machine(AppMsg::Store(StoreCmd::Search(crate::stores::search::SearchCmd::Reset))),
+            Delivery::Machine(AppMsg::Store(StoreCmd::Search(plx_data::stores::search::SearchCmd::Reset))),
         ),
     );
     frame(&mut d, &mut rig, route.clone(), tick(4), vec![]);
@@ -128,9 +134,9 @@ fn a_store_command_through_the_dispatcher_steps_the_store_and_notifies_the_page(
 /// which an op is parked but not yet applied for `reset_for_profile` to catch.
 #[test]
 fn switching_profile_leaves_the_container_holding_nothing_of_the_previous_profile() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::with_transition(
-        Box::new(crate::ui::containers::transition::PageDip::new()));
+        Box::new(plx_ui::containers::transition::PageDip::new()));
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     for i in 1..20u32 { super::frame(&mut d, &mut rig, tick(i * 16), vec![]); }
@@ -169,6 +175,35 @@ fn switching_profile_leaves_the_container_holding_nothing_of_the_previous_profil
     );
 }
 
+/// **A profile switch dismisses an open Settings surface, at once.** The Playback page names the
+/// seated profile and lists that profile's own picks, so it must not survive the switch to the next
+/// one: it would say "for Maya" over Noah's values for as long as it stayed up. The surfaces go
+/// in `Navigator::reset_for_profile` (they are dropped first, then the page stack), which is
+/// called before the switch commits. Graded the moment `switch_profile` returns, before any frame
+/// runs: `Root(Profiles)` alone would sweep the surface a frame LATER (it retires the page the
+/// surface stands over), so only the reset itself can make this true immediately, and a frame in
+/// between would be a window in which the old profile's page is still drawn.
+///
+/// Not behind `hostsim`: nothing here needs the desktop simulator, so `make check` runs it.
+#[test]
+fn a_profile_switch_dismisses_an_open_settings_surface() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    open_settings_at(&mut d, SettingsPage::Playback);
+    frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+    assert!(settings_up(&d), "the Settings surface is up on the Playback page");
+    assert_eq!(overlay_word(&d), Some("playback"));
+
+    switch_profile(&mut d);
+    assert!(!settings_up(&d), "the switch dismissed Settings before any frame ran");
+
+    for i in 0..20u32 { frame(&mut d, &mut rig, AppArg::Profiles, tick(2 + i), vec![]); }
+    assert!(!settings_up(&d), "and it stays gone behind the picker");
+    assert!(d.nav.top_page().is_some_and(|e| e.arg == AppArg::Profiles));
+}
+
 /// **An app switch parks the tree; it does not tear the session's page history down.**
 ///
 /// RED FIRST (D1). The 0x103/0x106 lifecycle used to `suspend()` the tree and then write
@@ -188,7 +223,7 @@ fn switching_profile_leaves_the_container_holding_nothing_of_the_previous_profil
 /// rather than the detail page the session was launched from.
 #[test]
 fn an_app_switch_parks_the_page_stack_and_gives_the_same_entries_back() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -220,7 +255,7 @@ fn an_app_switch_parks_the_page_stack_and_gives_the_same_entries_back() {
 
 /// **Every test in this module that calls [`frame`] must hold `testlock::serial()`, even when
 /// it asserts nothing about the stores.** `frame`'s second act is
-/// `crate::stores::take_notices()`, which DRAINS a process-global dirty flag — so a test that
+/// `plx_data::stores::take_notices()`, which DRAINS a process-global dirty flag — so a test that
 /// merely walks the nav tree still consumes whatever notice another test was about to observe.
 /// This one had no guard until 2026-09-07 and stole
 /// `a_store_command_through_the_dispatcher_steps_the_store_and_notifies_the_page`'s notice at
@@ -233,7 +268,7 @@ fn an_app_switch_parks_the_page_stack_and_gives_the_same_entries_back() {
 /// a month and broken from `app::mod` anyway, through `every_surface_word`.
 #[test]
 fn route_flips_preserve_content_and_player_origin_entries() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     assert_eq!(frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]).0, "home");
@@ -250,7 +285,7 @@ fn route_flips_preserve_content_and_player_origin_entries() {
         frame(&mut d, &mut rig, AppArg::Player, tick(3), vec![]).0,
         "player"
     );
-    assert_eq!(d.top_screen().map(|s| s.render()), Some(crate::ui::screen::RenderStrategy::VideoPlane));
+    assert_eq!(d.top_screen().map(|s| s.render()), Some(plx_ui::screen::RenderStrategy::VideoPlane));
     assert_eq!(d.nav.tabs.stack.depth(), 3);
     frame(&mut d, &mut rig, detail_arg("1001"), tick(4), vec![]);
     assert_eq!(d.nav.top_page().map(|e| e.id), detail);
@@ -273,7 +308,7 @@ fn route_flips_preserve_content_and_player_origin_entries() {
 /// than by actually pushing 16 pages, since the fallback does not care HOW the entry went away.
 #[test]
 fn player_exit_with_a_gone_origin_returns_to_the_existing_home_entry() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -321,14 +356,14 @@ fn player_exit_with_a_gone_origin_returns_to_the_existing_home_entry() {
 /// right: "home"` at `frame_with_results`'s `debug_assert_eq!`.
 #[test]
 fn leaving_the_player_with_a_panel_up_returns_the_page_in_the_route_s_own_frame() {
-    use crate::screens::player::overlay::OverlayKind;
-    let _g = crate::testlock::serial();
+    use plx_screens::player::overlay::OverlayKind;
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     let home = d.nav.top_page().map(|e| e.id);
     assert_eq!(frame(&mut d, &mut rig, AppArg::Player, tick(1), vec![]).0, "player");
-    open_player_overlay(crate::route::idle_session_for_test(), &mut d, OverlayKind::Info);
+    open_player_overlay(plx_media::route::idle_session_for_test(), plx_data::stores::metadata::MetadataStore::default().view(), &mut d, OverlayKind::More { page: None });
     frame(&mut d, &mut rig, AppArg::Player, tick(2), vec![]);
     assert!(player_overlay_up(&d), "the panel is on the player page's own ModalStack");
     // …`exit_player`'s own order: the panels are dismissed, then the route is the origin's.
@@ -338,12 +373,105 @@ fn leaving_the_player_with_a_panel_up_returns_the_page_in_the_route_s_own_frame(
     assert!(!player_overlay_up(&d), "the panel left with the page that hosted it");
 }
 
+/// **Issue #163**: the diagnostics ("Stats for nerds") panel painted over the player's own
+/// overlay panels — sharpest with `More`, since that popover carries the very toggle the panel
+/// answers to, so a viewer who turned Stats on from `More` had no way back to the control that
+/// turns it off. `bridge::player_diagnostics_visible` is the decision `app/run.rs`'s player
+/// branch gates `app.diagnostics.draw()` on; this exercises it directly against the real
+/// `ModalStack`, across every overlay kind — the bug generalizes to `Tracks` too, since each is
+/// anchored well inside the panel's near-full-width rect.
+#[test]
+fn player_diagnostics_hide_behind_any_open_player_overlay() {
+    use plx_screens::player::overlay::OverlayKind;
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    let mut t = 0u32;
+    let mut next = |d: &mut Dispatcher<AppHost>| {
+        t += 1;
+        frame(d, &mut rig, AppArg::Player, tick(t), vec![])
+    };
+    next(&mut d);
+    assert!(
+        player_diagnostics_visible(&d),
+        "nothing is open yet — the panel draws as it always did"
+    );
+    for kind in [
+        OverlayKind::Tracks { tab: 0 },
+        OverlayKind::More { page: None },
+    ] {
+        open_player_overlay(
+            plx_media::route::idle_session_for_test(),
+            plx_data::stores::metadata::MetadataStore::default().view(),
+            &mut d,
+            kind,
+        );
+        next(&mut d);
+        assert!(
+            !player_diagnostics_visible(&d),
+            "{kind:?} is open — the panel that carries its own controls must stay reachable"
+        );
+        dismiss_player_overlays(&mut d);
+        // The dismissed surface fades rather than vanishing (`ModalStack::dismiss` — `Phase::
+        // Closing` until its own spring `settled()`), so `player_overlay_up` — and therefore
+        // this predicate — keeps answering "up" for a run of frames after the request. Drive
+        // enough of them that the fade actually finishes before asking again.
+        for _ in 0..200 {
+            next(&mut d);
+            if player_diagnostics_visible(&d) {
+                break;
+            }
+        }
+        assert!(
+            player_diagnostics_visible(&d),
+            "{kind:?} closed — the panel draws again once the dismiss fade settles"
+        );
+    }
+}
+
+/// **The Stats panel stays behind an open HUD section too.** On `main` the Info card and the Chapters strip were
+/// `PlayerOverlay` surfaces, so `player_diagnostics_visible` held the panel back while either was up (and while one
+/// faded out); a section is the page's own state, not a surface, so the gate reads the page's sections as well. The
+/// rows are the ones `player_diagnostics_hide_behind_any_open_player_overlay` had before the switch: open, and
+/// closed once the fade has settled.
+#[test]
+fn player_diagnostics_hide_behind_an_open_hud_section() {
+    use plx_appkit::player_hud::command::Section;
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    let mut t = 0u32;
+    let mut next = |d: &mut Dispatcher<AppHost>| {
+        t += 1;
+        frame(d, &mut rig, AppArg::Player, tick(t * 16), vec![])
+    };
+    next(&mut d);
+    assert!(player_diagnostics_visible(&d), "nothing is open yet");
+    toggle_player_section(&mut d, Section::Info);
+    for _ in 0..4 {
+        next(&mut d);
+    }
+    assert!(player(&d).is_some_and(|p| p.hud.sections.contains(Section::Info)), "premise: the section opened");
+    assert!(!player_diagnostics_visible(&d), "Info is open: the panel stays clear of it");
+    toggle_player_section(&mut d, Section::Info);
+    next(&mut d);
+    assert!(player(&d).is_some_and(|p| !p.hud.sections.any()), "premise: the section is closed");
+    assert!(!player_diagnostics_visible(&d), "a section fading out still counts, as a fading panel did");
+    for _ in 0..200 {
+        next(&mut d);
+        if player_diagnostics_visible(&d) {
+            break;
+        }
+    }
+    assert!(player_diagnostics_visible(&d), "closed: the panel draws again once the fade has settled");
+}
+
 /// Phase 5b: the Settings surface is PRESENTED on the tree, owns input from its first frame,
 /// names the heartbeat word of its top page, walks its own stack on BACK (root → Legal →
 /// back → root) and only then lets the container dismiss it — with the app's page untouched.
 #[test]
 fn the_settings_surface_owns_input_and_walks_its_own_stack() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -355,7 +483,7 @@ fn the_settings_surface_owns_input_and_walks_its_own_stack() {
     assert_eq!(overlay_word(&d), Some("settings"));
     assert_ne!(d.nav.input_owner(), home_owner, "Settings takes input from its Home host");
     assert!(host_frozen(&d));
-    // DOWN, DOWN to Legal notices (Favourites is absent signed out: Privacy, Legal, About)
+    // DOWN x3 to Legal notices (signed out: Playback, Language, Privacy, Legal, About)
     let mut t = 2;
     let mut press = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, key: Key| {
         let ev = script_key(key, tick(t));
@@ -364,7 +492,9 @@ fn the_settings_surface_owns_input_and_walks_its_own_stack() {
         frame(d, rig, AppArg::Home, tick(t), vec![]);
         t += 1;
     };
-    press(&mut d, &mut rig, Key::Down);
+    for _ in 0..3 {
+        press(&mut d, &mut rig, Key::Down);
+    }
     press(&mut d, &mut rig, Key::Ok);
     assert_eq!(overlay_word(&d), Some("legal"), "OK on Legal notices pushed the index");
     press(&mut d, &mut rig, Key::Back);
@@ -379,6 +509,110 @@ fn the_settings_surface_owns_input_and_walks_its_own_stack() {
     assert_eq!(d.nav.tabs.stack.depth(), 1, "the app's page never moved");
 }
 
+fn hud_preview_world(name: &str) -> World {
+    let mut world = World::new(name);
+    world.step(vec![]);
+    let index = plx_data::hudpacks::catalog::parse(include_bytes!(
+        "../../../tests/fixtures/hud-gallery/index.json"
+    )).unwrap();
+    let sha = index.entries.iter().find(|package| package.name == "Reference").unwrap().sha();
+    open_settings_at(&mut world.d, SettingsPage::HudDetail(sha));
+    world.settle(40);
+    let list = plx_screens::hud_settings::HudList {
+        catalog: plx_data::hudpacks::catalog::Snapshot {
+            index: Some(std::sync::Arc::new(index)),
+            ..Default::default()
+        },
+        gallery_enabled: true,
+        app_version: "0.10.0".into(),
+        language_tag: "en".into(),
+        ..Default::default()
+    };
+    assert_eq!(world.bridge.huds_pages.len(), 1);
+    world.bridge.huds_pages[0].0.send(list.clone()).unwrap();
+    world.frames(2);
+    assert_eq!(overlay_word(&world.d), Some("hud-detail"));
+    world.press(Key::Ok);
+    assert_eq!(world.bridge.huds_pages.len(), 2);
+    for (page, _) in &world.bridge.huds_pages { page.send(list.clone()).unwrap(); }
+    // Let the shared route spring settle: during a push both pages register drawn stops.
+    world.settle(60);
+    assert_eq!(overlay_word(&world.d), Some("hud-preview"));
+    world
+}
+
+fn hud_preview_scene(world: &World) -> u32 {
+    let mut probe = String::new();
+    world.d.nav.modals.top().unwrap().entry.inst.as_ref().unwrap().screen.state().probe(&mut probe);
+    // The surface reports pages bottom-to-top; read the active preview, not its opener's scene.
+    probe.rsplit_once("scene=").expect("HUD scene in the logical state").1
+        .split(|ch: char| !ch.is_ascii_digit()).next().unwrap().parse().unwrap()
+}
+
+fn hud_preview_stops(world: &mut World) -> Vec<plx_ui::screen::Stop<u32>> {
+    let owner = world.d.nav.modals.top().unwrap().entry.id;
+    let parts = CxParts {
+        tick: tick(world.frame),
+        press: Default::default(),
+        focus: plx_machine::machine::FocusRead {
+            current: world.d.input.engine.current(InputOwner::Entry(owner)),
+            ..Default::default()
+        },
+        owner: InputOwner::Entry(owner),
+    };
+    let cx = parts.cx::<AppHost>(world.bridge.views(), world.bridge.measure());
+    let mut draw = plx_ui::screen::DrawFrame::new(&cx, plx_ui::Painter::recording());
+    let surface = world.d.nav.modals.surface_mut(owner).unwrap().entry.inst.as_mut().unwrap();
+    plx_ui::record_walk(|| plx_ui::screen::record_stops_while_recording(|| {
+        plx_gfx::gfx::without_frame_clear(|| surface.screen.draw(&mut draw));
+    }));
+    draw.into_stops()
+}
+
+#[test]
+fn hud_preview_remote_ok_commits_scenes_and_the_back_control() {
+    let mut world = hud_preview_world("hud-preview-remote");
+    world.press(Key::Right);
+    world.press(Key::Right);
+    assert_eq!(hud_preview_scene(&world), 0, "focus travel does not select a scene");
+    world.press(Key::Ok);
+    assert_eq!(hud_preview_scene(&world), 1, "OK release selects Chapters & info");
+    world.press(Key::Right);
+    world.press(Key::Ok);
+    assert_eq!(hud_preview_scene(&world), 2, "OK release selects Up Next");
+    for _ in 0..3 { world.press(Key::Left); }
+    world.press(Key::Ok);
+    assert_eq!(overlay_word(&world.d), Some("hud-detail"), "the Back control returns to the opener");
+}
+
+#[test]
+fn hud_preview_pointer_release_commits_scenes_and_the_back_control() {
+    let mut world = hud_preview_world("hud-preview-pointer");
+    for (elem, scene) in [(2, 1), (3, 2), (0, 2)] {
+        let stops = hud_preview_stops(&mut world);
+        let owner = world.d.nav.modals.top().unwrap().entry.id;
+        let matching = stops.iter().filter(|stop| stop.key.entry == owner && stop.key.elem == elem)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "only the settled preview contributes this control");
+        assert_eq!(matching[0].activate, plx_ui::screen::Activate::Press,
+            "the click targets the preview control, not its opening table row");
+        let rect = matching[0].rect;
+        world.d.input.hit.fill(stops);
+        world.d.input.hit.swap();
+        let before = hud_preview_scene(&world);
+        world.step(vec![click_input(rect.cx(), rect.cy(), tick(world.frame + 1))]);
+        assert!(world.d.input.arm.is_some(), "pointer down uses the shared press arm");
+        assert_eq!(hud_preview_scene(&world), before, "pointer down alone does not activate");
+        world.step(vec![release_input(tick(world.frame + 1))]);
+        world.frames(28);
+        if elem == 0 {
+            assert_eq!(overlay_word(&world.d), Some("hud-detail"), "pointer release on Back returns to the opener");
+        } else {
+            assert_eq!(hud_preview_scene(&world), scene, "pointer release selects its scene");
+        }
+    }
+}
+
 /// **Phase 10: the profile menu is a SURFACE over the page whose chip was pressed.**
 ///
 /// `Route::Account { over: BarHost }` existed to answer three questions the container answers
@@ -389,7 +623,7 @@ fn the_settings_surface_owns_input_and_walks_its_own_stack() {
 /// chip used to cut the page underneath to Home.
 #[test]
 fn the_profile_menu_is_a_surface_over_the_page_whose_chip_was_pressed() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     for (route, word) in [
         (AppArg::Home, "home"),
         (AppArg::Library, "library"),
@@ -448,7 +682,7 @@ fn the_profile_menu_is_a_surface_over_the_page_whose_chip_was_pressed() {
 /// disappearing mid-hold — and the assertion that catches it is the same one each time.
 #[test]
 fn the_card_menu_is_a_surface_over_the_page_the_hold_happened_on() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     for (route, word) in [
         (AppArg::Home, "home"),
         (AppArg::Library, "library"),
@@ -461,7 +695,7 @@ fn the_card_menu_is_a_surface_over_the_page_the_hold_happened_on() {
         frame(&mut d, &mut rig, route.clone(), tick(0), vec![]);
         let host = d.nav.top_page().expect("a host page").id;
         let host_owner = d.nav.input_owner();
-        let mut row = crate::pms::PmsMovie::default();
+        let mut row = plx_data::pms::PmsMovie::default();
         row.rk = "42".into();
         row.kind = 3;
         row.show_rk = "7".into();
@@ -506,6 +740,162 @@ fn the_card_menu_is_a_surface_over_the_page_the_hold_happened_on() {
     }
 }
 
+/// **Opening the item menu leaves the card's press to its release spring, and the opener lift
+/// draws at that press's own scale.** The press is the ONE owner of the card's motion: the
+/// dispatcher abandoned it when the hold was answered (`cancel_press`, the underdamped release
+/// spring), and the menu opening neither ends it early (the card would jump from its dip to its
+/// pop in one frame, 0.8.0-rc.3) nor starts a second animation. The lift is the page's card drawn
+/// again above the dim: handed the SAME scale the page reads, the two never disagree, whatever
+/// frame the spring is on. A lift fixed at rest drew the pop while the page (and the host snapshot
+/// taken from it) still held the dip, which is the doubled title the owner saw. The card hold is
+/// armed on `d.input.press` — the legacy `App.input.press` is the player control rows' alone.
+#[test]
+fn opening_the_item_menu_leaves_the_press_springing_and_the_opener_lift_follows_it() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    let host = d.nav.top_page().unwrap().id;
+    let mut row = plx_data::pms::PmsMovie::default();
+    row.rk = "42".into();
+    row.kind = 0;
+    // The press a card hold arms: `InputMachine::arm` sets BOTH the press and the arm record, so
+    // `cancel_press` (what the dispatcher does when the screen answers the hold) finds an arm to
+    // abandon and really starts the spring-back. Arming the bare `press` alone leaves `arm` None
+    // and `cancel_press` a no-op. The whole chain from a real key hold through `content_requests`
+    // is `run.rs`'s `a_real_card_hold_*` tests; this one pins the two halves that live here:
+    // opening the menu leaves the press alone, and the lift reads it.
+    d.input.arm(
+        plx_machine::machine::PressArm {
+            key: plx_machine::machine::FocusKey { entry: host, elem: 0 },
+            from: plx_machine::machine::PressFrom::Key,
+            holdable: true,
+        },
+        MachineId::Nav,
+        0,
+    );
+    for ms in (16..200).step_by(16) { d.input.press.tick(ms, 0.016); }
+    assert!(d.input.press.is_live() && d.input.press.scale() < 0.99, "dipped");
+    d.input.cancel_press(); // what the dispatcher does when it hears the hold answered
+    assert!(d.input.press.is_active() && !d.input.press.is_live(), "abandoned and springing back");
+    let dipped = d.input.press.scale();
+    assert_eq!(d.opener_press().scale, dipped, "the lift draws the card at the press's own scale");
+
+    open_item_menu(&mut d, card_menu_arg(&row, false, true, host, None, None));
+    assert!(d.input.press.is_active(), "the menu opening does not end the spring-back");
+    assert_eq!(d.input.press.scale(), dipped, "…nor move the card by a frame");
+
+    // And the lift keeps following it frame by frame, up through the overshoot to rest.
+    let mut ms = 200;
+    let mut rose = false;
+    let mut moving_frames = 0;
+    for _ in 0..80 {
+        ms += 16;
+        d.input.press.tick(ms, 0.016);
+        assert_eq!(d.opener_press().scale, d.input.press.scale(), "lift and page agree at {ms} ms");
+        // …and the context the dispatcher's lift pass really draws with is built from that press: the scale
+        // the lift paints at is the press's own, and (while it moves) not the resting 1.0 a lift
+        // that stopped reading the press would draw.
+        let lift = d.opener_parts(host, None).press.scale;
+        assert_eq!(lift, d.input.press.scale(), "the drawn lift scale is the press's at {ms} ms");
+        if (d.input.press.scale() - 1.0).abs() > 0.01 { moving_frames += 1; assert_ne!(lift, 1.0, "…not the pop at {ms} ms"); }
+        rose |= d.input.press.scale() > dipped + 0.05;
+    }
+    assert!(rose, "the spring really moved the card");
+    assert!(moving_frames > 5, "the lift was checked mid-spring, not only at rest");
+    assert!(!d.input.press.is_active());
+    assert_eq!(d.opener_press().scale, 1.0, "at rest the lift is the resting pop");
+}
+
+/// **A card hold the app takes: the release spring under the open item menu is the LIFT's, not
+/// the page's.** The page under a panel is one frozen snapshot, re-taken whenever the page raises
+/// damage (`popover::host_refresh`), and every re-take is a full-page capture that holds the next
+/// present back. The spring of #484 reported each visibly moving frame as page damage, so the open
+/// re-captured the page 7-8 times (21 fps on the set). The lifted card is now left out of the page
+/// pass and drawn only by the lift, so after the menu mounts and ONE page pass has said so, the
+/// spring raises no page damage at all. Counts the damage `begin_frame` would read per frame
+/// (`idle::take_page_damage`), over the whole spring, with the real dispatcher and Home's
+/// frames (a host test has no GL, so the page PASS itself, which is what tells the press the card
+/// is left out, is `cards::tests::the_lifted_card_is_left_out_of_the_page_pass_and_drawn_by_the_lift`;
+/// here it is said by hand after the mount frame). The control run (no lift owning the card) proves the counter sees the old behaviour.
+#[cfg(feature = "hostsim")]
+fn page_damage_frames_across_a_taken_holds_spring(lift_owns_the_card: bool) -> (usize, usize) {
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    let mut t = 0u32;
+    let run = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, t: &mut u32| {
+        *t += 1;
+        frame(d, rig, AppArg::Home, tick(*t), vec![]);
+        let damage = plx_machine::idle::take_page_damage();
+        damage
+    };
+    run(&mut d, &mut rig, &mut t);
+    rig.seed_hub_grid_for_test(3, 4);
+    for _ in 0..6 { run(&mut d, &mut rig, &mut t); }
+    let host = d.nav.top_page().unwrap().id;
+    let instance = d.nav.instance_of(host).unwrap();
+    d.emit(MachineId::Nav, plx_machine::machine::Fx::Deliver(
+        MachineId::Instance(instance),
+        plx_machine::machine::Delivery::Screen(plx_ui::screen::ScreenEvent::App(
+            plx_screens::registry::AppMsg::Home(plx_screens::registry::HomeCmd::FocusGrid { row: 0, col: 0 })))));
+    for _ in 0..40 { run(&mut d, &mut rig, &mut t); }
+    let key = d.focus().expect("the grid card is focused");
+    assert_eq!(key.entry, host);
+
+    // The hold: armed, dipped, latched long; then the app answers it (what `content_requests` does).
+    d.input.arm(
+        plx_machine::machine::PressArm { key, from: plx_machine::machine::PressFrom::Key, holdable: true },
+        MachineId::Nav,
+        t * 16,
+    );
+    for _ in 0..80 {
+        run(&mut d, &mut rig, &mut t);
+        if d.input.press.is_long(t * 16) { break; }
+    }
+    assert!(d.input.press.is_long(t * 16) && d.input.press.scale() < 0.99, "premise: a latched, dipped hold");
+    d.input.cancel_press();
+    let mut row = plx_data::pms::PmsMovie::default();
+    row.rk = "1".into();
+    row.kind = 0;
+    open_item_menu(&mut d, card_menu_arg(&row, false, true, host, Some(key), None));
+
+    // The mount frame (its page pass takes the one designed capture and the card sections say they
+    // left the card out), then the spring.
+    run(&mut d, &mut rig, &mut t);
+    assert!(item_menu_up(&d), "the menu mounted");
+    assert_eq!(d.lifted_opener(), Some((host, Some(key))));
+    plx_ui::popover::set_lift_owns(lift_owns_the_card);
+    let (mut moving, mut damaged) = (0, 0);
+    for _ in 0..40 {
+        let damage = run(&mut d, &mut rig, &mut t);
+        // A frame the spring visibly moves the card on (half a percent of its size or more).
+        if (d.input.press.scale() - 1.0).abs() > 0.005 {
+            moving += 1;
+            if damage { damaged += 1; }
+        }
+    }
+    // The flag is per thread and a later test on this thread must not inherit it.
+    plx_ui::popover::set_lift_owns(false);
+    (moving, damaged)
+}
+
+#[cfg(feature = "hostsim")]
+#[test]
+fn a_taken_holds_release_spring_raises_no_page_damage_under_the_open_menu() {
+    let _g = plx_base::testlock::serial();
+    let (moving, damaged) = page_damage_frames_across_a_taken_holds_spring(true);
+    assert!(moving > 8, "the spring ran for {moving} frames under the menu");
+    assert_eq!(damaged, 0, "none of its {moving} moving frames may be page damage (each is a full page capture)");
+}
+
+#[cfg(feature = "hostsim")]
+#[test]
+fn the_page_damage_counter_sees_a_spring_the_lift_does_not_own() {
+    let _g = plx_base::testlock::serial();
+    let (moving, damaged) = page_damage_frames_across_a_taken_holds_spring(false);
+    assert!(moving > 8 && damaged * 2 > moving, "control: {damaged} of {moving} moving frames were page damage");
+}
+
 /// **OK on a row reports ONE request and dismisses in the same drain**, carrying the row and
 /// the server the panel captured.
 ///
@@ -516,12 +906,12 @@ fn the_card_menu_is_a_surface_over_the_page_the_hold_happened_on() {
 /// nothing is read after the dismissal at all.
 #[test]
 fn a_card_menus_commit_reports_one_request_carrying_the_row_it_captured() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     let host = d.nav.top_page().unwrap().id;
-    let mut row = crate::pms::PmsMovie::default();
+    let mut row = plx_data::pms::PmsMovie::default();
     row.rk = "42".into();
     row.kind = 0; // a movie: [Go to Movie, —, Mark as Watched, Play from Start]
     row.unwatched = true;
@@ -530,9 +920,10 @@ fn a_card_menus_commit_reports_one_request_carrying_the_row_it_captured() {
     frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
     let menu = d.nav.modals.top().unwrap().entry.id;
 
-    // A movie's rows are [Go to Movie, —, Mark as Watched, Play from Start], so the SEPARATOR
-    // is index 1 and the row this test commits is index 3. Two DOWNs reach it, and the first
-    // of them is what proves the separator is not a stop: it lands on 2, not on 1.
+    // A movie's rows are [Go to Movie, —, Mark as Watched, Play from Start]; the focus elements
+    // are the rows' identities (`ItemRow`), not their positions. Two DOWNs reach the row this test
+    // commits, and the first of them is what proves the separator is not a stop: it lands on
+    // Mark as Watched, not on the rule above it.
     let mut t = 2;
     let mut press = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, key: Key| {
         let ev = script_key(key, tick(t));
@@ -542,16 +933,16 @@ fn a_card_menus_commit_reports_one_request_carrying_the_row_it_captured() {
     press(&mut d, &mut rig, Key::Down);
     assert_eq!(
         d.focus().map(|k| (k.entry, k.elem)),
-        Some((menu, 2)),
-        "the engine steps OVER the separator at index 1, which carries no action"
+        Some((menu, plx_screens::item_menu::ItemRow::MarkWatched.focus_key())),
+        "the engine steps OVER the separator, which carries no action"
     );
     press(&mut d, &mut rig, Key::Down);
-    assert_eq!(d.focus().map(|k| (k.entry, k.elem)), Some((menu, 3)));
+    assert_eq!(d.focus().map(|k| (k.entry, k.elem)), Some((menu, plx_screens::item_menu::ItemRow::PlayFromStart.focus_key())));
     press(&mut d, &mut rig, Key::Ok);
 
     let reqs = rig.take_item_menu_reqs();
     assert_eq!(reqs.len(), 1, "one commit, one request");
-    assert!(matches!(&reqs[0].act, crate::screens::item_menu::Action::PlayFromStart(rk) if rk == "42"));
+    assert!(matches!(&reqs[0].act, plx_screens::item_menu::Action::PlayFromStart(rk) if rk == "42"));
     assert!(reqs[0].from_home, "…and the trail reset the HOME root earns (`menu_leave`)");
     assert!(!reqs[0].loaded_episode);
     assert_eq!(
@@ -570,7 +961,7 @@ fn a_card_menus_commit_reports_one_request_carrying_the_row_it_captured() {
 /// **The Settings row hands one surface to another without ever un-freezing the host** (§16.5).
 ///
 /// The two ops are parked one frame apart — the screen's own `NavOp::Dismiss` commits on the
-/// press frame, and `LoopReq::AccountSettings` is drained after `bridge::frame` returns, so
+/// press frame, and `LoopReq::OpenSettings` is drained after `bridge::frame` returns, so
 /// `open_settings`' `Present` commits on the next one. The window between them is the risk: if
 /// the account sheet let go of the host on its press frame, the page would be re-rendered in
 /// full for one frame and re-snapshotted for the next, under a panel nobody can see, on the
@@ -589,12 +980,18 @@ fn a_card_menus_commit_reports_one_request_carrying_the_row_it_captured() {
 /// Red first, simulated: with the screen's `Dismiss` removed from `activate`, the account
 /// sheet stays `Open` `(Frozen, Cached)` under the Settings surface and this passes — so the
 /// discriminating half is the `Closing` assertion below, which fails without it. With
-/// `LoopReq::AccountSettings` mapped to `dismiss_surfaces` + `open_settings` in the WRONG
+/// `LoopReq::OpenSettings` mapped to `dismiss_surfaces` + `open_settings` in the WRONG
 /// order (present first, then dismiss all) the fold reads `(Frozen, Cached)` throughout and
 /// the Settings surface is dismissed with the sheet — caught by the `settings_up` assertion.
 #[test]
 fn account_to_settings_never_unfreezes_the_host() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
+    // The account menu builds its rows only from a SETTLED session (`peek_settled`), and the first
+    // read of one is asynchronous (a job on the storage worker). Run alone, in a fresh process, the
+    // three frames below beat that read about one run in forty and the menu had no rows to walk
+    // (`d.focus()` was `None`). The scratch session is saved through the cache, so it is settled and
+    // signed out (a client id, no account) before the first frame, whatever ran before this test.
+    let _session = plx_plex::plex::session::TempSession::new("account-to-settings");
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -603,8 +1000,8 @@ fn account_to_settings_never_unfreezes_the_host() {
     frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
     assert_eq!(d.host_policy(), (HostUpdate::Frozen, HostRender::Cached));
 
-    // Focus the Settings row and commit it. Signed out (a host test has no session file the
-    // fixture wrote), the rows are [Sign in, Settings], so one DOWN then OK.
+    // Focus the Settings row and commit it. Signed out (the scratch session carries a client id and
+    // no account), the rows are [Sign in, Settings], so one DOWN then OK.
     let menu_entry = d.nav.modals.top().unwrap().entry.id;
     let mut t = 2;
     let mut press = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, key: Key| {
@@ -615,7 +1012,7 @@ fn account_to_settings_never_unfreezes_the_host() {
     press(&mut d, &mut rig, Key::Down);
     assert_eq!(
         d.focus().map(|k| (k.entry, k.elem)),
-        Some((menu_entry, 1)),
+        Some((menu_entry, plx_screens::account_menu::Action::Settings.focus_key())),
         "the engine walked the menu's own rows"
     );
     press(&mut d, &mut rig, Key::Ok);
@@ -630,7 +1027,11 @@ fn account_to_settings_never_unfreezes_the_host() {
 
     // …and the loop's drain performs the request on the next frame.
     let reqs = rig.take_reqs();
-    assert_eq!(reqs, vec![LoopReq::AccountSettings], "one request, and it is the Settings row's");
+    assert_eq!(
+        reqs,
+        vec![LoopReq::OpenSettings(plx_screens::family::SettingsPage::Root)],
+        "one request, and it is the Settings row's"
+    );
     open_settings(&mut d);
     for i in 0..12u32 {
         frame(&mut d, &mut rig, AppArg::Home, tick(20 + i), vec![]);
@@ -660,8 +1061,8 @@ fn account_to_settings_never_unfreezes_the_host() {
 /// for (§16.9).
 #[test]
 fn a_player_panel_is_a_surface_on_the_players_own_page_and_leaves_the_instance_alone() {
-    let ps = crate::route::PlaybackSession::IDLE;
-    let _g = crate::testlock::serial();
+    let ps = plx_media::route::PlaybackSession::IDLE;
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Player, tick(0), vec![]);
@@ -669,13 +1070,8 @@ fn a_player_panel_is_a_surface_on_the_players_own_page_and_leaves_the_instance_a
     let instance = d.nav.top_page().and_then(|e| e.inst.as_ref()).map(|i| i.id);
     assert!(instance.is_some(), "…with a live instance");
     let depth = d.nav.tabs.stack.depth();
-    for kind in [
-        crate::screens::player::overlay::OverlayKind::Tracks { tab: 1 },
-        crate::screens::player::overlay::OverlayKind::Info,
-        crate::screens::player::overlay::OverlayKind::Chapters,
-        crate::screens::player::overlay::OverlayKind::More { quality: false },
-    ] {
-        open_player_overlay(&ps, &mut d, kind);
+    for kind in plx_screens::player::overlay::OverlayKind::ALL {
+        open_player_overlay(&ps, plx_data::stores::metadata::MetadataStore::default().view(), &mut d, kind);
         frame(&mut d, &mut rig, AppArg::Player, tick(1), vec![]);
         assert_eq!(player_overlay_kind(&d), Some(kind), "{kind:?} is up");
         assert_eq!(
@@ -703,6 +1099,93 @@ fn a_player_panel_is_a_surface_on_the_players_own_page_and_leaves_the_instance_a
     }
 }
 
+/// **The rect the app seeds the mounter with is the rect the menu mounts with, once.** The canonical
+/// `PlayerOverlayArg` is the panel's KIND, so the opener's anchor rides on the mounter
+/// (`Bridge::seed_player_menu_anchor`), is taken by the mount of the next menu, and is gone for the one after:
+/// a press that seeds nothing mounts the menu's own default, not the previous press's rect.
+#[test]
+fn a_seeded_menu_anchor_is_mounted_into_the_next_menu_and_only_that_one() {
+    use plx_screens::player::overlay::{OverlayKind, Panel};
+    let ps = plx_media::route::PlaybackSession::IDLE;
+    let meta = || plx_data::stores::metadata::MetadataStore::default();
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Player, tick(0), vec![]);
+    let anchor_of = |d: &mut Dispatcher<AppHost>| match player_overlay_mut(d).expect("a panel is up").panel() {
+        Panel::Tracks(p) => p.anchor(),
+        Panel::More(p) => p.anchor(),
+        _ => panic!("a menu"),
+    };
+    let seeded = plx_ui::Rect::new(333.0, 222.0, 111.0, 55.0);
+    let own_default = plx_appkit::player_hud::audit_geometry().row;
+    assert_ne!(seeded, own_default);
+    for (kind, tick_at) in [(OverlayKind::Tracks { tab: 1 }, 1), (OverlayKind::More { page: None }, 5)] {
+        rig.seed_player_menu_anchor(Some(seeded));
+        open_player_overlay(&ps, meta().view(), &mut d, kind);
+        frame(&mut d, &mut rig, AppArg::Player, tick(tick_at), vec![]);
+        assert_eq!(anchor_of(&mut d), seeded, "{kind:?} mounts with the rect it was handed");
+        dismiss_player_overlays(&mut d);
+        frame(&mut d, &mut rig, AppArg::Player, tick(tick_at + 1), vec![]);
+        frame(&mut d, &mut rig, AppArg::Player, tick(tick_at + 2), vec![]);
+        // the seed is spent: an open that seeds nothing keeps the menu's own default
+        open_player_overlay(&ps, meta().view(), &mut d, kind);
+        frame(&mut d, &mut rig, AppArg::Player, tick(tick_at + 3), vec![]);
+        assert_eq!(anchor_of(&mut d), own_default, "{kind:?} with no seed mounts at its default");
+        dismiss_player_overlays(&mut d);
+        frame(&mut d, &mut rig, AppArg::Player, tick(tick_at + 4), vec![]);
+        frame(&mut d, &mut rig, AppArg::Player, tick(tick_at + 5), vec![]);
+    }
+}
+
+/// **The folded rows the app seeds are mounted into the next More menu, once, and into no other panel.** Like the
+/// opener's rect they ride the mounter (`Bridge::seed_player_more_folds`): a press that seeds nothing mounts the root
+/// More always had, and a Tracks menu opened with a seed pending ignores it (and leaves none for a later More).
+#[test]
+fn seeded_folded_rows_are_mounted_into_the_next_more_menu_and_only_that_one() {
+    use plx_appkit::more_menu::{Action, FoldedRow, MoreRow};
+    use plx_appkit::player_hud::command::HudCommand;
+    use plx_screens::player::overlay::{OverlayKind, Panel};
+    use plx_ui::form::FormId;
+    let ps = plx_media::route::PlaybackSession::IDLE;
+    let meta = || plx_data::stores::metadata::MetadataStore::default();
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Player, tick(0), vec![]);
+    let seeded = || vec![FoldedRow { command: HudCommand::FromBeginning, label: "From Beginning" }];
+    let folded_key = MoreRow::Act(Action::Hud(HudCommand::FromBeginning)).key().0;
+    let has_row = |d: &mut Dispatcher<AppHost>| match player_overlay_mut(d).expect("a panel is up").panel() {
+        Panel::More(p) => p.keys().contains(&folded_key),
+        _ => false,
+    };
+    let at = std::cell::Cell::new(1);
+    let next = || at.replace(at.get() + 1);
+    let open = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge, kind| {
+        open_player_overlay(&ps, meta().view(), d, kind);
+        frame(d, rig, AppArg::Player, tick(next()), vec![]);
+    };
+    let close = |d: &mut Dispatcher<AppHost>, rig: &mut Bridge| {
+        dismiss_player_overlays(d);
+        for _ in 0..2 {
+            frame(d, rig, AppArg::Player, tick(next()), vec![]);
+        }
+    };
+    plx_media::ff::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
+    rig.seed_player_more_folds(seeded());
+    open(&mut d, &mut rig, OverlayKind::More { page: None });
+    assert!(has_row(&mut d), "More mounts with the rows it was handed");
+    close(&mut d, &mut rig);
+    open(&mut d, &mut rig, OverlayKind::More { page: None });
+    assert!(!has_row(&mut d), "the seed is spent: the next More is the root it always was");
+    close(&mut d, &mut rig);
+    rig.seed_player_more_folds(seeded());
+    open(&mut d, &mut rig, OverlayKind::Tracks { tab: 1 });
+    close(&mut d, &mut rig);
+    open(&mut d, &mut rig, OverlayKind::More { page: None });
+    assert!(!has_row(&mut d), "a Tracks menu spent the seed");
+}
+
 /// **`ScreenArg::same_instance` compares the PLAYBACK, never the panel** (§16.9), and the two
 /// arguments are different KINDS: a panel is `AppArg::PlayerOverlay`, so it can never be
 /// mistaken for the page it stands on. Two panels of different kinds are two instances —
@@ -710,16 +1193,11 @@ fn a_player_panel_is_a_surface_on_the_players_own_page_and_leaves_the_instance_a
 /// a menu is open, and what stops the track menu being reused as the Info card.
 #[test]
 fn same_instance_reads_the_playback_and_not_the_overlay() {
-    use crate::screens::player::overlay::{OverlayKind, PlayerOverlayArg};
-    use crate::ui::screen::ScreenArg;
+    use plx_screens::player::overlay::{OverlayKind, PlayerOverlayArg};
+    use plx_ui::screen::ScreenArg;
     let player = AppArg::Player;
     assert!(player.same_instance(&AppArg::Player));
-    for kind in [
-        OverlayKind::Tracks { tab: 0 },
-        OverlayKind::Info,
-        OverlayKind::Chapters,
-        OverlayKind::More { quality: false },
-    ] {
+    for kind in OverlayKind::ALL {
         let panel = AppArg::PlayerOverlay(PlayerOverlayArg { kind });
         assert!(
             !player.same_instance(&panel) && !panel.same_instance(&player),
@@ -727,9 +1205,9 @@ fn same_instance_reads_the_playback_and_not_the_overlay() {
         );
         assert!(panel.same_instance(&AppArg::PlayerOverlay(PlayerOverlayArg { kind })));
     }
-    assert!(!AppArg::PlayerOverlay(PlayerOverlayArg { kind: OverlayKind::Info })
+    assert!(!AppArg::PlayerOverlay(PlayerOverlayArg { kind: OverlayKind::Tracks { tab: 0 } })
         .same_instance(&AppArg::PlayerOverlay(PlayerOverlayArg {
-            kind: OverlayKind::Chapters
+            kind: OverlayKind::More { page: None }
         })));
     // The panel that carries a parameter is still ONE panel: reopening the track menu on the
     // other tab reuses the entry rather than stacking a second one, exactly as
@@ -738,6 +1216,126 @@ fn same_instance_reads_the_playback_and_not_the_overlay() {
         .same_instance(&AppArg::PlayerOverlay(PlayerOverlayArg {
             kind: OverlayKind::Tracks { tab: 1 }
         })));
+}
+
+/// **The Tracks→Timing hand-off never stacks a second surface.** `PlayerOverlayScreen::activate`'s
+/// `TrackOk::OpenTiming` arm (`screens/player/overlay.rs`) dismisses the Tracks entry and asks for
+/// a fresh `Timing` one in the same beat this test drives by hand — `open_player_overlay` +
+/// `dismiss_player_overlays` + `open_player_overlay` mirrors exactly what that arm does, one call
+/// each. The frame in between is the one plan §4 calls out by name: Tracks is `Closing` while
+/// Timing is `Opening`, and `bridge::player_hud_policy` must read `HudPolicy::Hidden` right there —
+/// Timing's own `hud_policy` outranking Tracks' still-fading `Lifted` — never a frame where the
+/// HUD is neither lifted nor hidden, and never one where both panels
+/// still count as "up" for `player_overlay_kind`'s purposes.
+#[test]
+fn tracks_to_timing_hands_off_without_stacking_a_second_surface() {
+    use plx_screens::player::overlay::OverlayKind;
+    let ps = plx_media::route::PlaybackSession::IDLE;
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Player, tick(0), vec![]);
+
+    open_player_overlay(&ps, plx_data::stores::metadata::MetadataStore::default().view(), &mut d, OverlayKind::Tracks { tab: 1 });
+    frame(&mut d, &mut rig, AppArg::Player, tick(1), vec![]);
+    assert_eq!(player_overlay_kind(&d), Some(OverlayKind::Tracks { tab: 1 }));
+
+    // The hand-off: dismiss Tracks, open Timing, in the one beat `activate`'s OpenTiming arm does.
+    dismiss_player_overlays(&mut d);
+    open_player_overlay(&ps, plx_data::stores::metadata::MetadataStore::default().view(), &mut d, OverlayKind::Timing);
+    frame(&mut d, &mut rig, AppArg::Player, tick(2), vec![]);
+
+    let surfaces: Vec<(OverlayKind, Phase)> = d
+        .nav
+        .modals
+        .surfaces
+        .iter()
+        .filter_map(|s| match &s.entry.arg {
+            AppArg::PlayerOverlay(a) => Some((a.kind, s.phase)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(surfaces.len(), 2, "Tracks closing + Timing opening, never zero and never a third");
+    assert!(
+        surfaces.iter().any(|(kind, phase)| matches!(kind, OverlayKind::Tracks { .. }) && *phase == Phase::Closing),
+        "Tracks is fading out, not gone: {surfaces:?}",
+    );
+    assert!(
+        surfaces.iter().any(|(kind, phase)| *kind == OverlayKind::Timing && *phase != Phase::Hidden),
+        "Timing is up: {surfaces:?}",
+    );
+    assert_eq!(
+        crate::app::bridge::player_hud_policy(&d),
+        HudPolicy::Hidden,
+        "Hidden outranks Tracks' own still-fading Lifted, exactly this one frame",
+    );
+
+    // Let the fade finish: Tracks disappears and Timing alone remains the input owner. A fade is
+    // HELD while its text rasterises on the per-frame prewarm budget, for at most
+    // `SURFACE_TEXT_HOLD_MAX_MS`, so the frame count depends on how many labels the panel had —
+    // drive frames to that bound instead of assuming two.
+    let bound = (plx_ui::containers::modal::SURFACE_TEXT_HOLD_MAX_MS / 16.0).ceil() as u32 + 2;
+    for i in 0..bound {
+        if d.nav.modals.surfaces.iter().filter(|s| matches!(s.entry.arg, AppArg::PlayerOverlay(_))).count() == 1 {
+            break;
+        }
+        frame(&mut d, &mut rig, AppArg::Player, tick(3 + i), vec![]);
+    }
+    assert_eq!(player_overlay_kind(&d), Some(OverlayKind::Timing), "Timing alone owns input once Tracks is gone");
+    let left: Vec<_> = d.nav.modals.surfaces.iter().filter(|s| matches!(s.entry.arg, AppArg::PlayerOverlay(_))).collect();
+    assert_eq!(left.len(), 1, "exactly one player-overlay surface once the fade settles");
+}
+
+/// **`player_hud_policy` over every phase a surface can be in.** Opening, Open and
+/// Closing all count (a closing panel is still on screen); Hidden never does. A Tracks panel
+/// alone lifts the captions and leaves the transport alone; the capsule in ANY visible phase
+/// hides the transport and suppresses the lift; and a surface that is not a player panel at all
+/// (Settings over the player) lifts the captions as `Dispatcher::surface_up` always did.
+#[test]
+fn the_hud_state_helper_reads_every_phase_of_every_surface() {
+    use plx_screens::player::overlay::OverlayKind;
+    let ps = plx_media::route::PlaybackSession::IDLE;
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Player, tick(0), vec![]);
+    open_player_overlay(&ps, plx_data::stores::metadata::MetadataStore::default().view(), &mut d, OverlayKind::Tracks { tab: 1 });
+    frame(&mut d, &mut rig, AppArg::Player, tick(1), vec![]);
+    open_player_overlay(&ps, plx_data::stores::metadata::MetadataStore::default().view(), &mut d, OverlayKind::Timing);
+    frame(&mut d, &mut rig, AppArg::Player, tick(2), vec![]);
+    crate::app::bridge::open_settings(&mut d);
+    frame(&mut d, &mut rig, AppArg::Player, tick(3), vec![]);
+    let find = |d: &Dispatcher<AppHost>, want: fn(&AppArg) -> bool| {
+        d.nav.modals.surfaces.iter().position(|s| want(&s.entry.arg)).expect("surface presented")
+    };
+    let tracks = find(&d, |a| matches!(a, AppArg::PlayerOverlay(p) if matches!(p.kind, OverlayKind::Tracks { .. })));
+    let timing = find(&d, |a| matches!(a, AppArg::PlayerOverlay(p) if p.kind == OverlayKind::Timing));
+    let other = find(&d, |a| !matches!(a, AppArg::PlayerOverlay(_)));
+    use HudPolicy::{Lifted, Normal};
+    use Phase::{Closing, Hidden, Open, Opening};
+    for (tr, ti, ot, want) in [
+        (Hidden, Hidden, Hidden, Normal),
+        (Open, Hidden, Hidden, Lifted),
+        (Opening, Hidden, Hidden, Lifted),
+        (Closing, Hidden, Hidden, Lifted),
+        (Hidden, Open, Hidden, HudPolicy::Hidden),
+        (Hidden, Opening, Hidden, HudPolicy::Hidden),
+        (Hidden, Closing, Hidden, HudPolicy::Hidden),
+        (Closing, Opening, Hidden, HudPolicy::Hidden),
+        (Open, Closing, Hidden, HudPolicy::Hidden),
+        (Hidden, Hidden, Open, Lifted),
+        (Hidden, Hidden, Closing, Lifted),
+        (Hidden, Open, Open, HudPolicy::Hidden),
+    ] {
+        d.nav.modals.surfaces[tracks].phase = tr;
+        d.nav.modals.surfaces[timing].phase = ti;
+        d.nav.modals.surfaces[other].phase = ot;
+        assert_eq!(
+            crate::app::bridge::player_hud_policy(&d),
+            want,
+            "tracks={tr:?} timing={ti:?} other={ot:?}",
+        );
+    }
 }
 
 /// **THE FOURTH ROOT** (`app/input.rs`'s `back_at_root`, and the key ladder's dispatcher arm).
@@ -751,7 +1349,7 @@ fn same_instance_reads_the_playback_and_not_the_overlay() {
 /// dismisses the question, so selecting the tile again must come straight back to it.
 #[test]
 fn back_at_the_first_consent_stage_is_the_root_press_and_leaves_the_question_up() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Profiles, tick(0), vec![]);
@@ -804,7 +1402,7 @@ fn a_replaced_host_draws_surfaces_only_whoever_owns_the_page() {
 /// two cannot disagree and the predicate has no route argument left to compare against.
 #[test]
 fn the_first_run_favourites_page_is_owned_because_the_container_holds_it() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -826,7 +1424,7 @@ fn the_first_run_favourites_page_is_owned_because_the_container_holds_it() {
 /// flipped, was the ghost.
 #[test]
 fn dismiss_surfaces_now_settles_the_surface_in_the_same_call_unlike_the_ordinary_path() {
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
@@ -841,6 +1439,9 @@ fn dismiss_surfaces_now_settles_the_surface_in_the_same_call_unlike_the_ordinary
     // not yet "mid-open", and asserting `appear > 0.0` there fails on the frame ORDER rather
     // than on anything this test is about.
     frame(&mut d, &mut rig, AppArg::Home, tick(2), vec![]);
+    // …and a THIRD: the first tick after `present` holds the spring at 0 for the frame that
+    // renders the host into its snapshot (`PopoverMotion::hold`), so the ramp starts one later.
+    frame(&mut d, &mut rig, AppArg::Home, tick(3), vec![]);
     // Now one tick HAS run over it: the appear spring is climbing toward its open target and
     // the phase has not yet been promoted past `Opening` (`ModalStack::tick` only promotes it
     // to `Open` once `motion.settled()`) — i.e. deliberately mid-open, nowhere near the
@@ -884,7 +1485,7 @@ fn dismiss_surfaces_now_settles_the_surface_in_the_same_call_unlike_the_ordinary
 /// Search arm does.
 #[test]
 fn search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_two_source_table_for_test();
@@ -894,16 +1495,18 @@ fn search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale() 
     // whose reveal target for its last entry sits well past the real strip's viewport, so
     // jumping straight to it (`StripRender::reveal`, a JUMP, not a step) leaves `rig.strip`'s
     // scroll spring far from where Search's own (short) labels want it.
-    let wide: Vec<String> = (0..8).map(|i| format!("Wide Destination Label Number {i}")).collect();
+    let wide: Vec<plx_ui::widgets::TabFace> = (0..8)
+        .map(|i| plx_ui::widgets::TabFace::Label(format!("Wide Destination Label Number {i}")))
+        .collect();
     rig.strip.reveal(
-        crate::ui::widgets::TabLabels { generation: 1, labels: &wide },
+        plx_ui::widgets::TabLabels { generation: 1, faces: &wide },
         wide.len() - 1,
     );
 
     super::show_page(&mut d, AppArg::Search);
     rig.capture_chrome(&mut d);
 
-    let base = crate::ui::dispatch::STRIP_BASE;
+    let base = plx_ui::dispatch::STRIP_BASE;
     let search_member = |d: &Dispatcher<AppHost>| {
         d.nav.tabs.strip.iter().find(|m| m.elem == base + 3).copied().expect("Search pill published")
     };
@@ -914,7 +1517,7 @@ fn search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale() 
 
     // The fix under test: the Search arm of `run::update`'s chrome chain calls exactly this,
     // every frame, while standing on Search.
-    let mut glass = crate::ui::frame::glass::GlassPlan::new();
+    let mut glass = plx_ui::frame::glass::GlassPlan::new();
     for _ in 0..60 {
         rig.update_home_chrome(&mut d, &mut glass, 1.0 / 60.0);
     }
@@ -925,4 +1528,118 @@ fn search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale() 
         "the strip's published rect must travel to its target once Search steps it each frame \
          (stale={stale_gap}, settled after 1s={settled_gap}) — losing the Search chrome arm \
          again silently reproduces the frozen capsule / stale pointer targets this pins");
+}
+
+/// **A second open of the detail page already on its way is not a new navigation** — the detail
+/// half of `enter_player`'s pending-push rule. The dip-out prepares the pushed page, which spends
+/// the `DetailSeed` at its mount, and a repeated `Push` of the same page is inert
+/// (`NavStack::is_inert`); a re-seed written for it would never be spent by that page and would
+/// linger for the next detail mount of the same item that nobody seeded.
+#[test]
+fn a_second_open_of_the_pending_detail_page_leaves_no_seed_behind() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::with_transition(
+        Box::new(plx_ui::containers::transition::PageDip::new()));
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    for i in 1..20u32 { super::frame(&mut d, &mut rig, tick(i * 16), vec![]); }
+    let sid = plx_plex::plex::ServerId::UNSET;
+    open_detail(&mut d, &mut rig, sid, "1001", Some(1), None);
+    super::frame(&mut d, &mut rig, tick(400), vec![]);
+    assert!(
+        d.nav.tabs.stack.pending_target_mut().is_some_and(|e| e.inst.is_some()),
+        "premise: the dip-out has prepared the detail page",
+    );
+    assert!(rig.mounter.seed.is_none(), "the prepared mount spent the first seed");
+    open_detail(&mut d, &mut rig, sid, "1001", Some(2), None);
+    for i in 1..30u32 { super::frame(&mut d, &mut rig, tick(400 + i * 16), vec![]); }
+    assert_eq!(d.nav.tabs.stack.depth(), 2, "one detail page, not two");
+    assert!(rig.mounter.seed.is_none(), "no unspent seed is left for a later mount");
+}
+
+/// **A dismissed item menu's opener lift stands down once focus has left the opener tile.**
+/// `dismiss` returns input to the page on the same frame but the surface lingers (`Closing`) for
+/// its fade; a D-pad press in that window moves the page's focus to the neighbour, and a lift that
+/// kept repainting the menu's ORIGINAL key drew the old tile fully popped and captioned above the
+/// page — two tiles focused at once (Collection, owner's recording). The decision is
+/// [`Dispatcher::lifted_opener`], shared by every page.
+#[test]
+fn a_closing_item_menus_opener_lift_stands_down_when_focus_moves_off_the_opener() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    let host = d.nav.top_page().unwrap().id;
+    let mut row = plx_data::pms::PmsMovie::default();
+    row.rk = "42".into();
+    row.kind = 0;
+    let key = |elem| plx_machine::machine::FocusKey { entry: host, elem };
+    open_item_menu(&mut d, card_menu_arg(&row, false, true, host, Some(key(7)), None));
+    frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+    assert_eq!(d.lifted_opener(), Some((host, Some(key(7)))), "open: the lift paints the opener");
+
+    let ev = script_key(Key::Back, tick(2));
+    frame(&mut d, &mut rig, AppArg::Home, tick(2), ev);
+    assert_eq!(d.nav.modals.top().map(|s| s.phase), Some(Phase::Closing));
+    d.set_focus(Some(key(7)));
+    assert_eq!(d.lifted_opener(), Some((host, Some(key(7)))), "closing, focus still on the opener: it stays lifted");
+    d.set_focus(Some(key(8)));
+    assert_eq!(d.lifted_opener(), None, "closing, focus moved to the neighbour: the old tile is NOT repainted as focused");
+}
+
+/// **OK on a Continue Watching EPISODE opens the SHOW on the card's season** (Settings > Playback >
+/// Continue Watching = "Open details"): the decision `activate_deck_card` makes from the card, the
+/// shelf's `from_deck` and whether the press plays. The pure half pins every case that must NOT
+/// reroute — a discovery shelf's episode (its OK opens the episode's page), a press that plays
+/// (`DeckPress::Play` arrives as `want_play`), a movie, a show/season card, and an episode whose
+/// row names no show.
+#[test]
+fn a_deck_episode_press_opens_the_show_and_nothing_else_reroutes() {
+    use crate::app::input::deck_press_opens_show;
+    let card = |kind: i32, show_rk: &str| {
+        let mut m = plx_data::pms::PmsMovie::default();
+        m.rk = "ep".into();
+        m.kind = kind;
+        m.show_rk = show_rk.into();
+        m.season_index = 3;
+        m
+    };
+    let episode = card(3, "show");
+    assert!(deck_press_opens_show(&episode, true, false), "deck episode, OK opens details");
+    assert!(!deck_press_opens_show(&episode, false, false), "a discovery shelf's episode keeps its own page");
+    assert!(!deck_press_opens_show(&episode, true, true), "a press that plays plays");
+    assert!(!deck_press_opens_show(&card(3, ""), true, false), "no show row: today's episode page");
+    for kind in [0, 1, 2] {
+        assert!(!deck_press_opens_show(&card(kind, "show"), true, false), "kind {kind} is unchanged");
+    }
+}
+
+/// …and the other half: the page that is actually opened. A deck episode seeds the SHOW's detail
+/// page with the card's season; the same card from a discovery shelf seeds the episode's own page
+/// with no season (`open_detail` writes the seed in the call, before any frame spends it).
+#[test]
+fn activating_a_deck_episode_seeds_the_show_page_on_its_season_and_a_discovery_one_its_own() {
+    let _g = plx_base::testlock::serial();
+    let mut ps = plx_media::route::PlaybackSession::default();
+    let mt = unsafe { plx_base::task::MainThread::assume() };
+    let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
+    let mut wait = None;
+    let mut episode = plx_data::pms::PmsMovie::default();
+    episode.sid = plx_plex::plex::ServerId::UNSET;
+    episode.rk = "ep-55".into();
+    episode.kind = 3;
+    episode.show_rk = "show-7".into();
+    episode.season_index = 3;
+
+    for (from_deck, rk, season) in [(true, "show-7", Some(3)), (false, "ep-55", None)] {
+        let mut d = Dispatcher::<AppHost>::new();
+        let mut rig = Bridge::for_test(|| 0);
+        frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+        unsafe {
+            crate::app::input::activate_deck_card(&mut ps, &mut pa, &episode, from_deck, false, 0, None,
+                &mut d, &mut rig, &mut wait, 0);
+        }
+        let seed = rig.mounter.seed.as_ref().expect("a detail page was opened");
+        assert_eq!((seed.rk.as_str(), seed.spot.season), (rk, season), "from_deck {from_deck}");
+    }
 }

@@ -1,5 +1,38 @@
 # Detail-hero trailer UX: faster autoplay, a shrinking logo, and a full-trailer mode
 
+**SUPERSEDED IN PART (2026-09-17): full-trailer mode now draws trailer CONTROLS, and the action
+row is gone.** Everything below about dwell, the logo shrink, the synopsis and the collapse keys
+still stands. What no longer holds, wherever this document says it (§2.4, the state diagram and
+table in §1, §8.3, §8.4, the goal's bullet 4 and the third decision bullet):
+
+- Full-trailer mode does NOT leave "only the Play/Resume pill" on screen. It takes the WHOLE page
+  off — the action row with it — and draws a trailer transport in its place: the `Trailer` kicker
+  over a title (`trailer::transport_title` — the FILM/SHOW title by default, so a trailer whose own
+  PMS title is the boilerplate "Trailer" doesn't repeat the kicker word right under it; the extra's
+  own title only when it says something the kicker doesn't), the playbar with elapsed/remaining,
+  and the play/pause state read-out, built from `appkit::player_hud::classic`'s own
+  `draw_scrim`/`draw_title`/`draw_playbar`. There is still no quality, subtitle, audio or Info
+  control and no track menu — that part of "there is no HUD" was never about the transport, it was
+  about the panels that write session state a preview has none of.
+- `hero::focusable`'s Play-only narrowing survives as the mode's FOCUS ANCHOR, not as something
+  drawn. §8.4's "Play/Resume stays visible and focused" is now "Play stays focusABLE".
+- OK and PLAYPAUSE pause and resume the preview session (`player::preview::transport`, performed by
+  the loop through `ContentReq::PreviewTransport`). LEFT/RIGHT do NOT seek: every non-in-place seek
+  path falls back to a fresh Starfish `Load` that `preview::Machine` never admitted, and a failed
+  reload would arm the process-wide breaker. They reveal the controls instead, which auto-hide on
+  the player HUD's own 4.5 s linger.
+- The wedge's `landing_hero::PROMOTED_FIELD` (0.4) is **deleted**. With no page ink left to protect
+  in full-trailer mode, `preview_field` targets 0.0 like the base scrim, and the only scrim in that
+  state is the transport's own at the bottom. §2.4(c)'s device-tuning item and its `TODOS.md` entry
+  go with it.
+- Background autoplay gained a hint — an up-chevron key cap reading "`[^] Full screen`" (glyph
+  first, no `Press`/`for` filler — shortened 2026-09-17) under the action row
+  (`screens::detail::trailer::hint_shown`), fading in with the picture and out on promotion or
+  collapse.
+
+The current record is `rust-modules/screens/src/detail/trailer.rs`, `player/preview.rs`'s module
+doc and `hero.rs`'s `focusable`/`visible_ctls`.
+
 **Status (2026-09-15): implemented.** All host-testable pieces below landed
 (`rust-modules/src/{player/preview.rs, screens/detail/{mod.rs,hero.rs}, ui/{hero_logo.rs,
 landing_hero.rs, detail_layout.rs}}`), `cargo test --lib` (default + `hostsim`) and
@@ -33,8 +66,8 @@ landing_hero.rs, detail_layout.rs}}`), `cargo test --lib` (default + `hostsim`) 
   this task wanted surfaced was already there.
 
 **Status (original).** Design plan, not yet implemented. Targets the existing background-trailer feature
-(`e5739f9e feat: add trailer support and extras handling`, `rust-modules/src/player/preview.rs` +
-`rust-modules/src/screens/detail/{mod.rs,hero.rs}`). Read `rust-modules/src/player/CLAUDE.md` and
+(`e5739f9e feat: add trailer support and extras handling`, `rust-modules/media/src/player/preview.rs` +
+`rust-modules/screens/src/detail/{mod.rs,hero.rs}`). Read `rust-modules/media/src/player/CLAUDE.md` and
 `rust-modules/src/ui/CLAUDE.md` before implementing — this plan assumes both.
 
 **Goal**, as given:
@@ -44,7 +77,8 @@ landing_hero.rs, detail_layout.rs}}`), `cargo test --lib` (default + `hostsim`) 
    shrink it, smoothly.
 3. Keep the short description/synopsis visible while it plays in the background.
 4. Pressing UP while the trailer plays opens it "full": the logo and synopsis fade out, leaving
-   only the Play/Resume button. BACK or DOWN returns to the background state.
+   only the Play/Resume button. BACK or DOWN returns to the background state. *(2026-09-17: the
+   Play/Resume button leaves too, and a trailer transport takes its place — see the banner above.)*
 
 Three explicit decisions were made with the requester before finalizing this plan (recorded so a
 reviewer does not have to re-derive them):
@@ -57,6 +91,8 @@ reviewer does not have to re-derive them):
 - **In full-trailer mode, focus collapses onto Play/Resume only** (the other controls leave the
   focus ring, not just the screen), **and the darkening layer over the video is also eased down**
   once only the Play/Resume button is left to protect, so the trailer reads brighter and cleaner.
+  *(2026-09-17: the pill is no longer drawn either, so the darkening goes to zero rather than to a
+  residual — see the banner above.)*
 
 ---
 
@@ -159,10 +195,11 @@ Four states, keyed off the same two bits the code already tracks (`view.picture`
                                                              ▼     │         │
                                                       ┌─────────────────────┐│
                                                       │  Full trailer        ││
-                                                      │  logo+synopsis→0,    ││
-                                                      │  ONLY Play/Resume    ││
-                                                      │  visible+focusable,  ││
-                                                      │  field→PROMOTED_FIELD││
+                                                      │  ALL chrome→0,       ││
+                                                      │  trailer transport   ││
+                                                      │  up; Play = the      ││
+                                                      │  focus anchor only,  ││
+                                                      │  field→0 (2026-09-17)││
                                                       └──────────┬──────────┘│
                                                                  │           │
                                                      EOS / failure / item    │
@@ -184,7 +221,7 @@ Table form of the same four states, with every visual channel spelled out:
 | **Idle / browsing** | default, or hero not focused, or scrolled off | 1.0 (full still) | Hero rung, hero position | visible | visible | visible | 1.0 | 1.0 (`base_scrim_a`'s own scroll-driven value) |
 | **Dwelling** | hero focused, unscrolled, no preview yet, dwell timer running | 1.0 | Hero rung, hero position | visible | visible | visible | 1.0 | 1.0 |
 | **Background autoplay** | `view.picture == true`, `!preview_promoted` | **0.0** (art fully yields to video) | **Compact rung, top-left**, animated in | **stays visible** (new) | **fades to 0** (unchanged) | **stays visible** (decision: unchanged from today) | 1.35 (unchanged — protects the now-larger amount of text: logo + synopsis) | 1.0 (unchanged — still protecting the action row) |
-| **Full trailer** | `view.picture == true`, `preview_promoted == true` | 0.0 | fades to 0 (from wherever the compact rung left it) | **fades to 0** (new — previously already 0, now explicit) | 0 (unchanged) | **only Play/Resume visible and focusable**, everything else leaves the row | **eased down** to a low residual (new — see §2.4) | **eased to 0.0** (§8.3, follow-up pass — was unwired at first ship, see §8) |
+| **Full trailer** | `view.picture == true`, `preview_promoted == true` | 0.0 | fades to 0 (from wherever the compact rung left it) | **fades to 0** (new — previously already 0, now explicit) | 0 (unchanged) | **nothing drawn** (2026-09-17: the row fades out with the rest of the chrome; Play stays the focus ANCHOR, and the trailer transport is drawn over the top) | **eased to 0.0** (2026-09-17: was a `PROMOTED_FIELD` residual) | **eased to 0.0** (§8.3, follow-up pass — was unwired at first ship, see §8) |
 
 Transitions:
 
@@ -255,7 +292,7 @@ already a confirmed problem worth a UI surface.
 This needs new geometry — `detail_layout::COMPACT_TITLE_BOT` and `LogoRung::Compact` already exist,
 but for a **different** treatment (the scroll-driven, horizontally **centered** pinned title at
 `mod.rs:1987-2016`, which answers "how far down have I scrolled", not "is a trailer playing"). Reusing
-its rung *sizing* (`COMPACT_AREA`/`COMPACT_H_MIN`/`COMPACT_H_MAX`, `theme.rs:249-263`) is right; reusing
+its rung *sizing* (`COMPACT_AREA`/`COMPACT_BAND_H`/`COMPACT_W_MAX`/`COMPACT_H_MAX` in `theme::logo`) is right; reusing
 its *position* is not — this is a new anchor, top-left, independent of scroll.
 
 **New geometry** (`detail_layout.rs`):
@@ -390,6 +427,11 @@ follow-ups this plan is not allowed to skip:
    video content is a worse bet at every one of the three lines, not a better one at the third.
 
 ### 2.4 Full-trailer mode: only Play/Resume, focus collapses, scrim lifts
+
+> **Superseded 2026-09-17** (banner at the top of this file): the action row is not drawn in this
+> mode at all, the wedge eases to 0.0 rather than to `PROMOTED_FIELD`, and the trailer's own
+> transport is what the viewer sees. (a) and (b)'s focus mechanism still stands as the mode's
+> anchor; (c)'s residual value does not.
 
 Three changes to `preview_tick`/`draw_buttons`/`draw_hero`, all gated on the existing
 `preview_promoted && view.picture` predicate — no new trigger condition.
@@ -638,13 +680,13 @@ gate for anything that moves pixels)**
 
 | File | Change |
 |---|---|
-| `rust-modules/src/player/preview.rs` | `DWELL_S` 4.5 → 2.0 |
+| `rust-modules/media/src/player/preview.rs` | `DWELL_S` 4.5 → 2.0 |
 | `rust-modules/src/ui/landing_hero.rs` | new `PROMOTED_FIELD` constant |
 | `rust-modules/src/ui/detail_layout.rs` | new `PREVIEW_LOGO_X/Y/MAX_W` constants |
 | `rust-modules/src/ui/hero_logo.rs` | new interpolated-bounds path for a continuous Hero↔Compact transform (§2.2) |
 | `rust-modules/src/ui/consts.rs` | new `K_PREVIEW_LOGO` spring rate |
-| `rust-modules/src/screens/detail/hero.rs` | new `hero::visible_ctls` (full-trailer control filter), its host tests |
-| `rust-modules/src/screens/detail/mod.rs` | new `preview_logo` (Spring), `preview_synopsis`, `preview_field` fields; `preview_tick` target logic for all three plus the split `prose`/`synopsis` targets; `draw_hero`/`draw_backdrop`/`draw_buttons` reading them; new DOWN key arm; focus-collapse wiring through `reconcile`; all associated host tests |
+| `rust-modules/screens/src/detail/hero.rs` | new `hero::visible_ctls` (full-trailer control filter), its host tests |
+| `rust-modules/screens/src/detail/mod.rs` | new `preview_logo` (Spring), `preview_synopsis`, `preview_field` fields; `preview_tick` target logic for all three plus the split `prose`/`synopsis` targets; `draw_hero`/`draw_backdrop`/`draw_buttons` reading them; new DOWN key arm; focus-collapse wiring through `reconcile`; all associated host tests |
 | `rust-modules/src/ui/widgets.rs` (`hero_scrim_a`'s test module, wherever the anchor table lives — see `ui/CLAUDE.md`'s `widgets.rs` row) | new anchor-table row for synopsis-over-bound-video legibility (§2.3) |
 
 ## 7. Explicitly out of scope
@@ -933,7 +975,7 @@ this fix — pressing the Trailer control still plays the trailer on demand, eve
 
 **Considered and deferred (eng review, outside-voice finding #3 — overcomplexity):** moving this
 detection into `player::preview::Machine` itself as a one-shot `just_finished` flag, set at
-`note_eos()` before `note_stopped()` wipes the session's key, would eliminate this fix's ordering
+the `Machine::eos` transition before `Machine::stopped` wipes the session's key (the `note_eos()`/`note_stopped()` of this record's time), would eliminate this fix's ordering
 fragility at the source rather than patching around it, and would benefit any future consumer of
 trailer-completion signal, not just this screen. Not chosen for this PR — it touches a shared
 module other code paths depend on, a larger blast radius than a screen-local fix for what is
@@ -956,6 +998,8 @@ HERO_FADE)`:
   (`mod.rs:1815`), so IT already eases correctly between the idle/background values and
   `PROMOTED_FIELD = 0.4` in full-trailer mode. This part of the original plan's §2.4(c) is verified
   shipped as documented. The wedge is not part of this fix; only the base gradient is.
+  *(2026-09-17: the wedge now eases to 0.0 in full-trailer mode and `PROMOTED_FIELD` is deleted —
+  there is no page ink left up there to protect.)*
 
 **Fix**: a new eased scalar, alongside `preview_field`, targeting full transparency in full-trailer
 mode:
@@ -985,6 +1029,10 @@ transforms (position/scale) use `Spring` — this is an opacity multiplier, not 
 
 ### 8.4 Play/Resume stays visible and focused in full-trailer mode — already correct, missing only its regression test
 
+> **Superseded 2026-09-17** (banner at the top of this file): Play stays FOCUSABLE — it anchors the
+> engine while the mode is up — but nothing in the row is drawn any more. The regression test this
+> section added still grades exactly the right property under its new name.
+
 **Verified directly against source, not assumed from this doc's "implemented" status line** (the
 same diligence the scrim item above needed, since that one turned out to be only half-implemented
 despite the doc's claim). `hero::focusable(ctl, full_trailer)` (`hero.rs:181-183`) is
@@ -1012,9 +1060,9 @@ behavior with no regression test is one accidental refactor away from breaking s
 
 | File | Change |
 |---|---|
-| `rust-modules/src/screens/detail/mod.rs` | swap Cast/Extras order in `sections()` (§8.1); shared `hero_active` local + new `preview_played_for`/`preview_started_for`/`preview_had_picture` fields + gate/set logic in `preview_tick`, `request_preview` capturing `preview_started_for`, both new fields added to the `WillLeave`/`Unmount` reset block (§8.2); new `preview_base_scrim` field + ease target + fold into idle-gate `\|` chain (§8.3); `draw_backdrop` multiplies `base_scrim_a` by `preview_base_scrim` (§8.3) |
-| `rust-modules/src/screens/detail/section.rs` | update `is_hide_anchor`'s stale comment describing Extras' old position (§8.1) |
-| `rust-modules/src/screens/detail/tests.rs` | rename + update the section-order pinning test, plus a new `compact_title_hide_pos` pixel-identity regression test (§8.1, eng review issue 3A); new play-once tests: natural-EOS suppression (both the sitting-still case AND the full-trailer-mode-completion case the eng review's outside-voice pass found missing), abandon-then-return still replays, item-change resets, leave-and-return resets via the `WillLeave`/`Unmount` path (§8.2); new scrim-fade test: `preview_base_scrim` eases to 0/1 correctly and reports idle-gate motion (§8.3); new `reconcile`/`valid`/`place` Restart→Play regression test (§8.4) |
+| `rust-modules/screens/src/detail/mod.rs` | swap Cast/Extras order in `sections()` (§8.1); shared `hero_active` local + new `preview_played_for`/`preview_started_for`/`preview_had_picture` fields + gate/set logic in `preview_tick`, `request_preview` capturing `preview_started_for`, both new fields added to the `WillLeave`/`Unmount` reset block (§8.2); new `preview_base_scrim` field + ease target + fold into idle-gate `\|` chain (§8.3); `draw_backdrop` multiplies `base_scrim_a` by `preview_base_scrim` (§8.3) |
+| `rust-modules/screens/src/detail/section.rs` | update `is_hide_anchor`'s stale comment describing Extras' old position (§8.1) |
+| `rust-modules/screens/src/detail/tests.rs` | rename + update the section-order pinning test, plus a new `compact_title_hide_pos` pixel-identity regression test (§8.1, eng review issue 3A); new play-once tests: natural-EOS suppression (both the sitting-still case AND the full-trailer-mode-completion case the eng review's outside-voice pass found missing), abandon-then-return still replays, item-change resets, leave-and-return resets via the `WillLeave`/`Unmount` path (§8.2); new scrim-fade test: `preview_base_scrim` eases to 0/1 correctly and reports idle-gate motion (§8.3); new `reconcile`/`valid`/`place` Restart→Play regression test (§8.4) |
 
 ### 8.6 Verification
 
@@ -1239,27 +1287,27 @@ Claude Code or Codex; checkbox as you ship.
 
 - [ ] **T1 (P1, human: ~30min / CC: ~8min)** — screens/detail — Fix play-once suppression: `hero_active` extraction, corrected EOS condition, `preview_started_for` capture, leave-reset
   - Surfaced by: Outside voice — EOS-detection ordering bug (`preview_promoted` clears after the naive check reads it) + missing `WillLeave`/`Unmount` reset
-  - Files: `rust-modules/src/screens/detail/mod.rs`
+  - Files: `rust-modules/screens/src/detail/mod.rs`
   - Verify: new host tests in T6 below; `make check`
 - [ ] **T2 (P1, human: ~10min / CC: ~3min)** — screens/detail — Swap Extras/Cast order in `sections()`, update `is_hide_anchor` comment
   - Surfaced by: Design review §8.1 + eng review issue 3A verification (`LayoutCache`/`Spot` confirmed identity-keyed, safe to reorder)
-  - Files: `rust-modules/src/screens/detail/mod.rs`, `rust-modules/src/screens/detail/section.rs`
+  - Files: `rust-modules/screens/src/detail/mod.rs`, `rust-modules/screens/src/detail/section.rs`
   - Verify: updated pinning test + new `compact_title_hide_pos` test (T5); device capture per §8.6
 - [ ] **T3 (P1, human: ~15min / CC: ~4min)** — screens/detail — Wire `preview_base_scrim`: new eased scalar, fold into idle-gate chain, multiply into `draw_backdrop`
   - Surfaced by: Design review §8.3 — `base_scrim_a` was completely unwired from full-trailer mode
-  - Files: `rust-modules/src/screens/detail/mod.rs`
+  - Files: `rust-modules/screens/src/detail/mod.rs`
   - Verify: state-table test extension + idle-gate settle test; device UP/BACK cycle capture
 - [ ] **T4 (P2, human: ~20min / CC: ~5min)** — screens/detail — Add `reconcile`/`valid`/`place` Restart→Play regression test in full-trailer mode
   - Surfaced by: Original plan §5 called this CRITICAL; never added. Design review §8.4 closed the gap
-  - Files: `rust-modules/src/screens/detail/tests.rs`
+  - Files: `rust-modules/screens/src/detail/tests.rs`
   - Verify: `make check` — expected to pass immediately (closing coverage, not fixing a bug)
 - [ ] **T5 (P2, human: ~15min / CC: ~4min)** — screens/detail — Add `compact_title_hide_pos` pixel-identity regression test across the Extras/Cast reorder
   - Surfaced by: Eng review issue 3A — closes the `detail-sections-array-position-traps` hazard class with a test, not just a source read
-  - Files: `rust-modules/src/screens/detail/tests.rs`
+  - Files: `rust-modules/screens/src/detail/tests.rs`
   - Verify: `make check`
 - [ ] **T6 (P2, human: ~30min / CC: ~8min)** — screens/detail — Add play-once host tests: natural EOS (sitting-still + full-trailer-mode), abandon-preserves-replay, item-change reset, leave-reset
   - Surfaced by: Design review §8.6 + eng review outside-voice cases 2, 5, 6
-  - Files: `rust-modules/src/screens/detail/tests.rs`
+  - Files: `rust-modules/screens/src/detail/tests.rs`
   - Verify: `make check` — cases 2 and 6 must be written to fail against the uncorrected/unfixed code first, per this repo's reproduce-fail-fix-pass rule
 
 JSONL artifact: `~/.gstack/projects/MrcRjs-plx-native/tasks-eng-review-20260915-144303.jsonl` (6 tasks, for `/autoplan` aggregation).

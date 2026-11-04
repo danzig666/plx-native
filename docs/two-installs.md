@@ -1,5 +1,11 @@
 # Two installs on one television
 
+**This document predates the nightly flavour.** A third flavour, `FLAVOR=nightly`
+(`com.beb.plxnative.nightly`, port 8912), has since landed, and nightly is the one flavour that
+feeds a codegen input — `PLX_CHANNEL` / `PLX_NIGHTLY_DATE` into `build.rs`'s reported version. See
+`docs/agent-reference.md` for the current account; the body below still only describes stable and
+debug.
+
 **Status, 2026-08-21: BUILT ENTIRELY OFF-DEVICE. NOTHING BELOW HAS BEEN ON A TELEVISION.**
 
 Everything here is either a fact provable on a desk — a make variable, a `/proc/self/exe` read, a
@@ -36,7 +42,7 @@ So: two ids, two installs, two tiles.
 | runtime root | `/tmp` | `/tmp/com.beb.plxnative.debug` |
 | session file | `/media/developer/com.beb.plxnative-auth.json` | `/media/developer/com.beb.plxnative.debug-auth.json` |
 | launcher title | `PlxNative` | `PlxNative debug` |
-| launcher artwork | `pkg/icon.png` | `pkg/dev/icon.png` (amber DEV bar) |
+| launcher artwork | `pkg/icon.png` | `pkg/dev/icon.png` (amber DEV bar; nightly: `pkg/nightly/`, grey NIGHTLY bar) |
 | plex.tv device name | `PlxNative (LG TV)` | `PlxNative debug (LG TV)` |
 
 **`FLAVOR ?= debug`, in the tracked Makefile.** The asymmetry is deliberate and it is the whole
@@ -63,7 +69,7 @@ make -s print-tv                        # the television's address, expanded
 ```
 
 **Not `make -p` / `make -pn`.** That prints a recursive variable's *unexpanded definition*, so `TV`
-comes back as the literal `$(strip $(shell cat .tv-host 2>/dev/null))` — every ssh built from it
+comes back as the literal `$(strip $(shell tools/tv-config.sh host 2>/dev/null))` — every ssh built from it
 then fails, and the tool reports "TV unreachable" against a television that is awake and answering.
 `tools/tv-session.sh`'s `tv_host()` documents that trap because it hit it.
 
@@ -75,7 +81,7 @@ rather than a message on a terminal.
 ## 2. The identity model: the id is the directory, read at runtime
 
 **The app id is not compiled in. It is the name of the directory the binary is running out of**,
-read from `/proc/self/exe` at first use (`rust-modules/src/paths.rs::app_id`, via
+read from `/proc/self/exe` at first use (`rust-modules/base/src/paths.rs::app_id`, via
 `std::env::current_exe`).
 
 That is sound because **our own package lays that directory down from the appinfo `id`, and three
@@ -178,7 +184,7 @@ inside a bullet already claiming to be separate. It is written out in full below
   - the capture listener's file trigger (`plxnative-capture`) and the two profiler JSONLs;
   - the two local Annex-B sample payloads, `sample.h264` and `sample.h265` — the only runtime files
     that are *not* spelled `plxnative-*`, which is why they have their own door
-    (`dev::read_sample`). They took an absolute `/tmp` path until after the split landed, so they
+    (`devtrig::read_sample`). They took an absolute `/tmp` path until after the split landed, so they
     were the last two surfaces still pinned to a shared root while every other one had moved. Two
     installs reading one sample is harmless in itself; a rule with a hole in it is not, because it
     stops being checkable. They now live in the install's own root —
@@ -333,8 +339,10 @@ while the app runs jailed under its own uid and creates its logs there. Whoever 
 sets the mode, so any owner-only mode locks the other out.
 
 `create_dir_all` (and `mkdir -p`) applies the process umask, which silently drops the group and
-other bits — hence `paths::ensure_runtime_dir` follows it with an explicit
-`set_permissions(0o1777)`, and the Makefile's `BOOT_SH` follows `mkdir -p` with an explicit
+other bits — hence `paths::ensure_runtime_dir` does a bare `mkdir` (`paths::share_runtime_dir`) and
+then `fchmod`s 1777 on a descriptor it opened `O_NOFOLLOW` and confirmed is a directory it owns
+(never a `create_dir_all` followed by a path chmod, which follows a symlink planted in the shared
+`/tmp` and makes its target 1777), and the Makefile's `BOOT_SH` follows `mkdir -p` with an explicit
 `chmod 1777`. `/tmp` on the television is 1777 for the same reason; a per-install root inside it
 must not be stricter.
 
@@ -381,7 +389,7 @@ forgetting: the stable package must not contain the `plxnative-noidle` dev witne
 That gate is graded **unconditionally**, outside the build-configuration branch, and the nesting is
 why it is worth a paragraph rather than a clause. `pkg/.build-config` records a feature set, and it
 maps to `None` for anything that is neither shipped configuration — the Makefile's own header
-documents a third (`--no-default-features --features devtriggers`, the README-screenshot recipe).
+documents a third (`--no-default-features --features devtriggers`, the on-device screenshot recipe).
 Nested under that stamp, exactly that combination satisfied `release-guard` (`RELEASE` is
 non-empty), printed `SKIP — neither shipped configuration`, and would have packaged a dev-trigger
 binary under the released id on an all-green run. "This package carries no dev-trigger surface" is a

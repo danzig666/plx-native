@@ -6,9 +6,9 @@ use super::*;
 
 /// Preserve one IME commit and its place among key events. Desktop text does not imply an
 /// on-screen panel; the owning field decides whether it is editing when delivery reaches it.
-pub(crate) fn text_inputs(text: &str, panel: bool, at: crate::ui::machine::Tick,
-    source: crate::ui::machine::Source) -> Vec<crate::ui::machine::InputEvent<u32>> {
-    use crate::ui::machine::{InputEvent, InputKind, TextEdit};
+pub(crate) fn text_inputs(text: &str, panel: bool, at: plx_machine::machine::Tick,
+    source: plx_machine::machine::Source) -> Vec<plx_machine::machine::InputEvent<u32>> {
+    use plx_machine::machine::{InputEvent, InputKind, TextEdit};
     if text.is_empty() { return Vec::new(); }
     let mut events = Vec::with_capacity(if panel { 2 } else { 1 });
     if panel { events.push(InputEvent { at, source, kind: InputKind::SystemKeyboard(true) }); }
@@ -118,10 +118,10 @@ pub(crate) const SYNTH_WINDOW: u32 = 0x504c_584b; // "PLXK"
 pub(crate) fn host_wcode(sym: u32) -> u32 {
     // ASCII literals spelled numerically: `b'p' as u32` is an expression, not a pattern.
     match sym {
-        32 => crate::ui::consts::WCODE_PAUSE, // space
-        112 => crate::ui::consts::WCODE_PLAY, // 'p'
-        115 => crate::ui::consts::WCODE_STOP, // 's'
-        8 => crate::ui::consts::WCODE_BACK,   // backspace
+        32 => plx_ui::consts::WCODE_PAUSE, // space
+        112 => plx_ui::consts::WCODE_PLAY, // 'p'
+        115 => plx_ui::consts::WCODE_STOP, // 's'
+        8 => plx_ui::consts::WCODE_BACK,   // backspace
         _ => 0,
     }
 }
@@ -180,10 +180,10 @@ pub(crate) fn encode_key_repeat(sym: c_uint, wcode: c_uint) -> [u8; 128] {
 ///
 /// THE one place event coordinates enter the UI, so the conversion cannot be forgotten at a new
 /// call site — there are nine, and patching them individually is how the tenth ends up wrong.
-/// `surface::to_logical` is the identity while the drawable is 1920x1080, which it is on every
-/// television seen so far.
+/// `surface::to_logical` is the identity while the drawable is 1920x1080, which it is 1:1 unless
+/// a webOS 1-3 owner picks a smaller Interface resolution (or the debug drawable trigger asks for one).
 pub(crate) fn ptr_xy(ev: &[u8]) -> (f32, f32) {
-    crate::surface::to_logical(rd_i32(ev, 20) as f32, rd_i32(ev, 24) as f32)
+    plx_base::surface::to_logical(rd_i32(ev, 20) as f32, rd_i32(ev, 24) as f32)
 }
 
 pub(crate) fn rd_i32(ev: &[u8], off: usize) -> i32 {
@@ -234,18 +234,62 @@ pub(crate) fn remote_token_key(tok: &str) -> Option<(c_uint, c_uint)> {
         "stop" => (0, WCODE_STOP),
         // The transport keys settled from LG's own scancode table (`ui::consts`' WCODE_REWIND doc).
         // Here for the same reason the edit keys below are: nothing else can press them headlessly.
-        "ff" | "fastforward" => (0, crate::ui::consts::WCODE_FASTFORWARD),
-        "rew" | "rewind" => (0, crate::ui::consts::WCODE_REWIND),
-        "playpause" => (0, crate::ui::consts::WCODE_PLAYPAUSE),
-        "exit" => (0, crate::ui::consts::WCODE_EXIT),
+        "ff" | "fastforward" => (0, plx_ui::consts::WCODE_FASTFORWARD),
+        "rew" | "rewind" => (0, plx_ui::consts::WCODE_REWIND),
+        "playpause" => (0, plx_ui::consts::WCODE_PLAYPAUSE),
+        "exit" => (0, plx_ui::consts::WCODE_EXIT),
         // The system keyboard's own two edit keys (`ui::consts`' doc has the protocol). They are
         // here because they are otherwise UNREACHABLE without a human at the panel: no trigger
         // raises the keyboard and `SDL_PushEvent` cannot carry a text event on the simulator, so
         // without these the only grader for backspace and Clear all is somebody's thumb.
-        "backspace" | "del" => (crate::ui::consts::SDLK_BACKSPACE, 42),
-        "clear" => (crate::ui::consts::SDLK_CLEAR, 156),
+        "backspace" | "del" => (plx_ui::consts::SDLK_BACKSPACE, 42),
+        "clear" => (plx_ui::consts::SDLK_CLEAR, 156),
         _ => return None,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePointer {
+    Click,
+    Move,
+    Down,
+    Up,
+}
+
+/// FIFO and Lab Control share one pointer alphabet. Coordinates are authored integer pixels;
+/// malformed/overflowing values are refused, and off-canvas values retain `ck:`'s edge clamp.
+fn remote_token_pointer(tok: &str) -> Option<(RemotePointer, i32, i32)> {
+    let (name, coords) = tok.split_once(':')?;
+    let kind = match name {
+        "ck" => RemotePointer::Click,
+        "pm" => RemotePointer::Move,
+        "pd" => RemotePointer::Down,
+        "pu" => RemotePointer::Up,
+        _ => return None,
+    };
+    let (x, y) = coords.split_once(',')?;
+    Some((kind,
+        x.parse::<i32>().ok()?.clamp(0, plx_base::surface::LOGICAL_W as i32 - 1),
+        y.parse::<i32>().ok()?.clamp(0, plx_base::surface::LOGICAL_H as i32 - 1)))
+}
+
+/// SDL pointer bytes shared by clicks, held-pointer FIFO edges and recorded-event replay.
+/// The inverse of `ptr_xy`: convert authored coordinates exactly once, including window scaling
+/// and letterboxing. Replay may carry a real off-canvas motion, so only the token parser clamps.
+/// ABI: SDL's `SDL_events.h` (stock and the NDK's) mouse-event declarations put four
+/// Uint32 fields before button@16/state@17 and Sint32 x@20/y@24. ARM32 NDK syntax-only
+/// `offsetof` assertions verified these offsets; see `docs/testing-player-pointer.md`.
+fn encode_pointer(et: u32, x: i32, y: i32) -> [u8; 128] {
+    let mut ev = [0u8; 128];
+    let (px, py) = plx_base::surface::to_physical(x as f32, y as f32);
+    ev[0..4].copy_from_slice(&et.to_ne_bytes());
+    ev[20..24].copy_from_slice(&(px.round() as i32).to_ne_bytes());
+    ev[24..28].copy_from_slice(&(py.round() as i32).to_ne_bytes());
+    if matches!(et, SDL_MOUSEBUTTONDOWN | SDL_MOUSEBUTTONUP) {
+        ev[16] = 1; // SDL_BUTTON_LEFT
+        ev[17] = u8::from(et == SDL_MOUSEBUTTONDOWN);
+    }
+    ev
 }
 
 /// Synthesize a Magic-Remote pointer click at authored 1920x1080 coords (the browser
@@ -255,40 +299,21 @@ pub(crate) fn remote_token_key(tok: &str) -> Option<(c_uint, c_uint)> {
 /// the second lands on the target. The LG SDL fork's mouse events carry x@20 / y@24
 /// (i32) — the only fields the handlers read.
 ///
-/// Click only, deliberately: forwarding hover moved app focus on every pass of the
-/// mouse over the streamed picture (parking it on a top-band tab pill, so the next
-/// ENTER opened the library). The host page draws its own local crosshair instead.
+/// The browser still sends clicks only: forwarding hover moved app focus on every pass of the
+/// mouse over the streamed picture. A driver can explicitly send `pm:`/`pd:`/`pu:` instead to
+/// separate HUD reveal from a press or to hold a drag across frames. Those edges add no jitter.
 pub(crate) fn remote_synth_ptr(x: i32, y: i32) {
-    let mut ev = [0u8; 128];
-    let mut push = |et: u32, px: i32, py: i32| {
-        // Authored coords go onto SDL's queue as WINDOW pixels, because that is what a real
-        // pointer event carries and `ptr_xy` converts every one of them back. Skipping this would
-        // transform the synthetic path twice on a scaled surface — and it is the path the whole
-        // headless test harness clicks through, so it would fail in a way that looked like the UI.
-        let (px, py) = crate::surface::to_physical(px as f32, py as f32);
-        let (px, py) = (px.round() as i32, py.round() as i32);
-        ev[0..4].copy_from_slice(&et.to_ne_bytes());
-        ev[20..24].copy_from_slice(&px.to_ne_bytes());
-        ev[24..28].copy_from_slice(&py.to_ne_bytes());
-        unsafe { SDL_PushEvent(ev.as_ptr() as *const c_void) };
-    };
     let jx = if x >= 200 { x - 200 } else { x + 200 };
-    push(SDL_MOUSEMOTION, jx, y);
-    push(SDL_MOUSEMOTION, x, y);
-    push(SDL_MOUSEBUTTONDOWN, x, y);
-    push(SDL_MOUSEBUTTONUP, x, y);
+    remote_synth_pointer(SDL_MOUSEMOTION, jx, y);
+    remote_synth_pointer(SDL_MOUSEMOTION, x, y);
+    remote_synth_pointer(SDL_MOUSEBUTTONDOWN, x, y);
+    remote_synth_pointer(SDL_MOUSEBUTTONUP, x, y);
 }
 
-/// ONE pointer event in authored coordinates — the replay driver's re-injection of a recorded
-/// motion (`SDL_MOUSEMOTION`), press or release, without `remote_synth_ptr`'s jitter prelude
-/// (the recording already holds whatever motion defeated the D-pad gate).
+/// ONE pointer event in authored coordinates, shared by the FIFO and replay. Unlike `ck:`,
+/// these primitives add no motion or release: `pd:` stays held until a separate `pu:` arrives.
 pub(crate) fn remote_synth_pointer(et: u32, x: i32, y: i32) {
-    let mut ev = [0u8; 128];
-    let (px, py) = crate::surface::to_physical(x as f32, y as f32);
-    let (px, py) = (px.round() as i32, py.round() as i32);
-    ev[0..4].copy_from_slice(&et.to_ne_bytes());
-    ev[20..24].copy_from_slice(&px.to_ne_bytes());
-    ev[24..28].copy_from_slice(&py.to_ne_bytes());
+    let ev = encode_pointer(et, x, y);
     unsafe { SDL_PushEvent(ev.as_ptr() as *const c_void) };
 }
 
@@ -305,6 +330,10 @@ pub(crate) fn remote_synth_lifecycle(code: u32) {
 /// driver re-dispatches them. `txt:` is here because its payload never becomes an SDL event on
 /// this host (`dispatch_remote_token`'s arm says why).
 pub(crate) fn token_is_direct(tok: &str) -> bool {
+    #[cfg(feature = "devtriggers")]
+    if crate::remote::HangProbe::parse(tok).is_some() {
+        return true;
+    }
     tok == "shot"
         || tok == "diag"
         || tok == "diagnostics"
@@ -376,6 +405,47 @@ pub(crate) fn is_input_event(et: u32) -> bool {
 mod input_event_tests {
     use super::*;
 
+    #[test]
+    fn pointer_tokens_validate_coordinates_and_keep_click_edge_clamping() {
+        for (prefix, kind) in [("ck", RemotePointer::Click), ("pm", RemotePointer::Move),
+            ("pd", RemotePointer::Down), ("pu", RemotePointer::Up)] {
+            assert_eq!(remote_token_pointer(&format!("{prefix}:1400,870")), Some((kind, 1400, 870)));
+            assert_eq!(remote_token_pointer(&format!("{prefix}:-2147483648,2147483647")),
+                Some((kind, 0, 1079)));
+            for invalid in ["", "1", "1,", ",1", "1,2,3", "NaN,1", "1.5,2", "2147483648,2"] {
+                assert_eq!(remote_token_pointer(&format!("{prefix}:{invalid}")), None);
+            }
+        }
+        assert_eq!(remote_token_pointer("pointer:1,2"), None);
+    }
+
+    #[test]
+    fn pointer_bytes_round_trip_through_the_common_coordinate_decoder() {
+        let _serial = plx_base::testlock::serial();
+        for et in [SDL_MOUSEMOTION, SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP] {
+            for (x, y) in [(0, 0), (1400, 870), (1919, 1079), (-200, 400)] {
+                let ev = encode_pointer(et, x, y);
+                assert_eq!(rd_u32(&ev, 0), et);
+                assert_eq!(ptr_xy(&ev), (x as f32, y as f32));
+                if et != SDL_MOUSEMOTION {
+                    assert_eq!(ev[16], 1, "the left button survives SDL's event queue");
+                    assert_eq!(ev[17], u8::from(et == SDL_MOUSEBUTTONDOWN));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn hang_probes_are_direct_recorder_tokens() {
+        for token in ["hang:1", "hang-raw:1", "hang:5001"] {
+            assert!(token_is_direct(token));
+        }
+        for token in ["down", "hang:", "hang:-1", "hang-raw:bad"] {
+            assert!(!token_is_direct(token));
+        }
+    }
+
     /// The boundary `popover::host::input_scope` rests on: every input kind is in, and the
     /// lifecycle events (background/foreground, `0x103`–`0x106`), window events and quit are out.
     #[test]
@@ -404,25 +474,29 @@ mod input_event_tests {
 ///
 /// `true` means the token was accepted and injected/requested, not that the screen necessarily
 /// changed — pressing DOWN at the bottom of a list is still a successfully delivered command.
-pub(crate) fn dispatch_remote_token(tok: &str, ps: &crate::route::PlaybackSession) -> bool {
+pub(crate) fn dispatch_remote_token(tok: &str, ps: &plx_media::route::PlaybackSession) -> bool {
     // As the SDL loop: a modal's input is its own. NOT for `pat:`, which is not input at all — it
     // changes the PAGE's ground directly, and a frozen host must be retaken to show it.
     let _own_input = if tok.starts_with("pat:") {
         None
     } else {
-        crate::ui::popover::host::input_scope()
+        plx_ui::popover::host::input_scope()
     };
-    crate::ui::idle::invalidate(); // injected input is input like any other
-                                   // pointer click token "ck:X,Y" — authored 1920x1080 coords
-    if let Some(rest) = tok.strip_prefix("ck:") {
-        let Some((xs, ys)) = rest.split_once(',') else {
-            return false;
+    plx_machine::idle::invalidate(); // injected input is input like any other
+    if let Some((kind, x, y)) = remote_token_pointer(tok) {
+        let name = match kind {
+            RemotePointer::Click => "click",
+            RemotePointer::Move => "pointer move",
+            RemotePointer::Down => "pointer down",
+            RemotePointer::Up => "pointer up",
         };
-        let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) else {
-            return false;
-        };
-        log(&format!("remote: click {},{}", x, y));
-        remote_synth_ptr(x.clamp(0, 1919), y.clamp(0, 1079));
+        log(&format!("remote: {name} {x},{y}"));
+        match kind {
+            RemotePointer::Click => remote_synth_ptr(x, y),
+            RemotePointer::Move => remote_synth_pointer(SDL_MOUSEMOTION, x, y),
+            RemotePointer::Down => remote_synth_pointer(SDL_MOUSEBUTTONDOWN, x, y),
+            RemotePointer::Up => remote_synth_pointer(SDL_MOUSEBUTTONUP, x, y),
+        }
         true
     } else if cfg!(feature = "hostsim") && tok == "shot" {
         // Simulator only. Screenshotting has to be a TOKEN rather than a launch option, because
@@ -476,7 +550,7 @@ pub(crate) fn dispatch_remote_token(tok: &str, ps: &crate::route::PlaybackSessio
             None => false,
         }
     } else if tok == "diag" || tok == "diagnostics" {
-        if crate::lab::menu_row_enabled() {
+        if plx_platform::labcfg::menu_row_enabled() {
             crate::lab::request_upload("command", ps);
             true
         } else {
@@ -484,9 +558,9 @@ pub(crate) fn dispatch_remote_token(tok: &str, ps: &crate::route::PlaybackSessio
         }
     } else if let Some(spec) = tok.strip_prefix("pat:") {
         // `pat:flat:40` — swap the synthetic ground live for a one-session graded sweep.
-        let ok = crate::ui::testpat::set(spec);
+        let ok = plx_ui::testpat::set(spec);
         if !ok {
-            crate::log(&format!("remote: unrecognised pattern {spec:?}"));
+            plx_base::eventlog::log(&format!("remote: unrecognised pattern {spec:?}"));
         }
         ok
     } else if let Some(text) = tok.strip_prefix("txt:") {
@@ -515,7 +589,7 @@ pub(crate) fn dispatch_remote_token(tok: &str, ps: &crate::route::PlaybackSessio
 #[cfg(test)]
 mod key_layout_tests {
     use super::{decode_key, encode_key, encode_key_repeat};
-    use crate::ui::consts::{SDLK_DOWN, SDLK_RETURN, WCODE_BACK, WCODE_PAUSE};
+    use plx_ui::consts::{SDLK_DOWN, SDLK_RETURN, WCODE_BACK, WCODE_PAUSE};
 
     /// `encode_key` and `decode_key` must agree, in whichever layout this build compiled.
     ///
@@ -621,11 +695,11 @@ mod key_layout_tests {
         );
         assert_eq!(
             remote_token_key("chup"),
-            Some((0, crate::ui::consts::WCODE_CH_UP_KEY))
+            Some((0, plx_ui::consts::WCODE_CH_UP_KEY))
         );
         assert_eq!(
             remote_token_key("pageup"),
-            Some((crate::ui::consts::SDLK_PAGEUP, 0))
+            Some((plx_ui::consts::SDLK_PAGEUP, 0))
         );
     }
 }

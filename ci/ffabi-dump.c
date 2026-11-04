@@ -22,6 +22,7 @@
 #include <libavcodec/bsf.h>
 #include <libavutil/frame.h>
 #include <libavutil/dovi_meta.h>
+#include <libavutil/mastering_display_metadata.h>
 
 /* Two ways to recover the same list, chosen by the platform's constraint rather than by taste.
  *
@@ -54,11 +55,12 @@ DUMP(off_stream_codecpar,  offsetof(AVStream, codecpar))
 DUMP(off_stream_metadata,  offsetof(AVStream, metadata))
 DUMP(sizeof_stream,        sizeof(AVStream))
 
-/* AVFormatContext — modelled through `nb_streams`/`streams`, plus duration by offset. */
+/* AVFormatContext — modelled through `nb_streams`/`streams`, plus duration and start_time by offset. */
 DUMP(off_fmt_nb_streams, offsetof(AVFormatContext, nb_streams))
 DUMP(off_fmt_streams,    offsetof(AVFormatContext, streams))
 DUMP(off_fmt_pb,         offsetof(AVFormatContext, pb))
 DUMP(off_fmt_duration,   offsetof(AVFormatContext, duration))
+DUMP(off_fmt_start_time, offsetof(AVFormatContext, start_time))
 
 /* AVCodecContext — set by AVOption name, but the venc self-check wants these. */
 DUMP(off_ctx_width,   offsetof(AVCodecContext, width))
@@ -134,6 +136,12 @@ DUMP(off_bsf_time_base_in, offsetof(AVBSFContext, time_base_in))
 /* Enum constants ff.rs hardcodes. */
 DUMP(id_h264,   AV_CODEC_ID_H264)
 DUMP(id_hevc,   AV_CODEC_ID_HEVC)
+DUMP(id_vp9,    AV_CODEC_ID_VP9)
+DUMP(pkt_mastering_display, AV_PKT_DATA_MASTERING_DISPLAY_METADATA)
+DUMP(pkt_content_light, AV_PKT_DATA_CONTENT_LIGHT_LEVEL)
+DUMP(size_mastering_display, sizeof(AVMasteringDisplayMetadata))
+DUMP(size_content_light, sizeof(AVContentLightMetadata))
+DUMP(id_av1,    AV_CODEC_ID_AV1)
 DUMP(id_aac,    AV_CODEC_ID_AAC)
 DUMP(id_ac3,    AV_CODEC_ID_AC3)
 DUMP(id_eac3,   AV_CODEC_ID_EAC3)

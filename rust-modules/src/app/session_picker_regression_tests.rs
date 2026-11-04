@@ -2,9 +2,9 @@
 //! Use the existing Bridge/owner/dispatcher and explicit resource fixtures; no global controller.
 
 use super::*;
-use crate::auth::owner::ReplyTo;
-use crate::auth::{Phase, Picker, SessionCmd, SessionInit};
-use crate::plex::session::{self, HomeUserRef, ServerRef, Session, SourceRef, UserRef};
+use plx_session::auth::owner::ReplyTo;
+use plx_session::auth::{Phase, Picker, SessionCmd, SessionInit};
+use plx_plex::plex::session::{self, HomeUserRef, ServerRef, Session, SourceRef, UserRef};
 
 fn stored(protected: bool) -> Session {
     let uuid = if protected { "adult" } else { "kid" };
@@ -109,6 +109,7 @@ fn refused_back(rig: &mut Bridge, d: &mut Dispatcher<AppHost>) {
 
 #[test]
 fn back_out_of_the_boot_picker_refuses_a_pin_protected_profile_and_nothing_else() {
+    let _serial = plx_base::testlock::serial();
     // Pure may_resume/default/reason-string assertions remain in auth.rs's legacy bodies;
     // these are actual owner commands and resource handoffs, not evidence about log output.
     for protected in [true, false] {
@@ -175,21 +176,22 @@ fn back_out_of_the_boot_picker_refuses_a_pin_protected_profile_and_nothing_else(
     }
 }
 
-struct ResourceCleanup<'a>(&'a crate::task::MainThread);
+struct ResourceCleanup<'a>(&'a plx_base::task::MainThread);
 impl Drop for ResourceCleanup<'_> {
     fn drop(&mut self) {
-        crate::plex::reset_servers_for_test();
-        session::ProfilePublisher::new(self.0).publish(None, 0);
+        plx_plex::plex::reset_servers_for_test();
+        session::ProfilePublisher::new(self.0).publish(None, 0, String::new());
     }
 }
 
+/// Called with the test's `testlock::serial()` guard held (the seat trigger writes the player's
+/// process-global cells from every rig in this file, so the whole test holds it, not this part).
 fn live_detachment() {
-    let _lock = crate::testlock::serial();
-    let mt = unsafe { crate::task::MainThread::assume() };
+    let mt = unsafe { plx_base::task::MainThread::assume() };
     let tmp = session::TempSession::new("picker-owner-detachment");
     let _cleanup = ResourceCleanup(&mt);
     tmp.assert_only_target();
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
     let saved = stored(true);
     session::save(&saved);
     let disk = std::fs::read(tmp.path()).unwrap();
@@ -236,6 +238,7 @@ fn live_detachment() {
 
 #[test]
 fn change_profile_then_back_cannot_restore_the_protected_profile_it_left() {
+    let _serial = plx_base::testlock::serial();
     for protected in [true, false] {
         let saved = stored(protected);
         assert_eq!(saved.active_profile_is_protected(), protected);
@@ -322,13 +325,13 @@ fn change_profile_then_back_cannot_restore_the_protected_profile_it_left() {
 #[test]
 fn first_run_consent_over_the_picker_does_not_flip_mounts_every_frame() {
     use super::test_support::tick;
-    let _g = crate::testlock::serial();
-    let saved_consent = crate::telemetry::consent::current();
-    crate::telemetry::consent::install(crate::telemetry::consent::Consent::default());
+    let _g = plx_base::testlock::serial();
+    let saved_consent = plx_telemetry::telemetry::consent::current();
+    plx_telemetry::telemetry::consent::install(plx_telemetry::telemetry::consent::Consent::default());
     // Any `plxnative-*` file in the runtime root suppresses the question (`dev::any_trigger_present`);
     // run under `--features hostsim` with a private `PLXNATIVE_RUNTIME_DIR`, as `make check` does.
     assert!(!crate::dev::any_trigger_present(), "a stray trigger in {:?} suppresses the consent question",
-        crate::paths::runtime_dir());
+        plx_base::paths::runtime_dir());
     assert!(crate::dev::scenarios::consent_override().is_none());
 
     let mut account = stored(true);
@@ -340,7 +343,7 @@ fn first_run_consent_over_the_picker_does_not_flip_mounts_every_frame() {
     let mut rig = rig(account);
     // Production's dispatcher (`app/boot.rs`): the PageDip route transition, not the tests' cut.
     let mut d = Dispatcher::<AppHost>::with_transition(Box::new(
-        crate::ui::containers::transition::PageDip::new(),
+        plx_ui::containers::transition::PageDip::new(),
     ));
 
     // The QR screen was the root before the sign-in completed.
@@ -379,7 +382,7 @@ fn first_run_consent_over_the_picker_does_not_flip_mounts_every_frame() {
     }
 
     if let Some(c) = saved_consent {
-        crate::telemetry::consent::install(c);
+        plx_telemetry::telemetry::consent::install(c);
     }
     // The first-run consent surface is a Settings-family screen: its `Screen::name()` is "settings".
     let named = |w: &str| mounts.iter().filter(|(_, n)| *n == w).count();
@@ -409,14 +412,14 @@ fn first_run_consent_over_the_picker_does_not_flip_mounts_every_frame() {
 #[test]
 fn login_phase_follower_settles_and_does_not_recycle_the_qr_screen() {
     use super::test_support::tick;
-    let _g = crate::testlock::serial();
+    let _g = plx_base::testlock::serial();
 
     let mut init = SessionInit::captured(Session::default());
     init.phase = Phase::Waiting;
     let mut rig = Bridge::for_session_test(init);
     // Production's dispatcher (`app/boot.rs`): the PageDip route transition, not the tests' cut.
     let mut d = Dispatcher::<AppHost>::with_transition(Box::new(
-        crate::ui::containers::transition::PageDip::new(),
+        plx_ui::containers::transition::PageDip::new(),
     ));
 
     // `app/boot.rs`: the QR screen is minted as the root once, before the loop's first iteration.
@@ -447,4 +450,76 @@ fn login_phase_follower_settles_and_does_not_recycle_the_qr_screen() {
         "(frame, screen) mounts {mounts:?}; {unmounts} unmounts",
     );
     assert_eq!(d.nav.tabs.stack.page_alpha(), 1.0, "the page transition actually settled");
+}
+
+/// **A cold start lands on the FIRST profile, whatever the roster's size.** The first frame of a
+/// boot has no mounted page yet, so `capture_chrome` read the missing route as Home and published
+/// the tab strip; the picker's mount `Enter` was composed with that strip and seated focus on a
+/// strip pill. The next frame (route now Profiles, strip cleared) asked the picker to reconcile
+/// the foreign key, and `ProfilesView::reconcile` clamped it to `n - 1` — the LAST avatar. With
+/// one profile the clamp is invisible, which is why a single-profile roster never showed it.
+#[test]
+fn a_cold_start_picker_seats_focus_on_the_first_profile() {
+    use super::test_support::{frame, tick};
+    let _g = plx_base::testlock::serial();
+    for n in [1usize, 2, 4, 6] {
+        let mut saved = stored(false);
+        saved.home_users = (0..n)
+            .map(|i| HomeUserRef { uuid: format!("u{i}").into(), protected: false, ..Default::default() })
+            .collect();
+        saved.user.uuid = "u0".into();
+        let mut rig = rig(saved);
+        let mut d = Dispatcher::<AppHost>::new();
+        execute_session_command(&mut d, SessionCmd::StartSwitch(Picker::Boot));
+        for i in 0..40 {
+            frame(&mut d, &mut rig, AppArg::Profiles, tick(i), vec![]);
+        }
+        assert_eq!(rig.auth_read().0.users.len(), n);
+        assert_eq!(
+            d.focus().map(|k| k.elem),
+            Some(0),
+            "{n} profiles: the picker must open on the first avatar"
+        );
+    }
+}
+
+/// **A player pushed over the QR sign-in page lands, whatever the follower asks while it dips in.**
+///
+/// The `playurl` dev trigger starts playback from a boot with no session, so the player is pushed
+/// OVER the sign-in page. Until the dip-out commits, `top_arg()` still names Login, so the loop's
+/// per-frame `follow_auth_landing` keeps running, and its `Phase::Waiting` arm
+/// (`nav_root_if_unsettled(Login)`) read a pending push as "Login is not settled" and parked a
+/// `Root(Login)` that replaced it: the player never mounted. Same order as the loop: the
+/// dispatcher frame commits, then the follower runs while the top still reads Login.
+///
+/// Expected: the player is the top once the dip settles, and the QR page was not re-minted.
+#[test]
+fn a_player_pushed_over_the_qr_screen_is_not_re_rooted_by_the_follower() {
+    use super::test_support::tick;
+    let _g = plx_base::testlock::serial();
+
+    let mut init = SessionInit::captured(Session::default());
+    init.phase = Phase::Waiting;
+    let mut rig = Bridge::for_session_test(init);
+    let mut d = Dispatcher::<AppHost>::with_transition(Box::new(
+        plx_ui::containers::transition::PageDip::new(),
+    ));
+    super::nav_root(&mut d, AppArg::Login);
+
+    let mut login_mounts = 0usize;
+    for i in 0..140u32 {
+        if i == 30 {
+            // The sign-in page has been the settled root since the boot; this is `enter_player`.
+            assert!(top_settled_on(&d, &AppArg::Login), "Login is the settled root before the push");
+            super::nav_push(&mut d, AppArg::Player);
+        }
+        let (_, report) = super::frame(&mut d, &mut rig, tick(i), vec![]);
+        login_mounts += report.mounted.iter().filter(|(_, n)| *n == "login").count();
+        if matches!(d.top_arg(), Some(AppArg::Login | AppArg::Profiles)) {
+            super::follow_auth_landing(&mut d, &mut rig);
+        }
+    }
+
+    assert!(matches!(d.top_arg(), Some(AppArg::Player)), "the follower withdrew the player push");
+    assert_eq!(login_mounts, 1, "the QR page was re-minted over the player");
 }

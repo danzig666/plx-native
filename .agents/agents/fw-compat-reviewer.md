@@ -3,7 +3,7 @@ name: fw-compat-reviewer
 description: >
   Review a change that touches FFI, linkage, or the runtime library seam and answer one
   question — can this binary still START on every firmware this project claims to support?
-  Use before pushing anything that edits `rust-modules/src/dynlib.rs`, `ff.rs`, `net.rs`,
+  Use before pushing anything that edits `rust-modules/base/src/dynlib.rs`, `ff.rs`, `net.rs`,
   `src/starfish.c`, `ci/expected-dt-needed.txt`, the Makefile's `LIBS_REAL`, or that adds any
   `extern "C"` block, `#[link]` directive, `dlopen`, mangled-symbol declaration or new FFmpeg /
   curl / Starfish / ACB call. Also use when a reviewer asks "does this still load on webOS 5?",
@@ -45,9 +45,9 @@ In scope if the diff touches any of:
 
 | path / edit | why it can move the answer |
 |---|---|
-| `rust-modules/src/dynlib.rs` | the one door for runtime-bound libraries; the macro's shape *is* the calling convention |
-| `rust-modules/src/ff.rs` | the four bundled-FFmpeg `dynlib!` blocks + the pinned-major gate |
-| `rust-modules/src/net.rs` | the libcurl `dynlib!` block — three variadic wrappers over two C symbols, plus the candidate list |
+| `rust-modules/base/src/dynlib.rs` | the one door for runtime-bound libraries; the macro's shape *is* the calling convention |
+| `rust-modules/media/src/ff.rs` | the four bundled-FFmpeg `dynlib!` blocks + the pinned-major gate |
+| `rust-modules/net/src/net.rs` | the libcurl `dynlib!` block — variadic wrappers over two C symbols, plus the candidate list |
 | `src/starfish.c` | 15 mangled C++ externs against real libraries, plus its own `dlopen` of ACB |
 | any new `extern "C"` block, `#[link]`, or `__asm__("<mangled>")` declaration | each one adds an undefined symbol, or a whole `DT_NEEDED` entry |
 | `Makefile`'s `LIBS_REAL` / the link line (currently line 256 / 444) | a new `-l` is a new hard `DT_NEEDED` |
@@ -123,8 +123,8 @@ Two preconditions, and neither is in the `--help` text.
 
 **1. A ~317 MB firmware inventory database, fetched ONCE.** `ensure_db` runs before every mode —
 `--inventory` and `--lib` included — and looks for `~/.cache/plxnative/fwsym/data`. If that is
-absent it downloads `webosbrew-toolbox-fw-symbols_0.4.0-1_arm64.deb` from GitHub (pinned in the
-script as `FWSYM_TAG = v20260731-e1bb0c0`, so a database refresh is a visible commit rather than a
+absent it downloads `webosbrew-toolbox-fw-symbols_0.4.0-1_arm64.deb` from GitHub (pinned, with its sha256, in
+`ci/dependencies.json` as entry `webosbrew-toolbox`, so a database refresh is a visible commit rather than a
 silent change of verdict) and unpacks it. **So the first invocation on a machine needs the
 network; every invocation after it is genuinely offline** — measured on this checkout 2026-08-23,
 0.07 s for `--inventory`, 0.27 s for the full matrix. In a sandbox with no egress and a cold
@@ -146,9 +146,9 @@ grade an ELF at all.
 
 ```sh
 git -C <repo> diff --stat HEAD          # or the range under review
-git -C <repo> diff HEAD -- rust-modules/src/dynlib.rs rust-modules/src/ff.rs \
-    rust-modules/src/net.rs src/starfish.c Makefile ci/expected-dt-needed.txt
-grep -rn '#\[link\|extern "C"\|__asm__("' rust-modules/src src   # against the diff, not the tree
+git -C <repo> diff HEAD -- rust-modules/base/src/dynlib.rs rust-modules/media/src/ff.rs \
+    rust-modules/net/src/net.rs src/starfish.c Makefile ci/expected-dt-needed.txt
+grep -rn '#\[link\|extern "C"\|__asm__("' rust-modules/src rust-modules/media/src rust-modules/net/src src   # against the diff, not the tree
 ```
 
 ### 1. Decide, out loud, whether you are grading an ELF or grading source
@@ -235,16 +235,18 @@ Reading the output:
 
 * **Always pass `--min-release 4.4.2`: a bare `tools/fwcompat.py` EXITS 1 on a perfectly healthy
   binary.** Verified 2026-08-23 on this checkout — same ELF, byte-identical table, `bare exit=1`
-  against `--min-release 4.4.2 exit=0`. With no floor every release gates, and the five oldest
-  fail permanently (next bullet). So a `set -e`, a wrapper script, or anyone who reads `$?`
+  against `--min-release 4.4.2 exit=0`. With no floor every release gates, including the
+  old images below the floor (next bullet). So a `set -e`, a wrapper script, or anyone who reads `$?`
   instead of the table gets a regression that is not one. docs/agent-reference.md's own example line
   (`tools/fwcompat.py   # the matrix: OK/FAIL per release`) does not mention it.
-* **`--min-release 4.4.2` is the floor, and there is a reason.** The five oldest images (1.2.0,
-  1.4.0, 2.2.3, 3.4.0, 3.9.2) fail permanently and for something nobody intends to fix: they
-  predate the C++11 `std::string` ABI, so `StarfishMediaAPIs::Feed` has a different mangling.
-  `tools/fwcompat.py --release 3.9.2` shows it directly — the two missing symbols are
-  `SDL_webOSCursorVisibility` and `_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc`, the `B5cxx11` tag being
-  the whole story. Those rows are still printed; they just do not set the exit status.
+* **`--min-release 4.4.2` is the floor, and there is a reason.** It is the oldest release this
+  project has graded as healthy; the older images (1.2.0, 1.4.0, 2.2.3, 3.4.0, 3.9.2) predate the
+  C++11 `std::string` ABI and are untested on a set apart from one 3.4.3 (webOS 1.x/2.x were never
+  tried). They used to fail on two missing symbols, `SDL_webOSCursorVisibility` and
+  `StarfishMediaAPIs::Feed`'s C++11 name, but since #578 both are `dlsym`'d at runtime
+  (`src/starfish.c`, `rust-modules/src/app/boot.rs`), so the binary no longer imports them. Re-run
+  `tools/fwcompat.py` for what the old rows print now; they are still printed below the floor and
+  do not set the exit status.
 * **Baseline as of 2026-08-23** (verified by running it): `15 DT_NEEDED, 319 undefined dynamic
   symbols`, **OK on 4.4.2, 4.10.0, 5.3.1, 6.4.0, 7.4.0, 8.3.0, 9.2.0, 10.2.0, 11.2.0**. Anything
   else at or above the floor is a regression introduced by the diff. Do not quote this baseline as
@@ -299,11 +301,11 @@ fn curl_easy_setopt_ptr = "curl_easy_setopt"(handle: *mut CURL, option: c_int, .
 
 That reads oddly and it is deliberate: `handle` and `option` are the only NAMED parameters in
 `curl.h`, everything else arrives through `va_arg`, and naming the trailing type is how one C
-symbol is bound as more than one wrapper. **Count them; do not quote a count.** `net.rs` holds
-THREE variadic wrappers over TWO C symbols — `curl_easy_setopt` twice (`_ptr`, `_long`) and
-`curl_easy_getinfo` once. docs/agent-reference.md, `dynlib!`'s own doc and `net.rs`'s own comment all say "one C
-symbol … three wrappers", which is the arithmetic of neither half; the number rotted in three
-places at once, and a finding that repeats it is a wrong finding.
+symbol is bound as more than one wrapper. **Count them; do not quote a count.** `net.rs` binds
+two C symbols through variadic wrappers — `curl_easy_setopt` twice (`_ptr`, `_long`) and
+`curl_easy_getinfo` twice (`_long`, `_ptr`). docs/agent-reference.md, `dynlib!`'s own doc and `net.rs`'s own comment
+say "bound as more than one wrapper" for that reason: a quoted count rotted in three places at
+once, and a finding that repeats one is a wrong finding.
 
 Moving that argument **before** the ellipsis is not a style choice — it selects a different
 **calling convention**, because **Apple's ARM64 ABI passes variadic arguments on the stack while
@@ -344,7 +346,9 @@ can answer **nothing** about:
 And even within its own remit it grades **starting**, not working. A firmware can export every ACB
 entry point and still refuse to put a picture on the video plane; `docs/webos5-port.md` §4 is the
 standing list of what only a human with a television can settle. Playback is device-verified on
-4.10.0 (the dev set) and 6.5.2 (issue #22) and nowhere else.
+4.10.0 (the dev set) and 6.5.2 (issue #22); beyond those, the only evidence is opt-in PostHog
+`playback.started` events from field sets (4.4.2 to 11.2.0 as of 2026-09), which say a first frame
+was shown and nothing about why a firmware might differ.
 
 For the questions in that list, the answer is not this tool. It is
 `.agents/skills/decompile-tv-lib/` — harvest the actual `.so` off a set and read it — and for a
@@ -368,17 +372,18 @@ infer past.)
   (14 GB on this checkout, per feature set, per worktree). Worse for your own job: any make
   invocation that is not a **pure query** and whose feature configuration differs from the stamp
   **deletes `pkg/plxnative` at parse time** — so `make RELEASE=1 <anything>` would destroy the very
-  binary you were about to grade. The only side-effect-free goals are the seven `print-*` queries
-  and `release-guard`; `make -s print-appdir` is safe, `make -p` is never (it prints unexpanded
+  binary you were about to grade. The side-effect-free goals are the `SIDE_EFFECT_FREE` list
+  (`grep '^SIDE_EFFECT_FREE' Makefile`: the `print-*` queries, `release-guard`, `make disk`,
+  `make check-nodef` and a few more); `make -s print-appdir` is safe, `make -p` is never (it prints unexpanded
   recursive variables).
 * Host-only tooling is fine and encouraged: `tools/fwcompat.py`, `ci/check-elf.sh`, the NDK's
-  `arm-webos-linux-gnueabi-readelf` / `-objdump`, `cd rust-modules && cargo +nightly check`,
-  `make check`. **`make check` is NOT in `SIDE_EFFECT_FREE`** (Makefile line 358 — that list is
-  the seven `print-*` goals plus `release-guard`, and nothing else), so on a checkout whose last
+  `arm-webos-linux-gnueabi-readelf` / `-objdump`, `cd rust-modules && cargo check`,
+  `make check`. **`make check` is NOT in `SIDE_EFFECT_FREE`** (the Makefile line starting
+  `SIDE_EFFECT_FREE =` is the exact set), so on a checkout whose last
   build was `RELEASE=1`, a plain `make check` rewrites `pkg/.build-config` at parse time and takes
   `pkg/plxnative` and the staged `.so` files with it: the binary you were about to grade, gone
   before cargo has started. **Grade the ELF first and run host checks after**, or invoke
-  `cargo +nightly check` inside `rust-modules/` directly, which never touches the stamp.
+  `cargo check` inside `rust-modules/` directly, which never touches the stamp.
 
 ## OUTPUT
 

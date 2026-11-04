@@ -3,10 +3,10 @@
 font-hint-audit.py — verify the theme::size ladder rasterizes with design-true stroke
 weights for the INTER faces we ship (`FONTS` below).
 
-Scope, because a third face ships and is deliberately NOT audited here: `pkg/appfont-cjk.ttf`
-(Noto Sans CJK KR, the fallback chain's link 2 — see rust-modules/src/text.rs) never draws Latin
+Scope, because further faces ship and are deliberately NOT audited here: `pkg/appfont-emoji.ttf` and `pkg/appfont-cjk.ttf`
+(Noto Sans CJK KR, the fallback chain's link 2 — see rust-modules/gfx/src/text.rs) never draws Latin
 in this app, the ladder was tuned on Inter's stems, and SDL_ttf's synthetic bold is never applied
-to it. A CJK re-cut is graded by rust-modules/src/fontcov.rs's coverage gate and by a device
+to it. A CJK re-cut is graded by rust-modules/base/src/fontcov.rs's coverage gate and by a device
 capture, not by this script.
 
 Why this exists: TrueType hinting grid-fits strokes to whole pixels, and the rounding is
@@ -14,10 +14,10 @@ size- and font-specific. Under FreeType's default NORMAL hinting, Arial's own by
 rounds horizontal bars UP — at bold 26 (size::LABEL, the card-title rung) it drew 4px bars
 over 3px stems, inverting the typeface's stem>bar design and making titles read top-heavy.
 The app therefore rasterizes with LIGHT hinting and draws text quads at integer pixel
-origins (both in rust-modules/src/text.rs), which keeps stems >= bars at every size.
+origins (both in rust-modules/gfx/src/text.rs), which keeps stems >= bars at every size.
 
-This script proves that property holds: it parses the rungs out of theme.rs `mod size`
-(single source of truth), adds the two documented carve-outs, and renders a capital F from
+This script proves that property holds: it parses the rungs out of gfx/tokens.rs `mod size`
+(single source of truth; `ui::theme::size` re-exports it), adds the two documented carve-outs, and renders a capital F from
 each shipped font at each size under LIGHT hinting, measuring the solid core (coverage
 > 0.9) of the top bar vs the vertical stem. Any size where bars come out heavier is
 flagged; new flags (outside the accepted list below) fail the run.
@@ -37,12 +37,12 @@ except ImportError:
     sys.exit("freetype-py not installed — run: pip install freetype-py")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-THEME = os.path.join(REPO, "rust-modules", "src", "ui", "theme.rs")
+THEME = os.path.join(REPO, "rust-modules", "gfx", "src", "gfx", "tokens.rs")
 FONTS = {
     "bold": os.path.join(REPO, "pkg", "appfont-bold.ttf"),
     "regular": os.path.join(REPO, "pkg", "appfont.ttf"),
 }
-# Named carve-outs living outside the ladder (see theme.rs's size-module doc).
+# Named carve-outs living outside the ladder (see the size-module doc in gfx/tokens.rs).
 CARVEOUTS = {54: "HUD_TITLE_SZ (bold)", 36: "subtitle caption (bold)"}
 # Known, accepted imbalances — reviewed 2026-07-18. MICRO (22) and LABEL's rare regular
 # sites (26) are bar-heavy by one solid pixel even under LIGHT hinting; both are low-
@@ -52,9 +52,15 @@ ACCEPTED = {("regular", 22), ("regular", 26)}
 
 
 def ladder():
-    """size -> rung name, parsed from theme.rs `mod size`."""
+    """size -> rung name, parsed from gfx/tokens.rs `mod size`."""
+    if not os.path.isfile(THEME):
+        sys.exit(f"font-hint-audit: the size ladder's home is missing: {THEME}\n"
+                 "  (it lives in the plx_gfx crate; if the file moved again, update THEME at the top of this script)")
     src = open(THEME).read()
-    mod = re.search(r"pub mod size \{(.*?)\n\}", src, re.S).group(1)
+    found = re.search(r"pub mod size \{(.*?)\n\}", src, re.S)
+    if not found:
+        sys.exit(f"font-hint-audit: no `pub mod size {{ ... }}` block in {THEME}")
+    mod = found.group(1)
     return {int(m.group(2)): m.group(1)
             for m in re.finditer(r"pub const (\w+): c_int = (\d+);", mod)}
 

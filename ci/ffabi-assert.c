@@ -1,4 +1,4 @@
-/* Compile-time proof that rust-modules/src/ff.rs's FFmpeg ABI constants match the FFmpeg the app
+/* Compile-time proof that rust-modules/media/src/ff.rs's FFmpeg ABI constants match the FFmpeg the app
  * SHIPS — compiled against the very headers those libraries were built from.
  *
  * WHAT CHANGED. This file used to check offsets against the TELEVISION's FFmpeg, re-derived from
@@ -25,7 +25,9 @@
 #include <libavutil/frame.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dovi_meta.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/dict.h>
+#include <libavutil/opt.h>
 
 #define SAME(expr, want, what) _Static_assert((expr) == (want), what)
 
@@ -92,8 +94,11 @@ SAME32(offsetof(AVFormatContext, streams), 28, "AVFormatContext.streams moved");
 SAME64(offsetof(AVFormatContext, streams), 48, "AVFormatContext.streams moved [host]");
 SAME32(offsetof(AVFormatContext, duration), 64, "OFF_FMT_DURATION != 64");
 SAME64(offsetof(AVFormatContext, duration), 104, "OFF_FMT_DURATION != 64 [host]");
+/* start_time is the int64 right before duration: how a transport stream's clock is rebased to 0. */
+SAME32(offsetof(AVFormatContext, start_time), 56, "OFF_FMT_START_TIME != 56");
+SAME64(offsetof(AVFormatContext, start_time), 96, "OFF_FMT_START_TIME != 56 [host]");
 
-/* --- AVFrame: poked directly by the encode path. --- */
+/* --- AVFrame: poked directly by the encode path, and read by the lossless → PCM decoder. --- */
 SAME(offsetof(AVFrame, data), 0, "OFF_FRAME_DATA != 0");
 SAME32(offsetof(AVFrame, linesize), 32, "OFF_FRAME_LINESIZE != 32");
 SAME64(offsetof(AVFrame, linesize), 64, "OFF_FRAME_LINESIZE != 32 [host]");
@@ -108,6 +113,37 @@ SAME64(offsetof(AVFrame, format), 116, "OFF_FRAME_FORMAT != 80 [host]");
    likely to be got wrong by reading a struct definition on a 64-bit machine. This assertion is
    the reason the FFmpeg 9 bump did not ship a wrong PTS: it fired here, on a desk. */
 SAME32(offsetof(AVFrame, pts), 96, "OFF_FRAME_PTS != 96 (ARM EABI int64 alignment)");
+/* The audio half, read by ff.rs's SpeedDecoder (playback speed) and ff_pcm.rs's PcmDecoder (FLAC, ALAC, LPCM). */
+SAME32(offsetof(AVFrame, extended_data), 64, "OFF_AFRAME_EXTENDED_DATA != 64");
+SAME64(offsetof(AVFrame, extended_data), 96, "OFF_AFRAME_EXTENDED_DATA != 96 [host]");
+SAME32(offsetof(AVFrame, nb_samples), 76, "OFF_AFRAME_NB_SAMPLES != 76");
+SAME64(offsetof(AVFrame, nb_samples), 112, "OFF_AFRAME_NB_SAMPLES != 112 [host]");
+SAME32(offsetof(AVFrame, sample_rate), 132, "OFF_AFRAME_SAMPLE_RATE != 132");
+SAME64(offsetof(AVFrame, sample_rate), 180, "OFF_AFRAME_SAMPLE_RATE != 180 [host]");
+SAME32(offsetof(AVFrame, ch_layout) + offsetof(AVChannelLayout, nb_channels), 260, "OFF_AFRAME_NB_CHANNELS != 260");
+SAME64(offsetof(AVFrame, ch_layout) + offsetof(AVChannelLayout, nb_channels), 388, "OFF_AFRAME_NB_CHANNELS != 388 [host]");
+/* The channel layout's order and native mask, read by ff_pcm.rs's lossy mode to mix by channel ROLE.
+   `u` is a union of the mask and a pointer (a custom layout), so the mask is only read when the order
+   is AV_CHANNEL_ORDER_NATIVE; `u` is 8-aligned on ARM EABI as on the 64-bit hosts. */
+SAME32(offsetof(AVFrame, ch_layout) + offsetof(AVChannelLayout, order), 256, "OFF_AFRAME_CH_ORDER != 256");
+SAME64(offsetof(AVFrame, ch_layout) + offsetof(AVChannelLayout, order), 384, "OFF_AFRAME_CH_ORDER != 384 [host]");
+SAME32(offsetof(AVFrame, ch_layout) + offsetof(AVChannelLayout, u), 264, "OFF_AFRAME_CH_MASK != 264");
+SAME64(offsetof(AVFrame, ch_layout) + offsetof(AVChannelLayout, u), 392, "OFF_AFRAME_CH_MASK != 392 [host]");
+SAME(AV_CHANNEL_ORDER_NATIVE, 1, "ff::CH_ORDER_NATIVE");
+SAME(sizeof(((AVChannelLayout *)0)->u.mask), 8, "the channel mask is 64 bits");
+/* `av_opt_set`'s search flag, passed by ff_pcm.rs to reach the DTS decoder's private `core_only` option; a moved
+   value would make that call fail silently and a DTS-HD stream decode its extensions. */
+SAME(AV_OPT_SEARCH_CHILDREN, 1, "ff_pcm::AV_OPT_SEARCH_CHILDREN");
+SAME(AV_SAMPLE_FMT_U8, 0, "speed_audio::SampleFormat::from_av U8");
+SAME(AV_SAMPLE_FMT_S16, 1, "speed_audio::SampleFormat::from_av S16");
+SAME(AV_SAMPLE_FMT_S32, 2, "speed_audio::SampleFormat::from_av S32");
+SAME(AV_SAMPLE_FMT_FLT, 3, "speed_audio::SampleFormat::from_av FLT");
+SAME(AV_SAMPLE_FMT_DBL, 4, "speed_audio::SampleFormat::from_av DBL");
+SAME(AV_SAMPLE_FMT_U8P, 5, "speed_audio::SampleFormat::from_av U8P");
+SAME(AV_SAMPLE_FMT_S16P, 6, "speed_audio::SampleFormat::from_av S16P");
+SAME(AV_SAMPLE_FMT_S32P, 7, "speed_audio::SampleFormat::from_av S32P");
+SAME(AV_SAMPLE_FMT_FLTP, 8, "speed_audio::SampleFormat::from_av FLTP");
+SAME(AV_SAMPLE_FMT_DBLP, 9, "speed_audio::SampleFormat::from_av DBLP");
 SAME64(offsetof(AVFrame, pts), 136, "OFF_FRAME_PTS != 96 (ARM EABI int64 alignment) [host]");
 
 /* --- AVPacket: modelled field-by-field in ff.rs. Never allocated by us (av_packet_alloc does),
@@ -239,6 +275,23 @@ SAME64(offsetof(AVBSFContext, time_base_in), 40, "AVBSFContext.time_base_in move
        FF_API_VOXWARE were removed; the n3.3 values are 28 / 174 / 0x15029. --- */
 SAME(AV_CODEC_ID_H264, 27, "AV_CODEC_ID_H264 != 27");
 SAME(AV_CODEC_ID_HEVC, 172, "AV_CODEC_ID_HEVC != 172 (173 on FFmpeg 6 — the enum shifts again)");
+SAME(AV_PKT_DATA_MASTERING_DISPLAY_METADATA, 20, "AV_PKT_DATA_MASTERING_DISPLAY_METADATA != 20");
+SAME(AV_PKT_DATA_CONTENT_LIGHT_LEVEL, 22, "AV_PKT_DATA_CONTENT_LIGHT_LEVEL != 22");
+/* `player/vp9_hdr.rs` parses these two structs out of raw bytes at hard-coded offsets, so a size
+   alone cannot pin them: a reorder that keeps 88 bytes would swap fields silently. Every member is
+   4-byte aligned, so the offsets are the same at both pointer widths. */
+SAME(sizeof(AVMasteringDisplayMetadata), 88, "AVMasteringDisplayMetadata size moved");
+SAME(offsetof(AVMasteringDisplayMetadata, display_primaries), 0, "AVMasteringDisplayMetadata.display_primaries moved");
+SAME(offsetof(AVMasteringDisplayMetadata, white_point), 48, "AVMasteringDisplayMetadata.white_point moved");
+SAME(offsetof(AVMasteringDisplayMetadata, min_luminance), 64, "AVMasteringDisplayMetadata.min_luminance moved");
+SAME(offsetof(AVMasteringDisplayMetadata, max_luminance), 72, "AVMasteringDisplayMetadata.max_luminance moved");
+SAME(offsetof(AVMasteringDisplayMetadata, has_primaries), 80, "AVMasteringDisplayMetadata.has_primaries moved");
+SAME(offsetof(AVMasteringDisplayMetadata, has_luminance), 84, "AVMasteringDisplayMetadata.has_luminance moved");
+SAME(sizeof(AVContentLightMetadata), 8, "AVContentLightMetadata size moved");
+SAME(offsetof(AVContentLightMetadata, MaxCLL), 0, "AVContentLightMetadata.MaxCLL moved");
+SAME(offsetof(AVContentLightMetadata, MaxFALL), 4, "AVContentLightMetadata.MaxFALL moved");
+SAME(AV_CODEC_ID_VP9, 166, "AV_CODEC_ID_VP9 != 166");
+SAME(AV_CODEC_ID_AV1, 222, "AV_CODEC_ID_AV1 != 222");
 SAME(AV_CODEC_ID_AAC, 0x15002, "AV_CODEC_ID_AAC moved");
 SAME(AV_CODEC_ID_AC3, 0x15003, "AV_CODEC_ID_AC3 moved");
 SAME(AV_CODEC_ID_EAC3, 0x15028, "AV_CODEC_ID_EAC3 != 0x15028 (0x15029 names ATRAC3P here)");
@@ -246,3 +299,5 @@ SAME(SUBTITLE_BITMAP, 1, "SUBTITLE_BITMAP != 1 (NONE is 0)");
 SAME(AVMEDIA_TYPE_VIDEO, 0, "AVMEDIA_TYPE_VIDEO != 0");
 SAME(AVMEDIA_TYPE_AUDIO, 1, "AVMEDIA_TYPE_AUDIO != 1");
 SAME(AVMEDIA_TYPE_SUBTITLE, 3, "AVMEDIA_TYPE_SUBTITLE != 3");
+
+SAME(AVMEDIA_TYPE_ATTACHMENT, 4, "AVMEDIA_TYPE_ATTACHMENT != 4");

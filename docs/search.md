@@ -5,8 +5,8 @@ lost — the **research into the television's on-screen keyboard**, which is whe
 went. If you read one section of this file before touching text entry, make it §3.
 
 **Scope: the user's own servers, and nothing else.** Every result comes from a PMS the account can
-reach. Plex Discover / Watchlist / the "Movies & Shows on Plex" catalog are deliberately absent —
-see §6.
+reach. Plex Discover and the "Movies & Shows on Plex" catalog are deliberately absent from the
+results, and the Watchlist is its own strip destination rather than a search scope — see §6.
 
 ---
 
@@ -15,7 +15,7 @@ see §6.
 ### It is a peer, not a page
 
 `AppArg::Search` sits beside `Home` and `Library`, not on top of them
-(`rust-modules/src/screens/registry.rs`, the variant and its doc comment). It is reached from the
+(`rust-modules/screens/src/registry.rs`, the variant and its doc comment). It is reached from the
 strip's last pill and BACK from it returns to Home — all three navigate with `NavOp::SelectTab`, so
 arriving at one unwinds whatever was above the root and **what Search opens stacks; Search itself
 does not.** It wears the shared top tab bar (`ScreenArg::chrome() == Chrome::TabBar`), which is what
@@ -39,9 +39,17 @@ as "0 post-warmup samples", which is indistinguishable from a real regression.
 
 ### The pill goes LAST
 
-`ui/widgets.rs::search_pill()` is `tab_count() - 1` — Search is always the LAST pill, and since
-2026-09-05 that is the only thing about its position that holds still. The row is
-`Home`, then one pill per type that has a FAVOURITE library, then Search: two to four stops, because
+Search is always the LAST pill: `app/chrome.rs` builds the strip's faces as `Home`, the type pills,
+the Watchlist bookmark (`TabFace::Icon(Icon::Bookmark)`, key `TAB_KEY_WATCHLIST`, `STRIP_BASE + 5`,
+appended after the chip's `+4` so no existing key moved but drawn before Search), then
+`TabFace::Icon(Icon::Search)`. Nothing reads "the last face" as the Search pill: the strip's
+destinations are found by KEY (`widgets::TAB_KEY_SEARCH`, `STRIP_BASE + 3`, and `TAB_KEY_CHIP` at
+`+4`), `app/chrome.rs` builds the faces and the keys together from one `strip_keys` list, and
+`Pill::Search` resolves to wherever that key sits, so an icon pill inserted before it moves no
+other destination. The library and search pages map a pressed key to its destination with those
+constants. The row is
+`Home`, then one pill per type that has a FAVOURITE library, then the bookmark, then Search: three to
+five stops, because
 `browse::tab_count()` now counts `tab_kinds()`, and a type whose last favourite is switched off
 draws no pill. Movies and TV Shows are still type destinations whose concrete owned/shared section
 is resolved later.
@@ -54,9 +62,9 @@ type that has no pill today. Every positional cursor in the app was converted fo
 `HomeCmd::FocusStrip` delivered when Home MOUNTS, since phase 12 folded `Nav`'s four variants into
 `app::bridge::nav_tab`).
 
-It is also the one pill that is a **mark instead of a word**, so it is square (60×60) and skips the
-label padding, inked through the same `TabPill::mixed_ink` the labels use so it travels under the
-focus capsule with them instead of being a separate colour story.
+It is also the one pill whose face is an **icon instead of a word** (`TabFace::Icon`), so it is square
+(60×60) and skips the label padding, inked through the same `TabPill::mixed_ink` the labels use so it
+travels under the focus capsule with them instead of being a separate colour story.
 
 ### The layout is dictated by the keyboard
 
@@ -77,8 +85,9 @@ That is also why **nothing scrolls while the panel is up**: the result set has t
 the user's eyes while they are still typing.
 
 `search::recents::CAP` is **four, not five**, for the same reason — with the keyboard raised the header, the
-rows and the Clear control all have to finish above its edge. The fifth is *dropped*, not scrolled:
-a list you cannot see the end of asks to be paged, and there is no paging in this product.
+rows and the Clear control all have to finish above its edge. The fifth is *dropped*, not scrolled.
+Recents are the user's own typing, not content, so the cap hides nothing they could not retype, and
+four rows fit above the raised keyboard.
 
 ### The caret and the one-character hint stay in the field
 
@@ -104,7 +113,7 @@ because ink alone read too close to idle from the couch (owner feedback). It shi
 owner rejected it on sight the next day: "you made the search bar background white, while I wanted
 text to be white". **The plate is gone (2026-09-04)** — `field.rs`'s test suite carries a narrow
 regression tripwire, reading the file's own source for the exact `p.rect(field_box`/`theme::ACCENT,`
-shape issue 22 shipped (the same technique `diag::scrub` uses for its own absence property), so
+shape issue 22 shipped (the same technique `eventlog::scrub` uses for its own absence property), so
 that specific reintroduction fails loudly. It is a tripwire for the bug that already happened, not a
 proof that no fill can ever reappear under a different name or shape — the actual contract is the
 plain-English one above, upheld by review and device/simulator verification each time this control
@@ -157,6 +166,10 @@ checks the captured installation and account credentials against the session und
 an old account's pending history cannot be written into a replacement account. The queue admits
 64 distinct profiles at once (a resource ceiling, not a Plex limit); when full it refuses a new
 profile's edit without evicting accepted saves and retries the background drain.
+The write itself is a store job: the Search step that made the edit emits `StoreJob::SaveRecents`,
+`Bridge::search_run` hands it to the application's runner in the same call, and the runner starts the
+drain on a worker. A drain the runner refuses is remembered, and the next edit (even one that
+changes nothing) asks for it again (`docs/sans-io.md`, "The Search lane").
 The renderer in `screens/search/render.rs` keeps only geometry and a glyph cache keyed on that
 publication. `SearchSnapshot` includes recents beside query/results and is retained at the bridge's
 frame boundary. `SearchScreen` consumes these retained views and never reads the session or stores
@@ -217,7 +230,7 @@ document continues painting underneath its glass.
 
 ## 2. The data layer
 
-`GET /hubs/search?query=…&limit=…` — `plex::Client::search` in `rust-modules/src/plex/hubs.rs`,
+`GET /hubs/search?query=…&limit=…` — `plex::Client::search` in `rust-modules/plex/src/plex/hubs.rs`,
 written long before this screen and dead until now. Four facts were **measured against PMS 1.43.3**
 rather than taken from the spec, and each one decides something:
 
@@ -225,7 +238,7 @@ rather than taken from the spec, and each one decides something:
 |---|---|
 | A one-character query returns every hub empty | `search::MIN_QUERY` is 2 — the first keystroke of every search costs no round trip |
 | Hub ORDER moves per query (`sta` ranks people first, `star` ranks films first) | the shelf order here is FIXED (`search::KINDS`) and ranking is honoured only *inside* a shelf; reordering rows per keystroke would move the row under a typing user's focus |
-| Items arrive in **two** containers — `Metadata[]` for `movie`/`show`/`episode`, `Directory[]` for `actor`/`director`/`collection` | `search::Item` has two variants (`Media`/`Tag`) instead of being one struct. `plex-openapi.json`'s own worked example disagrees with the server, which is why this was probed live; see the table in `Hub::directory`'s doc in `plex/models.rs` |
+| Items arrive in **two** containers — `Metadata[]` for `movie`/`show`/`episode`, `Directory[]` for `actor`/`director`/`collection` | `search::Item` is an enum (`Media`/`Tag`/`Collection`) instead of one struct. The request sends `includeCollections=1`, which turns the `collection` hub into full `Metadata[]` rows (`Item::Collection`: ratingKey, thumb, childCount; OK opens the collection page); a server that ignores it still sends tag rows (`Item::Tag`, opened by section + tag id). `plex-openapi.json`'s own worked example disagrees with the server, which is why this was probed live; see the table in `Hub::directory`'s doc in `plex/models.rs` |
 | A search response carries **every** hub type the server knows, most with `size: 0` | `Hub::size` is the field that says which shelves are worth drawing |
 
 The `actor` and `director` hubs are merged into one **Cast & Crew** shelf. Merging in the data layer
@@ -240,7 +253,10 @@ untrue about their library.
 server-side (`docs/shared-servers.md`). So the store fans out one query per `plex::server_ids` and
 merges into the shelves, which is why every `Item` carries its own `ServerId` and why a shelf heading
 can never claim an owner — the owner annotation follows FOCUS and rides the focused tile's caption,
-exactly as Continue Watching's does on Home.
+exactly as Continue Watching's does on Home. On a poster row that caption is the Under posters
+setting's (`registry/captions.rs`) and the handle is credited after its details line, so under
+Under posters → Nothing, which draws no details line, there is no annotation either; a still or a
+headshot keeps its own block and its annotation under every setting.
 
 ---
 
@@ -281,9 +297,9 @@ than assuming.
 webOS inserts a `Uint32 inputSource` before the text, so the UTF-8 bytes start at **+16**, not +12.
 Both halves are checkable on the dev Mac without a television:
 
-- `include/SDL2/SDL_events.h` — the tree we compile against — declares
-  `SDL_TextInputEvent { type, timestamp, windowID, text[] }`, i.e. text at **+12**. That tree is
-  stock **2.0.4** (`include/SDL2/SDL_version.h`).
+- Stock SDL **2.0.4**'s `SDL_events.h` declares
+  `SDL_TextInputEvent { type, timestamp, windowID, text[] }`, i.e. text at **+12**. (The repository
+  keeps no copy of it; no C unit includes an SDL header.)
 - The NDK sysroot's fork copy
   (`$(WEBOS_SDK)/arm-webos-linux-gnueabi/sysroot/usr/include/SDL2/SDL_events.h`, SDL **2.24.1**)
   declares `{ type, timestamp, windowID, inputSource /* webOS specific field */, text[] }` — text at
@@ -296,7 +312,7 @@ single hard-coded number ships garbage on one of the two platforms.
 
 **2. `SDL_WINDOW_INPUT_FOCUS` is a silent precondition.**
 
-`SDL_StartTextInput` looks for a window carrying `0x200` (`include/SDL2/SDL_video.h`) before
+`SDL_StartTextInput` looks for a window carrying `0x200` (`SDL_video.h` in the SDK sysroot's `usr/include/SDL2/`) before
 dispatching to the driver hook. Our window is created with
 `SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN` and nothing else — `app.rs`'s `SDL_WINDOW_FLAGS` is
 `0x2 | 0x1` on the device — so it carries neither `SHOWN` nor a focus flag at creation. **If the flag
@@ -369,7 +385,7 @@ Neither the TV harness nor the desktop simulator can type, so both would otherwi
 empty state.
 
 - **`/tmp/plxnative-search[=<query>]`** — boot straight into Search with the field already holding
-  `<query>`. Read once at boot in `app/boot.rs`, through `dev::read` like every other trigger; it
+  `<query>`. Read once at boot in `app/boot.rs`, through `devtrig::read` like every other trigger; it
   seeds `stores::search::SearchCmd::SetQuery` directly rather than driving a screen method.
 - **`/tmp/plxnative-searchosc`** — sweep the result shelves' focus down↔up perpetually: one step per
   350 ms, reversing every 3 s, the same cadence `homeosc` and `libosc` use so all three read the same
@@ -421,7 +437,7 @@ refuses outright to grade a log carrying the simulator's `sim=1` tag against dev
 
 ---
 
-## 6. Out of scope: Discover, Watchlist, and the catalog
+## 6. Out of scope: Discover results and the catalog (the Watchlist is not a search scope)
 
 The official client's search returns Plex's own catalog and Discover results alongside server ones.
 **Ours does not, by decision.** Those live on `discover.provider.plex.tv` /
@@ -430,6 +446,12 @@ The official client's search returns Plex's own catalog and Discover results alo
 tracked them as their own gap from the start. Adding a catalog row to this screen is a separate
 feature with its own client, its own store and its own failure modes — not a wider `limit=` on
 `/hubs/search`.
+
+The Watchlist did ship, but as a destination of its own: the bookmark tab before the Search pill,
+backed by `plex::watchlist`, `WatchlistStore` and the Watchlist page, with the Discover-only
+`CatalogScreen` for titles no server holds (`docs/watchlist.md`). It reads the account's list, not a
+search; typing a query still searches servers only, and a catalog title never appears among the
+results.
 
 What this screen closes, and what it does not, is written up in `docs/parity-gaps.md` under the
 search entries.

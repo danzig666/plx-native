@@ -10,8 +10,8 @@
 //! independent UI and data-layer work proceed in parallel.
 //!
 //! **What it is NOT.** There is no video. The 29-symbol media seam does not exist off-device, and
-//! `player::ffi`'s host arm reports the same "no video path" failure a television with no usable
-//! ACB binding reports, so Play lands on the app's real failure read-out. Nor is it a substitute
+//! `player::ffi_host`'s `HostSink` reports the same "no video path" failure a television with no
+//! usable ACB binding reports, so Play lands on the app's real failure read-out. Nor is it a substitute
 //! for the device on anything the GPU decides: the `--fps` gates are calibrated to the SM9000's
 //! Mali, and text rasterization here goes through a different FreeType. A green run on this binary
 //! is evidence about a Mac. Layout, focus, navigation, and every byte of the Plex data layer are
@@ -19,12 +19,23 @@
 //!
 //! Usage:
 //!   plxnative-sim [pms-host] [pms-port]
+//!   plxnative-sim --hud-lint <file> [--format text|json] [--lang all|<tag>]
+//!   plxnative-sim --hud-schema
+//!   plxnative-sim --hud-export builtin:classic
+//!
+//! The three `--hud-*` forms are the HUD plugin tools (`docs/hud-plugins.md`): they open no window,
+//! start no application and touch no instance root, and print to stdout and end the process.
+//! `--hud-lint` prints the findings of a package (text, one line each, or JSON), measured with the
+//! shipped fonts from `PLXNATIVE_APP_DIR`; `--hud-schema` prints the JSON Schema of the format this
+//! build writes; `--hud-export builtin:classic` prints the built-in HUD as a package. Exit codes of
+//! `--hud-lint`: 0 no finding, 1 findings, 2 usage (bad arguments, an unreadable file, no fonts); the
+//! other two exit 0, or 2 for a bad argument. All of it is `plxnative_modules::hud_cli`.
 //! Environment:
 //!   PLXNATIVE_PMS_HOST / PLXNATIVE_PMS_PORT   server to talk to (argv wins)
 //!   PLXNATIVE_RUNTIME_DIR                     this instance's trigger/FIFO/log root
 //!   PLXNATIVE_APP_DIR                         where appfont*.ttf and the icons live (repo `pkg/`)
 
-use plxnative_modules::plex_run;
+use plxnative_modules::port::plex_run;
 use std::ffi::CString;
 use std::os::raw::c_int;
 
@@ -36,7 +47,14 @@ fn main() {
     // precisely because a C `main` skips Rust's `std::rt::init`. This IS a Rust main, so std has
     // already done it, and the first PMS socket closed mid-write cannot kill the process.
 
-    let mut args = std::env::args().skip(1);
+    // The HUD tools run before the PMS host is read from argv: a flag is not a host. `exit_now`
+    // flushes the report; nothing else of the simulator starts.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if plxnative_modules::hud_cli::wants(&argv) {
+        plx_base::process::exit_now(plxnative_modules::hud_cli::main_from(&argv));
+    }
+
+    let mut args = argv.into_iter();
     let host = args
         .next()
         .or_else(|| std::env::var("PLXNATIVE_PMS_HOST").ok())
@@ -61,8 +79,14 @@ fn main() {
                 .open(path).map_err(|_| "cannot create initial input file")?;
             file.write_all(encoded.as_bytes()).map_err(|_| "cannot write initial input file")
         })();
-        if let Err(reason) = result { eprintln!("synthetic initial input: {reason}"); std::process::exit(2); }
+        if let Err(reason) = result { eprintln!("synthetic initial input: {reason}"); plx_base::process::exit_now(2); }
         return;
+    }
+    // The simulator has no firmware file, so the webOS version is unknown (0) and webOS-1-3-only UI
+    // (Settings > System > Interface resolution) is hidden. `PLXNATIVE_SIM_WEBOS_MAJOR=3` publishes
+    // that version for the run, to see those rows; nothing else reads it.
+    if let Some(major) = std::env::var("PLXNATIVE_SIM_WEBOS_MAJOR").ok().and_then(|v| v.parse().ok()) {
+        plxnative_modules::publish_sim_webos_major(major);
     }
     let port: u16 = args
         .next()
@@ -96,7 +120,7 @@ fn main() {
             "plxnative-sim: cannot create runtime dir {}: {e}",
             root.display()
         );
-        std::process::exit(1);
+        plx_base::process::exit_now(1);
     }
     let events = plxnative_modules::sim_events_log();
     // The banner is the FIRST line of the log, so a log read from the middle, tailed, or pasted
@@ -106,7 +130,7 @@ fn main() {
                   frame rates here describe this Mac's GPU and must never be read as an fps gate.\n";
     if let Err(e) = std::fs::write(&events, banner) {
         eprintln!("plxnative-sim: cannot truncate {}: {e}", events.display());
-        std::process::exit(1);
+        plx_base::process::exit_now(1);
     }
 
     eprintln!(
@@ -117,10 +141,12 @@ fn main() {
 
     let c_host = CString::new(host).unwrap_or_else(|_| {
         eprintln!("plxnative-sim: host contains a NUL byte");
-        std::process::exit(2)
+        plx_base::process::exit_now(2)
     });
 
     // `as c_int` directly — an intermediate i16 would wrap every port above 32767.
+    // `plex_run` ends the process itself through `plx_base::process::exit_now` (no `atexit`
+    // handlers under live workers, #1115); the call is typed `c_int` only for the C shim.
     let rc = plex_run(c_host.as_ptr(), port as c_int);
-    std::process::exit(rc);
+    plx_base::process::exit_now(rc)
 }

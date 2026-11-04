@@ -39,6 +39,9 @@ written and the report chain never starts). Per crash it emits:
 
 ```
 *** SIGNAL 11 (SIGSEGV) addr=0x6bcf pc=0xf5a4dd08 lr=0x0
+time: 1750000000                                       -- wall-clock unix second of the crash (newer builds only)
+thread: tid=4242 main=0 name=tokio-rt.worker           -- which thread faulted; main=1 is the main thread (newer builds only)
+phase: running uptime=57                               -- running | shutdown | exiting (libc atexit/destructors), seconds since install
 reg: sp=0x… fp=0x… ip=0x… cpsr=0x… r0=0x… r1=0x… … r10=0x…
 at:  <the /proc/self/maps line containing pc or lr>    -- which library faulted
 bin: <the maps line for our own executable>            -- our load base, for addr2line
@@ -80,11 +83,12 @@ All paths are relative to the repo root. The TV address comes from the `Makefile
 
 ## First: which install crashed
 
-Two builds can be on this television — `com.beb.plxnative` (stable, what users install) and
-`com.beb.plxnative.debug` (the developer build beside it, and the Makefile's **default**). They
-have separate app directories, separate runtime roots and therefore **separate crash logs**, so
-triaging the wrong one produces a clean bill of health for an app that is dying. Ask the Makefile
-rather than typing a path:
+Three builds can be on this television — `com.beb.plxnative` (stable, what users install),
+`com.beb.plxnative.debug` (the developer build beside it, and the Makefile's **default**), and
+`com.beb.plxnative.nightly` (the nightly build, its own install beside the other two). Each has
+its own app directory, its own runtime root and therefore its own **crash log**, so triaging the
+wrong one produces a clean bill of health for an app that is dying. Ask the Makefile rather than
+typing a path:
 
 ```bash
 make -s print-appid    FLAVOR=debug     # com.beb.plxnative.debug
@@ -94,7 +98,7 @@ make -s print-eventlog FLAVOR=debug
 ```
 
 Not `make -p`/`make -pn`: that prints a recursive variable's UNEXPANDED DEFINITION, so `TV` comes
-back as the literal `$(strip $(shell cat .tv-host …))` and every ssh built from it fails — which
+back as the literal `$(strip $(shell tools/tv-config.sh host …))` and every ssh built from it fails — which
 reads as an unreachable television and sends you to `wake-tv` for a set that is already awake.
 
 ## Run this first
@@ -131,7 +135,7 @@ and then dumps stderr, the SAM exit status and the crash-daemon reports.
 
 ## Read the right log
 
-All three live in the crashing install's **runtime root** — `/tmp` for stable, `/tmp/<app id>` for
+These files live in the crashing install's **runtime root** — `/tmp` for stable, `/tmp/<app id>` for
 a flavoured install (`make -s print-rundir FLAVOR=<f>`). The file names are identical in both, so
 a path typed from memory reads the wrong app's log without erroring.
 
@@ -140,9 +144,14 @@ a path typed from memory reads the wrong app's log without erroring.
 | `<rundir>/plxnative-crash.log` | **append-only, survives the relaunch** — read this after a crash+restart |
 | `<rundir>/plxnative-events.log` | truncated at every launch — after a relaunch it is already gone |
 | `<rundir>/plxnative-stderr.log` | where Rust panics print |
+| `<rundir>/plxnative-diag.log` | atomically replaced storage-stage snapshot, 0640, at most 16 KiB; no account data or paths |
 
-**The event log's FIRST line names the install**, before anything can fail, and it is the only
-witness in the system that does:
+Events, crash and stderr are 0640 as well (they were 0600 until 2026-10-04), so a Dev Mode user can
+fetch them with webOS Dev Manager. The storage snapshot is group-readable for a shell sharing
+its gid and records build identity, directory write probes and helper/activation outcomes. A failed
+publication preserves the prior snapshot; it is not proof that the current process reached startup.
+
+**The event log's FIRST line names the install**, before anything can fail, so use it to identify the crashing process:
 
 ```
 install: id=com.beb.plxnative.debug flavour=debug runtime=/tmp/com.beb.plxnative.debug features=dev APPID_env=…
@@ -191,7 +200,7 @@ make FLAVOR=<f> deploy             # the SAME flavour you are triaging, then rep
 ```
 
 `make` does not track `RUSTFLAGS` changes, so the Rust staticlib will not rebuild on its
-own — hence the `touch`. Verified output after that: `plex_run at rust-modules/src/app/mod.rs:<line>` (it read `app.rs:248` before phase 1a moved the file),
+own — hence the `touch`. Verified output after that: `plex_run at rust-modules/src/port.rs:<line>` (it read `app.rs:248` before phase 1a moved the file, then `app/mod.rs`, before step L15 put the C entry in the port),
 `main at src/main.c:92`. Same codegen, larger binary; deploy it only while chasing a crash.
 
 ## Prove the tracer works before reading its silence
@@ -206,7 +215,7 @@ purpose and check the recorder end to end.
 tools/tv-lock.sh acquire --why "prove the crash tracer"
 make deploy                                     # a devtriggers build; RELEASE=1 compiles this out
 RUN=$(make -s print-rundir)
-ssh root@"$(make -s print-tv)" "echo segv > $RUN/plxnative-crashtest"
+tools/tv-ssh ssh tv "echo segv > $RUN/plxnative-crashtest"
 make run RUN_SECS=12                            # it will die at once, on purpose
 tools/crash-report.sh                           # the record, symbolized
 ```
@@ -215,7 +224,7 @@ Four things to check, and the third and fourth are the ones no host test can rea
 
 1. `crashtest: DELIBERATE crash, kind=segv signal=11` in the event log — so nobody later mistakes
    this for the bug they were hunting.
-2. `*** SIGNAL 11 (SIGSEGV) addr=0x0 pc=0x… lr=0x…` in the crash log, with a `reg:` line under it.
+2. `*** SIGNAL 11 (SIGSEGV) addr=0x0 pc=0x… lr=0x…` in the crash log, with a `time:` line and a `reg:` line under it.
 3. **`at:` and `bin:` lines.** These come from `/proc/self/maps` and exist on no development Mac;
    `ci/crashtrace-test.c` grades the reader against fixtures, but only the set proves it against
    the real file. `bin:` must name the install you deployed to.
@@ -235,7 +244,7 @@ so a by-hand session leaves it armed and the next launch dies too — which read
 app having become unlaunchable.
 
 ```bash
-ssh root@"$(make -s print-tv)" "rm -f $RUN/plxnative-crashtest"
+tools/tv-ssh ssh tv "rm -f $RUN/plxnative-crashtest"
 ```
 
 ## Gotchas

@@ -22,12 +22,12 @@ answers what a QA pass would find.
 | Question | Answer |
 | --- | --- |
 | Ship via **webOS Homebrew Channel**? | **Yes** — it is a real, current, native-app-friendly path. ~1 day of packaging work plus the licence fixes below. |
-| Ship via **LG Content Store**? | **Submittable — this was a "no" here until 2026-08-23 and the "no" was wrong.** Seller Lounge parses this project's ipk as **File Type: Native** and asks for the native SDK version, chipset and resolution. The old verdict rested on a `develop/*` **web-runtime** page (*"Only `web` is allowed currently"*), which is not authority over a native app. What remains is a QA problem, not a permission problem — §2, and `docs/lg-self-checklist.md` for the four items that genuinely fail. |
+| Ship via **LG Content Store**? | **No — not through Seller Lounge.** LG Seller Lounge answered in writing on 2026-10-20 that its registration and Functional QA support **Web Type applications only**, that Native Type applications are "not eligible for submission or review", and that it gives no information on any native program, NDK access or partnership. The 2026-08-23 "submittable" verdict (the portal parsing our ipk as `File Type: Native`) is superseded — §2. Distribution is Developer Mode or Homebrew Channel. |
 | Runs on **newer webOS**? | 32-bit armv7 is *not* the problem — it stays the native userland through webOS 26. **ACB is the problem**: `libAcbAPI` exists on webOS 4.x only. Today's binary does not reach `main()` on 5.0+. |
-| Is **private data** in the repo? | Git history is clean of credentials. Release CI has no `config.local.h`, remaps host paths, compiles out the trigger/FIFO/capture surfaces, and verifies the shipped bytes. Runtime logs are mode 0600 and scrub tokens, server addresses, household names and media text before writing; §4 records the remaining diagnostic surface. |
+| Is **private data** in the repo? | Git history is clean of credentials. Release CI has no `config.local.h`, remaps host paths, compiles out the trigger/FIFO/capture surfaces, and verifies the shipped bytes. The event log scrubs tokens, server addresses, household names and media text before writing, and the three runtime logs (events, crash, stderr) are mode 0640 — group read for a Dev Mode user's file tool, never world-readable; §4 records the remaining diagnostic surface and the residual risk. |
 | Needs a **rooted** TV? | **No** — the unprivileged Dev Mode jail is device-proven in §3.5. Homebrew and retail layouts now use probed writable paths; Key Manager permission is capability-tested and denial keeps the mode-0600 fallback. A real LG Content Store entitlement/install is still an acceptance test, not something the rooted development set can prove. |
 | **Licensing** clear? | Font blocker **CLEARED 2026-08-01** — Inter (OFL 1.1) replaced Monotype Arial. FFmpeg/LGPL is fine. The repo still has **no LICENSE file at all**. |
-| **Trademarks**? | Plex itself is fine (their guidelines have an explicit permitted formula). **Rotten Tomatoes marks have no licensing route that exists**, and the TMDB logo ships without its mandatory attribution. |
+| **Trademarks**? | Plex itself is fine (their guidelines have an explicit permitted formula). **Rotten Tomatoes marks have no public licence** (RT reviews each proposed use case by case, and this project holds no permission), so the rating row names its providers in words and ships no RT, IMDb or TMDB marks (§11). |
 
 **Blockers, in the order they'd bite:** *(1 — the Arial font — was cleared 2026-08-01, see §5.3)*
 
@@ -190,7 +190,23 @@ factory webOS 10.0 is vulnerable) — but **webOS 4.5, our own target, is unpatc
 
 ---
 
-## 2. LG Content Store — a native ipk IS submittable
+## 2. LG Content Store — native apps are not accepted through Seller Lounge
+
+**[corrected 2026-10-20 — supersedes the 2026-08-23 verdict below]** LG Seller Lounge support
+answered a direct written question on 2026-10-20 (after a first reply on 2026-10-19 saying the same):
+*"According to the current LG webOS TV App Service policy, the standard Seller Lounge registration
+and Functional QA process support Web Type applications only. Therefore, Native Type applications
+are not eligible for submission or review through Seller Lounge."* It also declined to say whether
+third-party developers can publish native apps at all, whether any separate native program exists,
+or what its qualifications would be. The portal classifying our ipk as `File Type: Native` showed
+that LG's tooling recognises native packages; it did not show that LG will review one from us, and
+the 2026-08-23 reading drew that second conclusion from the first. **Treat Store distribution as
+unavailable**: the shipping routes are LG Developer Mode (each user signs in with their own LG
+account, and the session needs renewal) and Homebrew Channel (§1, §1.7). Everything below this
+paragraph is the superseded 2026-08-23 analysis, kept as dated history; its QA findings
+(`docs/lg-self-checklist.md`) remain true statements about the app, not a submission plan.
+
+### Superseded 2026-08-23 analysis
 
 **[corrected 2026-08-23]** This section used to be headed *"LG Content Store — no"* and to argue
 that native eligibility was **unsettled**, on the strength of one sentence in LG's `appinfo.json`
@@ -328,6 +344,9 @@ refinements the table understated:
   corrected 2026-08-05**: 3.9.2 *has* `libAcbAPI.so.1`. It fails on the FFmpeg SONAMEs (it ships
   55/55/52/2, not 57/57/55/4) and on `StarfishMediaAPIs::Feed`, which carries a pre-C++11
   `std::string` mangling there. Check either with `tools/fwcompat.py --release 3.9.2`.
+  **Update 2026-10-09:** both reasons are gone (bundled FFmpeg; `Feed` and
+  `SDL_webOSCursorVisibility` resolved at runtime), and a 3.4.3 set plays. The `>=4.0` catalogue
+  bound in `docs/webosbrew-package.yml` is unchanged pending wider 3.x testing.
 
 ### 3.3 The pinning inside our own code (`audit:portability`, file-cited)
 
@@ -463,7 +482,7 @@ So a **Homebrew-Channel install breaks two things**:
    `X-Plex-Client-Identifier` minted each launch. There is **no persistent writable directory common
    to both layouts**, so the path has to become a probed search order, not a constant.
 
-**FIXED 2026-08-01** — `rust-modules/src/paths.rs`. The app directory is resolved from
+**FIXED 2026-08-01** — `rust-modules/base/src/paths.rs`. The app directory is resolved from
 `read_link("/proc/self/exe")` (not `$HOME`: LG's conf sets it twice and which one wins differs
 between the profiles), `text.rs` builds the font paths from it, and `capture.rs` now shares the
 same resolver instead of open-coding it.
@@ -471,8 +490,8 @@ same resolver instead of open-coding it.
 The session file became a **probed search order**, because there is no single writable persistent
 directory common to both layouts: `/media/developer/<id>-auth.json` (Dev Mode, survives a
 reinstall) → `/media/internal/.<id>-auth.json` (the production jail's only rw persistent location)
-→ `<appdir>/auth.json` → the legacy path, read-only, for migration. `peek()` takes the first plain
-file that parses, so a half-written file at a preferred location cannot shadow a good one. A
+→ `<appdir>/auth.json` → the legacy path, read-only, for migration. The read behind `peek()` takes
+the first plain file that parses, so a half-written file at a preferred location cannot shadow a good one. A
 recognized encrypted envelope deliberately does shadow lower candidates when its device key is
 unavailable: skipping it could resurrect stale plaintext and a later save could destroy the only
 live credentials;
@@ -518,7 +537,7 @@ world-readable `/tmp` on the TV across many runs.
 
 **Judgment calls, made explicitly:**
 
-- `sshpass -p alpine` (`Makefile:24-25`) — **not a secret.** `alpine` is the published webosbrew
+- `sshpass -p alpine` (`tools/tv-ssh`, the one ssh/scp front door) — **not a secret.** `alpine` is the published webosbrew
   dev-mode root password; the repo's own skill says so. Publishable. It does teach an insecure
   default and will authenticate against *any* rooted webOS TV a contributor points `TV=` at.
 - `TV_HOST` / `PMS_HOST` — RFC1918, low risk, but they are the maintainer's home topology,
@@ -604,9 +623,10 @@ world-readable `/tmp` on the TV across many runs.
   plus dropping titles and profile names from the log, or logging ratingKeys instead of titles".
 
   **The MODE half was already fixed when this paragraph still claimed otherwise** — `src/main.c`'s
-  `open_log_0600` creates all three sinks 0600 with an explicit `fchmod` (an append target that
-  survived a previous run keeps its old mode). This entry went stale without anything failing,
-  which is the failure mode the whole `doc-claim-auditor` skill exists for.
+  `open_fd_0600` (renamed `open_fd_log` on 2026-10-04, see the update below) created all three sinks
+  0600 with an explicit `fchmod`, which also corrected an append target that survived a previous
+  run. This entry went stale without anything failing, which is the failure mode the whole
+  `doc-claim-auditor` skill exists for.
 
   **The CONTENT half is now done**, and not the way this entry proposed. "Log ratingKeys instead of
   titles" is right for the local file and wrong as a general rule: a ratingKey plus a server
@@ -614,11 +634,11 @@ world-readable `/tmp` on the TV across many runs.
   the device even though it is the right thing to keep on a 0600 local disk. So there are two
   exits, and they differ in exactly one respect:
 
-  * `crate::log` now applies **`diag::scrub::scrub_local`** to every line before the write —
+  * `crate::log` now applies **`eventlog::scrub::scrub_local`** to every line before the write —
     credentials, hosts, bare addresses, Plex GUIDs, `q='…'` search queries and the household names
     the session layer publishes. It **rewrites only and never drops**: a line vanishing from the
     primary debugging surface is worse than a leaky one.
-  * Anything crossing the network takes `diag::scrub::scrub`, which may refuse a line outright.
+  * Anything crossing the network takes `eventlog::scrub::scrub`, which may refuse a line outright.
 
   Three call sites were the actual leaks and were fixed at source, because **a scrubber cannot
   catch a title** — nothing distinguishes `'The One Where Ross Finds Out'` from
@@ -626,8 +646,64 @@ world-readable `/tmp` on the TV across many runs.
   `search.rs`'s seven sites log `q[Nch]` and not the query; and `player/mod.rs` logged **34
   characters of the viewer's actual subtitle dialogue** and now logs `len=`. That last one was the
   most sensitive line the log has ever carried and it was not in this entry's list at all.
-  `diag::scrub`'s `no_log_call_site_interpolates_viewing_content` greps the tree to keep it that
+  `eventlog::scrub`'s `no_log_call_site_interpolates_viewing_content` greps the tree to keep it that
   way, and is itself proven to fail on a reintroduced leak.
+
+  **UPDATE 2026-10-04 — the mode is now 0640, not 0600, for all three sinks (events, crash,
+  stderr).** `src/main.c`'s `open_fd_log` and `eventlog::open_log_append` create them owner
+  read/write, the app's own group (gid 5000 on the television) read, and nothing for "other";
+  the `fchmod` makes that independent of the umask and corrects a 0600 file left by an older
+  release. `plxnative-diag.log` has always shipped the same 0640. **Both openers refuse a sink
+  whose `fstat` shows more than one link** (and anything that is a symlink, not a regular file or
+  not ours), on the OPENED descriptor, and only create a missing name, with `O_EXCL`: a co-resident
+  app in gid 5000 that can link names in the sticky `/tmp` could otherwise `link(2)` one of our 0600
+  files (the `auth.json` session fallback shares the directory) onto a sink name when
+  `fs.protected_hardlinks` is off, and the next open would pass every other check and widen it. The
+  panic hook's crash-log write goes through the same open (`eventlog::append_record`), and
+  `paths::ensure_runtime_dir` `fchmod`s a `/tmp/<app id>` root it has opened `O_NOFOLLOW` and
+  confirmed is a directory it owns, never by path.
+
+  *Why.* A Developer Mode television that is not rooted gives its owner one tool, webOS Dev
+  Manager, and it reads files as an unprivileged user that shares the app's group but is not the
+  app's uid. At 0600 none of the logs could be fetched, so there was no way to support such a user
+  without root (§6.9).
+
+  *Why this does not reopen the 2026-08-12 finding.* That was 0644 — **world**-readable — in a
+  shared, mode-1777 `/tmp`. 0640 is group read only: no process outside gid 5000 can read the
+  files. And the content half above has been closed since 2026-08-29: every event-log line passes
+  `scrub_local` before the write, and the tree-grepping test keeps titles and dialogue out of
+  `log(...)` call sites.
+
+  *Residual risk, stated plainly.* Another native app on the same television that runs in
+  gid 5000 can now read all three files. What each holds: the event log is scrubbed, but it still
+  carries server-local ratingKeys (`rk=` — the playback-triage handle, deliberately kept locally),
+  which is a trace of what was played (the server's name and addresses are already rewritten) —
+  and the C-side
+  `fprintf(elogf, …)` lines in `src/starfish.c` bypass the scrubber (they carry
+  pointers, library paths, Starfish pipeline ids and Starfish JSON replies, no credential); the
+  crash log is a signal, a faulting PC, the crash's wall-clock second (a `time:` line, also written
+  under the panic text by the Rust hook), the `/proc/self/maps` lines holding the pc, the lr and
+  our own binary, the build id and panic text; the
+  stderr log is whatever aborts, panics, GL info logs and the television's own libraries print,
+  and **the stderr log does not go through `scrub_local`, nor do the C tracer's records in the
+  crash log** (the panic text the Rust hook appends to it does, since the follow-up of the same day).
+
+  *Audit of what can reach stderr and the crash log (2026-10-04, by reading the producers; no
+  television run).* No credential-bearing path found: the only production `eprintln!`s are
+  `gfx.rs`'s GL shader info log and a fixed "link failed"; libcurl is never put in verbose mode and
+  no `CURLOPT_STDERR` is set (neither `net.rs` nor `curlio.rs` names either option); every
+  `avformat_open_input` in a shipped build opens a custom AVIO with a NULL url, so libavformat has
+  no URL to print (the one call that does take a URL is the `plxnative-ffprobe` developer trigger,
+  compiled out of a release); Sentry's debug logger is off; and the production panic sites that
+  were read are static invariant messages, mutex/`Option` unwraps and `serde_json::to_*`
+  serialisations, none of which formats a credential. This is an audit of the code that exists,
+  **not a mechanism**: the panic hook (`app/boot.rs`) scrubs the panic line it writes to the
+  crash log, but the default hook prints the raw message to stderr, so a future `unwrap()` on an
+  `Err` that embeds a URL or token would still land there verbatim. Two things could not be settled without the
+  television: whether LG's SDL logs committed keyboard text at `SDL_LOG_CATEGORY_INPUT` /
+  `SDL_LOG_PRIORITY_DEBUG`, which `textinput::trace_driver` enables in every build (the five
+  message formats the driver is documented to print carry a state number, never text), and what
+  the closed TV libraries (libplayerAPIs, libAcbAPI, libpf) write to fd 2.
 
 **Verified clean, no action:** the only outbound hosts are the user's PMS, plex.tv and
 `discover.provider.plex.tv` — plus, since the telemetry work, Sentry and PostHog in the EU, and
@@ -796,12 +872,11 @@ Inter if you're willing to re-tune the size ladder.
 | `libgcc_s` | GPL-3 + Runtime Library Exception 3.1 | None (exception covers it, dynamically linked). |
 | SDL2, SDL2_ttf | Zlib *(SDL_ttf since **2.0.11**, not 2.20)* | None — clause 3 is a source-distribution clause. Listing is courtesy. |
 | FreeType | FTL / GPLv2 | **Not triggered** — not in `DT_NEEDED`; it's transitive inside the TV's SDL2_ttf. Include the credit line anyway, it's one line. |
-| nanosvg (vendored) | **Zlib**, Mikko Mononen | Keep the header intact (it is). **`src/svg.c:1` mislabels it "public domain" — wrong**, and a NOTICES file generated from that comment would omit Mononen and the AGG/Shemanarev credit. |
+| nanosvg (fetched at a pinned commit by `ci/deps.py`; not in the repository) | **Zlib**, Mikko Mononen | The fetched header is sha256-pinned, so its notice stays intact. `src/svg.c:1` once mislabelled it "public domain" (fixed); a NOTICES file generated from that comment would have omitted Mononen and the AGG/Shemanarev credit. |
 | libjpeg-turbo 2.1.4 | IJG + BSD-3 + Zlib | Currently **not** in the ipk (only `make deploy`-ed). The moment it ships: IJG attribution + the complete Modified BSD text. |
-| jsmpeg (`tools/jsmpeg.min.js`) | MIT, Dominic Szablewski | **Live breach** — the minifier stripped the banner; 138 KB with no notice, and it's served over HTTP by two tools. Two-line fix. |
+| jsmpeg (fetched by `ci/deps.py` for `tools/stream-screen.py`) | MIT, Dominic Szablewski | Not in the repository (it was a banner-less copy at `tools/jsmpeg.min.js`); upstream licence text is `licenses/jsmpeg.txt`. |
 | Rust crates (30 third-party) | 100% permissive, **zero copyleft** | Standard MIT/Apache notices. `moxcms` and `pxfm` are `BSD-3-Clause OR Apache-2.0` — elect Apache to avoid BSD-3's binary-reproduction clause. |
-| Rust std via `-Z build-std` | MIT OR Apache-2.0 | One notices entry. **Plus `compiler_builtins 0.1.160`, whose licence is a *conjunction*: `MIT AND Apache-2.0 WITH LLVM-exception AND (MIT OR Apache-2.0)`** — the LLVM-exception text must be reproduced. This is the most-missed entry in Rust NOTICES files. |
-| `include/SDL2/*` | Zlib (stock upstream 2.0.4, **not** an LG fork) + Mesa MIT + Khronos MIT/Apache | Notices. |
+| Rust std (the pinned stable toolchain's prebuilt armv7 std) | MIT OR Apache-2.0 | One notices entry. **Plus `compiler_builtins 0.1.160`, whose licence is a *conjunction*: `MIT AND Apache-2.0 WITH LLVM-exception AND (MIT OR Apache-2.0)`** — the LLVM-exception text must be reproduced. This is the most-missed entry in Rust NOTICES files. |
 | webosbrew NDK | n/a | A compiler doesn't licence its output. Just never add `-static` (that would pull LGPL §6(a) in for glibc). |
 
 ### 5.5 Trademarks — the part with real teeth
@@ -919,8 +994,15 @@ Listed because each could change a decision above.
    unresolved part is an end-to-end run against a remote/shared server on real TV firmware.
 8. **What should the app do on unsupported firmware?** `requirements.webosRelease` does **not** hide
    the app from a webOS 6 user browsing the channel (§1.4). It needs a graceful failure.
-9. **Support model.** A Dev Mode user has no shell, so "send me `/tmp/plxnative-events.log`" doesn't
-   work as a bug-report path.
+9. **Support model.** A Dev Mode user has no shell, so "send me `/tmp/plxnative-events.log`" does
+   not work as a bug-report path **by shell**. Their one tool is webOS Dev Manager, which reads files
+   as an unprivileged user that is in the app's group (gid 5000) but is not the app's uid. As of
+   2026-10-04 the event, crash and stderr logs are mode 0640 in `/tmp` (§4 has why, and the
+   residual risk of a co-resident app in the same group), so those three files can be downloaded
+   with Dev Manager without root, exactly as `plxnative-diag.log` already could. **Not yet proven
+   on a real unrooted set**: the host tests prove the mode (under a restrictive umask, from a fresh
+   create and from a 0600 survivor), not that Dev Manager's reader is in the group the file lands
+   in on the television.
 10. ~~**`requiredMemory: 60`** vs a measured ~74 MB peak.~~ **RESOLVED 2026-08-22 — the “~74 MB” was never a measurement.** It was an uncited sentence written into this very section (“things nobody has verified”) and then copied verbatim into five other files, where it reads as established. The real figure, taken on the dev set (M16p3, webOS 4.10.2) from a `features=release` build via `VmHWM`: **35 MB** at boot, **119 MB** browsing Home/detail, **155,292 kB ≈ 152 MiB peak** with playback. Note `VmRSS` on this TV already INCLUDES Mali pages — proven arithmetically, `smaps_rollup` 38,540 kB + `/proc/gpu` 20,159×4 kB = 119,176 kB against `VmRSS` 119,044 kB — so roughly two thirds of the footprint is texture memory and adding `/proc/gpu` on top double-counts. `requiredMemory` is now **160**; it was raised because webOS substitutes a default of **120** when the field is absent or ≤ 0, which made 60 strictly worse than declaring nothing at all.
 
 ---
@@ -1047,8 +1129,8 @@ between here and a release, and none of them is code:
 - **Make the repo public**, for the same reason: that raw URL must return 200.
 - ~~Set the `RUST_NIGHTLY` repo variable~~ **DONE 2026-08-02** — `nightly-2026-07-02`, the toolchain
   the device-verified builds actually used. Unset, both workflows fell back to floating `nightly`,
-  which defeats the pin `-Z build-std` needs (and a `rust-toolchain.toml` cannot substitute — see
-  the Makefile).
+  which defeats the pin `-Z build-std` needs. (Superseded: the pin is now `rust-modules/rust-toolchain.toml`,
+  see "Toolchain pinning" below.)
 - **Run `ci.yml` by `workflow_dispatch` before ever cutting a tag.** Nothing in `.github/` has ever
   executed: no CI run, no Release, no tag. The NDK action's cache and relocate step, the toolbox
   `.deb` download, the pip install, the arm64 runner — all unexecuted. The first run should not be
@@ -1110,7 +1192,11 @@ Two other ways in, both still supported:
 *No double build.* `prepare` pushes the tag with `GITHUB_TOKEN`, and GitHub deliberately refuses to
 start a workflow run from a `GITHUB_TOKEN` push. So the `push: tags: ['v*']` trigger stays for a
 hand-pushed tag without firing a second time on our own. If that push is ever moved to a PAT or a
-deploy key, this becomes an infinite loop — that is the thing to remember.
+deploy key, this becomes an infinite loop — that is the thing to remember. The BRANCH push is
+already on one: `main`'s required-checks ruleset rejects the workflow token (GH013), so `prepare`
+and `publish` check out with `ssh-key: ${{ secrets.MAIN_PUSH_KEY }}`, a write deploy key the
+ruleset names as a bypass actor, and `prepare` pushes the tag separately over the token URL.
+`site-video.yml`'s publish checkout uses the same key.
 
 *`needs` exposes only DIRECT dependencies.* `legal-gate`, `build` and `publish` cannot see
 `prepare`, so the resolved tag is computed once in `guard` and published as `needs.guard.outputs.tag`;
@@ -1196,11 +1282,57 @@ luna-send -i -a com.webos.appInstallService luna://com.webos.appInstallService/d
 wholesale, so stopping at the install leaves the packaged binary behind and you are looking at a
 build you did not make.
 
+## 7c. Release candidates (2026-10-06)
+
+**Actions → Release candidate → Run workflow, with the inputs the release takes.** `rc.yml` builds
+the stable package exactly as `release.yml` does (`build-package.yml`, `flavor: stable`, production
+telemetry, every gate, the LGPL source) and publishes it as a GitHub **prerelease** for people to
+install before the release is cut. `ci/rc.py`'s module doc is the full account; what differs from a
+release is deliberately small:
+
+| | release `vX.Y.Z` | candidate `rc/vX.Y.Z-rc.N` |
+|---|---|---|
+| package id and version | `com.beb.plxnative`, `X.Y.Z` | the same — webOS installs only three integers |
+| version the app reports | `X.Y.Z` | `X.Y.Z-rc.N` (Makefile `RC=N`, `build.rs`'s `PLX_CHANNEL=rc` arm) |
+| tag | `vX.Y.Z`, on the line | `rc/vX.Y.Z-rc.N`, on the bump commit, **no branch moves** |
+| GitHub release | latest | prerelease, `--latest=false` |
+| Homebrew Channel manifest | attached | none (`build-package.yml` refuses one) |
+| release audit | completed and pushed | none |
+
+**It replaces the stable install.** A candidate is the stable id, so on a television it installs
+over PlxNative the way an update does; the debug and nightly installs are separate ids
+(`docs/two-installs.md`) and are not the package being installed. That is the point — a candidate
+under its own id would not prove what playback does under the shipped one (item 1 of that document's §6).
+Two consequences the prerelease body states for testers: the Homebrew Channel never offers a
+candidate (it resolves `releases/latest`), and because a candidate carries the final's package
+version — and the Channel compares versions by string equality — the Channel will not offer the
+final release over a candidate either. Testers reinstall the final by hand.
+
+**Promotion ships the tested source, or nothing.** `release.yml`'s `candidate` input names the tag;
+`prepare` makes its usual bump commit and then refuses unless that commit's tree is the candidate's,
+before anything is pushed. Anything that landed on the line after the candidate was cut is a reason
+to cut `rc.N+1`. The release binary is still a fresh build: only the reported version string differs
+from the candidate's.
+
+**Numbering burns.** `ci/rc.py plan` numbers per version from the `rc/vX.Y.Z-rc.*` tags, and the tag
+is pushed before the build runs, so a failed run consumes its number. Delete the tag (and any
+release) first to reuse it. A candidate for a version that already has a `vX.Y.Z` tag is refused.
+
+**Dry runs** (`dry_run: true`, or a same-repo pull request touching `rc.yml` or `ci/rc.py`) build the
+line as it stands under the next candidate number and bump, tag and publish nothing. `rc.yml` shares
+`release.yml`'s concurrency group, so a candidate and a release never interleave.
+
 ---
 
 ## 8. Release CI (built 2026-08-01)
 
-`.github/workflows/{ci,release}.yml` + `.github/actions/webos-ndk` + `ci/`.
+`.github/workflows/{ci,release,nightly,build-package}.yml` + `.github/actions/webos-ndk` + `ci/`.
+The ARM build+verify pipeline itself lives once, in `build-package.yml`, as a reusable
+(`workflow_call`) workflow — `release.yml`'s `build` job and `nightly.yml`'s `build` job are both
+thin callers into it, selecting a flavour, a telemetry pair, and which optional steps (the
+Homebrew manifest, the LGPL source asset, caches, the firmware-database gate) apply. (A third
+caller, `canary.yml`, existed the same way before nightly replaced it; its public prereleases
+remain on GitHub as history.)
 
 **The runner is forced.** `webosbrew/native-toolchain` publishes exactly three host builds for
 `webos-d7ed7ee.6` — `darwin-arm64`, `darwin-x86_64`, `linux-aarch64` — and **no linux-x86_64**.
@@ -1246,6 +1378,7 @@ seven-segment counter** (`app.rs`). The fps scenes are unaffected — they grade
 heartbeat in the *event log*, never the pixels. Anything added to this feature must be draw-only:
 the device is the only test this project has, so a release build must not differ from the tested
 one in any way that could change behaviour, only in what it paints.
+`RELEASE=1` also drops `threadcheck`, the default-on main-thread violation checker.
 
 Three traps this cost, all found by measurement rather than reasoning, all silent:
 
@@ -1261,9 +1394,10 @@ Three traps this cost, all found by measurement rather than reasoning, all silen
    comparison and cannot be defeated by either.
 3. **`make RELEASE=1 && make deploy` deploys a DEV binary** — the second invocation has no
    `RELEASE`, so it rebuilds and ships that. The flag must be on *every* invocation that produces
-   or ships the binary (`make RELEASE=1 deploy`). `deploy` and `ipk` now echo which configuration
-   they are shipping, and `release.yml` asserts `pkg/.build-config` really says
-   `--no-default-features` rather than trusting that the flag took.
+   or ships the binary (`make RELEASE=1 deploy`). `deploy` and `ipk` now echo which
+   configuration they are shipping, and `build-package.yml` (called from `release.yml`'s
+   `build` job) asserts `pkg/.build-config` really says `--no-default-features` rather than
+   trusting that the flag took.
 
 Verified on the device, not just by binary size: the release build deployed to the TV
 (md5-matched) renders the who's-watching screen with no counter; the dev build renders `62`.
@@ -1272,11 +1406,15 @@ Verified on the device, not just by binary size: the release build deployed to t
 Makefile derives `IPK_VERSION` and the ipk filename from it, `check-package.py` asserts
 `ipkroot/ctl/control` agrees, and `release.yml`'s `guard` asserts the git tag does too.
 
-**Nightly pinning.** A `rust-toolchain.toml` would **not** work: `cargo +nightly` on the command
-line outranks the file. The pin therefore comes through a new `RUST_NIGHTLY ?= nightly` Makefile
-variable — dev machines behave exactly as before, and CI passes `RUST_NIGHTLY=nightly-YYYY-MM-DD`
-(set the `RUST_NIGHTLY` repo variable). `-Z build-std` recompiles std from source, which is the
-most drift-sensitive thing this build does.
+**Toolchain pinning.** (Superseded: this section described pinning a nightly through a `RUST_NIGHTLY`
+repo variable, because `-Z build-std` recompiled std from source and that was the most
+drift-sensitive thing the build did.) The build now runs on ONE stable release, written once as the
+`channel` of `rust-modules/rust-toolchain.toml`. The Makefile reads that line into `RUST_TOOLCHAIN`
+and passes `+$(RUST_TOOLCHAIN)` to every cargo call, because a `cargo +toolchain` on the command line
+outranks the file; CI reads it through `.github/actions/rust-toolchain`; `ci/rust_toolchain.py`
+serves the Python gates; the notices generator and the GPL source bundle name the same release. There
+is no repo variable and no nightly. The ARM build uses `armv7-unknown-linux-gnueabi`'s prebuilt std,
+so `rust-src` is bundled in the source release only as the corresponding source of that std.
 
 **Two traps encoded in `release.yml`, both of which fail silently:**
 1. `gen-manifest` writes a **bare filename** into `ipkUrl`, resolved relative to the manifest URL —
@@ -1288,6 +1426,27 @@ most drift-sensitive thing this build does.
 **Propagation:** webosbrew has no webhook. The registry rebuilds on `cron: 41 */3 * * *` and
 re-fetches every manifest, so expect **~1.5–3 h** plus a ~10 min CDN TTL. The Homebrew Channel
 compares versions by **plain string equality** — its `versionHigher()` helper is dead code.
+
+**The nightly channel is a custom repository, not a listing.** The webosbrew catalogue's entry is
+keyed to the stable id, so nightlies are served from `https://plxnative.com/nightly/repo.json`
+(users add it under Homebrew Channel > Settings > Add repository). `ci/nightly.py repo-json`
+builds it from the newest nightly release: the index, that nightly's manifest with an absolute
+`ipkUrl`, and a description page; `pages.yml` stages it after every published nightly. Because the
+Channel compares version strings, each nightly's PACKAGE version carries its cut date as the patch
+(`X.Y.YYYYMMDD`, `ci/version_rule.py::nightly_package_triplet`) — the reported version
+(`X.Y.Z-nightly-YYYYMMDD`) is the human one. `repo-json` refuses a manifest whose id, sha256 or
+dated version disagrees with its release.
+
+**Measured on the dev television (webOS 4.5, 2026-10-06), through `dev/install` and a throwaway app
+id so no real install was touched:** the installer accepted every version form tried and moved the
+installed version each time — fresh install and upgrade for `0.8.261006` to `0.8.261007`, for the
+8-digit `0.8.20261006` to `0.8.20261007`, and for the `0.8.0+nightly.20261006` suffix form; the
+old per-cycle `0.8.0` upgraded to `0.8.20261006` (the path an existing nightly install takes); a
+same-version reinstall and a LOWER version both installed (every status event carries
+`downgrade: true`). So this firmware's installer neither restricts the syntax or size nor refuses
+a downgrade; the `main`-only guard exists because Homebrew Channel would offer an older build as an
+update, not because the installer would refuse it. Not covered: Homebrew Channel's own download,
+hash check and Update button, other firmware, and a package with a storage service.
 
 **Not built: on-device CI.** It is the only real gate, but `tests/run.py` has **no mutual-exclusion
 lock** (no `flock`, no pidfile), and there is one television — a scheduled run overlapping with the
@@ -1358,7 +1517,9 @@ survives the rewrite (two consecutive `make RELEASE=1 ipk` runs agree byte for b
 
 **Cost of the miss, had it shipped:** the manifest's sha256 would have matched, the download would
 have succeeded, and every install would have failed at extraction — on a channel where the
-developer has no shell on the user's TV and `/tmp/plxnative-events.log` is unreachable (§6.9).
+developer has no shell on the user's TV and `/tmp/plxnative-events.log` was unreachable at 0600
+(§6.9; since 2026-10-04 the user can fetch it with Dev Manager — and a failed install never reaches
+the app to write one anyway).
 
 ---
 
@@ -1467,6 +1628,15 @@ tracked, cut from the SAME master by the same script:
 python3 tools/mkicons.py assets/logo-master.png --out-dir=pkg/dev --sizes=80,130 --badge=DEV
 ```
 
+The nightly install (`com.beb.plxnative.nightly`) is a third tile beside both, so it wears its own
+set, `pkg/nightly/`, in the palette's cool grey (`COOL_200`, `#cdd3dd`) with the derived dark ink —
+cut the same way:
+
+```sh
+python3 tools/mkicons.py assets/logo-master.png --out-dir=pkg/nightly --sizes=80,130 \
+  --badge=NIGHTLY --badge-fill=#cdd3dd
+```
+
 The badge is a **full-bleed bottom bar** — amber (`theme::RESUME_FILL` over `AMBER_950` ink, the
 design system's own filled-control pair, so it is on-brand while being the one thing on the tile
 that could not be mistaken for the release artwork). Both halves of "full-bleed bottom bar" are
@@ -1480,7 +1650,7 @@ load-bearing rather than taste:
   corner alone, so **one `iconColor` stays correct for both flavours and the badge needs no
   descriptor change at all**. That is why the flavour transform moves only `id` and `title`. It is
   enforced, not merely documented: `check-package.py` runs the same pixel-(1,1)-within-2-levels test
-  a second time against `pkg/dev/largeIcon.png`, so a badge that creeps into the corner fails the
+  again against `pkg/dev/largeIcon.png` and `pkg/nightly/largeIcon.png`, so a badge that creeps into the corner fails the
   package rather than shipping a hard-edged rectangle in a differently-coloured tile.
 - **A bar, not a whole-tile tint.** Tinting means moving `iconColor` in lockstep — or reproducing
   exactly the defect above — and it stops looking like the product.
@@ -1534,10 +1704,14 @@ fontTools dumps of `pkg/appfont*.ttf`; `tar tzf ipkroot/data.tar.gz`.
 
 ## 11. The rating marks are ours now (2026-08-02)
 
-The last hard trademark blocker. Rotten Tomatoes' marks had **no licensing route in existence** —
-their developer programme is closed to unofficial projects and `developer.fandango.com` does not
-resolve, so there was not even an application path — and redrawing a mark is the standard
-infringement pattern rather than a defence.
+The last hard trademark blocker. Rotten Tomatoes' marks have **no public or self-serve licence**.
+RT's licensing page (`rottentomatoes.com/help_desk/licensing`, read 2026-10-29) sends every
+proposed use of its logos or data through a Business Proposal Form for case-by-case review, and
+says the Fresh Tomato, Rotten Splat, Hot Popcorn and Stale Popcorn logos *"cannot be altered
+without prior written permission"*. Fandango's developer portal (`developer.fandango.com`) no
+longer resolves. This project holds no such permission, and redrawing a mark is the standard
+infringement pattern rather than a defence. (The 2026-08-02 review found no application path at
+all; the 2026-10-29 re-check found the form. The decision is unchanged.)
 
 Removed: the 5 RT states as 11 layered SVGs (fruit, Certified Fresh seal, upright and spilled
 popcorn tubs), plus a dead `tmdb.svg` and a retired `star.svg` that nothing drew. Also removed —
@@ -1560,6 +1734,22 @@ What remains is not a licensing question but a taste one: the tomato is a fruit,
 a percentage in a movie app still gestures at Rotten Tomatoes. That is the owner's call, made with
 the facts on the table, and the two shapes a rights holder would actually write about — the seal and
 the popcorn pair — are the ones that are gone.
+
+**Re-checked 2026-10-29, when a revision of #1129 proposed redrawn splat and popcorn marks
+(withdrawn in review).** Other clients that show the marks are not precedent. Plezy ships copies
+of RT's marks (Wikimedia/Inkscape traces in RT's exact colours,
+`github.com/edde746/plezy/tree/1dd75b3e5e95913cdaa5b8c22911490e72dfb7c5/assets/rating_icons`),
+which RT's published terms do not allow. Infuse 8.5.7 (2026-10-13) shows RT's own artwork after
+Firecore said in 2024 that *"the Rotten Tomatoes service presents a number of challenges"* and that
+it had *"recently gained official access to Metacritic ratings"*
+(`community.firecore.com/t/imdb-rotten-tomato-ratings/14551?page=8`), so it is most likely a
+licensee. Neither helps us. Fandango grants its marks in writing, revocably, without sublicensing
+and per developer, so another app's licence never reaches this one. A use nobody has challenged is
+not a permitted one either; it only means the owner has not acted yet. And a logo is the weakest
+form of reference: *Toyota v. Tabari*, 610 F.3d 1171 (9th Cir. 2010), treated a stylized mark and
+logo as more of the mark than nominative use needs where words would do. The one enforcement action
+found is Fandango's 2017 legal request that made OMDb stop serving RT data
+(`github.com/omdbapi/OMDb-API/issues/5`).
 
 ---
 
@@ -1718,27 +1908,21 @@ section closed anything at all.
 4. **Does anything on a webOS TV display `appDescription` at all** for a sideloaded app, or is it
    Content-Store-listing metadata only? If the latter, this closes #41's listing half and nothing
    visible on the set, which is still the right answer for a submission but is a different claim.
-5. **The app does not crash or misrender on a language change** — which it structurally cannot,
-   see §12.5, but the checklist item asks about behaviour and behaviour is measured.
+5. **The app does not crash or misrender on a language change** — the checklist item asks about
+   behaviour, and behaviour is measured; the UI now follows the language (§12.5).
 
-### 12.5 What is explicitly NOT closed
+### 12.5 The UI half (since closed)
 
-**The UI is English-only and stays that way in this change.** There are ~203 display literals
-across 45 files, and `Label`/`Button` take a non-owning `*const c_char` — an owned `String` needs a
-lifetime story that a metadata change has no business inventing. The CJK fallback face landed
-separately and is a *precondition* for a translated UI, not the thing itself: glyph coverage means
-Korean renders, not that anything is written in Korean.
+**Superseded: the UI is localized now.** When this section was written the UI was English-only,
+with ~203 display literals across 45 files and no string ownership story, and the native UI was
+locale-blind apart from a best-effort `X-Plex-Language` read from the POSIX locale environment.
+Both are gone. The app's own text comes from bundled catalogs (every language `locales/languages.json` registers), the
+UI language resolves from a saved Settings → Language override, then the TV UI language reported
+by the native Settings Service, then the process locale, then English, and
+`plex::identity::language` now sends that resolved language as `X-Plex-Language`.
+[`docs/localization.md`](localization.md) is the current account of runtime behaviour and of its
+verification on the television.
 
-**The native UI remains locale-blind, but PMS metadata has a best-effort locale.**
-`plex::identity::language` reads the inherited POSIX `LC_ALL`, `LC_MESSAGES`, then `LANG` and
-validates the value; `plex::client::pms_headers` and `AccountClient::headers` send the result as
-`X-Plex-Language`. An absent, neutral, or malformed locale omits the header and leaves PMS on its
-default language. The app does not query webOS's language service, so whether the TV launcher
-exports the menu language into that process environment is a device acceptance question, not a
-host claim. This improves server-returned strings without pretending that the app's own display
-literals are translated.
-
-**So the honest mark for #41** is: the metadata half is implemented and gated; the UI half is
-English-only by design; and the whole thing is **unverified on a television** until §12.4 item 1 is
-run. A tester who changes the language and finds an English UI has found a documented decision, not
-a defect — but "Pass" cannot be written next to this row on the strength of this section alone.
+**So the mark for #41** is: the metadata half is implemented and gated as above; the UI half is
+implemented by the localization work and verified on the webOS 4.5 set as `docs/localization.md`
+records; the launcher-metadata acceptance questions in §12.4 are still separate device checks.

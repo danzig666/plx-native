@@ -20,42 +20,44 @@ use super::test_support::{frame};
 /// for Compact all along.
 #[test]
 fn a_compact_library_menu_holds_a_frozen_host_and_gives_it_back_on_dismissal() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-host-freeze");
+    let session = plx_plex::plex::session::TempSession::new("library-host-freeze");
     session.watching("u-library-host-freeze");
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test("freeze-own", "127.0.0.1", 9, "synthetic", "fixture");
-    crate::plex::set_current(sid);
-    let base = crate::ui::popover::host_users_for_test();
-    let users = || crate::ui::popover::host_users_for_test() - base;
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("freeze-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::set_current(sid);
+    let base = plx_ui::popover::host_users_for_test();
+    let users = || plx_ui::popover::host_users_for_test() - base;
 
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, sid]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(120);
     frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
     assert_eq!(users(), 0, "a bare library page freezes nothing");
     let page = d.nav.top_page().unwrap().id;
     let host = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
     let listing = rig.listing.view().id().unwrap();
-    d.nav.next_style = crate::ui::containers::modal::Style::Compact;
+    d.nav.next_style = plx_ui::containers::modal::Style::Compact;
     d.request(
         MachineId::Nav,
         NavOp::Present(AppArg::LibraryMenu(
-            crate::screens::registry::LibraryMenuArg {
+            plx_screens::registry::LibraryMenuArg {
                 host,
-                kind: crate::screens::registry::LibraryMenuKind::Sort,
+                kind: plx_screens::registry::LibraryMenuKind::Sort,
                 anchor: [0; 4],
-                target: crate::stores::browse::SectionAddress {
+                folded: Vec::new(),
+                opener: None,
+                target: plx_data::stores::browse::SectionAddress {
                     epoch: listing.epoch,
                     sid: listing.sid,
                     section: listing.section,
@@ -110,47 +112,49 @@ fn a_compact_library_menu_holds_a_frozen_host_and_gives_it_back_on_dismissal() {
 /// **It has to be the LIBRARY, and it has to be `idle`.** The dispatcher keeps a motion ledger of
 /// its own (`Present::page_moving`, reported as `FrameReport::underlay_moving`), but a screen only
 /// reaches it by calling `fx.note(PresentEvent::Motion)` — which `screens::library` never does. It
-/// animates through `crate::ui::Spring`, i.e. `gfx::spring`, which reports to `ui::idle` and
+/// animates through `plx_ui::Spring`, i.e. `gfx::spring`, which reports to `plx_machine::idle` and
 /// nowhere else; `report.underlay_moving` is false on every frame below. `idle::page_moving()` is
 /// the only witness there is.
 #[test]
 fn a_host_page_spring_under_an_open_panel_is_host_motion() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-host-motion");
+    let session = plx_plex::plex::session::TempSession::new("library-host-motion");
     session.watching("u-library-host-motion");
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test("motion-own", "127.0.0.1", 9, "synthetic", "fixture");
-    crate::plex::set_current(sid);
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("motion-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, sid]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(120);
     frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
-    d.nav.tabs.stack.transition = Box::new(crate::ui::containers::transition::Immediate);
+    d.nav.tabs.stack.transition = Box::new(plx_ui::containers::transition::Immediate);
     // park the grid focus deep, and let every boot spring settle
-    Bridge::library_command(&mut d, crate::screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 });
+    Bridge::library_command(&mut d, plx_screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 });
     for i in 1..80 {
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
     }
     let host = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
     let listing = rig.listing.view().id().unwrap();
-    d.nav.next_style = crate::ui::containers::modal::Style::Compact;
+    d.nav.next_style = plx_ui::containers::modal::Style::Compact;
     d.request(
         MachineId::Nav,
-        NavOp::Present(AppArg::LibraryMenu(crate::screens::registry::LibraryMenuArg {
+        NavOp::Present(AppArg::LibraryMenu(plx_screens::registry::LibraryMenuArg {
             host,
-            kind: crate::screens::registry::LibraryMenuKind::Sort,
+            kind: plx_screens::registry::LibraryMenuKind::Sort,
             anchor: [0; 4],
-            target: crate::stores::browse::SectionAddress {
+            folded: Vec::new(),
+            opener: None,
+            target: plx_data::stores::browse::SectionAddress {
                 epoch: listing.epoch,
                 sid: listing.sid,
                 section: listing.section,
@@ -164,34 +168,33 @@ fn a_host_page_spring_under_an_open_panel_is_host_motion() {
 
     // a settled panel over a settled page: nothing moves, and in particular the panel's own
     // appear spring (`ModalStack::tick`, now in a scope of its own) is not the page's motion
-    crate::ui::idle::frame_begin(1.0 / 60.0);
+    plx_machine::idle::frame_begin(1.0 / 60.0);
     frame(&mut d, &mut rig, AppArg::Library, tick(120), vec![]);
-    assert!(!crate::ui::idle::page_moving(), "a settled host does not move");
+    assert!(!plx_machine::idle::page_moving(), "a settled host does not move");
 
     // dismiss: input returns to the page while the panel is still visible, and the page is driven
     d.request(MachineId::Nav, NavOp::Dismiss(menu));
     frame(&mut d, &mut rig, AppArg::Library, tick(121), vec![]);
-    Bridge::library_command(&mut d, crate::screens::registry::LibraryCmd::FocusGrid { row: 0, col: 0 });
+    Bridge::library_command(&mut d, plx_screens::registry::LibraryCmd::FocusGrid { row: 0, col: 0 });
     let mut moved = 0;
     for i in 122..136u32 {
-        crate::ui::idle::frame_begin(1.0 / 60.0);
+        plx_machine::idle::frame_begin(1.0 / 60.0);
         let (_, report) = frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
-        if !crate::ui::idle::present_moving() {
+        // The panel's own close MORPH is motion too (S11: the menu runs back into its control), in
+        // the panel's scope; it is not the page's. A frame counts here when the page's own spring
+        // moved, and the attribution bug this pins shows as that never happening.
+        if !plx_machine::idle::page_moving() {
             continue;
         }
         moved += 1;
         assert!(
             d.surface_up(),
-            "frame {i}: the reproduction needs the panel still up (fading) while the page moves"
-        );
-        assert!(
-            crate::ui::idle::page_moving(),
-            "frame {i}: the page's own scroll spring is in flight and nothing else is — \
-             it is the HOST that is moving (report.underlay_moving={})",
+            "frame {i}: the reproduction needs the panel still up (fading) while the page moves \
+             (report.underlay_moving={})",
             report.underlay_moving
         );
         assert!(
-            crate::ui::popover::host_refresh(true, false, crate::ui::idle::page_moving()),
+            plx_ui::popover::host_refresh(true, false, plx_machine::idle::page_moving()),
             "frame {i}: …so the fading panel's frozen snapshot is re-taken"
         );
     }
@@ -202,7 +205,7 @@ fn a_host_page_spring_under_an_open_panel_is_host_motion() {
 /// from the container's own policy table, so the two cannot state different things again.
 #[test]
 fn every_style_caches_its_host_exactly_when_the_policy_table_says_cached() {
-    use crate::ui::containers::modal::{style_caches_host, surface_policy, HostRender, Phase, Style};
+    use plx_ui::containers::modal::{style_caches_host, surface_policy, HostRender, Phase, Style};
     for style in [
         Style::Compact,
         Style::Sheet,

@@ -8,10 +8,21 @@ import subprocess
 import tempfile
 import unittest
 
+import check_steps
+
 ROOT = Path(__file__).resolve().parent.parent
 HOOK = "_ZN17StarfishMediaAPIs20callbackFunctionHookEixPKc"
 LOAD = "_ZN17StarfishMediaAPIs4LoadEPKcPFvixS1_PvES2_"
 FILLER = "synthetic-padding-line\n" * 100000  # More than 2 MiB, far beyond a pipe buffer.
+# Hang guards, not budgets. This file's own timeouts used to be 20 s per gate run and 5 s for the
+# parallel-invocation rendezvous, which a quiet machine meets many times over; on a 3-core macOS runner
+# with a cargo build beside it the run that pipes 2.8 MiB through the gate took longer than 20 s and
+# the whole step went red with TimeoutExpired (build-bench run 37694891086; the same tests finish in
+# 15 s on a dev Mac and in 92 s there). They exist so a gate that DEADLOCKS (the SIGPIPE regressions
+# this file pins) fails the test instead of hanging the suite, so they only have to be far above any
+# machine's honest time.
+GATE_HANG_GUARD = 240
+RENDEZVOUS_HANG_GUARD = 120
 
 FAKE_TOOL = r'''#!/usr/bin/env python3
 import json, os, signal, sys, time
@@ -20,22 +31,27 @@ signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 tool = Path(sys.argv[0]).name
 key = tool + (":" + sys.argv[1] if tool == "readelf" else "")
 spec = json.loads(Path(os.environ["ELF_TEST_SPEC"]).read_text())
-if key == "readelf:-h" and "ELF_TEST_BARRIER" in os.environ:
+# Only the main binary's header read is the synchronised observation: the gate also reads the storage
+# helper's header later, after the other run may already have exited and removed its scratch, and that
+# call must not overwrite the snapshot.
+if key == "readelf:-h" and Path(sys.argv[-1]).name == "synthetic.elf" and "ELF_TEST_BARRIER" in os.environ:
     barrier = Path(os.environ["ELF_TEST_BARRIER"])
     (barrier / ("ready-" + os.environ["ELF_TEST_RUN"])).touch()
-    until = time.monotonic() + 5
+    until = time.monotonic() + RENDEZVOUS_HANG_GUARD
     while len(list(barrier.glob("ready-*"))) < 2:
         if time.monotonic() > until: sys.exit(99)
         time.sleep(0.01)
     scratch = sorted(str(p) for p in Path(os.environ["TMPDIR"]).glob("check-elf.*"))
     (barrier / ("seen-" + os.environ["ELF_TEST_RUN"])).write_text(json.dumps(scratch))
-record = spec[key]
+# A spec entry "<key>:<file name>" answers for that one file; the storage helper is graded beside the
+# main binary and the two must be able to disagree.
+record = spec.get(key + ":" + Path(sys.argv[-1]).name, spec[key])
 data = record["output"].encode()
 while data:
     count = os.write(1, data)
     data = data[count:]
 sys.exit(record.get("exit", 0))
-'''
+'''.replace("RENDEZVOUS_HANG_GUARD", str(RENDEZVOUS_HANG_GUARD))
 
 
 def defaults():
@@ -47,7 +63,8 @@ def defaults():
         "readelf:-l": "  LOAD 0x000000 0x00010000 0x00010000\n",
         "readelf:-n": "Build ID: " + "a" * 40 + "\n",
         "readelf:-d": "Shared library: [libalpha.so]\nShared library: [libbeta.so]\n",
-        "objdump": "  00: dmb ish\n" * 101,
+        "readelf:-d:plxnative-storage": "Shared library: [libgamma.so]\nShared library: [libalpha.so]\n",
+        "objdump": "  00: dmb ish\n" * 101 + "  04: vmul.f32 s0, s1, s2\n" * 200 + "  08: bl 0x100 <__aeabi_fmul>\n" * 5,
         "strings": "YOUR_PMS_HOST\n",
     }.items()}
 
@@ -67,6 +84,8 @@ class ElfGateTests(unittest.TestCase):
         self.script = self.root / "ci/check-elf.sh"
         self.script.write_text(source)
         (self.root / "ci/expected-dt-needed.txt").write_text("libalpha.so\nlibbeta.so\n")
+        (self.root / "ci/expected-dt-needed-storage.txt").write_text("libalpha.so\nlibgamma.so\n")
+        (self.root / "plxnative-storage").write_text("synthetic helper")
         for name in ("readelf", "objdump", "strings"):
             path = self.root / "tools" / name
             path.write_text(FAKE_TOOL)
@@ -84,7 +103,7 @@ class ElfGateTests(unittest.TestCase):
                     "ELF_TEST_SPEC": str(self.spec)})
         env.update(extra_env or {})
         return subprocess.run(["bash", str(self.script), "synthetic.elf"], cwd=self.root,
-                              env=env, capture_output=True, text=True, timeout=20)
+                              env=env, capture_output=True, text=True, timeout=GATE_HANG_GUARD)
 
     def assert_pass(self, spec):
         result = self.run_gate(spec)
@@ -109,6 +128,32 @@ class ElfGateTests(unittest.TestCase):
                 result = self.run_gate(spec)
                 self.assertNotEqual(result.returncode, 0, "forbidden value was allowed: " + result.stdout)
                 self.assertIn(diagnostic, result.stdout)
+
+    def test_three_component_locale_or_version_data_is_not_an_ipv4_address(self):
+        spec = defaults()
+        spec["strings"]["output"] += "10.11.12\n172.16.12\n192.168.12\n"
+        self.assert_pass(spec)
+
+    def test_private_shaped_subsequence_inside_longer_dotted_data_is_not_an_address(self):
+        spec = defaults()
+        spec["strings"]["output"] += "1.2.3.4.5.6.7.8.9.10.11.12.13.14\n"
+        self.assert_pass(spec)
+
+    def test_complete_private_ipv4_ranges_remain_forbidden(self):
+        for address in ("10.11.12.13", "10.0.0.1", "10.255.255.255",
+                        "172.16.0.1", "172.31.255.255", "192.168.0.1", "192.168.255.255"):
+            with self.subTest(address=address):
+                spec = defaults()
+                spec["strings"]["output"] += "http://" + address + ":32400/library\n"
+                result = self.run_gate(spec)
+                self.assertNotEqual(result.returncode, 0, "private address was allowed")
+                self.assertIn("private IP address", result.stdout)
+                self.assertIn(address, result.stdout, "the gate must identify the full four-octet address")
+
+    def test_neighbouring_public_ipv4_ranges_are_allowed(self):
+        spec = defaults()
+        spec["strings"]["output"] += "9.11.12.13\n11.11.12.13\n172.15.255.255\n172.32.0.1\n192.167.0.1\n192.169.0.1\n"
+        self.assert_pass(spec)
 
     def test_early_forbidden_relocation_with_large_tail(self):
         spec = defaults()
@@ -142,12 +187,91 @@ class ElfGateTests(unittest.TestCase):
                                  ("readelf:-n", "Build ID: abc\n"),
                                  ("readelf:-d", "Shared library: [unexpected.so]\n"),
                                  ("readelf:--dyn-syms", ""), ("strings", "no placeholder\n"),
-                                 ("objdump", "  00: dmb ish\n")]:
+                                 ("objdump", "  00: dmb ish\n"),
+                                 # float math without VFP: no vmul.f32 at all, and a libcall instead
+                                 ("objdump", "  00: dmb ish\n" * 101 + "  04: bl 0x100 <__aeabi_fmul>\n" * 200),
+                                 # VFP present but the libcalls are not the rare exception (the bound is 1 call per 20 vmul.f32)
+                                 ("objdump", "  00: dmb ish\n" * 101 + "  04: vmul.f32 s0, s1, s2\n" * 150
+                                  + "  08: bl 0x100 <__aeabi_fmul>\n" * 20)]:
             with self.subTest(key=key):
                 spec = defaults()
                 spec[key]["output"] = replacement
                 result = self.run_gate(spec)
                 self.assertNotEqual(result.returncode, 0, key)
+
+    def test_local_libm_body_is_rejected(self):
+        # compiler_builtins' weak soft-float copy won over glibc's libm: the objdump has a local body.
+        for name in ("roundf", "round", "floorf", "ceilf", "ceil", "trunc", "fmodf", "fmod",
+                     "cbrtf", "sqrtf", "sqrt", "fma"):
+            with self.subTest(name=name):
+                spec = defaults()
+                spec["objdump"]["output"] += f"0001a2b4 <{name}>:\n  00: bl 0x100 <__aeabi_fadd>\n"
+                result = self.run_gate(spec)
+                self.assertNotEqual(result.returncode, 0, "local libm body was allowed: " + result.stdout)
+                self.assertIn("local definitions of libm functions", result.stdout)
+                self.assertIn(name, result.stdout)
+
+    def test_too_many_soft_arithmetic_calls_are_rejected(self):
+        spec = defaults()
+        # Few fmul (the existing ratio check stays happy); the new bound counts every soft kind.
+        spec["objdump"]["output"] += "  08: bl 0x100 <__aeabi_fadd>\n" * 6 + "  0c: bl 0x100 <__aeabi_ddiv>\n" * 6
+        result = self.run_gate(spec)
+        self.assertNotEqual(result.returncode, 0, "17 soft arithmetic calls were allowed: " + result.stdout)
+        self.assertIn("soft-float arithmetic libcalls", result.stdout)
+
+    def test_fixed_link_shape_passes_with_libm_undefined_and_int_conversions(self):
+        spec = defaults()
+        # Math names are only CALLED (PLT stubs, not local bodies), 9 soft calls remain (core's
+        # float parsing) and the i64<->float conversions, which VFPv3 cannot do, are not counted.
+        spec["objdump"]["output"] += ("  10: bl 0x200 <roundf@plt>\n" * 30
+                                      + "  14: bl 0x100 <__aeabi_dmul>\n" * 4
+                                      + "  18: bl 0x100 <__aeabi_l2d>\n" * 53
+                                      + "  1c: bl 0x100 <__aeabi_d2lz>\n" * 20)
+        result = self.run_gate(spec)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no local libm bodies, 9 soft-float arithmetic calls", result.stdout)
+
+    def test_storage_helper_dt_needed_is_graded_against_its_own_list(self):
+        for label, output in [("an extra library", "Shared library: [libalpha.so]\nShared library: [libgamma.so]\n"
+                                                   "Shared library: [libdelta.so]\n"),
+                              ("a missing library", "Shared library: [libalpha.so]\n"),
+                              ("the main binary's list", "Shared library: [libalpha.so]\nShared library: [libbeta.so]\n")]:
+            with self.subTest(label=label):
+                spec = defaults()
+                spec["readelf:-d:plxnative-storage"]["output"] = output
+                result = self.run_gate(spec)
+                self.assertNotEqual(result.returncode, 0, "helper drift was allowed: " + result.stdout)
+                self.assertIn("storage helper DT_NEEDED drifted", result.stdout)
+
+    def test_storage_helper_must_be_arm_soft_float_v7(self):
+        for key, replacement, diagnostic in [
+                ("readelf:-h:plxnative-storage", "Class: ELF32\nMachine: x86-64\nFlags: soft-float\n", "not ARM"),
+                ("readelf:-h:plxnative-storage", "Class: ELF32\nMachine: ARM\nFlags: hard-float\n", "soft-float"),
+                ("readelf:-A:plxnative-storage", "Tag_CPU_arch: v6\n", "not ARMv7")]:
+            with self.subTest(key=key, diagnostic=diagnostic):
+                spec = defaults()
+                spec[key] = {"output": replacement}
+                result = self.run_gate(spec)
+                self.assertNotEqual(result.returncode, 0, "wrong helper ELF was allowed: " + result.stdout)
+                self.assertIn(diagnostic, result.stdout)
+
+    def test_absent_storage_helper_fails_in_ci_and_is_skipped_elsewhere(self):
+        (self.root / "plxnative-storage").unlink()
+        result = self.run_gate(defaults())
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("storage helper ships in the package", result.stdout)
+        result = self.run_gate(defaults(), extra_env={"CI": "false"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SKIP", result.stdout)
+
+    def test_storage_helper_path_can_be_named(self):
+        (self.root / "plxnative-storage").unlink()
+        (self.root / "elsewhere").write_text("synthetic helper")
+        spec = defaults()
+        spec["readelf:-d:elsewhere"] = {"output": "Shared library: [libdelta.so]\n"}
+        result = self.run_gate(spec, extra_env={"STORAGE_BIN": "elsewhere"})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("storage helper DT_NEEDED drifted", result.stdout)
 
     def test_parallel_invocations_have_private_scratch_and_remove_it(self):
         self.spec.write_text(json.dumps(defaults()))
@@ -168,14 +292,26 @@ class ElfGateTests(unittest.TestCase):
 
 class MakeCheckContractTests(unittest.TestCase):
     def test_host_check_runs_elf_gate_regressions(self):
+        # `make check` itself is just `tools/check-lock.py`'s machine-wide queue wrapper (two
+        # slots) around `check-unlocked`, which fans out to `check-python` and so to the step manifest
+        # (ci/check-python-steps.txt) this asserts on; `make check` still runs it, just queued.
         lines = (ROOT / "Makefile").read_text().splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("check:"))
-        recipe = []
-        for line in lines[start + 1:]:
-            if line and not line.startswith(("\t", "#")):
-                break
-            recipe.append(line)
-        self.assertIn("\tpython3 ci/test_check_elf.py", recipe)
+
+        def recipe_of(target):
+            start = next(i for i, line in enumerate(lines) if line.startswith(target + ":"))
+            recipe = []
+            for line in lines[start + 1:]:
+                if line and not line.startswith(("\t", "#")):
+                    break
+                recipe.append(line)
+            return recipe
+
+        # `check-unlocked` runs the `check-cargo` and `check-python` branches side by side; the
+        # Python-only gates (this one) live in the second.
+        unlocked = "\n".join(recipe_of("check-unlocked"))
+        self.assertIn("check-cargo", unlocked)
+        self.assertIn("check-python", unlocked)
+        self.assertIn("python3 ci/test_check_elf.py", check_steps.commands())
 
 
 if __name__ == "__main__":

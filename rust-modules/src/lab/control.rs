@@ -7,7 +7,7 @@
 //! as the development FIFO and the next poll acknowledges it.
 //!
 //! No WebSocket dependency is hidden here. The oldest supported television has libcurl 7.53.1,
-//! before libcurl's WebSocket API, while [`crate::net::post_pinned`] already supplies TLS, the
+//! before libcurl's WebSocket API, while [`plx_net::net::post_pinned`] already supplies TLS, the
 //! per-session SPKI pin, deadlines and a bounded response body. A held HTTP request also crosses
 //! Cloud Test Lab's outbound-only NAT without opening a second public port.
 //!
@@ -20,7 +20,8 @@
 //! this is deliberately **at least once across crashes**, which is the only honest guarantee
 //! without writable durable state on the rented set.
 
-use super::{config, ControlCommand};
+use super::ControlCommand;
+use plx_platform::labcfg::config;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,8 +103,8 @@ pub(crate) fn start() {
     // On an old OpenSSL whose lock callbacks could not be installed, net.rs serialises every
     // HTTPS request behind one mutex. A 15-second long poll would then starve sign-in and uploads;
     // keep diagnostics working and name why control is unavailable instead.
-    if !crate::net::threaded_tls_ready() {
-        crate::log("lab-control: disabled — this firmware cannot run concurrent TLS safely");
+    if !plx_net::net::threaded_tls_ready() {
+        plx_base::eventlog::log("lab-control: disabled — this firmware cannot run concurrent TLS safely");
         return;
     }
     if STARTED.swap(true, Ordering::AcqRel) {
@@ -114,9 +115,9 @@ pub(crate) fn start() {
     let secret = cfg.secret.clone();
     let session = cfg.session.clone();
     let pin = cfg.pin.clone();
-    if !crate::task::spawn_small("labctl", move || run(endpoint, secret, session, pin)) {
+    if !plx_base::task::spawn_small("labctl", move || run(endpoint, secret, session, pin)) {
         STARTED.store(false, Ordering::Release);
-        crate::log("lab-control: no worker thread — command channel unavailable");
+        plx_base::eventlog::log("lab-control: no worker thread — command channel unavailable");
     }
 }
 
@@ -127,7 +128,7 @@ fn run(url: String, secret: String, session: String, pin: String) {
         "Content-Type: application/json".to_string(),
         "Expect:".to_string(),
     ];
-    let timeouts = crate::net::Timeouts {
+    let timeouts = plx_net::net::Timeouts {
         connect_s: 8,
         // The receiver holds an idle poll for 15 seconds. Leave handshake and response headroom.
         total_s: 25,
@@ -146,13 +147,13 @@ fn run(url: String, secret: String, session: String, pin: String) {
             Ok(body) => body,
             Err(_) => return, // Ack contains only primitives; serialization cannot realistically fail.
         };
-        match crate::net::post_pinned(&url, &headers, &body, &pin, timeouts) {
+        match plx_net::net::post_pinned(&url, &headers, &body, &pin, timeouts) {
             Some(r) if r.status == 200 => {
                 // Receiving the response proves the receiver consumed the acknowledgement in this
                 // request. Clear it before considering the next command carried by that response.
                 ack = None;
                 if !connected {
-                    crate::log(if ever_connected {
+                    plx_base::eventlog::log(if ever_connected {
                         "lab-control: receiver reconnected"
                     } else {
                         "lab-control: receiver connected"
@@ -177,13 +178,13 @@ fn run(url: String, secret: String, session: String, pin: String) {
                     }
                     Ok(None) => {} // idle long poll expired; immediately open the next one
                     Err(()) => {
-                        crate::log("lab-control: receiver returned malformed JSON");
+                        plx_base::eventlog::log("lab-control: receiver returned malformed JSON");
                     }
                 }
             }
             Some(r) => {
                 if !failure_reported {
-                    crate::log(&format!(
+                    plx_base::eventlog::log(&format!(
                         "lab-control: receiver refused poll status={} — retrying",
                         r.status
                     ));
@@ -195,7 +196,7 @@ fn run(url: String, secret: String, session: String, pin: String) {
             }
             None => {
                 if !failure_reported {
-                    crate::log("lab-control: receiver unreachable — retrying");
+                    plx_base::eventlog::log("lab-control: receiver unreachable — retrying");
                 }
                 failure_reported = true;
                 connected = false;
@@ -290,7 +291,7 @@ mod tests {
 
     #[test]
     fn main_thread_mailbox_round_trips_a_result() {
-        let _g = crate::testlock::serial();
+        let _g = plx_base::testlock::serial();
         let mb = mailbox();
         let mut state = mb.state.lock().unwrap_or_else(|e| e.into_inner());
         state.pending.clear();

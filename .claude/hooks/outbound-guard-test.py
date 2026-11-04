@@ -34,6 +34,8 @@ spec.loader.exec_module(guard)
 FAKE_TV = "192.168.44.7"
 FAKE_PMS = "192.168.44.3"
 FAKE_MAC = "de:ad:be:ef:00:11"
+FAKE_USER_TV = "192.168.44.9"                # in the PER-USER ~/.config/plxnative/tv-host only
+FAKE_USER_MAC = "de:ad:be:ef:00:22"          # ...and in the per-user tv-mac only
 FAKE_TOKEN = "Kx7fQ2mZ9pLr4TvB1sNd"          # 20 alnum, mixed — a Plex token's shape
 FAKE_USERID = "987654321"
 FAKE_MACHINE = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"   # 40 hex
@@ -72,7 +74,27 @@ def build_root():
     return root
 
 
+def build_user_config(root):
+    """The per-user TV config (tools/tv-config.sh): FAKE `tv-host`/`tv-mac` in a directory OUTSIDE
+    the fake repo root, reached through PLX_TV_CONFIG_DIR, plus a fake HOME whose
+    `.config/plxnative` is a symlink to it so `~/.config/plxnative/tv-host` resolves to the same
+    file. Returns the directory."""
+    cfg = os.path.join(root, "user-config", "plxnative")
+    os.makedirs(cfg)
+    with open(os.path.join(cfg, "tv-host"), "w") as f:
+        f.write(FAKE_USER_TV + "\n")
+    with open(os.path.join(cfg, "tv-mac"), "w") as f:
+        f.write(FAKE_USER_MAC + "\n")
+    home = os.path.join(root, "home")
+    os.makedirs(os.path.join(home, ".config"))
+    os.symlink(cfg, os.path.join(home, ".config", "plxnative"))
+    os.environ["PLX_TV_CONFIG_DIR"] = cfg
+    os.environ["HOME"] = home
+    return cfg
+
+
 ROOT = build_root()
+USER_CFG = build_user_config(ROOT)
 SECRETS = guard.load_secrets(ROOT)
 
 BLOCK, ALLOW = True, False
@@ -108,6 +130,16 @@ CASES = [
     (BLOCK, 'gh pr create --body "the set is at $(cat .tv-host)"'),
     (BLOCK, 'gh pr create --body "the set is at `cat .tv-host`"'),
     (BLOCK, 'git commit -m "$(grep TOKEN src/config.local.h)"'),
+    # The per-USER copies of the TV address / MAC (tools/tv-config.sh) are as private as `.tv-host`:
+    # their values are loaded literally, and a payload that READS them is refused however the path
+    # is spelled -- absolute, `~`, or through an environment variable.
+    (BLOCK, 'gh pr create --body "the set is at %s"' % FAKE_USER_TV),
+    (BLOCK, 'git commit -m "wake %s first"' % FAKE_USER_MAC),
+    (BLOCK, 'gh pr create --body "the set is at $(cat %s/tv-host)"' % USER_CFG),
+    (BLOCK, 'gh pr create --body "the set is at $(cat ~/.config/plxnative/tv-host)"'),
+    (BLOCK, 'gh pr create --body "the set is at $(cat \"$PLX_TV_CONFIG_DIR/tv-host\")"'),
+    (BLOCK, 'gh pr create --body "mac `cat ~/.config/plxnative/tv-mac`"'),
+    (BLOCK, 'gh release upload v0.3.0 %s/tv-mac' % USER_CFG),             # the FILE, not its text
 
     # --- must be allowed: the false positives, which are the ones that matter ---------------
     (ALLOW, 'git commit -m "document the 203.0.113.5 placeholder"'),      # RFC 5737 TEST-NET-3
@@ -145,6 +177,9 @@ CASES = [
     (ALLOW, 'gh pr create --body ".tv-host"'),
     (ALLOW, 'gh pr create --body "src/config.local.h"'),
     (ALLOW, 'git commit -m ".tv-host"'),
+    (ALLOW, 'gh pr create --body "~/.config/plxnative/tv-host"'),         # naming the file is the advice
+    (ALLOW, 'cat ~/.config/plxnative/tv-host'),                           # reading it locally is fine
+    (ALLOW, 'tools/tv-config.sh host'),
     # The same letter, the other meaning: `-f` is a string field on gh and a boolean on `git add`
     # whose NEXT word is the path. A flat text-flag set gets one of these two wrong.
     (ALLOW, 'gh workflow run release.yml -f version=0.3.0'),
@@ -201,6 +236,235 @@ CASES += [
 def blocked(cmd, cwd=None):
     return guard.verdict(cmd, ROOT, cwd=cwd or ROOT, secrets=SECRETS,
                          published=lambda v: v in PUBLISHED) is not None
+
+
+# --- raw merges: `merge_verdict`, a second question this hook answers beside the private-value scan.
+# A pull request lands through `tools/pr-land.py` (the `land-pr` skill), which gates on the checks
+# before it calls `gh pr merge` itself. What is refused is a merge typed straight into the shell: the
+# CLI, the REST endpoint `.../pulls/N/merge` with a write method, and GraphQL `mergePullRequest`.
+# The false positives are the point of half of these -- the words "gh pr merge" in a grep, an echo, a
+# commit message or a heredoc are prose, and a GET of the merge endpoint is how a merge is READ.
+MERGE_HEREDOC = """gh api graphql --input - <<'EOF'
+{"query": "mutation { mergePullRequest(input: {pullRequestId: \\"PR_x\\"}) { clientMutationId } }"}
+EOF"""
+MERGE_DOC_HEREDOC = """cat > notes.md <<'EOF'
+Land it with tools/pr-land.py, never `gh pr merge 5`.
+EOF"""
+MERGE_CASES = [
+    # the CLI, however it is dressed
+    (BLOCK, 'gh pr merge 5'),
+    (BLOCK, 'gh pr merge'),
+    (BLOCK, 'gh pr merge 5 --squash --match-head-commit %s' % GIT_SHA),
+    (BLOCK, 'gh pr merge --auto --squash 5'),
+    (BLOCK, 'gh pr merge 5 --admin'),
+    (BLOCK, 'gh -R GLinnik21/plx-native pr merge 5'),           # the verb sits behind a global flag
+    (BLOCK, 'gh --repo GLinnik21/plx-native pr merge 5 --squash'),
+    (BLOCK, 'cd /repo && gh pr merge 5 --squash'),
+    (BLOCK, 'make check; gh pr merge 5'),
+    (BLOCK, 'gh pr checks 5 --watch && gh pr merge 5'),         # the chain this guard exists for
+    (BLOCK, 'env GH_PAGER= gh pr merge 5'),
+    (BLOCK, 'nohup /opt/homebrew/bin/gh pr merge 5 --squash'),
+    (BLOCK, 'echo go\ngh pr merge 5'),
+    (BLOCK, 'gh pr merge 5 --squash --body "a message with %s in it"' % FAKE_TV),   # echoes nothing
+    # the REST endpoint with a write method, spelled four ways
+    (BLOCK, 'gh api -X PUT repos/o/r/pulls/9/merge'),
+    (BLOCK, 'gh api repos/o/r/pulls/9/merge -X PUT -f merge_method=squash'),
+    (BLOCK, 'gh api --method PUT repos/o/r/pulls/9/merge'),
+    (BLOCK, 'gh api --method=PUT repos/o/r/pulls/9/merge'),
+    (BLOCK, 'gh api -XPUT repos/o/r/pulls/9/merge'),
+    (BLOCK, 'gh api -X POST repos/o/r/pulls/9/merge'),
+    (BLOCK, "gh api -X PUT 'repos/{owner}/{repo}/pulls/9/merge'"),
+    (BLOCK, 'gh api -X PUT /repos/o/r/pulls/9/merge'),
+    (BLOCK, 'gh api -X DELETE repos/o/r/pulls/9/merge'),
+    # ... and a field, which makes gh send a POST when no method is named
+    (BLOCK, 'gh api repos/o/r/pulls/9/merge -f merge_method=squash'),
+    (BLOCK, 'gh api repos/o/r/pulls/9/merge -F sha=%s' % GIT_SHA),
+    (BLOCK, 'gh api repos/o/r/pulls/9/merge --field merge_method=squash'),
+    (BLOCK, 'gh api repos/o/r/pulls/9/merge --raw-field commit_title=x'),
+    (BLOCK, 'gh api repos/o/r/pulls/9/merge --input body.json'),
+    # GraphQL
+    (BLOCK, 'gh api graphql -f query=\'mutation { mergePullRequest(input: {pullRequestId: "PR_x"}) '
+            '{ clientMutationId } }\''),
+    (BLOCK, 'gh api graphql -f query="mutation{mergePullRequest(input:{pullRequestId:\\"PR_x\\"})'
+            '{clientMutationId}}"'),
+    (BLOCK, MERGE_HEREDOC),
+    # the other hatch does not open this one, and the value must be exactly 1
+    (BLOCK, 'PLX_PUBLISH_BYPASS=1 gh pr merge 5'),
+    (BLOCK, 'PLX_MERGE_BYPASS=0 gh pr merge 5'),
+    (BLOCK, 'PLX_MERGE_BYPASS=10 gh pr merge 5'),
+    # the hatch
+    (ALLOW, 'PLX_MERGE_BYPASS=1 gh pr merge 5 --squash'),
+    (ALLOW, 'PLX_MERGE_BYPASS=1 gh api -X PUT repos/o/r/pulls/9/merge'),
+    (ALLOW, 'PLX_MERGE_BYPASS=1 gh api graphql -f query=\'mutation { mergePullRequest(input: {}) '
+            '{ clientMutationId } }\''),
+    # words, not commands
+    (ALLOW, "grep 'gh pr merge' AGENTS.md"),
+    (ALLOW, 'echo gh pr merge'),
+    (ALLOW, 'echo "then gh pr merge 5 once green"'),
+    (ALLOW, 'git commit -m "docs: a raw gh pr merge is refused, use tools/pr-land.py"'),
+    (ALLOW, 'git commit -m "first line\ngh pr merge 5\nthird line"'),
+    (ALLOW, 'gh pr comment 5 --body "ready to merge"'),
+    (ALLOW, 'gh pr list --search "merge"'),
+    (ALLOW, MERGE_DOC_HEREDOC),
+    # reads, and GitHub calls that are not a merge
+    (ALLOW, 'gh pr view 5'),
+    (ALLOW, 'gh pr view 5 --json mergeStateStatus,headRefOid'),
+    (ALLOW, 'gh pr checks 5 --watch'),
+    (ALLOW, 'gh pr ready 5'),
+    (ALLOW, 'gh api repos/o/r/pulls/9/merge'),                  # the merge-STATUS read: 204 or 404
+    (ALLOW, 'gh api -X GET repos/o/r/pulls/9/merge'),
+    (ALLOW, 'gh api --method GET repos/o/r/pulls/9/merge -f x=y'),   # GET: the field is a query string
+    (ALLOW, 'gh api repos/o/r/pulls/9'),
+    (ALLOW, 'gh api repos/o/r/commits/%s/check-runs' % GIT_SHA),
+    (ALLOW, 'gh api -X PUT repos/o/r/pulls/9/update-branch'),
+    (ALLOW, 'gh api -X POST repos/o/r/issues/9/comments -f body=hi'),
+    (ALLOW, 'gh api graphql -f query=\'query { repository(owner: "o", name: "r") '
+            '{ pullRequest(number: 9) { mergeable } } }\''),
+    (ALLOW, 'git merge origin/main'),
+    (ALLOW, 'git merge --no-ff -s ours %s' % GIT_SHA),
+    # the tool is the sanctioned way
+    (ALLOW, 'python3 tools/pr-land.py merge 9 --sha %s --subject "player: fix seek" '
+            '--body-file body.txt' % GIT_SHA),
+    (ALLOW, 'python3 tools/pr-land.py gate 9'),
+    (ALLOW, 'python3 tools/pr-land.py restack --worktree w --upper b --lower 3 --push'),
+]
+
+# The idiom a commit message and a PR body are written in: a heredoc opened INSIDE `$(...)`. Its body
+# is prose, so a body line that starts `gh pr merge` (a wrapped sentence, an indented example, an api
+# call named in a sentence) is not a command. It used to be graded as one, but only when the body had
+# no parenthesis pair in it, because that decided whether the substitution was looked into at all.
+SUBST_HEREDOC_LEADS = [
+    'git commit -m "$(cat <<\'EOF\'\n%s\nEOF\n)"',
+    'gh pr create --title t --body "$(cat <<\'EOF\'\n%s\nEOF\n)"',
+    'gh pr comment 5 --body "$(cat <<\'EOF\'\n%s\nEOF\n)"',
+]
+SUBST_HEREDOC_LINES = [
+    'gh pr merge 5 --squash',
+    '    gh pr merge 5 --squash',
+    'gh api -X PUT repos/o/r/pulls/5/merge is refused now.',
+]
+for _lead in SUBST_HEREDOC_LEADS:
+    for _line in SUBST_HEREDOC_LINES:
+        for _extra in ("", "It closes the gap (see #5).\n"):
+            MERGE_CASES.append((ALLOW, _lead % ("Subject\n\n%s%s\nmore prose" % (_extra, _line))))
+MERGE_CASES += [
+    # ... and a merge that is really run is still refused, inside a substitution or after one
+    (BLOCK, 'echo $(gh pr merge 5)'),
+    (BLOCK, 'x=$(cd /x && gh pr merge 5)'),
+    (BLOCK, 'echo $(echo $(gh pr merge 5))'),
+    (BLOCK, 'git commit -m "$(cat <<\'EOF\'\nsubject\nEOF\n)" && gh pr merge 5'),
+]
+
+
+def merge_blocked(cmd):
+    return guard.merge_verdict(cmd) is not None
+
+
+def merge_case():
+    ok = True
+    for want, cmd in MERGE_CASES:
+        got = merge_blocked(cmd)
+        if got != want:
+            print("  FAIL  merge: expected %s, got %s: %s"
+                  % ("BLOCK" if want else "ALLOW", "BLOCK" if got else "ALLOW",
+                     cmd.replace("\n", "\\n")[:110]))
+            ok = False
+    return ok
+
+
+def pr_land_text_case():
+    """`pr-land.py merge` publishes its --subject and its body as the squash commit's message, so the
+    guard scans them like any other outbound text, and a text flag's value is a STRING (not a path).
+
+    The script also scans a --subject and a --body-file itself, before any `gh` call; this is the
+    second look, and the only one that sees the text before the tool starts. A --body-from-pr body
+    is not on the command line: the script alone scans it, once, after fetching it.
+    """
+    ok = True
+    with open(os.path.join(ROOT, "land-msg.txt"), "w") as f:
+        f.write("player: seek fix\n\nVerified on the set at %s.\n" % FAKE_TV)
+    with open(os.path.join(ROOT, "land-clean.txt"), "w") as f:
+        f.write("player: seek fix\n\nTwelve seeks, no reload.\n")
+    land = "tools/pr-land.py merge 9 --sha %s" % GIT_SHA
+    for cmd, want in (
+        ('python3 %s --subject "player: seek fix on %s" --body-file land-clean.txt' % (land, FAKE_TV),
+         BLOCK),
+        ('python3 %s --subject "player: seek fix" --body-file land-msg.txt' % land, BLOCK),
+        ('%s --subject "player: seek fix" --body-file land-msg.txt' % land, BLOCK),
+        ('python3 %s --subject "player: seek fix" --body-file .tv-host' % land, BLOCK),
+        ('python3 %s --subject "player: seek fix" --body-file land-clean.txt' % land, ALLOW),
+        ('./%s --subject "player: seek fix" --body-file land-clean.txt' % land, ALLOW),
+        ('python3 %s --subject "player: seek fix" --body-from-pr' % land, ALLOW),
+        ('python3 %s --subject ".tv-host" --body-file land-clean.txt' % land, ALLOW),   # text, not a path
+        ('python3 tools/pr-land.py gate 9', ALLOW),
+        ('python3 tools/pr-land.py wait 9 --sha %s' % GIT_SHA, ALLOW),
+    ):
+        got = blocked(cmd)
+        if got != want:
+            print("  FAIL  pr-land: expected %s, got %s: %s"
+                  % ("BLOCK" if want else "ALLOW", "BLOCK" if got else "ALLOW", cmd))
+            ok = False
+    return ok
+
+
+def merge_refusal_case():
+    """Drive the REAL binary: exit 2 with a message that names the tool and the hatch, exit 0 silent
+    for the tool itself and for the hatch -- and the refusal must not echo the command, which can
+    carry a `--body` the private-value scan has not seen."""
+    ok = True
+    hook = os.path.join(HERE, "outbound-guard.py")
+
+    def drive(cmd):
+        p = subprocess.run(
+            [sys.executable, hook], capture_output=True, text=True, timeout=30,
+            input=json.dumps({"tool_name": "Bash", "cwd": ROOT, "tool_input": {"command": cmd}}))
+        return p.returncode, p.stderr
+
+    for cmd in ('gh pr merge 5 --squash --match-head-commit %s' % GIT_SHA,
+                'gh api -X PUT repos/o/r/pulls/9/merge',
+                'gh api graphql -f query=\'mutation { mergePullRequest(input: {}) { id } }\'',
+                'gh pr merge 5 --body "reproduced on %s"' % FAKE_TV):
+        rc, err = drive(cmd)
+        if rc != 2:
+            print("  FAIL  merge: exit %d, wanted 2: %s" % (rc, cmd[:70]))
+            ok = False
+            continue
+        for need in ("tools/pr-land.py", "land-pr", "PLX_MERGE_BYPASS=1"):
+            if need not in err:
+                print("  FAIL  merge: the refusal does not name %r: %s" % (need, cmd[:70]))
+                ok = False
+        if FAKE_TV in err:
+            print("  FAIL  merge: the refusal echoed a private value: %s" % cmd[:40])
+            ok = False
+    for cmd in ('PLX_MERGE_BYPASS=1 gh pr merge 5 --squash',
+                'python3 tools/pr-land.py merge 9 --sha %s --subject "player: fix seek" '
+                '--body-file land-clean.txt' % GIT_SHA,
+                'gh pr view 5'):
+        rc, err = drive(cmd)
+        if rc != 0 or err.strip():
+            print("  FAIL  merge: exit %d, stderr %r, wanted a silent allow: %s"
+                  % (rc, err.strip()[:60], cmd[:70]))
+            ok = False
+    # The hatch skips the merge refusal only: a merge that carries a private value is still refused.
+    rc, _err = drive('PLX_MERGE_BYPASS=1 gh pr merge 5 --body "reproduced on %s"' % FAKE_TV)
+    if rc != 2:
+        print("  FAIL  merge: PLX_MERGE_BYPASS=1 let a private value through (exit %d)" % rc)
+        ok = False
+    return ok
+
+
+def settings_case():
+    """The GitHub MCP connector can merge too, and no Bash hook sees it: a deny rule is the refusal."""
+    path = os.path.join(HERE, "..", "settings.json")
+    try:
+        deny = json.load(open(path))["permissions"]["deny"]
+    except (OSError, ValueError, KeyError) as e:
+        print("  FAIL  settings.json has no permissions.deny list (%s)" % e)
+        return False
+    if "mcp__claude_ai_GitHub_MCP__merge_pull_request" not in deny:
+        print("  FAIL  settings.json does not deny mcp__claude_ai_GitHub_MCP__merge_pull_request")
+        return False
+    return True
 
 
 def file_payload_case():
@@ -320,7 +584,8 @@ def refusal_case():
     except Exception:
         pass                            # falls back to abspath(cwd); the assertions do not change
     hook = os.path.join(HERE, "outbound-guard.py")
-    fakes = (FAKE_TV, FAKE_PMS, FAKE_TOKEN, FAKE_MAC, FAKE_USERID, FAKE_MACHINE)
+    fakes = (FAKE_TV, FAKE_PMS, FAKE_TOKEN, FAKE_MAC, FAKE_USERID, FAKE_MACHINE,
+             FAKE_USER_TV, FAKE_USER_MAC)
 
     def drive(cmd):
         p = subprocess.run(
@@ -334,6 +599,8 @@ def refusal_case():
         ('gh issue comment 22 --body "token %s"' % FAKE_TOKEN, 2),
         ('git commit -m "server at %s"' % FAKE_TV, 2),
         ('git commit -m "wake %s"' % FAKE_MAC, 2),
+        ('gh pr create --body "reproduced on %s"' % FAKE_USER_TV, 2),
+        ('git commit -m "wake %s"' % FAKE_USER_MAC, 2),
         ('gh pr create --body "uid %s"' % FAKE_USERID, 2),
         ('git commit -m "docs: explain the 203.0.113.5 placeholder"', 0),
         ('make check', 0),
@@ -373,6 +640,8 @@ def secrets_case():
         (True, FAKE_PMS, "PMS_HOST"),
         (True, FAKE_TOKEN, "PMS_TOKEN"),
         (True, FAKE_MAC, ".tv-mac"),
+        (True, FAKE_USER_TV, "the per-user tv-host"),
+        (True, FAKE_USER_MAC, "the per-user tv-mac"),
         (True, FAKE_USERID, "test_user.id"),
         (True, FAKE_MACHINE, "shared_server.machine_id"),
         (False, "32400", "the port, in every doc"),
@@ -443,7 +712,7 @@ def main():
                   % ("BLOCK" if want else "ALLOW", "BLOCK" if got else "ALLOW",
                      cmd.replace("\n", "\\n")[:110]))
     helpers = (file_payload_case, secrets_case, refusal_case, variable_reference_case,
-               recording_case)
+               recording_case, merge_case, pr_land_text_case, merge_refusal_case, settings_case)
     for fn in helpers:
         if not fn():
             fails += 1

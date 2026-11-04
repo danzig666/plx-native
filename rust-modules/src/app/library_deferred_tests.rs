@@ -10,19 +10,19 @@ fn back_dismisses_the_filter_menu_before_the_floor_without_cancelling_its_query(
     #[derive(Default)]
     struct Trace {
         edits: usize,
-        commits: Vec<crate::stores::browse::QueryEdit>,
+        commits: Vec<plx_data::stores::browse::QueryEdit>,
     }
-    impl crate::ui::dispatch::Tap<AppHost> for Trace {
-        fn effect(&mut self, _: u64, effect: &crate::ui::machine::Stamped<AppHost>) {
+    impl plx_ui::dispatch::Tap<AppHost> for Trace {
+        fn effect(&mut self, _: u64, effect: &plx_machine::machine::Stamped<AppHost>) {
             match &effect.fx {
                 Fx::Deliver(_, Delivery::Screen(ScreenEvent::App(AppMsg::LibraryEdit { .. }))) => {
                     self.edits += 1
                 }
                 Fx::App(AppFx::Store(
                     _,
-                    crate::stores::StoreCmd::Browse(crate::stores::browse::BrowseCmd::Addressed {
+                    plx_data::stores::StoreCmd::Browse(plx_data::stores::browse::BrowseCmd::Addressed {
                         work:
-                            crate::stores::browse::LibraryWork::Commit {
+                            plx_data::stores::browse::LibraryWork::Commit {
                                 query: Some(edit), ..
                             },
                         ..
@@ -32,40 +32,42 @@ fn back_dismisses_the_filter_menu_before_the_floor_without_cancelling_its_query(
             }
         }
     }
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-back-before-floor");
+    let session = plx_plex::plex::session::TempSession::new("library-back-before-floor");
     session.watching("u-library-back-before-floor");
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test("back-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test("back-own", "127.0.0.1", 9, "synthetic", "fixture");
     let shared =
-        crate::plex::register_for_test("back-shared", "127.0.0.1", 10, "synthetic", "fixture");
-    crate::plex::set_current(sid);
+        plx_plex::plex::register_for_test("back-shared", "127.0.0.1", 10, "synthetic", "fixture");
+    plx_plex::plex::set_current(sid);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(120);
     frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
     let page = d.nav.top_page().unwrap().id;
     let host = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
     let listing = rig.listing.view().id().unwrap();
-    d.nav.next_style = crate::ui::containers::modal::Style::Compact;
+    d.nav.next_style = plx_ui::containers::modal::Style::Compact;
     d.request(
         MachineId::Nav,
         NavOp::Present(AppArg::LibraryMenu(
-            crate::screens::registry::LibraryMenuArg {
+            plx_screens::registry::LibraryMenuArg {
                 host,
-                kind: crate::screens::registry::LibraryMenuKind::Filter,
+                kind: plx_screens::registry::LibraryMenuKind::Filter,
                 anchor: [0; 4],
-                target: crate::stores::browse::SectionAddress {
+                folded: Vec::new(),
+                opener: None,
+                target: plx_data::stores::browse::SectionAddress {
                     epoch: listing.epoch,
                     sid: listing.sid,
                     section: listing.section,
@@ -139,7 +141,7 @@ fn back_dismisses_the_filter_menu_before_the_floor_without_cancelling_its_query(
     }
     assert_eq!(
         trace.commits,
-        vec![crate::stores::browse::QueryEdit::Unwatched(true)],
+        vec![plx_data::stores::browse::QueryEdit::Unwatched(true)],
         "dismissal preserves the pending desired action and commits it exactly once"
     );
     assert!(rig.listing.view().unwatched());

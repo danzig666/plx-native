@@ -132,10 +132,9 @@ Every focusable control has three visually distinct states — **idle**, **focus
 **pressed**. Focus is drawn as a scale-up on a critically damped spring plus a glow; press is a
 separate depression (`ui/press.rs`). **Every control that performs an action responds to OK.**
 
-Two focus stops do not, and both are deliberate rather than dead: the tab pill for the page you are
-*already on* (OK on Home's own pill, standing on Home, is a documented no-op), and the person page's
-header band when that person has no biography long enough to expand. Neither is a button, neither
-leaves the user stuck, and every other focus stop in the app acts.
+One focus stop does not, and it is deliberate rather than dead: the person page's header band when
+that person has no biography long enough to expand. It is not a button, it does not leave the user
+stuck, and every other focus stop in the app acts (OK on the Home pill drops focus into the hero).
 
 **A long press is its own gesture.** Holding OK for ≥500 ms on a card opens that card's context
 menu (§5.6); releasing before then is an ordinary activation. Nothing else in the app uses a hold.
@@ -165,9 +164,10 @@ promoted items; the dots under the action row show the position.
 | control | what OK does |
 |---|---|
 | **Play** / **Continue** | starts playback — *Continue* when the item has a resume point, *Play* when it does not |
+| **🔖** (bookmark) | adds the title to the Watchlist (an episode's or season's show), or removes it when it is already on it; outline off the list, filled on it. Present only when the hero row names a title with a known catalog id |
 | **ⓘ** (info) | opens that item's detail page |
 
-Those are the only two. **The `›` beside them is an indicator, not a third button** — it is drawn,
+Those are the only three, in that order (the bookmark disc is absent for a row with no catalog id), and none of the circles carries a name, focused or not. **The `›` beside them is an indicator, not a third button** — it is drawn,
 it never takes focus and it has no hit rect. The hero is paged by **RIGHT past the info disc** or
 **LEFT off the Play pill**, and it also advances itself every **8 s** while the row sits idle. The
 dots under the row show the position.
@@ -177,32 +177,40 @@ dots under the row show the position.
 The strip is uncapped and scrolls once it outgrows the bar, so every discovered section is
 focusable. At the left margin, outside the group, sits the **profile chip** (§5.7).
 
-**UP from the hero reaches the bar**, landing on the profile chip; LEFT and RIGHT then walk the
-whole band — **chip → Home → Movies → TV Shows → … → Search**. DOWN leaves the bar: back to the
-hero action row from the chip, or into the shelves from a pill. The bar is worn by Home, the Library
-and Search and by nothing else — the detail, person, player and onboarding screens have none, which
-is why moving to or from them fades the whole screen rather than just the page.
+**UP from the hero reaches the bar**, landing on the Home pill (UP from any page that wears the bar
+lands on that page's own pill); LEFT and RIGHT then walk the whole band — **chip → Home → Movies →
+TV Shows → … → Search**. DOWN leaves the bar: back to the hero action row from the chip, or into the
+shelves from a pill. The bar is worn by Home, the Library family (the grid, its Collections page and
+its Recommended page), the Watchlist and Search, and by nothing else — the detail, person, player and
+onboarding screens have none, which is why moving to or from them fades the whole screen rather than
+just the page.
 
 **Below the hero**, the shelves.
 
 ![Home, shelves](screenshots/ux-home-shelves.jpg)
 
 DOWN from the hero enters the shelves; DOWN again steps between them; LEFT/RIGHT walks the cards.
-The focused card grows, and its title and a status line appear beneath it — here *"2 hr 6 min
-left"*, which is the resume state. A watched item carries a check mark in its corner.
+The focused card grows, and what Settings → Libraries → Under posters asks for appears
+beneath it (a title line when its Title switch is On; a line the setting turns on is never left empty, so a season, which has no length, says *"Season 6"* under its show's name, and a film the server told us nothing about says *"Movie"*; the setting is the same under every poster in the app: Search results, a person's filmography, a title's Related and collection shelves and a collection's members, though not under a landscape still or a cast headshot) — a Continue Watching card always shows its status line, under every Details setting, Nothing included, here *"S3 · E4 · 8m
+left"* (*"8m left"* for a film), which is the resume state. A watched item carries a check mark in its corner. In a library whose grid is sorted by something that has a value (Settings → Libraries → Under posters → Sort value, on by default), every card of its movies, shows, seasons or episodes shows that value on one line instead, in place of the title and details line: a score beside its provider's mark, a length, a count of plays, a date as *"Today"*, *"Yesterday"*, *"27 Oct"* or *"Oct 2024"*; the Episodes view's wide cards say the same thing under each still (sorted by Audience score, *"TMDB 84%"*). A sort with no value to show, such as the Show order Seasons and Episodes default to, keeps the usual captions.
 
-**OK on a card in *Continue Watching* plays it directly**, and the amber ▶ on the card is what
-announces that. **Every other card opens a page, an episode included**: an episode tile on a
+**OK on a card in *Continue Watching* opens its page by default** (Settings → Playback →
+Continue Watching: *Open details*); set to *Play*, OK plays it directly and the amber ▶ before the first line the card draws is
+what announces that (the title when Under posters → Title is On, otherwise the status line) — the ▶ is drawn only in that mode, and in the default the card's menu leads
+with Play instead; an *episode* card there opens its **show** on that episode's season (the card's menu
+offers *Go to Episode*). **Every other card opens a page, an episode included**: an episode tile on a
 discovery shelf ("Recently Released Episodes", "Recently Added…") opens that EPISODE's own page and
-carries no ▶, precisely so nothing on it promises playback. The difference is intentional: the deck
-is a list of things already in progress, and one press is the whole point of it — everywhere else,
-a press is a question rather than a commitment. A card's resume bar is a fact about how far in you
+carries no ▶, precisely so nothing on it promises playback. The one-press resume is *Play* mode: there the deck is a list of things already in progress and one
+press is the whole point of it. In the default the deck behaves like every other shelf — a press is
+a question rather than a commitment — and the resume is the first row of the card's hold menu (§5.6),
+which opens on it. A card's resume bar is a fact about how far in you
 are and appears on both kinds, so it is never the thing that says a press will play; that is the
 triangle's job alone. (Until 2026-09-05 an episode played from wherever it sat, which put the
 triangle on cards that navigated.)
 
-One refinement inside the deck rule: a **show** or **season** card there has no single stream to
-start, so it opens its page, waits for the load to land on the expected item, and fires that page's
+One refinement inside the deck rule: a **show** or **season** card has no single stream to
+start, so where the deck plays it (OK in *Play* mode, or the menu's Play row in the default) it
+opens its page, waits for the load to land on the expected item, and fires that page's
 Play only then — never blindly, because a failed fetch would otherwise play whatever page was open
 before. On any other shelf, a show or season card simply opens its page.
 
@@ -233,7 +241,8 @@ advances by itself the moment the account is linked. Nothing needs pressing; aft
 answer the spinner's line becomes *"Still waiting — press OK for a new code"*, and OK mints a fresh
 code without leaving the screen.
 
-*The code in the figure is a one-time, short-lived claim code. It names no account.*
+*The code in the figure, DEMO, and its QR are the mock server's stand-in for plex.tv's pin
+service (§9); a real code is a one-time, short-lived claim code that names no account.*
 
 Account **creation** happens on plex.tv, not in the app.
 
@@ -273,27 +282,28 @@ pad back to the roster.
 
 Reached from any library pill in the top strip. A poster grid, four-way navigable, with:
 
-- **Sort** and **Filter** pills above the grid (left);
-- the item **count** (right) — *"27 films"*;
-- an **A–Z rail** down the right edge, which jumps the grid to a letter;
+- one **sort** control at the right of the header row, reading its current choice (the sort icon, the criterion and a down chevron; its Sort & Filter menu also holds the filters), beside the **Collections** and **Recommended** places;
+- an **A–Z rail** down the right edge, which jumps the grid to a letter, or on a value sort (Score, Duration, Unplayed, Plays, Date added, Date viewed, Release date, and Last episode added when sorted newest first) to a band: a date sort's bands are `Today`, the months of this year, then each earlier year, and Release date's are the year then the decades;
 - watched check marks on the cards.
 
 **CH ▲ / CH ▼ page the grid**, which is the fast way through a large library.
 
-**BACK here is ONE step to the head of the library, and a second leaves for Home.** From a shelf, a
-grid row, the Sort/Filter row or the A–Z rail, BACK returns to the top of the page — a deep shelf is
-as far from the head as a deep grid row is — and only from the head does it hand the screen back.
-(This said "two steps: to the tab row, then Home" until 2026-09-05. The Library is one continuous
-scroll now, with no fixed toolbar to walk up from and a tab track that never hides, so UP is the
-one-press route to the strip and BACK is about the DOCUMENT.)
+**BACK here climbs one region a press, and from the bar it leaves for Home.** From the A–Z rail (or a
+value sort's band rail) BACK returns to the grid; from deep in the grid it returns to the top of the page — a deep shelf is as far
+from the head as a deep grid row is; from the top it steps to the header row, from the header
+to the tab bar, and from the bar it hands the screen back. UP is still the one-press route to the
+strip; the header and bar steps exist so that BACK can never loop between them. The Collections and
+Recommended pages pop to the page that opened them from the top of their content, from their header or
+from the bar. (This said "two steps: to the tab row, then Home" until 2026-09-05, and "ONE step to the
+head of the library, and a second leaves for Home" after it.)
 
-Sort and Filter open as **popovers over the live grid**, never as full-screen sheets:
+The Sort & Filter menu opens as a **popover over the live grid**, never as a full-screen sheet:
 
 ![Library sort menu](screenshots/ux-library-sort.jpg)
 
 The options are the ones the **server** reports for that section, not a hardcoded list; the current
-choice carries a check and a direction chevron, and OK on the current choice reverses the direction.
-BACK closes the popover and returns focus to the pill.
+choice carries a check and its direction as a word ("A–Z", "Newest first"), and OK on the current choice reverses the direction.
+BACK closes the popover and returns focus to the sort control.
 
 ### 5.5 Search
 
@@ -318,9 +328,8 @@ The line beside the field names the **scope** — which server or servers are be
 covers the user's own servers and any shared with the account; Plex Discover / Watchlist catalog
 results are deliberately out of scope, by decision rather than by omission.
 
-*The scope line in the figure is redacted: it names a real server. The substitute is the app's own
-string for a server that reports no name (`screens/search/render.rs::scope_text`), so the figure shows a
-state the app really produces.*
+*The figure searches the demo library's mock server, so its scope line names that server,
+"Demo Library".*
 
 ### 5.6 Card context menu
 
@@ -328,9 +337,14 @@ state the app really produces.*
 
 Opened by **pressing and holding OK on a focused card** for ≥500 ms — a popover anchored to the
 card, over the live page. UP/DOWN moves, OK activates, BACK closes. The actions are the ones that
-apply to that item; for an in-progress movie on the deck:
+apply to that item; for an in-progress movie on the deck, by default (Continue Watching: *Open
+details*), the menu opens on its first row:
 
-*Go to Movie* · *Mark as Watched* · *Mark as Unwatched* · *Play from Start* · *Remove from Deck*.
+*Continue* · *Mark as Watched* · *Mark as Unwatched* · *Play from Start* · *Remove from Deck*.
+
+With Continue Watching set to *Play*, OK already resumes, so the menu leads with *Go to Movie*
+instead of *Continue*. A show or season card on the deck gets the same *Play* row first in the
+default (it opens the page and plays, as above), with its own "go to" row dropped.
 
 ### 5.7 Account menu
 
@@ -342,7 +356,7 @@ OK opens a popover headed *ACCOUNT*. Signed in, it offers switching profile and 
 
 One more row, **Settings**, is offered in **every** state, signed in or out. A person who cannot get
 past sign-in has still received a copy of this software, so privacy and legal information cannot be
-conditional on an account. *(The figure above predates this row.)* Settings opens a full-screen
+conditional on an account. Settings opens a full-screen
 modal: signed-in users also get **Favorite libraries** (under a **Libraries** section — which
 libraries this television shows, on Home, in the top strip and in the Library's own picker), while
 everyone gets **Privacy & data**, **Legal notices** and **About PlxNative**.
@@ -409,15 +423,19 @@ app; BACK no longer does, anywhere.
 
 When playback cannot start, the app does not fail silently and does not show a spinner forever. It
 draws a full-screen read-out: a warning mark, a headline, **the reason in plain language**, the
-server's own verdict beneath it where there is one, and BOTH ways out, each with its key cap so it
-survives a phone photograph — *"Press **OK** to choose quality or retry"* above *"Press **BACK** to
-return"*. The first is the recovery path: it opens the same quality ladder the `…` menu does, on the
-rung this playback is already using, so picking that rung is a plain retry and picking another
-starts the same item under a different policy. A failure is therefore terminal for the pipeline,
-not a trap for the viewer.
+server's own verdict beneath it where there is one, a row of the actions that can actually change
+the outcome, and a dim diagnostics footer. The row always ends in **Back**. For an ordinary failure
+it offers **Change quality**, which opens the same quality ladder the `…` menu does on the rung
+this playback is already using, preceded by **Try again** when the failure may be transient. With
+Force Direct Play enabled no rung can help, so the row offers **Switch to Auto and play** instead:
+OK turns Force off and retries in place, with no trip to Settings. A file with no video track gets
+Back alone, because nothing the viewer picks puts a picture in it. A failure is therefore terminal
+for the pipeline, not a trap for the viewer.
 
-The figure is a real server verdict (*"Cannot convert this item. Implementation for video encoder
-'hevc' not found."*). The screen is shaped to survive being photographed off a panel and pasted into
+The verdict in the figure (*"Cannot convert this item. Implementation for video encoder 'hevc' not
+found."*) is the one a real server returned when it had no HEVC encoder; the figure replays it
+through the `failtest` dev trigger, and its footer reads "webOS unknown — os_info.json unreadable · unknown
+set" because it was taken on the simulator. The screen is shaped to survive being photographed off a panel and pasted into
 a bug report, which is the state it is usually seen in.
 
 ### 5.11 Diagnostics read-out
@@ -490,9 +508,9 @@ grounds are below, and they are the reason this document exists.
 
 ![Player HUD](screenshots/player.jpg)
 
-*Device capture. The Starfish/ACB media seam exists only on the television, so the player cannot be
-photographed on the desktop simulator — see §9. The figure shows the **paused** state: note the
-pause mark immediately right of the `0:25` clock, and that there is no transport button row.*
+*Simulator capture — see §9 for how the picture under it was made. The figure shows the **paused**
+state: note the pause mark immediately right of the elapsed clock, and that there is no transport
+button row.*
 
 The HUD is summoned by any input and hides itself again after **4.5 s** of no input — **8 s** while
 one of its panels is open, which is longer read time for a list. While it is hidden the picture is
@@ -534,16 +552,16 @@ distinction §6.1 draws.
 
 | key | effect |
 |---|---|
-| **OK** | on the scrubber band, toggle play/pause; on a focused control, activate it |
-| **Play** / **Pause** / **Play-Pause** | the corresponding transition, from anywhere |
-| **LEFT / RIGHT** | seek, or move within the focused band — §6.6 |
+| **OK** | on the scrubber band, toggle play/pause — except with a seek target pending, where it takes the target: one seek there, and the film plays on from it (§6.6); on a focused control, activate it |
+| **Play** / **Pause** / **Play-Pause** | the corresponding transition, from anywhere — except that Play and Play-Pause with a seek target pending take the target and play on from it (§6.6); Pause leaves the target alone |
+| **LEFT / RIGHT** | move the seek target, or move within the focused band — §6.6 |
 | **Rewind / Fast-forward** | the same as LEFT / RIGHT (§1.2) |
 | **UP / DOWN** | move between the HUD's three bands; a press on a hidden HUD is spent raising it |
 | **Stop** | leave the player |
-| **BACK** | leave the player |
+| **BACK** | cancel a scrub in progress (§6.6); otherwise hide the HUD if it is up, and leave the player from a bare picture. While playback is still loading, buffering or seeking, the HUD cannot come down: the first BACK hides it with nothing visible, and the next BACK leaves. Any other key in between, or the load finishing, makes it a first BACK again |
 | **EXIT** | terminate the app (§2.3) |
 
-**Stop and BACK do the same thing here**: both run one teardown ritual — cancel any play still being
+**Stop, and a BACK that finds nothing to cancel or hide (or that is the second in a row while the player is busy), do the same thing here**: both run one teardown ritual — cancel any play still being
 resolved, close every panel, stop the buffer feed — and return to **the page playback started
 from**. For an episode that is the **show page, scrolled to the episode that played**, not the
 generic show root. The final position is reported to the server on the way out, so the item resumes
@@ -584,13 +602,15 @@ front of QA:
   LEFT/RIGHT scrub, a chapter or marker hop and a rapid seek burst — none of which agree about which
   key, if any, was pressed. It reports **net** travel, so dragging back from +100 s to +50 s while
   still ahead of the playhead keeps reading fast-forward: it answers *which way will I jump when I
-  let go*.
+  confirm*.
 - **The play mark clears after two seconds** deliberately. A play glyph held for a whole film would
   be saying "playing" to somebody who is watching a moving picture.
 
 ### 6.6 Seeking
 
-Seeking is a **preview-then-commit** gesture, not one immediate jump per press.
+Seeking is a **click-to-confirm** gesture, not one immediate jump per press — and the same one
+whether the film is playing or paused. The remote's keys only move a **target**; the film moves
+when the viewer says so.
 
 - **With the HUD hidden, a LEFT/RIGHT press is spent raising it and moves nothing.** The HUD sits on
   a 4.5 s timer over full-screen video, so *"where am I"* and *"take me back ten seconds"* are two
@@ -598,17 +618,40 @@ Seeking is a **preview-then-commit** gesture, not one immediate jump per press.
   viewer glancing at the clock loses their place. **A hold is not affected** — holding LEFT raises
   the HUD and then runs the ordinary continuous scrub as the auto-repeats arrive, by which point the
   band being dragged is on screen.
-- **With the HUD up and the scrubber focused, one press moves the preview 10 s.** The picture does
+- **With the HUD up and the scrubber focused, one press moves the target by the Skip interval — 10 s unless Settings > Playback says otherwise.** The picture does
   not move yet; the scrubber shows the target, and the state mark shows the direction.
-- **Holding engages a continuous scrub that accelerates** — from 10× up to 140× playback speed — and
-  the key release commits it. A lost key-up is caught by a 400 ms watchdog, so a dropped release
-  cannot leave the scrub running.
-- **Quick repeated taps accumulate into one seek.** The commit waits ~450 ms after the last tap, so
-  "back thirty seconds" is three presses and a single seek rather than three. That matters beyond
-  feel: back-to-back in-flight seeks are what stress the demux pipeline.
+- **Holding engages a continuous scrub that accelerates** — 60× playback speed, doubling every second up to 480× — and
+  releasing the key leaves the target where the hold got to. A lost key-up is caught by a 400 ms watchdog (700 ms right after a key bounce, while the remote's
+  repeat delay restarts), so a dropped release cannot leave the scrub running; it ends the hold and seeks nothing.
+- **Nothing seeks until the viewer confirms.** Not the key release, not a pause after the last tap, not
+  the watchdog. A later tap or hold goes on from the target, not from the playhead, so "forward
+  thirty seconds" is three presses at the default 10 s step and, once OK is pressed, a single seek
+  rather than three — which matters beyond feel: back-to-back in-flight seeks are what stress the
+  demux pipeline.
+- **The film keeps playing underneath** while a target is pending, and the HUD stays up for as long
+  as it is (the 4.5 s linger never takes it away, and never commits it).
+- **OK, Play or Play-Pause confirms the target** — one seek to it, and the film plays on from there (a
+  paused film resumes). Pause leaves the target alone. **BACK drops it** (below), as does leaving the
+  scrubber with UP/DOWN, and so does anything else that takes the page from the scrubber — a panel
+  opening, the Skip Intro / Skip Credits button appearing or being pressed, a teardown. The target is
+  cancelled in every one of them, never committed.
 - The seek target is clamped to the item, stopping 3 s short of the end.
 
-The pointer can drag the scrubber directly, under the same commit rule.
+The pointer can drag the scrubber directly, and **that is its own confirmation**: the button coming
+up commits the drag. A playing film plays on from the new spot; a paused film seeks and stays paused.
+
+**BACK around a scrub.** Two meanings, tried in this order:
+
+1. **While a scrub is live, BACK cancels it.** Live means a key held (or its release still waiting
+   out the bounce), a target pending, or a pointer drag in progress. Nothing is sought, the preview
+   goes, the knob eases back to the playhead over about 0.3 s, and the HUD stays up; BACK did not
+   hide it or leave.
+2. **Otherwise BACK is the ordinary one**: with the HUD up it hides it (the film keeps playing), and
+   from a bare picture it leaves the player (§6.4); while the player is still loading, buffering or
+   seeking, the HUD cannot come down, so the first BACK hides it unseen and the next one leaves.
+   **A committed scrub is final** — an OK / Play
+   confirmation or a pointer drag's release is not followed by a way back to where the scrub
+   started; BACK straight afterwards hides the HUD like any other BACK.
 
 ### 6.7 The control row — subtitles and audio, and what replaces them
 
@@ -622,11 +665,16 @@ full-screen sheet. All three are modal while open: they take every key, and BACK
 
 - **Subtitles** and **Audio** open the same two-panel track menu, on whichever panel was asked for.
   **LEFT/RIGHT swaps between the Audio and Subtitles panels**, UP/DOWN moves the row, OK selects and
-  closes. Subtitles offers the item's subtitle tracks plus *Off*; both text and image (PGS/VobSub)
-  subtitles render. Audio offers the item's audio tracks. Switching is a **server-side** selection,
+  closes. Subtitles offers the item's subtitle tracks plus *Off* and *Forced only* (the forced track
+  in the language of the audio that plays, or nothing; remembered per show like *Off*); both text and
+  image (PGS/VobSub) subtitles render. Audio offers the item's audio tracks. Switching is a **server-side** selection,
   so it persists as the item's preference rather than lasting only this session.
-- **More** opens an *Options* popover — one row today, **Stats for nerds**, an On/Off toggle that
-  overlays live playback statistics. LEFT/RIGHT are deliberately swallowed here: it is one column.
+- **More** opens a popover led by the **Quality** ladder — Auto plus the fixed rungs — then
+  **Playback speed** (0.5× to 2×, Plex Web's seven, back to Normal on a new item; a pick reloads the
+  stream at the same position; shown only where the playback can play a speed — not over segmented
+  HLS, and not above 60 fps fed), with an *Options* section beneath them: **Stats for nerds**, an On/Off toggle that overlays live playback
+  statistics, plus **Send diagnostics** when that row is enabled. LEFT/RIGHT are deliberately
+  swallowed here: it is one column.
 
 The app exposes **no subtitle appearance settings**, and its client-rendered subtitles do not read
 the television's own subtitle settings — stated here because that is what makes the second half of
@@ -648,16 +696,23 @@ other state cancels it, and **once cancelled it stays cancelled** for that segme
 cancels it explicitly and leaves the tile as a plain OK-to-play target. While the clock runs the HUD
 is held up, so the countdown is never invisible.
 
+Only a credits marker that runs to the end of the item qualifies (a mid-item credits marker keeps
+the Skip Credits pill), and only under the default *Next episode* setting, *Up Next countdown*:
+under *After credits* and *Off* the discs stay through the credits, with no tile, countdown or HUD
+raise.
+
 Up Next deliberately outranks Skip Credits: with somewhere to go, "next episode" is the better
 offer.
 
 **Credits detection is a Plex Pass server feature, and where the server has none the app synthesizes
-a 30 s tail — but only when there is a next episode to offer.** So the synthesized tail always
+a 30 s tail — but only when there is a next episode to offer, and only in the default Up Next
+countdown mode.** So the synthesized tail always
 raises Up Next and can never raise a Skip pill: a movie's tail must not grow a *Skip Credits* button
 pointing nowhere. The practical consequence for a bench test is that on a Pass-less server **Skip
 Credits is unreachable**, and only *Skip Intro* and *Up Next* can be exercised.
 
-At the end of an item with nothing queued, the player simply exits to the page it came from. **There
+At the end of an item with nothing queued — or with *Next episode* set to *Off* — the player simply
+exits to the page it came from. **There
 is no full-screen post-play interstitial** — one was built and is deliberately not shipped.
 
 ### 6.8 Info and Chapters
@@ -739,19 +794,24 @@ Where the four deferring items are answered, and the neighbouring items this doc
 
 ## 9. Figures, and which ones still need a device capture
 
-Every figure in this document except the player HUD was taken from the **desktop simulator**
-(`make sim`), which runs the same application core, against a real Plex server, at the authored
-1920×1080. Layout, focus, navigation and the whole data layer are identical to the television's.
+Every figure in this document was taken from the **desktop simulator**, which runs the same
+application core at the authored 1920×1080, against the **mock server's demo library** — openly
+licensed and public-domain films (`tests/demo_library/`, credited in
+`docs/screenshots/CREDITS.md`) — and never against a real Plex account. `make screenshots`
+regenerates all of them from the scene manifest `tests/screenshots/scenes.json`, which names the
+state each figure shows and the dev triggers that reach it. Layout, focus, navigation and the whole
+data layer are identical to the television's.
 
-**What the simulator cannot photograph** is anything involving video. The Starfish/ACB media seam is
-29 symbols that exist only on the television, so a Play press on the desktop lands on the app's real
-failure read-out — which is how §5.10's figure was taken honestly, and why the player figures cannot
-be.
+**What the simulator cannot show** is the television's video path. The Starfish/ACB media seam is
+29 symbols that exist only on the television. The player figure (§6.3) is the real HUD over a real
+decoded frame, but the frame is made by a simulator-only facility: a clock sink plays the file the
+mock serves and a system `ffmpeg` decodes it under the UI (`player/sim_video.rs`). It shows what the
+HUD looks like over a picture; it says nothing about LG's decoder or the hardware video plane.
 
 | figure | source | status |
 |---|---|---|
-| Home hero, Home shelves, Detail, Card menu, Library grid, Library sort, Search, Account menu, Sign in, Failure read-out | simulator, 1920×1080 | **in this document** |
-| Player HUD (`screenshots/player.jpg`) | device capture | **in this document** — shows the paused state mark |
+| Home hero, Home shelves, Detail, Card menu, Library grid, Library sort, Search, Account menu, Sign in, Failure read-out | simulator, demo library, 1920×1080 | **in this document** |
+| Player HUD (`screenshots/player.jpg`) | simulator, demo library, simulator-decoded frame | **in this document** — shows the paused state mark |
 | Player HUD, playing steadily (empty mark slot) | device | **needed** |
 | Player HUD, fast-forward and rewind marks | device | **needed** |
 | Subtitle track menu · Audio track menu | device | **needed** |
@@ -768,11 +828,12 @@ The needed captures are all reachable on the bench with the boot triggers docume
 
 - Key codes: LG's evdev→scancode table in the television's own `libSDL2-2.0.so.0.4.1`, plus 336
   captured key lines. Settled 2026-08-22.
-- Transport state-mark rule: `rust-modules/src/ui/player_hud.rs::transport_mark`.
+- Transport state-mark rule: `rust-modules/appkit/src/player_hud/state.rs::transport_mark`.
 - Key dispatch: `rust-modules/src/ui/consts.rs::classify` and `rust-modules/src/app.rs`'s ladder.
 - Screen map: the `Route` enum in `rust-modules/src/app.rs` and `ui::trail`.
 - Audio: `Makefile` `LIBS_REAL`, and `SDL_Init(SDL_INIT_VIDEO)` in `rust-modules/src/app.rs`.
-- Figures: `make sim`, 2026-08-23, at 1920×1080, dev counter compiled out.
+- Figures: `make screenshots` (the simulator against `tests/mock_pms.py`'s demo library), at
+  1920×1080, dev counter compiled out; the scene manifest is `tests/screenshots/scenes.json`.
 
-**Exactly one figure is edited, and the edit is stated where it appears**: the Search scope line
-(§5.5), which named a real server. No other figure has been retouched in any way.
+**No figure is edited.** Each is the app's own capture of a settled screen, scaled and encoded by
+`tools/screenshots.py` and nothing else.

@@ -1,4 +1,6 @@
-"""Exercise actual service archive metadata for both install identities, without an NDK."""
+"""Exercise actual service archive metadata for every install identity, without an NDK."""
+import os
+import subprocess
 import io
 import json
 from pathlib import Path
@@ -7,6 +9,7 @@ import tempfile
 import unittest
 
 import mkipk
+from rust_toolchain import pinned
 
 
 class StorageServicePackage(unittest.TestCase):
@@ -15,14 +18,14 @@ class StorageServicePackage(unittest.TestCase):
         appdir.mkdir(parents=True)
         (appdir / "appinfo.json").write_text(json.dumps({**app, "requiredPermissions": mkipk.STORAGE_PERMISSIONS}))
 
-    def test_built_helper_packages_for_both_flavors_when_available(self):
+    def test_built_helper_packages_for_every_flavor_when_available(self):
         repo = Path(__file__).resolve().parent.parent
         if not (repo / "pkg/plxnative-storage").is_file():
             self.skipTest("cross-built helper not available")
-        for flav in ("stable", "debug"):
+        for flav in mkipk.flavor.FLAVORS:
             with self.subTest(flavor=flav), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                app = mkipk.flavor.appinfo_for(flav)
+                app = mkipk.flavor.appinfo_for(flav, "20260919")
                 self.assertEqual(app["requiredPermissions"], ["database.operation", "securitykey.operation"])
                 data = root / "data"
                 self.stage_app(data, app)
@@ -31,8 +34,9 @@ class StorageServicePackage(unittest.TestCase):
                 mkipk.write_targz(root / "data.tar.gz", data, "")
                 self.assertEqual(mkipk.storage_archive_errors((root / "data.tar.gz").read_bytes(), app["id"]), [])
 
-    def test_both_flavors_have_private_native_service_and_no_writable_state(self):
-        for app_id in ("com.beb.plxnative", "com.beb.plxnative.debug"):
+    def test_every_flavor_has_private_native_service_and_no_writable_state(self):
+        for flav in mkipk.flavor.FLAVORS:
+            app_id = mkipk.flavor.app_id(flav)
             with self.subTest(app_id=app_id), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 (root / "pkg").mkdir()
@@ -57,6 +61,21 @@ class StorageServicePackage(unittest.TestCase):
                     application = json.load(tf.extractfile(f"usr/palm/applications/{app_id}/appinfo.json"))
                     self.assertEqual(application["requiredPermissions"], package["requiredPermissions"])
                     self.assertFalse(any("/state" in m.name for m in tf.getmembers()))
+                    helpers = ["/" + m.name for m in tf.getmembers()
+                               if m.name.endswith("/plxnative-storage")]
+                    self.assertEqual(len(helpers), 1)
+                    # Execute the real Rust path validator, not a Python copy of its allowlist.
+                    result = subprocess.run(
+                        ["cargo", "+" + pinned(), "test", "--manifest-path",
+                         str(Path(__file__).resolve().parent.parent / "rust-modules/Cargo.toml"),
+                         "-p", "plxnative-storage", "--bin", "plxnative-storage", "runtime::tests::packaged_app_identity",
+                         "--", "--exact"],
+                        env={**os.environ, "CARGO_INCREMENTAL": "0",
+                             "PATH": str(Path.home() / ".cargo" / "bin") + os.pathsep + os.environ.get("PATH", ""),
+                             "PLX_TEST_PACKAGED_HELPERS": "\n".join(helpers)},
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("test result: ok. 1 passed;", result.stdout)
 
     def test_archive_checker_rejects_obsolete_state_and_foreign_service(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,7 +25,7 @@
 # Wire modes (--codec, default mpeg): with a current app binary the app source is
 # MPEG1 video in MPEG-TS (the TV's own libavcodec mpeg1video encoder, ~29fps at
 # 960x540 in ~0.3-2.5Mbit) relayed to the page over a WebSocket (/ws) and decoded
-# by the vendored jsmpeg (served at /jsmpeg.js) into a <canvas>. The JPEG path
+# by jsmpeg (fetched at its pinned upstream commit by ci/deps.py, served at /jsmpeg.js) into a <canvas>. The JPEG path
 # remains as the fallback: legacy app binaries, and PLAYBACK viewing — the GL
 # capture can't see the video plane, so when the TS byte-flow stalls the service
 # capture feeds JPEG frames and the page flips to its pipelined long-poll pull
@@ -79,27 +79,29 @@
 # not our SDL/wayland path — hence the in-app FIFO.
 #
 # Environment overrides (same as capture-screen.sh):
-#     TV_HOST (default: the gitignored .tv-host)  TV_USER (root)  TV_PASS (alpine)
+#     TV_HOST (default: tools/tv-config.sh -- .tv-host, else ~/.config/plxnative/tv-host)  TV_USER (root)  TV_PASS (alpine)
 #
-# Auth: prefers an installed SSH key; falls back to `sshpass -p $TV_PASS` if present.
+# Auth: tools/tv-ssh -- the SSH key first; `sshpass -p $TV_PASS` only if the set refuses the key.
 # Stop with Ctrl-C. Requires: python3 (stdlib only), ssh; sshpass only if no key.
 #
-import argparse, base64, functools, hashlib, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, webbrowser
+import argparse, base64, functools, hashlib, os, re, shlex, signal, socket, subprocess, sys, threading, time, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import tv_config
+
 def _default_tv_host():
-    """The TV's address, from the gitignored .tv-host beside the Makefile — the same file
-    `make TV=` falls back to, so the repository carries no home-network address of its own."""
-    try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, ".tv-host")) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
+    """The TV's address from tools/tv-config.sh (this checkout's gitignored .tv-host, the main
+    checkout's, then the per-user ~/.config/plxnative/tv-host) — the same lookup `make TV=` falls
+    back to, so the repository carries no home-network address of its own."""
+    return tv_config.host()
 
 
 TV_HOST = os.environ.get("TV_HOST") or _default_tv_host()
 TV_USER = os.environ.get("TV_USER", "root")
-TV_PASS = os.environ.get("TV_PASS", "alpine")
+# What console output calls the television: its address names one household, so it is printed only
+# when asked for (PLX_VERBOSE=1), the same switch tools/tv-ssh uses.
+TV_LABEL = TV_HOST if os.environ.get("PLX_VERBOSE") else "the TV"
+TV_SSH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tv-ssh")
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 
@@ -119,7 +121,7 @@ def make_query(goals: tuple, flavour: str = "") -> tuple:
     fires), and one make start-up is cheaper than one per value.
 
     NEVER `make -p`/`make -pn` for this. That prints a recursive variable's UNEXPANDED
-    DEFINITION, so TV comes back as the literal `$(strip $(shell cat .tv-host …))` and
+    DEFINITION, so TV comes back as the literal `$(strip $(shell tools/tv-config.sh host …))` and
     every ssh built from it fails against a perfectly live television. These print-
     targets are real echo recipes and cannot do that.
     """
@@ -386,24 +388,11 @@ done
                 .replace("__MININT__", str(min_interval_ms)).strip())
 
 
-@functools.lru_cache(maxsize=1)
-def _ssh_prefix():
-    """Prefer key auth; fall back to sshpass if we have no key and it's installed.
-    Probed ONCE — the answer can't change during a run, and KeySink reconnects call
-    build_ssh_cmd from the HTTP thread serving /key, where a 10s probe would stall
-    a key press (which is exactly when the TV just came back from standby)."""
-    keycheck = subprocess.run(
-        ["ssh", *SSH_OPTS, "-o", "BatchMode=yes", f"{TV_USER}@{TV_HOST}", "true"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if keycheck.returncode == 0:
-        return []
-    if shutil.which("sshpass"):
-        return ["sshpass", "-p", TV_PASS]
-    sys.exit(f"ERROR: cannot auth to {TV_USER}@{TV_HOST}. Install an SSH key or sshpass.")
-
-
 def build_ssh_cmd(remote_script: str):
-    return [*_ssh_prefix(), "ssh", *SSH_OPTS, f"{TV_USER}@{TV_HOST}", remote_script]
+    """The ssh command for one remote script, through the shared key-first wrapper
+    (tools/tv-ssh: the key, then `sshpass` only if the set refuses it; a fast failure when it is
+    unreachable). It `exec`s the real ssh, so the child is a plain ssh process as before."""
+    return [TV_SSH, "ssh", *SSH_OPTS, f"{TV_USER}@{TV_HOST}", remote_script]
 
 
 def read_exact(stream, n: int) -> bytes:
@@ -670,7 +659,7 @@ def source_supervisor(hub: FrameHub, stats: dict, args, w, h, min_interval_ms, r
     while not hub.stopped:
         if mode in ("auto", "app") and probe_app_port(args.app_port):
             use_mpeg = args.codec == "mpeg" and tshub is not None and not legacy_app
-            print(f"  source: app stream (tcp {TV_HOST}:{args.app_port}, UI plane only, "
+            print(f"  source: app stream (tcp {TV_LABEL}:{args.app_port}, UI plane only, "
                   f"{'mpeg1/ts' if use_mpeg else 'jpeg'})")
             # auto mode arms the playback fallback (service view while the UI stream idles)
             if use_mpeg:
@@ -1278,10 +1267,14 @@ def main():
     jsmpeg_js = b""
     if tshub is not None:
         try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "jsmpeg.min.js"), "rb") as f:
+            # Not in the repository: ci/dependencies.json pins it (commit + sha256) and ci/deps.py
+            # downloads it into vendor/downloads, or finds it there already.
+            sys.path.insert(0, os.path.join(REPO_ROOT, "ci"))
+            import deps
+            with open(deps.fetch(deps.entry("jsmpeg"), label="jsmpeg")["archive"], "rb") as f:
                 jsmpeg_js = f.read()
-        except OSError:
-            print("WARN: jsmpeg.min.js not found next to stream-screen.py — mpeg mode disabled")
+        except (OSError, ValueError, KeyError) as e:
+            print(f"WARN: jsmpeg could not be fetched ({e}) — mpeg mode disabled")
             tshub = None
             args.codec = "jpeg"
     stats = {"frames": 0, "proc": None}
@@ -1309,7 +1302,7 @@ def main():
         except Exception:
             disp_host = "127.0.0.1"
     url = f"http://{disp_host}:{args.port}/"
-    print(f"Streaming TV {TV_HOST} [source={args.source}"
+    print(f"Streaming {TV_LABEL} [source={args.source}"
           f"{'' if not min_interval_ms else f', <= {args.fps:g} fps'}]  ->  {url}")
     # The capture port is printed BESIDE the install it belongs to, because those two
     # disagreeing is the failure with no error: the app is up, the log is healthy, and the

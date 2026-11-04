@@ -14,7 +14,7 @@
 //! the single failure every rule in here exists to prevent.
 
 use super::bridge;
-use crate::screens::registry::AppArg;
+use plx_screens::registry::AppArg;
 
 /// The heartbeat's `route=` WORD for a route — the string `tests/run.py` selects samples by
 /// (`LOOP_RE`/`FPS_RE`) against `manifest.json`'s `route` field, and the one the focus
@@ -23,17 +23,20 @@ use crate::screens::registry::AppArg;
 /// a route renamed here without its scenes following would otherwise fail on the device as
 /// "never entered this screen", which reads exactly like a total regression.
 pub(crate) fn route_word(route: &AppArg) -> &'static str {
-    use crate::screens::registry::ContentArg;
+    use plx_screens::registry::ContentArg;
     match route {
         AppArg::Login => "login",
         AppArg::Profiles => "profiles",
         AppArg::Onboard => "onboard",
-        AppArg::Library => "library",
+        AppArg::Library | AppArg::LibraryCollections { .. } | AppArg::LibraryRecommended { .. } => "library",
         AppArg::Content(ContentArg::Detail { .. }) => "detail",
         // The filmography sheet answers `word::PERSON` too (`FilmographyScreen::name`): the test
         // manifest intentionally records that opaque modal as `route=person`.
         AppArg::Content(ContentArg::Person { .. } | ContentArg::Filmography { .. }) => "person",
+        AppArg::Content(ContentArg::Collection(_)) => "collection",
+        AppArg::Content(ContentArg::Catalog { .. }) => "catalog",
         AppArg::Search => "search",
+        AppArg::Watchlist => "watchlist",
         AppArg::Player => "player",
         AppArg::Home => "home",
         // Not pages: a surface's word is ` overlay=`, and none of these reaches the page stack's
@@ -44,15 +47,18 @@ pub(crate) fn route_word(route: &AppArg) -> &'static str {
         | AppArg::FirstRunConsent(_)
         | AppArg::LibraryMenu(_)
         | AppArg::AccountMenu
+        | AppArg::WatchlistMenu(_)
         | AppArg::ItemMenu(_)
         | AppArg::PlayerOverlay(_)
         | AppArg::AltSources(_)
+        | AppArg::VersionsPanel(_)
         | AppArg::TracksPanel(_)
         | AppArg::AboutPanel
-        | AppArg::PersonBio => "",
+        | AppArg::PersonBio
+        | AppArg::CollectionAbout => "",
     }
 }
-/// **Every PAGE argument, one per heartbeat word** — the domain [`route_word`] is applied over to DERIVE the
+/// **Every PAGE argument** (a word may repeat: the library's three pages are all `library`) — the domain [`route_word`] is applied over to DERIVE the
 /// heartbeat's `route=` alphabet, and the list `app::bridge`'s own argument tests walk.
 ///
 /// The compiler is what keeps it complete: the array's length is written out, so an added variant
@@ -65,20 +71,27 @@ pub(crate) fn route_word(route: &AppArg) -> &'static str {
 /// holds one and asks about it. Its two readers are this module's word derivation and
 /// `app::bridge`'s argument tests, which used to keep a second copy of the same list.
 #[cfg(test)]
-pub(crate) fn every_route() -> [AppArg; 9] {
-    use crate::screens::registry::ContentArg;
-    let sid = crate::plex::ServerId::UNSET;
+pub(crate) fn every_route() -> [AppArg; 14] {
+    use plx_screens::registry::ContentArg;
+    let sid = plx_plex::plex::ServerId::UNSET;
     [
         AppArg::Login,
         AppArg::Profiles,
         AppArg::Onboard,
         AppArg::Home,
         AppArg::Library,
+        // The two pages the library's header pushes. They answer the library's word and the
+        // tab bar's chrome, and a list without them is how the strip they wear went unpublished.
+        AppArg::LibraryCollections { section: 0 },
+        AppArg::LibraryRecommended { section: 0 },
         AppArg::Content(ContentArg::Detail { sid, rk: String::new() }),
         AppArg::Content(ContentArg::Person {
             sid, key: String::new(), guid: String::new(), name: String::new(), thumb: String::new(),
         }),
+        AppArg::Content(ContentArg::Collection(plx_plex::plex::collections::CollectionRef::by_tag(sid, 0, 1, ""))),
+        AppArg::Content(ContentArg::Catalog { hex: [0; 12] }),
         AppArg::Search,
+        AppArg::Watchlist,
         AppArg::Player,
     ]
 }
@@ -95,7 +108,7 @@ pub(crate) fn every_route() -> [AppArg; 9] {
 /// all beside the bridge's: the player with nothing over it prints ` overlay=none`, which is a
 /// statement about the ROUTE that the container cannot make. (Five arms stood here, one per
 /// `Route::Player { overlay }` value, until phase 9 made the panels surfaces.)
-pub(crate) fn overlay_word(pages: &crate::ui::dispatch::Dispatcher<bridge::AppHost>, route: &AppArg) -> Option<&'static str> {
+pub(crate) fn overlay_word(pages: &plx_ui::dispatch::Dispatcher<bridge::AppHost>, route: &AppArg) -> Option<&'static str> {
     bridge::overlay_word(pages).or(matches!(route, AppArg::Player).then_some(NO_OVERLAY))
 }
 
@@ -105,8 +118,37 @@ pub(crate) const NO_OVERLAY: &str = "none";
 /// The heartbeat's ` overlay=<word>` suffix, prefix and all, empty when there is none. The prefix
 /// is built HERE rather than baked into every word because the words are the SCREENS' own and a
 /// screen has no business knowing what the heartbeat's grammar looks like.
-pub(crate) fn overlay_suffix(pages: &crate::ui::dispatch::Dispatcher<bridge::AppHost>, route: &AppArg) -> String {
+pub(crate) fn overlay_suffix(pages: &plx_ui::dispatch::Dispatcher<bridge::AppHost>, route: &AppArg) -> String {
     overlay_word(pages, route).map_or(String::new(), |w| format!(" overlay={w}"))
+}
+
+/// The heartbeat's ` section=` WORD for the player page's open HUD sections, or `None` when none is open.
+///
+/// **A section is the page's own state, not a surface**, so it has no `Screen::name` and ` overlay=` (the topmost
+/// MODAL surface's name, `none` over a bare player) stays what it always was. The fps scenes `info-panel` and
+/// `chapters-panel` used to select on `overlay=info` / `overlay=chapters`; they select on `overlay=none` and this
+/// word now. It names the LOGICAL set (`HudState::sections`), not the sections still fading out, so a scene's
+/// samples are the frames the page holds the section open for.
+///
+/// Both sections can be open under an inline package: `chapters_info`, in the fixed order Chapters then Info (the
+/// order the springs and the state key use), not the order they were opened in. Every word is a `\w+` token
+/// the harness's regexes can capture.
+pub(crate) fn section_word(pages: &plx_ui::dispatch::Dispatcher<bridge::AppHost>) -> Option<&'static str> {
+    use plx_appkit::player_hud::command::Section;
+    let sections = bridge::player(pages)?.hud.sections;
+    match (sections.contains(Section::Chapters), sections.contains(Section::Info)) {
+        (false, false) => None,
+        (true, false) => Some("chapters"),
+        (false, true) => Some("info"),
+        (true, true) => Some("chapters_info"),
+    }
+}
+
+/// The heartbeat's ` section=<word>` suffix, prefix and all, empty when no section is open. It rides right after
+/// ` overlay=` (`tests/run.py`'s `select_section` reads it from there) and is absent, not `none`, with nothing open,
+/// so the line every other scene reads is byte-identical to what it was.
+pub(crate) fn section_suffix(pages: &plx_ui::dispatch::Dispatcher<bridge::AppHost>) -> String {
+    section_word(pages).map_or(String::new(), |w| format!(" section={w}"))
 }
 
 /// **Every `route=` word [`route_word`] can print, and every ` overlay=` word [`overlay_word`]
@@ -134,6 +176,32 @@ fn overlay_words() -> Vec<&'static str> {
     let mut words = bridge::every_surface_word();
     words.push(NO_OVERLAY);
     words
+}
+
+/// Every ` section=` word [`section_word`] can print, DERIVED: each combination of the two sections put on the real
+/// player page, read back through the function the heartbeat calls. Held under `testlock::serial()` like
+/// [`overlay_words`] (it runs real frames).
+#[cfg(test)]
+fn section_words() -> Vec<&'static str> {
+    use plx_appkit::player_hud::command::Section;
+    use plx_screens::player::input::Sections;
+    let mut d = plx_ui::dispatch::Dispatcher::<bridge::AppHost>::new();
+    let mut rig = bridge::Bridge::for_test(|| 0);
+    bridge::show_page(&mut d, AppArg::Player);
+    bridge::frame(&mut d, &mut rig, plx_machine::machine::Tick { ms: 0, dt_us: 16_000 }, vec![]);
+    let mut out = Vec::new();
+    for (chapters, info) in [(true, false), (false, true), (true, true)] {
+        let mut sections = Sections::NONE;
+        if chapters {
+            sections = sections.toggled(Section::Chapters, false);
+        }
+        if info {
+            sections = sections.toggled(Section::Info, false);
+        }
+        bridge::player_mut(&mut d).expect("the player page is mounted").hud.sections = sections;
+        out.push(section_word(&d).expect("an open section names a word"));
+    }
+    out
 }
 
 /// The heartbeat word table versus `tests/manifest.json`. Every fps scene selects its samples by
@@ -170,13 +238,16 @@ mod heartbeat_word_tests {
     /// harness could not tell "opened the Home-sources editor" from "opened Settings and did
     /// nothing", so a trigger that silently failed to reach Favourites still produced a scene that
     /// passed, measuring the wrong screen.
-    const FAMILY_INNER: [&str; 3] = [
-        crate::screens::registry::word::PRIVACY,
-        crate::screens::registry::word::LEGAL,
-        crate::screens::registry::word::ONBOARD,
+    const FAMILY_INNER: [&str; 6] = [
+        plx_screens::registry::word::PRIVACY,
+        plx_screens::registry::word::LEGAL,
+        plx_screens::registry::word::ONBOARD,
+        plx_screens::registry::word::PLAYBACK,
+        plx_screens::registry::word::AUDIO,
+        plx_screens::registry::word::PICKER,
     ];
 
-    /// **Every caller holds `crate::testlock::serial()` for its whole body**, because deriving
+    /// **Every caller holds `plx_base::testlock::serial()` for its whole body**, because deriving
     /// this alphabet is not a read: [`overlay_words`] goes through
     /// `bridge::every_surface_word`, which mounts each surface by running real
     /// `bridge::frame`s — and a frame pumps every store. `browse`'s pump ends in `sync_roster`,
@@ -197,7 +268,7 @@ mod heartbeat_word_tests {
 
     #[test]
     fn every_manifest_route_word_is_one_the_heartbeat_prints() {
-        let _guard = crate::testlock::serial();
+        let _guard = plx_base::testlock::serial();
         let routes = route_words();
         let overlays = overlay_alphabet();
         for s in scenes() {
@@ -227,7 +298,7 @@ mod heartbeat_word_tests {
     /// is the player's.
     #[test]
     fn the_tables_are_derived_and_the_two_alphabets_stay_apart() {
-        let _guard = crate::testlock::serial();
+        let _guard = plx_base::testlock::serial();
         let routes = route_words();
         let overlays = overlay_alphabet();
         assert_eq!(
@@ -248,15 +319,15 @@ mod heartbeat_word_tests {
         // ONE word is in both alphabets, and it names one screen mounted on two stacks. Any other
         // overlap is a route and a surface that would be indistinguishable in a `route=` field.
         let both: Vec<&str> = overlays.iter().copied().filter(|w| routes.contains(w)).collect();
-        assert_eq!(both, [crate::screens::registry::word::ONBOARD]);
+        assert_eq!(both, [plx_screens::registry::word::ONBOARD]);
         // …and the two menus that became surfaces in phase 10 are on the overlay side ONLY. Both
         // MOVED between the tables in the commits that deleted their routes, and each moved with
         // its `manifest.json` scene's re-key (`home-acct-glass`, `item-menu`); a word left behind
         // in the route alphabet would have let a scene keep selecting on a `route=` the app can no
         // longer print, which fails on the television as "never entered this screen".
         for w in [
-            crate::screens::registry::word::ACCOUNT,
-            crate::screens::registry::word::ITEM_MENU,
+            plx_screens::registry::word::ACCOUNT,
+            plx_screens::registry::word::ITEM_MENU,
         ] {
             assert!(overlays.contains(&w), "{w:?} is a surface's own name");
             assert!(!routes.contains(&w), "{w:?} has no `route_word` arm any more");
@@ -266,7 +337,7 @@ mod heartbeat_word_tests {
         // container says nothing and the ROUTE decides, which is exactly the state every BARE
         // playback frame is in. It is the one word no screen owns, which is why it is added by
         // `overlay_words` rather than derived.
-        let empty = crate::ui::dispatch::Dispatcher::<super::bridge::AppHost>::new();
+        let empty = plx_ui::dispatch::Dispatcher::<super::bridge::AppHost>::new();
         assert_eq!(overlay_word(&empty, &AppArg::Player), Some(NO_OVERLAY));
         assert_eq!(overlay_word(&empty, &AppArg::Home), None);
         assert_eq!(super::overlay_suffix(&empty, &AppArg::Player), " overlay=none");
@@ -274,22 +345,74 @@ mod heartbeat_word_tests {
         assert!(overlays.contains(&NO_OVERLAY));
         assert!(!routes.contains(&NO_OVERLAY));
 
-        // The player's four panels are `OverlayKind::word` through `Screen::name`, so they arrive
+        // The player's panels are `OverlayKind::word` through `Screen::name`, so they arrive
         // in the derived alphabet with everything else — asserted here because it is the one place
         // a reader can see that the panel words and the family words come from ONE source now.
-        use crate::screens::player::overlay::OverlayKind;
-        for kind in [
-            OverlayKind::Tracks { tab: 0 },
-            OverlayKind::Info,
-            OverlayKind::Chapters,
-            OverlayKind::More { quality: false },
-        ] {
+        use plx_screens::player::overlay::OverlayKind;
+        for kind in OverlayKind::ALL {
             assert!(
                 overlays.contains(&kind.word()),
                 "{kind:?} prints {:?}, which the mounter's own alphabet must carry",
                 kind.word()
             );
         }
+    }
+
+    /// **An open HUD section prints its own word and leaves ` overlay=` alone**: a section is the page's state, not a
+    /// surface, so over a bare player the line still says `overlay=none` and gains ` section=<word>` right after it;
+    /// with nothing open the suffix is empty and the line is what it was.
+    #[test]
+    fn an_open_section_prints_its_own_word_and_leaves_the_overlay_word_alone() {
+        use plx_appkit::player_hud::command::Section;
+        use plx_screens::player::input::Sections;
+        let _guard = plx_base::testlock::serial();
+        let mut d = plx_ui::dispatch::Dispatcher::<super::bridge::AppHost>::new();
+        let mut rig = super::bridge::Bridge::for_test(|| 0);
+        super::bridge::show_page(&mut d, AppArg::Player);
+        super::bridge::frame(&mut d, &mut rig, plx_machine::machine::Tick { ms: 0, dt_us: 16_000 }, vec![]);
+        assert_eq!(super::section_word(&d), None);
+        assert_eq!(super::section_suffix(&d), "", "nothing open: no field");
+        for (sections, word) in [
+            (Sections::NONE.toggled(Section::Chapters, true), "chapters"),
+            (Sections::NONE.toggled(Section::Info, true), "info"),
+            (Sections::NONE.toggled(Section::Chapters, false).toggled(Section::Info, false), "chapters_info"),
+        ] {
+            super::bridge::player_mut(&mut d).expect("the player page").hud.sections = sections;
+            assert_eq!(super::section_word(&d), Some(word));
+            assert_eq!(
+                format!("{}{}", super::overlay_suffix(&d, &AppArg::Player), super::section_suffix(&d)),
+                format!(" overlay=none section={word}"),
+                "{word}: the overlay word is the bare player's, the section word follows it"
+            );
+        }
+        let derived = super::section_words();
+        assert_eq!(derived, ["chapters", "info", "chapters_info"]);
+        for w in derived {
+            assert!(w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{w:?} is not a heartbeat token");
+        }
+    }
+
+    /// **The two scenes that used to select on `overlay=info` / `overlay=chapters` select on a section word**, over a
+    /// bare player (`overlay=none`): a scene naming a section word the heartbeat cannot print would read on the
+    /// television as "scene never entered this screen". Only these two scenes carry one.
+    #[test]
+    fn the_manifests_section_scenes_name_words_the_heartbeat_prints() {
+        let _guard = plx_base::testlock::serial();
+        let words = super::section_words();
+        let mut seen = Vec::new();
+        for s in scenes() {
+            let name = s["name"].as_str().unwrap_or("?").to_owned();
+            let Some(word) = s.get("section").and_then(|w| w.as_str()) else { continue };
+            assert!(words.contains(&word), "scene {name}: section word {word:?} is not in {words:?}");
+            assert_eq!(s["route"].as_str(), Some("player"), "scene {name}: a section is the player page's");
+            assert_eq!(s["overlay"].as_str(), Some(NO_OVERLAY), "scene {name}: over a bare player");
+            seen.push((name, word.to_owned()));
+        }
+        assert_eq!(
+            seen,
+            [("info-panel".to_owned(), "info".to_owned()), ("chapters-panel".to_owned(), "chapters".to_owned())],
+            "the player's two section scenes"
+        );
     }
 
     /// **A word the app can print but no scene uses is fine; the reverse is not** — and the
@@ -302,7 +425,7 @@ mod heartbeat_word_tests {
     /// route that exists.
     #[test]
     fn the_manifest_uses_a_subset_of_the_derived_alphabets() {
-        let _guard = crate::testlock::serial();
+        let _guard = plx_base::testlock::serial();
         let routes = route_words();
         let overlays = overlay_alphabet();
         let mut used_overlays = 0;
@@ -336,10 +459,10 @@ mod heartbeat_word_tests {
     /// thread, under the guard, and is therefore deterministic.
     #[test]
     fn deriving_the_surface_alphabet_cannot_mutate_an_unrelated_browse_owner() {
-        let _guard = crate::testlock::serial();
-        let stores = crate::stores::Stores::default();
+        let _guard = plx_base::testlock::serial();
+        let stores = plx_data::stores::Stores::default();
         stores.browse.borrow_mut().seed_two_source_table_for_test();
-        let mut directory = crate::stores::browse::DirectorySnapshot::default();
+        let mut directory = plx_data::stores::browse::DirectorySnapshot::default();
         stores.capture_browse(&mut directory);
         assert_eq!(
             directory.view().section_count(),

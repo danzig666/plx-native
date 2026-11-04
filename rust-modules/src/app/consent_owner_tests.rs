@@ -1,6 +1,6 @@
 use super::*;
-use crate::telemetry::consent::{self, Consent};
-use crate::ui::dispatch::NoTap;
+use plx_telemetry::telemetry::consent::{self, Consent};
+use plx_ui::dispatch::NoTap;
 
 struct PublishedSnapshot(Option<Consent>);
 
@@ -36,7 +36,7 @@ fn drive(rig: &mut Bridge, fx: AppFx) {
 
 #[test]
 fn consent_decides_from_its_owned_state_and_not_the_published_snapshot() {
-    let _serial = crate::testlock::serial();
+    let _serial = plx_base::testlock::serial();
     let saved = PublishedSnapshot(consent::current());
     let published = decision("published-id");
     consent::install(published.clone());
@@ -84,7 +84,7 @@ fn consent_effect_is_an_addressed_delivery_before_the_owner_steps() {
     assert_eq!(rig.consent.current(), &initial, "AppFx routing must not step the owner inline");
     assert!(matches!(
         out.as_slice(),
-        [crate::ui::machine::Stamped {
+        [plx_machine::machine::Stamped {
             fx: Fx::Deliver(
                 MachineId::Consent,
                 Delivery::Machine(AppMsg::Consent(ConsentCmd::Record {
@@ -104,8 +104,8 @@ fn session_close_telemetry_is_executed_by_the_consent_owner() {
 
     drive(
         &mut rig,
-        AppFx::SessionEffect(crate::auth::owner::SessionFx::Coordinator(
-            crate::auth::owner::CoordinatorAction::CloseTelemetry,
+        AppFx::SessionEffect(plx_session::auth::owner::SessionFx::Coordinator(
+            plx_session::auth::owner::CoordinatorAction::CloseTelemetry,
         )),
     );
 
@@ -121,7 +121,7 @@ fn session_close_telemetry_is_executed_by_the_consent_owner() {
         .iter()
         .any(|action| matches!(
             action,
-            crate::auth::owner::CoordinatorAction::CloseTelemetry
+            plx_session::auth::owner::CoordinatorAction::CloseTelemetry
         )));
 }
 
@@ -133,8 +133,8 @@ fn signing_out_through_consent_owner_leaves_nothing_for_the_next_account() {
     }
     impl Drop for Redirects {
         fn drop(&mut self) {
-            crate::telemetry::spool::set_test_path(None);
-            crate::telemetry::redirect_for_test(None);
+            plx_telemetry::telemetry::spool::set_test_path(None);
+            plx_telemetry::telemetry::redirect_for_test(None);
             if let Some(saved) = self.saved.take() {
                 consent::install(saved);
             }
@@ -142,7 +142,7 @@ fn signing_out_through_consent_owner_leaves_nothing_for_the_next_account() {
         }
     }
 
-    let _serial = crate::testlock::serial();
+    let _serial = plx_base::testlock::serial();
     let dir = std::env::temp_dir().join(format!(
         "plxnative-consent-owner-signout-{}",
         std::process::id()
@@ -154,8 +154,8 @@ fn signing_out_through_consent_owner_leaves_nothing_for_the_next_account() {
         saved: consent::current(),
     };
     let consent_file = dir.join("telemetry.json");
-    crate::telemetry::redirect_for_test(Some(consent_file.clone()));
-    crate::telemetry::spool::set_test_path(Some(dir.join("spool.jsonl")));
+    plx_telemetry::telemetry::redirect_for_test(Some(consent_file.clone()));
+    plx_telemetry::telemetry::spool::set_test_path(Some(dir.join("spool.jsonl")));
 
     let enabled = Consent {
         asked_version: consent::POLICY_VERSION,
@@ -165,9 +165,9 @@ fn signing_out_through_consent_owner_leaves_nothing_for_the_next_account() {
         errors_id: Some("b".repeat(32)),
         ..Default::default()
     };
-    crate::telemetry::record(enabled.clone());
+    plx_telemetry::telemetry::record(enabled.clone());
     assert_eq!(
-        crate::telemetry::persistence::load(std::slice::from_ref(&consent_file)),
+        plx_telemetry::telemetry::persistence::load(std::slice::from_ref(&consent_file)),
         consent::migrate_loaded(enabled.clone()),
         "the decision is durably persisted before sign-out"
     );
@@ -175,8 +175,8 @@ fn signing_out_through_consent_owner_leaves_nothing_for_the_next_account() {
 
     drive(
         &mut rig,
-        AppFx::SessionEffect(crate::auth::owner::SessionFx::Coordinator(
-            crate::auth::owner::CoordinatorAction::CloseTelemetry,
+        AppFx::SessionEffect(plx_session::auth::owner::SessionFx::Coordinator(
+            plx_session::auth::owner::CoordinatorAction::CloseTelemetry,
         )),
     );
 
@@ -185,7 +185,7 @@ fn signing_out_through_consent_owner_leaves_nothing_for_the_next_account() {
     assert!(!published.answered() && !published.any());
     assert!(published.install_id.is_none() && published.errors_id.is_none());
     assert!(!consent::allows_usage() && !consent::allows_errors());
-    let reopened = crate::telemetry::persistence::load(std::slice::from_ref(&consent_file));
+    let reopened = plx_telemetry::telemetry::persistence::load(std::slice::from_ref(&consent_file));
     assert!(!reopened.answered() && !reopened.any(), "the next launch is asked afresh");
     assert!(reopened.install_id.is_none() && reopened.errors_id.is_none());
     assert!(!consent_file.exists());

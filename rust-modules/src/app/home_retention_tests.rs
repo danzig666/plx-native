@@ -2,26 +2,87 @@
 //! worker-result addressing and directory-discovery landing order.
 
 use super::*;
+use plx_ui::screen::DrawFrame;
 #[allow(unused_imports)]
 use super::test_support::*;
 use super::test_support::{frame, frame_with_tap, frame_with_results};
 
 #[test]
+fn pending_home_grid_focus_wins_when_the_first_catalog_arrives() {
+    let _guard = plx_base::testlock::serial();
+    for on_strip in [false, true] {
+        let mut d = Dispatcher::<AppHost>::new();
+        let mut rig = Bridge::for_test(|| 0);
+        rig.stores.hubs.seed_for_test(0, plx_data::pms::HubState::Loading);
+        frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+        let entry = d.nav.top_page().unwrap().id;
+        d.set_focus_in(
+            on_strip.then_some(FocusKey { entry, elem: plx_screens::home::STRIP_HOME_ELEM }),
+            on_strip.then_some(plx_ui::containers::tabs::STRIP),
+        );
+        assert!(rig.home_command(HomeCmd::FocusGrid { row: 0, col: 2 }));
+        frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+        assert_eq!(rig.with_home(&d, |_, cx, _| cx.views.hubs.state), Some(plx_data::pms::HubState::Loading));
+        assert_eq!(rig.with_home(&d, |home, cx, _| home.hero_item::<AppHost>(cx).is_none()), Some(true));
+
+        // The real bridge releases the retained command before this frame's Tick. Its nested
+        // Enter has not reached the focus engine when Tick observes the first available CTA.
+        rig.stores.hubs.seed_grid_for_test(3, 4);
+        frame(&mut d, &mut rig, AppArg::Home, tick(2), vec![]);
+        assert_eq!(rig.with_home(&d, |home, cx, focus| home.grid_position::<AppHost>(focus, cx)),
+            Some(Some((0, 2))), "the first CTA must not override explicit grid intent; on_strip={on_strip}");
+        assert_eq!(rig.with_home(&d, |home, _, _| home.snap_target()), Some(1.0));
+        let hero = rig.with_home(&d, |home, cx, _| home.hero_item::<AppHost>(cx).unwrap().rk.clone());
+
+        // Ten seconds exceeds the hero's eight-second carousel period. Remaining in the grid
+        // must not silently restore Hero or start its periodic slideshow.
+        for i in 3..628 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
+        assert_eq!(rig.with_home(&d, |home, cx, focus| home.grid_position::<AppHost>(focus, cx)), Some(Some((0, 2))));
+        assert_eq!(rig.with_home(&d, |home, _, _| home.snap_target()), Some(1.0));
+        assert_eq!(rig.with_home(&d, |home, cx, _| home.hero_item::<AppHost>(cx).unwrap().rk.clone()), hero);
+    }
+}
+
+#[test]
+fn first_home_catalog_preserves_default_and_explicit_hero_seating() {
+    let _guard = plx_base::testlock::serial();
+    for commands in [
+        vec![],
+        vec![HomeCmd::FocusGrid { row: usize::MAX, col: 0 }],
+        vec![HomeCmd::Hero],
+        vec![HomeCmd::FocusGrid { row: 0, col: 2 }, HomeCmd::Hero],
+    ] {
+        let mut d = Dispatcher::<AppHost>::new();
+        let mut rig = Bridge::for_test(|| 0);
+        rig.stores.hubs.seed_for_test(0, plx_data::pms::HubState::Loading);
+        frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+        assert_eq!(rig.with_home(&d, |_, cx, _| cx.views.hubs.state), Some(plx_data::pms::HubState::Loading));
+        let entry = d.nav.top_page().unwrap().id;
+        d.set_focus_in(None, None);
+        for command in &commands { assert!(rig.home_command(*command)); }
+        rig.stores.hubs.seed_grid_for_test(3, 4);
+        frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+        assert_eq!(d.focus(), Some(FocusKey { entry, elem: 0 }), "commands={commands:?}");
+        assert_eq!(rig.with_home(&d, |home, _, _| home.snap_target()), Some(0.0));
+    }
+}
+
+#[test]
 fn home_requests_keep_the_emitting_instance_and_captured_return_memory() {
-    use crate::screens::registry::{HomeGroupKey, HomeHubIdentity, HomeItemIdentity, HomeItemKey, HomeMemory, HomeTab};
-    let _guard = crate::testlock::serial();
+    use plx_screens::registry::{HomeGroupKey, HomeHubIdentity, HomeItemIdentity, HomeItemKey, HomeMemory, HomeTab};
+    let _guard = plx_base::testlock::serial();
     let mut rig = Bridge::for_test(|| 0);
-    let sid = crate::plex::ServerId::UNSET;
+    let sid = plx_plex::plex::ServerId::UNSET;
     let groups = vec![HomeHubIdentity::ContinueWatching,
-        HomeHubIdentity::Identifier { sid, id: "recent".into() },
+        HomeHubIdentity::Identifier { sid, id: "recent".into(), key: "/hubs/recent".into() },
         HomeHubIdentity::Key { sid, key: "/library/collections/7/children".into() },
         HomeHubIdentity::Ephemeral { generation: 9, ordinal: 0 }];
     let memory = HomeMemory {
         groups: groups.iter().enumerate().map(|(i, identity)| HomeGroupKey { identity: identity.clone(), group: i as u32 }).collect(),
-        items: vec![
+        items: std::sync::Arc::new(vec![
             HomeItemKey { elem: 10, identity: HomeItemIdentity::Item { hub: groups[0].clone(), sid, rk: "1".into() }, last_row: 0, last_col: 0 },
             HomeItemKey { elem: 11, identity: HomeItemIdentity::Slot { hub: groups[3].clone(), generation: 9, ordinal: 0 }, last_row: 0, last_col: 0 },
-        ], next_elem: 12, next_group: 4, carousel: Some((sid, "1".into())), strip_chosen: false,
+        ]), next_elem: 12, next_group: 4, carousel: Some((sid, "1".into())), strip_chosen: false,
         ..Default::default()
     };
     let ret = ReturnState { memory: PageMemory::Home(memory), ..Default::default() };
@@ -46,12 +107,12 @@ fn home_requests_keep_the_emitting_instance_and_captured_return_memory() {
     let split = rig.split();
     let cx = parts.cx::<AppHost>(split.views, split.measure);
     assert_eq!(<AppHost as HomeLike>::hubs(&cx).generation, split.views.hubs.generation);
-    assert_eq!(crate::screens::registry::word::HOME, "home");
+    assert_eq!(plx_screens::registry::word::HOME, "home");
 }
 
 #[test]
 fn removed_home_items_recover_near_their_old_slot_after_live_or_evicted_return() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     for evict in [false, true] {
         for (row, col, removed_hub, reordered, expected_row, expected_col, expected_rk) in [
             (1, 2, false, false, 1, 2, "4"),
@@ -72,8 +133,8 @@ fn removed_home_items_recover_near_their_old_slot_after_live_or_evicted_return()
             for i in 2..40 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
             let removed_rk = rig.with_home(&d, |home, cx, focus|
                 home.focused_item::<AppHost>(focus, cx).unwrap().rk.clone()).unwrap();
-            d.nav.tabs.stack.transition = Box::new(crate::ui::containers::transition::Immediate);
-            let count = if evict { crate::ui::containers::stack::CAP + 1 } else { 1 };
+            d.nav.tabs.stack.transition = Box::new(plx_ui::containers::transition::Immediate);
+            let count = if evict { plx_ui::containers::stack::CAP + 1 } else { 1 };
             for i in 0..count {
                 d.request(MachineId::Nav, NavOp::Push(AppArg::Library));
                 let report = d.frame_with(&mut rig, tick(40 + i as u32), vec![], vec![], &mut NoTap, false);
@@ -97,15 +158,15 @@ fn removed_home_items_recover_near_their_old_slot_after_live_or_evicted_return()
 
 #[test]
 fn mounted_home_navigation_stays_inside_a_full_or_oversized_catalog() {
-    let _guard = crate::testlock::serial();
-    for offered in [crate::pms::MAX_SHELVES, crate::pms::MAX_SHELVES + 5] {
+    let _guard = plx_base::testlock::serial();
+    for offered in [16, 21] {
         let mut d = Dispatcher::<AppHost>::new();
         let mut rig = Bridge::for_test(|| 0);
         rig.stores.hubs.seed_grid_for_test(offered, 3);
         frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
         frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
         let mut i = 2;
-        for row in 0..crate::pms::MAX_SHELVES {
+        for row in 0..offered {
             frame(&mut d, &mut rig, AppArg::Home, tick(i), script_key(Key::Down, tick(i)));
             i += 1;
             assert_eq!(rig.with_home(&d, |home, cx, focus| home.grid_position::<AppHost>(focus, cx)),
@@ -115,7 +176,7 @@ fn mounted_home_navigation_stays_inside_a_full_or_oversized_catalog() {
         for _ in 0..3 {
             frame(&mut d, &mut rig, AppArg::Home, tick(i), script_key(Key::Down, tick(i)));
             i += 1;
-            assert_eq!(d.focus(), last, "DOWN cannot escape the capped final shelf");
+            assert_eq!(d.focus(), last, "DOWN cannot escape the final shelf");
         }
         let instance = d.nav.instance_of(last.unwrap().entry).unwrap();
         for (row, col) in [(usize::MAX, 0), (0, usize::MAX)] {
@@ -129,11 +190,29 @@ fn mounted_home_navigation_stays_inside_a_full_or_oversized_catalog() {
 }
 
 #[test]
-fn hero_edge_keys_page_without_seating_a_pager_or_leaving_the_control() {
-    let _guard = crate::testlock::serial();
+fn mounted_home_walks_to_the_twentieth_row() {
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(3, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_grid_for_test(20, 3);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+    let mut i = 2;
+    for row in 0..20 {
+        frame(&mut d, &mut rig, AppArg::Home, tick(i), script_key(Key::Down, tick(i)));
+        i += 1;
+        assert_eq!(rig.with_home(&d, |home, cx, focus| home.grid_position::<AppHost>(focus, cx)),
+            Some(Some((row, 0))), "row={row}");
+    }
+    assert_eq!(rig.with_home(&d, |home, _, _| home.shelf_len(19)), Some(Some(3)));
+}
+
+#[test]
+fn hero_edge_keys_page_without_seating_a_pager_or_leaving_the_control() {
+    let _guard = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    rig.stores.hubs.seed_for_test(3, plx_data::pms::HubState::Ready);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
     let selected = |rig: &Bridge, d: &Dispatcher<AppHost>| rig.with_home(d,
@@ -150,9 +229,13 @@ fn hero_edge_keys_page_without_seating_a_pager_or_leaving_the_control() {
         assert_eq!(d.focus().unwrap().elem, control);
         assert_ne!(selected(&rig, &d), before, "the delivered edge must page, not just report an edge");
         rig.with_home(&d, |home, cx, _| {
-            let mut draw = DrawFrame::new(cx, crate::ui::Painter::root());
+            let mut draw = DrawFrame::new(cx, plx_ui::Painter::root());
             home.record_stops(&mut draw, cx.views.hubs);
-            let mut keys: Vec<_> = draw.into_stops().into_iter().map(|s| s.key.elem).collect();
+            // the first shelf peeking under the hero has its cards' stops (a click there brings
+            // the page down to it); what is asked here is the hero's own row
+            let mut keys: Vec<_> = draw.into_stops().into_iter()
+                .filter(|s| home.grid_position::<AppHost>(Some(s.key), cx).is_none())
+                .map(|s| s.key.elem).collect();
             keys.sort();
             assert_eq!(keys, vec![0, 1], "pager chevron/dots are not hit stops");
         }).unwrap();
@@ -165,45 +248,56 @@ fn hero_edge_keys_page_without_seating_a_pager_or_leaving_the_control() {
 
 #[test]
 fn a_removed_home_type_tab_recovers_to_home_not_the_profile_chip() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(3, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(3, plx_data::pms::HubState::Ready);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
     let entry = d.nav.top_page().unwrap().id;
-    let movies = crate::screens::home::STRIP_MOVIES_ELEM;
-    d.nav.tabs.strip.push(crate::ui::containers::tabs::StripMember::new(movies,
-        crate::ui::Rect::new(800.0, 50.0, 160.0, 60.0)));
-    d.set_focus_in(Some(FocusKey { entry, elem: movies }), Some(crate::ui::containers::tabs::STRIP));
+    let movies = plx_screens::home::STRIP_MOVIES_ELEM;
+    d.nav.tabs.strip.push(plx_ui::containers::tabs::StripMember::new(movies,
+        plx_ui::Rect::new(800.0, 50.0, 160.0, 60.0)));
+    d.set_focus_in(Some(FocusKey { entry, elem: movies }), Some(plx_ui::containers::tabs::STRIP));
     // Republish the current empty-library strip: the previous Movies destination is gone.
     frame(&mut d, &mut rig, AppArg::Home, tick(2), vec![]);
     assert!(!d.nav.tabs.strip.iter().any(|member| member.elem == movies));
-    assert_eq!(d.focus(), Some(FocusKey { entry, elem: crate::screens::home::STRIP_HOME_ELEM }));
+    assert_eq!(d.focus(), Some(FocusKey { entry, elem: plx_screens::home::STRIP_HOME_ELEM }));
 }
 
 #[test]
 fn home_return_restores_the_offscreen_item_and_viewport_after_retention_or_eviction() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     for (evict, reorder) in [(true, false), (false, false), (true, true), (false, true)] {
         let mut d = Dispatcher::<AppHost>::new();
         let mut rig = Bridge::for_test(|| 0);
         rig.stores.hubs.seed_grid_for_test(6, 24);
         frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
-        d.nav.tabs.stack.transition = Box::new(crate::ui::containers::transition::Immediate);
+        d.nav.tabs.stack.transition = Box::new(plx_ui::containers::transition::Immediate);
         let home = d.nav.top_page().unwrap().id;
         let instance = d.nav.instance_of(home).unwrap();
         d.emit(MachineId::Nav, Fx::Deliver(MachineId::Instance(instance),
             Delivery::Screen(ScreenEvent::App(AppMsg::Home(HomeCmd::FocusGrid { row: 4, col: 18 })))));
-        for i in 1..80 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
+        // Home holds cards for the rows around the user and gives the rest up; this fixture has no
+        // server, so the rows that come back into the ring are answered here, each frame, as a
+        // server answers them. Nothing answers after the user leaves: what the return shows on its
+        // first frame is what Home still held.
+        for i in 1..80 {
+            rig.stores.hubs.land_kept_rows_for_test();
+            frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]);
+        }
         for i in 80..84 { frame(&mut d, &mut rig, AppArg::Home, tick(i), script_key(Key::Left, tick(i))); }
-        for i in 84..160 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
+        for i in 84..160 {
+            rig.stores.hubs.land_kept_rows_for_test();
+            frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]);
+        }
         let focus = d.focus().unwrap();
         let before = rig.with_home(&d, |s, cx, f| {
             assert_eq!(s.grid_position::<AppHost>(f, cx), Some((4, 14)));
+            assert!(!s.focused_item::<AppHost>(f, cx).unwrap().rk.is_empty(), "the card left must be a landed card");
             s.focused_rect::<AppHost>(f, cx, At::Drawn).unwrap()
         }).unwrap();
-        let count = if evict { crate::ui::containers::stack::CAP + 1 } else { 1 };
+        let count = if evict { plx_ui::containers::stack::CAP + 1 } else { 1 };
         for i in 0..count {
             d.request(MachineId::Nav, NavOp::Push(AppArg::Library));
             let report = d.frame_with(&mut rig, tick(160 + i as u32), vec![], vec![], &mut NoTap, false);
@@ -220,7 +314,7 @@ fn home_return_restores_the_offscreen_item_and_viewport_after_retention_or_evict
             d.prune(&report.unmounted);
             if i == 200 {
                 rig.with_home(&d, |s, cx, _| {
-                    let mut draw = DrawFrame::new(cx, crate::ui::Painter::root());
+                    let mut draw = DrawFrame::new(cx, plx_ui::Painter::root());
                     s.record_stops(&mut draw, cx.views.hubs);
                     let stops = draw.into_stops();
                     let stop = stops.iter().find(|stop| stop.key == focus)
@@ -245,28 +339,28 @@ fn home_return_restores_the_offscreen_item_and_viewport_after_retention_or_evict
 
 #[test]
 fn library_detail_return_restores_engine_card_and_viewport_after_stack_eviction() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct RegistryCleanup;
     impl Drop for RegistryCleanup {
-        fn drop(&mut self) { crate::plex::reset_servers_for_test(); }
+        fn drop(&mut self) { plx_plex::plex::reset_servers_for_test(); }
     }
     let _cleanup = RegistryCleanup;
-    let session = crate::plex::session::TempSession::new("owned-library-return");
+    let session = plx_plex::plex::session::TempSession::new("owned-library-return");
     session.watching("u-owned-library-return");
     for evict in [false, true] {
-        crate::plex::reset_servers_for_test();
-        let sid = crate::plex::register_for_test("library-return-own", "127.0.0.1", 9, "synthetic", "fixture");
-        let shared = crate::plex::register_for_test("library-return-shared", "127.0.0.1", 10, "synthetic", "fixture");
-        crate::plex::set_current(sid);
+        plx_plex::plex::reset_servers_for_test();
+        let sid = plx_plex::plex::register_for_test("library-return-own", "127.0.0.1", 9, "synthetic", "fixture");
+        let shared = plx_plex::plex::register_for_test("library-return-shared", "127.0.0.1", 10, "synthetic", "fixture");
+        plx_plex::plex::set_current(sid);
         let mut d = Dispatcher::<AppHost>::new();
         let mut rig = Bridge::for_test(|| 0);
         rig.stores.browse.borrow_mut().seed_registered_table_for_test([sid, shared]);
         rig.refresh_browse_directory();
-        rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+        rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
         rig.stores.browse.borrow_mut().seed_items_for_test(120);
         frame(&mut d, &mut rig, AppArg::Library, tick(0), vec![]);
-        d.nav.tabs.stack.transition = Box::new(crate::ui::containers::transition::Immediate);
-        Bridge::library_command(&mut d, crate::screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 });
+        d.nav.tabs.stack.transition = Box::new(plx_ui::containers::transition::Immediate);
+        Bridge::library_command(&mut d, plx_screens::registry::LibraryCmd::FocusGrid { row: 8, col: 4 });
         for i in 1..80 { frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]); }
         let entry = d.nav.top_page().unwrap().id;
         let focus = d.focus().unwrap();
@@ -274,7 +368,7 @@ fn library_detail_return_restores_engine_card_and_viewport_after_stack_eviction(
             "fixture must reach grid: focus={focus:?}, listing={:?}, total={}, current={:?}",
             rig.listing.view().id(), rig.listing.view().total(), rig.directory.view().current()));
         let before = opener.rect.unwrap();
-        let count = if evict { crate::ui::containers::stack::CAP + 1 } else { 1 };
+        let count = if evict { plx_ui::containers::stack::CAP + 1 } else { 1 };
         for i in 0..count {
             d.request(MachineId::Nav, NavOp::Push(AppArg::Content(ContentArg::Detail {
                 sid: item.sid, rk: if i == 0 { item.rk.clone() } else { format!("return-{i}") },
@@ -299,23 +393,23 @@ fn library_detail_return_restores_engine_card_and_viewport_after_stack_eviction(
 
 #[test]
 fn library_publishes_the_actual_container_strip() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     let mut dispatcher = Dispatcher::<AppHost>::new();
     let mut bridge = Bridge::for_test(|| 0);
     bridge.stores.browse.borrow_mut().seed_two_source_table_for_test();
     bridge.refresh_browse_directory();
     super::show_page(&mut dispatcher, AppArg::Library);
     bridge.capture_chrome(&mut dispatcher);
-    let base = crate::ui::dispatch::STRIP_BASE;
+    let base = plx_ui::dispatch::STRIP_BASE;
     assert_eq!(dispatcher.nav.tabs.strip.iter().map(|member| member.elem).collect::<Vec<_>>(),
-        vec![base + 4, base, base + 1, base + 2, base + 3]);
+        vec![base + 4, base, base + 1, base + 2, plx_ui::widgets::TAB_KEY_WATCHLIST, base + 3]);
     assert_eq!(dispatcher.nav.tabs.strip_fallback, Some(base));
 }
 
 #[test]
 fn all_splits_in_one_frame_keep_the_same_library_listing() {
-    use crate::ui::dispatch::Rig;
-    let _guard = crate::testlock::serial();
+    use plx_ui::dispatch::Rig;
+    let _guard = plx_base::testlock::serial();
     let mut rig = super::Bridge::for_test(|| 0);
     {
         let mut browse = rig.stores.browse.borrow_mut();
@@ -333,7 +427,7 @@ fn all_splits_in_one_frame_keep_the_same_library_listing() {
         assert_eq!(split.views.section_hubs.shelves()[0].items.len(), 3);
     }
     let retained = (rig.listing.clone(), rig.directory.clone(), rig.section_hubs.clone());
-    rig.browse_run(crate::stores::browse::BrowseCmd::Reset);
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::Reset);
     assert!(retained.0.view().item(2).is_some());
     assert_eq!(retained.2.view().shelves()[0].items.len(), 3);
     assert_eq!(retained.1.view().sections().len(), 4);
@@ -350,16 +444,16 @@ fn all_splits_in_one_frame_keep_the_same_library_listing() {
 
 #[test]
 fn all_splits_in_one_frame_keep_the_same_home_publication() {
-    use crate::ui::dispatch::Rig;
-    let _guard = crate::testlock::serial();
+    use plx_ui::dispatch::Rig;
+    let _guard = plx_base::testlock::serial();
     let mut rig = super::Bridge::for_test(|| 0);
     let mut dispatcher = Dispatcher::<AppHost>::new();
-    rig.stores.hubs.seed_for_test(3, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(3, plx_data::pms::HubState::Ready);
     rig.capture_views(&mut dispatcher);
     assert_eq!(rig.split().views.hubs.hub(0).unwrap().items.len(), 3);
     // `split()` reads `rig.hubs`, the last-captured publication — resetting the live store
     // underneath it must not retroactively change what an already-taken split saw.
-    let _ = rig.stores.hubs.run(crate::stores::hubs::HubsCmd::Reset);
+    let _ = rig.stores.hubs.run(plx_data::stores::hubs::HubsCmd::Reset);
     assert_eq!(rig.split().views.hubs.hub(0).unwrap().items.len(), 3);
     assert_eq!(rig.split().views.hubs.hub_count(), 1,
         "a post-step draw must not pair new data with the old element projection");
@@ -369,10 +463,10 @@ fn all_splits_in_one_frame_keep_the_same_home_publication() {
 
 #[test]
 fn removing_the_pressed_home_item_cancels_instead_of_activating_its_replacement() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(3, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(3, plx_data::pms::HubState::Ready);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Home, tick(1), script_key(Key::Down, tick(1)));
     for i in 2..40 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
@@ -391,17 +485,24 @@ fn removing_the_pressed_home_item_cancels_instead_of_activating_its_replacement(
 
 #[test]
 fn a_midframe_reorder_keeps_painted_keys_matched_and_a_click_activates_the_seen_item() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
+    // the click lands on a Continue Watching card, whose press plays only under the Play setting
+    struct Back(plx_media::route::DeckPress);
+    impl Drop for Back {
+        fn drop(&mut self) { plx_media::route::restore_deck_press(self.0); }
+    }
+    let _back = Back(plx_media::route::deck_press());
+    plx_media::route::restore_deck_press(plx_media::route::DeckPress::Play);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(3, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(3, plx_data::pms::HubState::Ready);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     frame(&mut d, &mut rig, AppArg::Home, tick(1), script_key(Key::Down, tick(1)));
     for i in 2..40 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
     let focus = d.focus().unwrap();
     let (stops, rect) = rig.with_home(&d, |home, cx, _| {
         assert_eq!(home.focused_item::<AppHost>(Some(focus), cx).unwrap().rk, "1");
-        let mut draw = DrawFrame::new(cx, crate::ui::Painter::root());
+        let mut draw = DrawFrame::new(cx, plx_ui::Painter::root());
         home.record_stops::<AppHost>(&mut draw, cx.views.hubs);
         (draw.into_stops(), home.focused_rect::<AppHost>(Some(focus), cx, At::Drawn).unwrap())
     }).unwrap();
@@ -424,8 +525,8 @@ fn a_midframe_reorder_keeps_painted_keys_matched_and_a_click_activates_the_seen_
 
 #[test]
 fn home_worker_results_cross_the_addressed_dispatcher_ingest_once() {
-    use crate::ui::dispatch::Tap;
-    use crate::ui::machine::Addr;
+    use plx_ui::dispatch::Tap;
+    use plx_machine::machine::Addr;
     #[derive(Default)]
     struct Results(Vec<Addr>);
     impl Tap<AppHost> for Results {
@@ -435,26 +536,38 @@ fn home_worker_results_cross_the_addressed_dispatcher_ingest_once() {
             self.0.push(*addr);
         }
     }
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
+    // The process-global session cache can be `Unloaded` here (a fresh process, or after any test
+    // that dropped a `TempSession`), and then the session owner's refill asks the fixture adapter
+    // for a read on the first frame. Start from that case: the tap must see only hub results
+    // whatever the cache holds, and a fixture adapter starts no worker for it. `invalidate_for_test`
+    // leaves a `Revoked` cache as it is (a sign-out is never overwritten), and a `Revoked` cache
+    // needs no read, so the premise is asserted: without it this test would pass having asked
+    // for nothing.
+    plx_plex::plex::session::invalidate_for_test();
+    assert!(plx_plex::plex::session::refresh_need().is_some(), "premise: the owner will ask for a read");
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(2, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(2, plx_data::pms::HubState::Ready);
     let mut tap = Results::default();
     let req = rig.stores.hubs.queue_test_landing(Some(5));
     frame_with_tap(&mut d, &mut rig, AppArg::Home, tick(0), vec![], &mut tap);
     assert_eq!(rig.stores.hubs.hub_len_for_test(0), 5);
     assert_eq!(tap.0, vec![Addr {
-        to: MachineId::Store(StoreId::Hubs.ord()), req: crate::ui::machine::RequestId(req),
+        to: MachineId::Store(StoreId::Hubs.ord()), req: plx_machine::machine::RequestId(req),
     }]);
+    // Whatever a worker was going to answer has landed before the second frame, so a refill that
+    // did start one fails here every time, not on whichever run the worker beats the frame.
+    plx_base::storage_worker::drain_for_test();
     frame_with_tap(&mut d, &mut rig, AppArg::Home, tick(1), vec![], &mut tap);
     assert_eq!(tap.0.len(), 1, "the store tick must not re-deliver the result");
 
     rig.stores.hubs.queue_test_landing(Some(9));
     let result = rig.stores.hubs.take_results().pop().unwrap();
     let parts = CxParts { tick: tick(2), press: Default::default(), focus: Default::default(),
-        owner: crate::ui::machine::InputOwner::Entry(EntryId(0)) };
+        owner: plx_machine::machine::InputOwner::Entry(EntryId(0)) };
     let mut out = Vec::new();
-    let mut present = crate::ui::present::Present::new();
+    let mut present = plx_machine::present::Present::new();
     let mut fx = Effects::new(&mut out, MachineId::Nav, &mut present);
     assert_eq!(rig.deliver(MachineId::Store(StoreId::Search.ord()),
         &AppMsg::HubsResult(result), &parts, &mut fx), Handled::No);
@@ -462,16 +575,52 @@ fn home_worker_results_cross_the_addressed_dispatcher_ingest_once() {
 }
 
 #[test]
-fn supplied_home_results_use_the_dispatcher_without_consuming_live_arrivals() {
-    let _guard = crate::testlock::serial();
+fn one_home_landing_notifies_the_home_screen_once() {
+    use plx_ui::dispatch::Tap;
+
+    #[derive(Default)]
+    struct HubsNotices(u32);
+
+    impl Tap<AppHost> for HubsNotices {
+        fn effect(&mut self, _frame: u64, stamped: &plx_machine::machine::Stamped<AppHost>) {
+            if matches!(
+                &stamped.fx,
+                Fx::Deliver(
+                    MachineId::Instance(_),
+                    Delivery::Screen(ScreenEvent::StoreChanged(store, _)),
+                ) if *store == StoreId::Hubs.ord()
+            ) {
+                self.0 += 1;
+            }
+        }
+    }
+
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(2, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(2, plx_data::pms::HubState::Ready);
+    let mut tap = HubsNotices::default();
+    frame_with_tap(&mut d, &mut rig, AppArg::Home, tick(0), vec![], &mut tap);
+    let baseline = tap.0;
+
+    rig.stores.hubs.queue_test_landing(Some(5));
+    frame_with_tap(&mut d, &mut rig, AppArg::Home, tick(1), vec![], &mut tap);
+    frame_with_tap(&mut d, &mut rig, AppArg::Home, tick(2), vec![], &mut tap);
+
+    assert_eq!(tap.0, baseline + 1, "one Hubs landing must notify Home exactly once");
+}
+
+#[test]
+fn supplied_home_results_use_the_dispatcher_without_consuming_live_arrivals() {
+    let _guard = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    rig.stores.hubs.seed_for_test(2, plx_data::pms::HubState::Ready);
     rig.stores.hubs.queue_test_landing(Some(5));
     let captured = rig.take_hubs_results().pop().unwrap();
     let AppMsg::HubsResult(result) = captured.1 else { unreachable!() };
-    let payload = crate::pms::record::encode(&result);
-    let decoded = crate::pms::record::decode(payload, |_| None).unwrap();
+    let payload = plx_data::pms::record::encode(&result);
+    let decoded = plx_data::pms::record::decode(payload, |_| None).unwrap();
     rig.stores.hubs.queue_test_landing(Some(9));
 
     frame_with_results(&mut d, &mut rig, AppArg::Home, tick(0), vec![],
@@ -486,11 +635,11 @@ fn supplied_home_results_use_the_dispatcher_without_consuming_live_arrivals() {
 
 #[test]
 fn store_work_is_addressed_and_idle_polling_does_not_invent_a_change() {
-    use crate::stores::StoreWork;
-    let _guard = crate::testlock::serial();
+    use plx_data::stores::StoreWork;
+    let _guard = plx_base::testlock::serial();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
-    rig.stores.hubs.seed_for_test(0, crate::pms::HubState::Ready);
+    rig.stores.hubs.seed_for_test(0, plx_data::pms::HubState::Ready);
     frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
     let before = rig.stores.gen(StoreId::Hubs);
     d.emit(MachineId::Nav, Fx::App(AppFx::StoreWork(StoreWork::Hubs)));
@@ -498,9 +647,9 @@ fn store_work_is_addressed_and_idle_polling_does_not_invent_a_change() {
     assert_eq!(rig.stores.gen(StoreId::Hubs), before);
 
     let parts = CxParts { tick: tick(2), press: Default::default(), focus: Default::default(),
-        owner: crate::ui::machine::InputOwner::Entry(EntryId(0)) };
+        owner: plx_machine::machine::InputOwner::Entry(EntryId(0)) };
     let mut out = Vec::new();
-    let mut present = crate::ui::present::Present::new();
+    let mut present = plx_machine::present::Present::new();
     let mut fx = Effects::new(&mut out, MachineId::Nav, &mut present);
     for work in [StoreWork::Hubs, StoreWork::BrowseDiscovery] {
         assert_eq!(rig.deliver(MachineId::Store(StoreId::Search.ord()),
@@ -510,11 +659,11 @@ fn store_work_is_addressed_and_idle_polling_does_not_invent_a_change() {
 
 #[test]
 fn onboard_frame_lands_owned_discovery_before_capturing_its_directory() {
-    let _guard = crate::testlock::serial();
-    crate::plex::reset_servers_for_test();
-    let sid = crate::plex::register_for_test(
+    let _guard = plx_base::testlock::serial();
+    plx_plex::plex::reset_servers_for_test();
+    let sid = plx_plex::plex::register_for_test(
         "onboard-same-tick", "127.0.0.1", 9, "synthetic", "fixture");
-    let client = crate::plex::client_for(sid).unwrap();
+    let client = plx_plex::plex::client_for(sid).unwrap();
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().queue_discovery_for_test(
@@ -527,23 +676,23 @@ fn onboard_frame_lands_owned_discovery_before_capturing_its_directory() {
     assert_eq!(rig.browse_directory().sources().len(), 1,
         "the pre-capture owner pump publishes discovery to Onboard in the same tick");
     assert_eq!(rig.browse_directory().sources()[0].0, sid);
-    assert_eq!(rig.browse_directory().discovery(), crate::browse::SecFetch::Ready);
-    crate::plex::reset_servers_for_test();
+    assert_eq!(rig.browse_directory().discovery(), plx_data::browse::SecFetch::Ready);
+    plx_plex::plex::reset_servers_for_test();
 }
 
 #[test]
 fn controlled_discovery_recaptures_the_directory_in_its_delivery_turn() {
-    let _guard = crate::testlock::serial();
-    crate::plex::reset_servers_for_test();
+    let _guard = plx_base::testlock::serial();
+    plx_plex::plex::reset_servers_for_test();
     let mut rig = Bridge::for_test(|| 0);
-    let sid = crate::plex::register_for_test(
+    let sid = plx_plex::plex::register_for_test(
         "same-turn-discovery", "127.0.0.1", 9, "synthetic", "fixture");
-    let client = crate::plex::client_for(sid).unwrap();
+    let client = plx_plex::plex::client_for(sid).unwrap();
     rig.stores.browse.borrow_mut().queue_discovery_for_test(
         client, client.token_gen(), true);
     let result = rig.stores.browse.borrow_mut().take_discovery().unwrap();
-    let mt = unsafe { crate::task::MainThread::assume() };
-    let publisher = crate::plex::session::ProfilePublisher::scoped(&mt);
+    let mt = unsafe { plx_base::task::MainThread::assume() };
+    let publisher = plx_plex::plex::session::ProfilePublisher::scoped(&mt);
     rig.home_io = Some(crate::app::HomeIo {
         replay: false,
         preferences: Default::default(),
@@ -561,11 +710,11 @@ fn controlled_discovery_recaptures_the_directory_in_its_delivery_turn() {
         &mut effects, MachineId::Store(StoreId::Browse.ord()), &mut present);
 
     assert_eq!(rig.deliver(MachineId::Store(StoreId::Browse.ord()),
-        &AppMsg::Store(StoreCmd::Browse(crate::stores::browse::BrowseCmd::Discovery(result))),
+        &AppMsg::Store(StoreCmd::Browse(plx_data::stores::browse::BrowseCmd::Discovery(result))),
         &parts, &mut fx), Handled::Yes);
     drop(fx);
 
     assert_eq!(rig.browse_directory().sources().len(), 1,
         "the result is visible to the following screen Tick, not the next frame capture");
-    crate::plex::reset_servers_for_test();
+    plx_plex::plex::reset_servers_for_test();
 }

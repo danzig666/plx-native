@@ -6,7 +6,7 @@ not. If this file and a pointer disagree, the pointer wins and this file is stal
 
 The full design and migration status lives in [docs/ui-system-migration.md](docs/ui-system-migration.md).
 The rules you must follow when writing UI code live in
-[rust-modules/src/ui/CLAUDE.md](rust-modules/src/ui/CLAUDE.md). Read that before touching a screen.
+[rust-modules/ui/src/CLAUDE.md](rust-modules/ui/src/CLAUDE.md). Read that before touching a screen.
 
 ## The surface
 
@@ -20,7 +20,7 @@ that number is a couch measurement rather than a taste call.
 
 ## Colour is two layers
 
-From `ui/CLAUDE.md` rule 1, enforced in `rust-modules/src/ui/theme.rs`:
+From `ui/CLAUDE.md` rule 1, enforced in `rust-modules/ui/src/theme.rs`:
 
 - A **role** says what a colour is for: `theme::TEXT_PRIMARY`, `theme::CONTROL_IDLE_FILL`,
   `theme::scrim(a)`. Roles are what call sites use.
@@ -37,7 +37,7 @@ what job it does. The two layers mirror the external PlxNative Design System pro
 
 ## Size is a scale
 
-From `ui/CLAUDE.md` rule 2, defined in `theme::size`. Nine rungs, and a size is a role rather than a
+From `ui/CLAUDE.md` rule 2, defined in `gfx/tokens.rs`'s `size` and named as `theme::size`. Nine rungs, and a size is a role rather than a
 number:
 
 | Rung | px | What it is for |
@@ -60,6 +60,10 @@ Text is never hand-placed with a magic y. Use `ui::label::Label` for a single ru
 `text::text_cap_band`. See `label.rs` for why: a guessed offset mis-centers the moment a string has
 a descender.
 
+Alert titles and reading text share the left padding edge (`theme::alert::TEXT_ALIGN`). This
+applies to both decision dialogs and read-only panels. Button labels and paired value columns
+keep their control-specific alignment; centering the panel does not center its prose.
+
 ## Legibility over artwork is a graded contract, not a vibe
 
 This is the part most easily broken by accident, so it is the part worth knowing before you change a
@@ -70,7 +74,7 @@ can grade it. `widgets.rs`'s `hero_scrim_a` doc says it plainly: the contract "i
 is the arithmetic the anchor table in this module's tests reads, so the promise and the paint cannot
 come from two different curves."
 
-- Vertical ramp, [rust-modules/src/ui/landing_hero.rs](rust-modules/src/ui/landing_hero.rs):
+- Vertical ramp, [rust-modules/ui/src/landing_hero.rs](rust-modules/ui/src/landing_hero.rs):
   zero above `HERO_BASE_SCRIM_Y0` (0.34 of the screen, 367), `foot * MID_WEIGHT` at `KNEE_Y` (0.65
   of the screen, 702), and `foot = 0.30 + 0.64 * hero_a` at the bottom. The text stack builds upward
   from `TEXT_BOTTOM` 692 in a column of `COL_W` 660.
@@ -101,7 +105,7 @@ Improve a component before forking one. If a shared widget almost fits, add a bu
 style variant. A genuinely new widget still lands in `ui/` as a reusable `View` so the next screen
 gets it free.
 
-Card rows come from `ui::card_row` with a named `RowStyle`:
+Card rows come from `plx_ui::cards::Shelf` with a named `RowStyle`:
 
 - `HOME` for poster shelves, and the single source of shelf motion
 - `EPISODE` 420x236, gap 28, `focus_scale` 1.09, the 16:9 landscape still
@@ -112,12 +116,21 @@ The focus pop values differ on purpose and each carries the reasoning at its def
 of widely spaced circles needs a bigger pop than a tight poster shelf to read as selected at all.
 
 Tile text is `TileLabel::title(t)` or `TileLabel::titled(t, caption)`, with the focused-label band
-driven by `band_reveal` and `under_band`. Row headings are `theme::size::HEADLINE` at `LABEL_H` 46
-(see `related.rs`).
+driven by `line_reveal_for` and `under_band` (a line shows once the room under its card holds its
+box, for a shelf and a grid alike, so no caption line is drawn over the tile or heading under it as it is
+drawn, pop and heading lift included). Row headings are `theme::size::HEADLINE` at the SHARED
+shelf pitch, `consts::TITLE_DY + CARD_DY` (see `related.rs`, `cast.rs`, `extras.rs`) — the same
+heading-to-card distance Home and the Library use, quoted as the sum rather than as a number this
+file would then have to keep in step.
 
-Surfaces over a page use the `Glass` policy, which has exactly one axis: how often the backdrop
-snapshot refreshes. `Glass::CACHED` is the default, capture once on open. A surface over a moving
-page opts into `Glass::DYNAMIC_BACKDROP`.
+Menus over a page are glass on frozen ground (DS6: `popover_glass`, gradient face, 1 px rim, soft shadow, 30% scrim; the body shows the dim's latched field and the rim refracts the once-captured host snapshot, so nothing is re-blurred while a menu is up). Every other surface stands on the page's own latched light: `widgets::panel_ground` draws the
+underlay field the modal dim latched, windowed to the panel's rect and graded toward the panel
+material under its frost. Backdrop-blur glass (`Glass::DYNAMIC_BACKDROP`) is chrome-only — the top
+bar's track and the profile chip — plus two non-interactive standing notes in the page layer: the "Hold OK for options"
+capsule (`ui::hold_hint`: standing once per install on the card screens, and once on the Detail season pill) and the Library's
+scroll capsule (`ui::scroll_capsule`: the library's name, size and sort ("Films 1,284 · Date viewed") once the chrome has tucked away on a page whose header names two
+or more libraries; the nav pill's own glass, asked for by the owner in place of its frozen-ground form). The guard is the file
+list in `widgets_glass_budget_tests`, not this paragraph. See `docs/liquid-glass.md`.
 
 ## Navigation says where BACK goes, once
 
@@ -127,18 +140,23 @@ forget to answer, and `None` means BACK leaves the app entirely.
 
 This replaced "Press [BACK] to return" across the family. The old hint spent a 60 px band restating
 a key the remote already has, and could not say where the key went, which on a three-deep push is
-the only part anybody needs. `KeyHint` survives only on the read-only ALERT panels that hold no
-control at all, where the line really is the whole affordance.
+the only part anybody needs. Keep the BACK-return `KeyHint` on read-only ALERT panels, where
+it supplies their dismissal affordance; do not repeat it beside a route's return crumb.
+
+First-run consent sizes its narrative from the complete disclosure and the related-link column.
+Its contextual answer verbs share one horizontal row, separated from BODY-sized reading copy by
+`space::MD`. Exceptional overflow scrolls with UP/DOWN while the selected answer stays focused.
 
 ## Where to look when you are changing something
 
 | Changing | Read first |
 |---|---|
-| any screen | `rust-modules/src/ui/CLAUDE.md`, then `docs/ui-system-migration.md` |
+| any screen | `rust-modules/ui/src/CLAUDE.md`, then `docs/ui-system-migration.md` |
 | adding a screen | `docs/ui-system-migration.md` section (E) |
-| a colour or a size | `rust-modules/src/ui/theme.rs` |
-| anything behind hero text | `rust-modules/src/ui/landing_hero.rs` and `widgets.rs`'s scrim section, then re-grade the anchor table |
-| a horizontal row | `rust-modules/src/ui/card_row.rs` |
-| playback UI | `rust-modules/src/player/CLAUDE.md` |
-| Plex data feeding UI | `rust-modules/src/plex/CLAUDE.md` and `docs/pms-api.md` |
+| a colour | `rust-modules/ui/src/theme.rs` |
+| a size | `rust-modules/gfx/src/gfx/tokens.rs` (`mod size`, re-exported as `theme::size`) |
+| anything behind hero text | `rust-modules/ui/src/landing_hero.rs` and `widgets.rs`'s scrim section, then re-grade the anchor table |
+| a horizontal row | `rust-modules/ui/src/card_row.rs` |
+| playback UI | `rust-modules/media/src/player/CLAUDE.md` |
+| Plex data feeding UI | `rust-modules/plex/src/plex/CLAUDE.md` and `docs/pms-api.md` |
 | known gaps against official clients | `docs/parity-gaps.md` |

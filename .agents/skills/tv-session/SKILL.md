@@ -13,12 +13,13 @@ description: >
 # Working on the TV
 
 > **FIRST: take the television's lock.** One set, no OS-level mutex — two jobs on it produce
-> plausible WRONG data rather than a clean failure. `tools/tv-lock.sh acquire --why "…"` before the
-> session and `release` after (and `tools/tv-lock.sh status` to see who has it). Every driving
-> subcommand below refuses without it; `log` and `status` are read-only and only name the holder.
-> The **`tv-lock` skill** is the workflow, and the reason to take one lease for the whole session
-> rather than letting each command take its own: the gap between two of your own commands is where
-> another lane lands.
+> plausible WRONG data rather than a clean failure. `tools/tv-lock.sh acquire --ttl 30 --why "…"` before
+> one run (`up` … `down`) and `release` right after it (and `tools/tv-lock.sh status` to see who
+> has it). Every driving subcommand below refuses without it; `log`, `status` and `fg` are read-only
+> and only name the holder. The **`tv-lock` skill** is the workflow: one lease spans the commands of
+> ONE run, because the gap between two of your own commands is where another lane lands — but
+> never a whole working session. Build, read captures and fix with the lease released, then queue
+> again for the next run; other lanes are waiting on the same set.
 
 > **Before booking the TV: can the simulator answer this?** `make sim` runs the same app core on
 > macOS — real UI, real PMS data, boot triggers, the same FIFO tokens, self-screenshotting, and
@@ -44,9 +45,71 @@ tools/tv-session.sh key down down ok        # key tokens through the real handle
 tools/tv-session.sh click 960 540           # authored 1920x1080 coords
 tools/tv-session.sh shot [out.png]          # panel capture (video plane included)
 tools/tv-session.sh log [--flavor <f>] [regex]   # the on-device event log
+tools/tv-session.sh screen off|on           # blank/restore the PANEL only (app keeps running)
+tools/tv-session.sh sound off|on|status     # mute/unmute the TELEVISION (independent of the panel)
+tools/tv-session.sh background [APPID]      # launch a full-screen app over ours: WILL/DID background (0x103/0x104)
+tools/tv-session.sh foreground              # launch ours again, no close-first: WILL/DID foreground (0x105/0x106)
+tools/tv-session.sh fg                      # read-only: the foreground app id
 tools/tv-session.sh wan off [TTL]|on|status  # cut the SET's uplink (LAN intact), self-restoring
 tools/tv-session.sh down [--flavor <f>]     # hand the TV back
 ```
+
+`up --mock-plextv=PORT --screen login` signs the debug install in through `tests/mock_pms.py`'s own
+plex.tv (mock started with `--host 0.0.0.0 --advertise-ip <host LAN IPv4> --authorize-after 2`): it
+arms `plxnative-plextv`, opens the reverse ssh tunnel that makes that loopback address real on the
+set, and the mock's server arrives OWNED through the app's normal sign-in, so server-updates
+(owned-only) can be checked without a real account. `down` closes the tunnel (`.tv-plextv.pid`).
+The stored session it leaves on the install is mock-only; clear `state/` under the debug runtime
+root when done.
+
+**Watchlist writes.** The same `--mock-plextv` boot arms `plxnative-discover`, so a Watchlist
+add/remove on the set goes to the mock, and so do a person page's biography and filmography reads
+(the mock's Discover stand-in answers them with synthetic data; the app's Discover also follows a bare
+`plxnative-plextv`). A `--guest` boot (with or without `--mock`) has no loopback stand-in to arm, so it
+never reaches `discover.provider.plex.tv` either: the boot logs `discover: base=real reads=refused`
+and a person page's two reads are refused once and logged (`discover: GET … refused`). **That is a
+standing decision, and its cost is that such a boot shows no person biography and no filmography
+credits** (the page settles as for an unknown person); arm the stand-in to see them. Without a stand-in a debug build also refuses a Watchlist
+write, and the page header says `Debug: watchlist write blocked`. `plxnative-watchlist-live` is the OWNER's switch that lets a
+debug build write to their real plex.tv Watchlist: **never create it, and never pass
+`--arm watchlist-live`, unless the owner asks for it in this same session** (AGENTS.md; the
+`watchlist-live-guard.py` hook refuses both). `up` sweeps every trigger, so an agent run turns it off.
+
+A REAL-LOOKING network loss between the set and the mock needs no root and no change to the set's
+network: `tools/netloss-proxy.py` is a host-side TCP proxy the mock advertises as its own address
+(`tests/mock_pms.py --host 0.0.0.0 --port M --advertise-ip <host LAN IPv4> --advertise-port P
+--home-users 2 --authorize-after 2`, then `tools/netloss-proxy.py --upstream 127.0.0.1:M --listen
+0.0.0.0:P --control-port C`; plex.tv sign-in still reaches the mock directly through the
+`--mock-plextv=M` tunnel, and every PMS connection after it, the SSE feed included, crosses the
+proxy). `curl -X POST -d '{"mode":"blackhole"}' http://127.0.0.1:C/_proxy/mode` then flips it:
+`pass`; `blackhole` (existing connections stay open and go silent in both directions, new ones are
+accepted and never answered: no FIN, no RST, the closest userland analogue to a dead link, and what
+was held is delivered on `pass`); `reset` (RST every connection, RST new ones on accept); `refuse`
+(listener closed). `--schedule blackhole@10,pass@70` flips on a timer for a one-lease run. Every
+mode change and connection is logged with a timestamp. Stopping or SIGSTOPping the mock is NOT
+this: use it when the question is what the app does when the link itself dies. Stop the proxy and
+the mock when the run ends.
+
+`screen off` blanks the picture while the app keeps running and playback keeps decoding — a PANEL
+state, not an app state (see the owner's panel rule below). `sound off`/`on` calls
+`com.webos.service.audio/setMuted` and reads `getVolume` back to confirm rather than trusting the
+call's own result; `sound status` only reads `getVolume`. This is the sanctioned way to mute the
+set — no lane needs the raw luna-send/`PLX_TV_LOCK_BYPASS` route for it. Neither `screen` nor
+`sound` is restored automatically by `down`; a lane that muted or blanked the panel for its own
+reasons is the one that knows when to undo it.
+
+**The panel rule (the owner's standing directive, amended 2026-10-24):** the sound is OFF for every
+device run, and so is the panel (the set is in a living room), fps / smoothness runs included: the
+panel is only the backlight, and the app keeps presenting at full rate with it dark (Home `grid-pong`,
+release build: 73 frames/cycle at 59.9 fps panel off, 59.6-59.9 on; the panel state changed neither
+pacing nor misses). `tests/run.py --fps --mock` blanks it by default; `--panel on` lights it for a run
+someone wants to watch. `tools/tv-session.sh screen on|off` and `tools/tv-session.sh sound off` are
+both it. `shot` (the DISPLAY compositor read) works with the panel off:
+`docs/measurements/tv-session-7-2026-09-10.md` ran `screen off` first and got a 1920x1080 capture
+with real pixel values, and `docs/measurements/library-all-types-and-fps-2026-09-26.md` checked
+native captures with the panel off. The live capture stream (the app's own GLES frames) with the
+panel off is not on record: check its first frame instead of assuming either way. See
+`docs/agent-reference.md` (Tier 2) for the full history of this rule.
 
 `wan off` is the offline-mode test condition: a netfilter chain on the television rejects every
 v4 packet leaving the LAN and every DNS query, an `unreachable 2000::/3` route cuts public v6
@@ -54,7 +117,14 @@ v4 packet leaving the LAN and every DNS query, an `unreachable 2000::/3` route c
 TTL whatever happens to your shell. Read what the APP saw from its own log (`net: curl
 rc=6`, `pinned: … name resolved locally`), not from this command's status lines.
 
-`down` hands back the APP (interactive boot, triggers cleared); `tools/tv-lock.sh release` hands
+`background`/`foreground` are the sanctioned way to drive the app's lifecycle edges (the Home/launcher
+ribbon is an overlay on this set and delivers none, see the traps below). `background` launches
+`org.webosbrew.hbchannel` (or the id you pass, or `PLX_BG_APP`) through the application manager, refuses
+unless our app is the foreground one, and asserts the launched app took the foreground with our pid
+unchanged; `foreground` launches our own id again WITHOUT closing first and asserts the same. Read the
+edges from the app's log (`suspend`, `resume`, `network changed`), not from this command's lines.
+
+`down` hands back the APP (triggers cleared, app closed and NOT relaunched); `tools/tv-lock.sh release` hands
 back the TELEVISION. Do both, in that order — a released lock with an automated app still on
 screen is the next lane's confusing morning.
 
@@ -73,7 +143,8 @@ token injected → close-first relaunch → process alive → the route heartbea
 on the screen you asked for → the remote FIFO exists. A live view is one flag away.
 
 `--screen` accepts: `home` (default), `profiles`, `login`, `account`, `library[=N]`,
-`detail=<ratingKey>`, `person=<MOVIE ratingKey>`, `player=<ratingKey>`, `itemmenu`.
+`detail=<ratingKey>`, `collection=<ratingKey>`, `person=<MOVIE ratingKey>`, `player=<ratingKey>`,
+`itemmenu`.
 (That is the script's whole `case`; `tools/tv-session.sh --help` is the other copy.)
 
 For a multi-server boot, `--server <slot>` supplies the server half of a `detail=` or `player=`
@@ -90,6 +161,10 @@ of printing a misleading `session up`.
 interactive gesture is a real ≥500 ms hold (`press::LONG_MS`), which no boot trigger can express,
 so `plxnative-itemmenu` snaps into the grid and holds the focused card for you. Driving it by hand
 instead means the FIFO's split halves — `okdown`, sleep past 500 ms, `okup` — never the `ok` tap.
+To measure the hold's own animation (the card's press-in, the capsule fill, the menu opening and
+closing) rather than the settled menu, use the counted `plxnative-holdbench` trigger or the fps scenes
+`home-hold` / `collection-hold` (`home-tap` / `collection-tap` for press-and-cancel): they send a real
+OK-down, never an OK while the menu is up, and dismiss with Back. `docs/agent-reference.md` has the wire format.
 
 `person` is the odd one: the actor page has **no boot trigger of its own** — it is *reached*
 from a detail page's cast row, so the rk you pass is the **movie's**, and `up` arms the three
@@ -99,13 +174,15 @@ you want both the Movies and Shows shelves populated.
 
 ## Which install — and the one step `up` cannot do for you
 
-Two builds live on this television. **stable** is `com.beb.plxnative`, the app the household
+Three builds live on this television. **stable** is `com.beb.plxnative`, the app the household
 watches with; **debug** is `com.beb.plxnative.debug`, the developer build beside it, with its own
-launcher tile (amber DEV bar), its own sign-in and its own runtime files. webOS keys the install
-directory, SAM's `launch`/`closeByAppId` and the LS2 role file on that id, so the two cannot touch
-each other. **`debug` is the default**, deliberately: deploying to `debug` when you meant `stable`
-costs you retyping one command, while the reverse destroys a working install — possibly mid-film —
-on the app somebody actually watches with. So `stable` has to be typed.
+launcher tile (amber DEV bar), its own sign-in and its own runtime files; **nightly** is
+`com.beb.plxnative.nightly`, its own install beside the other two with its own launcher tile
+(grey NIGHTLY bar), runtime root and crash log. webOS keys the install directory, SAM's `launch`/`closeByAppId` and the LS2 role file on
+that id, so none of the three can touch each other. **`debug` is the default**, deliberately:
+deploying to `debug` when you meant `stable` costs you retyping one command, while the reverse
+destroys a working install — possibly mid-film — on the app somebody actually watches with. So
+`stable` (and `nightly`) have to be typed.
 
 **A flavour must be INSTALLED once before `deploy`, and therefore before `up`, can reach it:**
 
@@ -135,7 +212,7 @@ make -s print-tv                        # the TV address, expanded
 ```
 
 **Never reach for `make -p`/`make -pn` to read one of these.** It prints a recursive variable's
-UNEXPANDED DEFINITION, so `TV` comes back as the literal `$(strip $(shell cat .tv-host …))` — every
+UNEXPANDED DEFINITION, so `TV` comes back as the literal `$(strip $(shell tools/tv-config.sh host …))` — every
 ssh built from it then fails, and the tool reports an unreachable television that is in fact awake
 and idle in front of you.
 
@@ -143,14 +220,20 @@ and idle in front of you.
 
 The stable install keeps `/tmp` byte for byte, so every recipe and every `/tmp/plxnative-…` line
 below stays literally true for the app users get. A flavoured install puts its triggers, its
-`plxnative-remote` FIFO and its three `*.log` files in `/tmp/<app id>` instead. **Every name is
+`plxnative-remote` FIFO and its runtime logs in `/tmp/<app id>` instead. **Every name is
 unchanged — only the directory moved**, so read each `/tmp/plxnative-…` path here as
 `$(make -s print-rundir FLAVOR=…)/plxnative-…`.
+
+`plxnative-diag.log` is the storage worker's allowlisted snapshot on every flavour (0640,
+at most 16 KiB). It records build/uid/gid, fixed-label write probes, activation and helper stages;
+it contains no session data or resolved paths. Events, crash and stderr are 0640 too (they were
+0600 until 2026-10-04; group read is what lets a Dev Mode user fetch them). The diagnostics
+file is exempt from trigger detection and is replaced only when diagnostic status changes.
 
 **Two payloads do not carry the prefix, and that rewrite rule silently misses them:**
 `sample.h264` and `sample.h265`, the raw Annex-B samples the player feeds instead of streaming.
 They moved into the runtime root with everything else — `$(make -s print-rundir FLAVOR=…)/sample.h264`,
-not a shared `/tmp/sample.h264` — and they are read through `dev::read_sample`, which resolves via
+not a shared `/tmp/sample.h264` — and they are read through `devtrig::read_sample`, which resolves via
 `paths::in_runtime_dir` like every other dev read. A second consequence follows from the same
 missing prefix and is easy to want the other way round: `dev::any_trigger_present` matches on
 `plxnative-`, so **a sample does NOT mark the boot as automated** and does not suppress the
@@ -202,11 +285,18 @@ Every `plxnative-*` trigger in the install's runtime root is read **once at boot
 must be in place before the launch. Anything you want to do to a *running* app goes through
 the remote FIFO (`tv-session.sh key` / `click`).
 
-**Three exceptions, all deliberate and all read LIVE**: `plxnative-failtest` (so a read-out variant
-can be swapped mid-playback), `plxnative-testpat` (the same for the synthetic ground), and
+**Some exceptions are deliberate and read LIVE**: `plxnative-failtest` (so a read-out variant
+can be swapped mid-playback), `plxnative-testpat` (the same for the synthetic ground),
 `plxnative-gohome` (which leg of the root press to force — armed AFTER the screen you want has
 settled, because arming it before the launch also makes the boot count as automated and moves which
-screen you land on).
+screen you land on), and `plxnative-signinfail` (`auth::scripted::signinfail_spec` is re-read on
+every sign-in code request and every poll, so *Try again* keeps failing the same way until the file
+is removed).
+
+**`plxnative-drawable=<W>x<H>` (debug builds only) asks for that window size at boot**, e.g.
+`1280x720`, bounded to 640x360..=1920x1080 (anything outside is ignored and logged). It outranks
+Settings > System > Interface resolution, so a TV run can compare sizes without touching the
+stored setting. Like every trigger it marks the boot as automated.
 
 **Two traps that cost real time:**
 
@@ -230,7 +320,7 @@ literals inside it are just where the stable install's root is.
 
 Two halves are needed and a single grep is the trap: a path literal now only ever appears in a
 COMMENT, and four triggers (`grid`, `h265`, `playidx`, `ptype`) are named nowhere but their
-`dev::flag`/`dev::read` call, so grepping paths alone silently under-reports the catalog.
+`devtrig::flag`/`devtrig::read` call, so grepping paths alone silently under-reports the catalog.
 
 Boot gate order, when you care which identity you land as: `plxnative-login` forces the QR
 screen → `plxnative-token` beats any stored session → a stored session (with the picker
@@ -245,18 +335,19 @@ for a multi-user account) → otherwise QR sign-in. Nothing is compiled into the
 
 **Two ports, and they are not the same one.** `:8909` is the local page `stream-screen.py`
 serves you; the app's own capture listener on the TV is a second port that the page consumes.
-That listener is **8910 for the stable install and 8911 for a flavoured one** — two installs must
+That listener is **8910 for the stable install, 8911 for debug, 8912 for nightly** — installs must
 not fight over one socket — and `make -s print-appport FLAVOR=…` is that rule for the shell
 (`capture::default_port` is the same rule in Rust; `ci/flavor.py --selftest` compares them).
 
 The split only bites when you arm the trigger **by hand**: an empty `plxnative-capture` takes the
-default for that install, so a debug install lands on 8911 and the page needs
-`--app-port 8911` (or `TV_APP_PORT=8911`) to find it. `tv-session.sh --stream` never has to be told:
-it writes the resolved number into the trigger content (`plxnative-capture=$APPPORT`, where
-`APPPORT` came from `make -s print-appport FLAVOR=$FLAVOR`) and hands the SAME variable to
-`stream-screen.py --app-port`, so the arm and the viewer cannot address different ports. The
-session is therefore on 8910 for `--flavor stable` and 8911 at the default — the port follows the
-flavour rather than being pinned to either.
+default for that install, so a debug install (the default flavour) lands on 8911 and the page needs
+`--app-port 8911` (or `TV_APP_PORT=8911`) to find the debug install. `tv-session.sh --stream` never
+has to be told: it writes the resolved number into the trigger content
+(`plxnative-capture=$APPPORT`, where `APPPORT` came from `make -s print-appport FLAVOR=$FLAVOR`)
+and hands the SAME variable to `stream-screen.py --app-port`, so the arm and the viewer cannot
+address different ports. The session is therefore on 8910 for `--flavor stable`, 8911 at the
+default (debug), or 8912 for `--flavor nightly` — the port follows the flavour rather than being
+pinned to any one of them.
 
 **Stream resolution is a speed lever, not cosmetics.** MPEG1 has no intra prediction, so
 encode cost tracks screen *detail* as much as size. Measured on the same home screen (a
@@ -342,8 +433,8 @@ prints that it revoked it, and `status` prints that it is live. Do not leave one
 ## Handback etiquette
 
 This is the user's actual television. When you are done, `tv-session.sh down` strips the
-token and every automation trigger and relaunches a genuine interactive boot (picker or QR,
-as a real user gets). Leaving an injected-token session up means the next person to turn on
+token and every automation trigger and closes the app, leaving the TV as it was (it does not
+relaunch the app). Leaving an injected-token session up means the next person to turn on
 the TV is signed in as whatever the automation chose.
 
 ## Gotchas
@@ -370,7 +461,7 @@ the TV is signed in as whatever the automation chose.
   split separates the app directories and the runtime roots, and nothing else: one panel,
   one video plane, one capture service, one set of luna calls. Run `tv-session.sh down`
   (or just stop the streamer) first.
-- **`BACK` at a ROOT hands the screen to the LG launcher** (`webos::go_home`) — Home's root, the
+- **`BACK` at a ROOT hands the screen to the LG launcher** (`tv::home::go_home`) — Home's root, the
   who's-watching picker and the QR sign-in all do this since 2026-09-03, and none of them ends the
   session. The consequence for a driver: a stray `back` at a root puts the **LG launcher RIBBON
   over the still-running, still-drawing app** — on this webOS 4 set the launcher is an overlay, so

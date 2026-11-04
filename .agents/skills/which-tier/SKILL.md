@@ -8,9 +8,8 @@ description: >
   TOUCHED — pure logic, a screen, text rasterization, an animation, frame rate, the player
   pipeline, selection/resume/markers, FFI, the release feature set, packaging — to the cheapest
   tier that can actually see it, names the tiers that cannot, and hands off to `ui-sim`,
-  `tv-session`, `tv-lock` or a plain `make check`. There are three tiers here with non-obvious
-  blind spots, and both recorded mistakes were the same shape: a green result from a tier that was
-  never able to see the thing being changed.
+  `tv-session`, `tv-lock` or a plain `make check`. Each tier has non-obvious blind spots, and a
+  tier that cannot see a change passes it green.
 ---
 
 # which-tier — what actually verifies this change
@@ -42,7 +41,7 @@ minutes of television for a pipeline the change cannot reach.)
 Mac through `/tmp/plxnative-playurl`, **no Plex anywhere**. Ask `./tests/run.py --list` for the
 count — a number written down here has now rotted twice, the second time inside the branch that
 was correcting the first. The 21 library-backed cases are
-`./tests/run.py --server`; `--fps` and `--fps-player` imply `--server` (their scenes navigate a
+`./tests/run.py --server`; `--fps` and `--fps-player` imply `--server` (except with `--mock`, which refuses it; see tests/README.md) (their scenes navigate a
 real signed-in Home and would otherwise grade a QR screen). `--pipeline` still parses — it names
 the default — and pairing it with `--server`/`--fps` is refused rather than silently resolved.
 
@@ -54,10 +53,9 @@ is not a subset failure, it is a whole bypassed layer:
   and a regression there passes it green;
 - it reaches **no resume, no markers, no Up Next, no `/:/timeline` reporter, no track SELECTION,
   and no transcode path** whatsoever;
-- `engine`'s `_ =>` arm maps an unrecognised audio codec to `"AC3"` and a non-`hevc` video codec to
-  the H264 payload — so a trigger that was **never read** still produces exactly the right payload
-  for the AC-3 baseline case. That is the tier's own false-PASS shape, and it is why the matrix
-  carries cases expecting `"AC3 PLUS"` and `"AAC"`.
+- Unsupported audio declarations fail before Load. The matrix's codec assertions still verify
+  that each fixture supplies the intended declaration; an omitted trigger cannot be inferred
+  from a generic liveness assertion.
 
 **Never ship on the default alone.** `tests/README.md` has the full tier table.
 
@@ -65,7 +63,7 @@ is not a subset failure, it is a whole bypassed layer:
 
 | tier | command | cost | can never answer |
 |---|---|---|---|
-| **1 — host suite** | `make check` | **3.8 s warm**, no TV | anything that needs a native library, a Linux kernel, or a pixel |
+| **1 — host suite** | `make check` | **~100 s warm on an otherwise idle 10-core Mac** (the cargo branch, the harness and the concurrent Python/shell/C gates all run beside each other), no TV, but machine-wide-bounded to two concurrent runs: it queues behind two other worktrees' `make check`s first | anything that needs a native library, a Linux kernel, or a pixel |
 | **1.5 — simulator** | `make sim` + the `ui-sim` skill | seconds, N at once | frame rate, text rasterization, anything about video |
 | **2 — the device** | `tv-lock` → `wake-tv` → `tv-session` / `tests/run.py` | one television, serialized | what only a PHOTOGRAPH of the panel shows — see below |
 
@@ -82,7 +80,7 @@ but a photograph could show it (`gfx.rs`, at the `glBlendFuncSeparate` call).
 
 ### Tier 1 — `make check`
 
-`cargo +$(RUST_NIGHTLY) test --lib`, preceded by `make lint` (three **named** clippy lints —
+`cargo +$(RUST_TOOLCHAIN) test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens`, preceded by `make lint` (three **named** clippy lints —
 `ifs_same_cond`, `same_functions_in_if_condition`, `if_same_then_else` — the shadowed-branch gate),
 and followed by **three** host checks that are easy to forget are in here: `python3 ci/flavor.py
 --selftest` (the flavour transform, whose central assertion is that the STABLE transform is the
@@ -93,11 +91,12 @@ whole of what that tool exposes to the public internet, and the only gate it has
 cargo can see a python file).
 
 **It is not sub-second, and the figure that circulates is one of its five parts.** The ~0.3 s
-everybody quotes is `cargo test --lib` alone, and that part is itself ~28 s now; end to end the
+everybody quotes is `cargo test --lib` alone, and that part is itself tens of seconds now (the 14 per-crate test binaries run side by side through
+`tools/cargo-test-parallel.py`; `make test-crate C=<crate>` runs just the one you touched); end to end the
 gate runs in MINUTES warm. The bulk of it is `python3 tests/test_harness.py`, which shells out to
-`ci/check-deps.sh` about thirty times to prove each structure gate still catches a planted
-violation — 386 s of a 616 s run, measured 2026-09-17, and that is AFTER the 2.5× speed-up of
-`check-deps.sh` itself. The lab selftest's **~7 s is mostly two DELIBERATE rate-limit waits** — so
+`ci/check-deps.sh` (11 s a run) once or more per self-test to prove each structure gate still
+catches a planted violation — 661 s of a 1100 s run, measured 2026-10-01 on a cold lane at load
+~5, before those self-tests moved to private tree copies and a thread pool (175 s after). The lab selftest's **~7 s is mostly two DELIBERATE rate-limit waits** — so
 a ten-second-plus pause there is the target working, not a hang. (That step
 also SSDP-probes the LAN to report whether a UPnP gateway is present; still no television, still no
 lock.) Do not write a new number here: measure it if you need one — this file has already carried a
@@ -107,13 +106,14 @@ lock.) Do not write a new number here: measure it if you need one — this file 
 Count it yourself if you need the number:
 
 ```sh
-cd rust-modules && cargo +nightly test --lib -- --list | grep -c ': test'
+cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens -- --list | grep -c ': test'
 ```
 
-**Run it on nightly.** `make check` uses `cargo +$(RUST_NIGHTLY)`; a bare `cargo test` uses your
-default toolchain and the two have disagreed — `task.rs`'s refused-spawn test passed on stable
-while panicking inside `std` on nightly, which reads as flakiness and is not. Nightly is what
-ships, because `-Z build-std` is what ships.
+**Run it on the pinned toolchain.** `make check` uses `cargo +$(RUST_TOOLCHAIN)`, the `channel` of
+`rust-modules/rust-toolchain.toml` (a bare `cargo` inside `rust-modules/` reads that file; from the
+repository root a bare `cargo test` uses your default toolchain). The two have disagreed —
+`task.rs`'s refused-spawn test passed on stable while panicking inside `std` on nightly — back when
+nightly shipped. One pinned stable release now builds the ARM binary and runs the host gates.
 
 **Three structural limits.** Know them before trusting green:
 
@@ -126,12 +126,12 @@ ships, because `-Z build-std` is what ships.
    exactly this: on the TV's kernel `shutdown(2)` **does** abort a `connect(2)` in progress, while
    on Darwin the same call makes `connect_timeout` report *success* on a socket that never
    connected. A socket assertion passing here is evidence about macOS.
-3. **Some tests are serialized on crate globals**, not parallel. `metadata.rs`'s take `lib.rs`'s
-   crate-wide `testlock::serial()`, and so does every owned-screen test that seeds a store —
+3. **Some tests are serialized on crate globals**, not parallel. `metadata.rs`'s take
+   `plx_base::testlock::serial()` (one lock per test binary), and so does every owned-screen test that seeds a store —
    an owned screen keeps no focus of its own (the `FocusEngine` does), but `pms`'s catalog statics
    are shared across modules. `ui/xfade.rs` is the cautionary case, and its own module doc says why:
    pure value semantics **with one exception that costs them their parallelism** — `tick` reports
-   to `ui::idle`'s process-global dirty flag, which `ui::idle`'s own "a settled screen does not
+   to `plx_machine::idle`'s process-global dirty flag, which `plx_machine::idle`'s own "a settled screen does not
    repaint" assertions read. Without the lock they fail *other modules'* tests intermittently,
    which is the worst shape a flake can take. **Anything you make report to the frame gate inherits
    that obligation**, and reach for `testlock` rather than a fresh local mutex when the global is
@@ -159,14 +159,17 @@ It provably cannot answer:
 - **Anything about video.** The 29-symbol Starfish/ACB seam does not exist off-device; Play lands
   on the app's real failure read-out, which is correct behaviour and a convenient way to look at
   that screen.
+- **The cached modal ground.** The simulator runs with the frame cache OFF (`frame cache:
+  CopyTexSubImage error=0x500 — cache off`), so `popover::host`'s cached stages never run and a sim
+  capture cannot show a fault in them; only the TV can.
 
 **Two host-only traps that read as your change being broken.** The recipes are `ui-sim`'s; they are
 named here only so you can tell them from a regression in your own edit.
 
 - **`make sim-shot` hangs on a settled screen.** `PLXNATIVE_SHOT_FRAME` (`SIM_FRAME`, default 200)
-  counts **presented** frames, and `ui::idle` gates presents — so a screen that settles before
+  counts **presented** frames, and `plx_machine::idle` gates presents — so a screen that settles before
   frame 200 never reaches it. Arm `plxnative-noidle` in the instance root, or drive the `shot` FIFO
-  token instead, which calls `ui::idle::invalidate()` for you (`shot.rs::request`).
+  token instead, which calls `plx_machine::idle::invalidate()` for you (`shot.rs::request`).
 - **A synthetic `SDL_TEXTINPUT` SIGSEGVs inside SDL** — macOS `libSDL2` is sdl2-compat forwarding
   into SDL3, whose text event carries a `char *text` where SDL2 carries an inline `char[32]`. No
   Rust panic, no log line, the process is just gone. The FIFO's key and `ck:` tokens are safe
@@ -182,7 +185,7 @@ OS-level mutex, and two jobs on it produce plausible WRONG data rather than a cl
 ./tests/run.py                 # the synthetic tier — the player pipeline, no Plex, no credentials
 ./tests/run.py --server        # the 21 library-backed cases — selection, the whole Plex chain
 ./tests/run.py --fps           # the UI fps scenes (implies --server; resolves the test identity)
-./tests/run.py --fps-player    # + the player-overlay scenes (info-panel, track-menu, chapters-panel)
+./tests/run.py --fps-player    # + the player-overlay scenes (manifest `tier: "player"`; `--list --server` names them)
 ./tests/run.py --list          # OFFLINE: the synthetic cases, each declaration and raster, and
                                #          which fixtures the pack is missing. THE census — a count
                                #          written into prose here rotted inside one commit.
@@ -200,8 +203,9 @@ nothing — no television, no PMS, no plex.tv — but it **lists the tier you di
 `--list` prints the synthetic matrix, and the library cases with their SKIP reasons appear only
 under `--list --server`. `run.py` prints two different tables on purpose, because the two matrices
 share no key (a `fixture` and a `declare` on one side, an `item`/`rk` on the other). It also still
-needs a TV **address** — `.tv-host`, the overlay's `tv`, or `--tv` — which it never dials; with none
-of the three it exits saying so.
+needs a TV **address** — the overlay's `tv`, `--tv`, or the shared lookup (`tools/tv-config.sh host`:
+the `.tv-host` files, then `~/.config/plxnative/tv-host`) — which it never dials; it exits saying so
+only when none of those yields one.
 
 **And the guard hook refuses it.** `.claude/hooks/tv-lock-guard.py` classifies by COMMAND WORD, so
 `./tests/run.py --list` is blocked exactly like a real run (verified 2026-08-23 by feeding the hook
@@ -219,12 +223,13 @@ knows the set is theirs.
 | **pure logic** — `route/plan.rs`, `plex/`, `metadata.rs`, `browse.rs`, `aq.rs`, `stream.rs` parsing, `ff.rs` helpers | `make check` (+ a new test) → `make sim-shot` if a screen reads it | the native libraries; Linux syscall semantics; whether the value reaches a pixel |
 | **UI layout / spacing / colour / a new screen** (`ui/`) | `make check` → `make sim-shot SIM_W=1920 SIM_H=1080` (`ui-sim`) → **one device capture, looked at** | the fps tier is blind to pixels (the 2026-08-13 watched-mark bug); a FITTED sim shot is 960x540 on a 1x display, layout evidence only — which is what `SIM_W`/`SIM_H` exist for |
 | **text rasterization, fonts, the `theme::size` ladder** | `tools/font-hint-audit.py` → device capture | **the simulator is disqualified** — different FreeType; `make check` never rasterizes anything |
+| **Arabic and Hebrew UI text** (shaped runs, `gfx/src/rtl.rs`) | `make check` (coverage, bidi order) → `make check-ass` (shaped ink through libass-plx) → device capture | libass-plx draws these runs with the same pinned FreeType and HarfBuzz in the simulator and on the TV, so their shape and order are evidence there; their weight beside the Inter runs around them stays a device question |
 | **anything ANIMATED, or repainting from a CLOCK** | two host tests (runs / rests) → `--fps` with a real `fps_floor`, plus an `fps_ceiling` if the screen settles | `loop_floor` cannot see a stopped animation at all; the simulator cannot see rate |
 | **frame rate / perf** | `profile-tv`: `./tests/run.py --fps` unarmed, or one scene with `--graphics-profile` for pacing + IRQ + HWCNT | never the simulator; only the profile's production leg has quotable FPS; `drift` is reported, never asserted |
 | **player pipeline, demux, Starfish/ACB, the Load payload, `route/decision.rs`** | `make check` (pure `ff.rs` logic) → `./tests/run.py` (synthetic) → `--server` if selection is involved | the synthetic tier bypasses `metadata → plan → apply_plan` and false-PASSes an unread trigger via `engine`'s `_ =>` arm |
 | **track selection, resume, markers, Up Next, `/:/timeline`** | `./tests/run.py --server` — **only** | the synthetic tier reaches none of these; a bare `./tests/run.py` is not evidence about any of them |
 | **FFI / linkage / `dynlib!`** | `tools/fwcompat.py` → `make check` → **`make sim` or `make macapp`** → device | **there is no link error any more**; and the device cannot see an Apple-ABI variadic bug — see below |
-| **the release feature configuration** | `cargo +nightly check --lib --no-default-features` → `make RELEASE=1` | `make check`, `make` and `make sim` all build DEV features; a broken `RELEASE=1` is invisible to every one of them |
+| **the release feature configuration** | `make check-nodef` (`cargo check --lib --no-default-features`) → `make RELEASE=1` | `make check`, `make` and `make sim` all build DEV features; a broken `RELEASE=1` is invisible to every one of them |
 | **the Makefile, packaging, the `.ipk`** | `make check` (flavour selftest) → `make ipk` (runs `ci/check-package.py`) → a real `make FLAVOR=… install` | the dev loop is `make deploy`, which scp's into an already-registered app dir and **never exercises the package** |
 
 ### The rows that carry a trap
@@ -238,14 +243,16 @@ given screen is its business, not this file's.
 
 **Anything animated.** It owes **two** tests, because the failure modes are opposite and each is
 invisible to the other's gate. Host: it reports while running **and** goes quiet at rest —
-`ui/idle.rs` and `ui/xfade.rs` are the pattern, including a settled-tree case that steps 439
+`machine/src/idle.rs` and `ui/xfade.rs` are the pattern, including a settled-tree case that steps 439
 springs and asserts *nothing* is requested. Device: an `fps_floor` scene proving it still animates
 under the present gate, and an `fps_ceiling` proving its screen actually stops. The ceiling is not
 politeness — an over-reporting animator gives back the whole ~38-points-of-a-core idle saving while
 every `floor` in the suite still passes.
 
 **Anything that animates from a CLOCK rather than a spring** — a millisecond ramp, a phase, a
-countdown — must call `ui::idle::invalidate()` itself. `note_spring` cannot see it, and both
+countdown — must report itself: `plx_machine::idle::invalidate()` when it changes content,
+`plx_machine::idle::note_motion()` when it is a decoration (the tab pulse; damage under a standing
+popover re-captures the frozen host every frame). `note_spring` cannot see it, and both
 `Xfade::tick` (every CONTENT cross-fade) and `Spinner::draw` (every loading read-out) **shipped
 FROZEN** before they were made to report. (`Xfade` drove the ROUTE dip too until restructure phase
 12 lifted that onto `ui::containers::transition::PageDip`, which reports from inside its own
@@ -284,7 +291,8 @@ coexist in one tree — so the usual case is caught for you. That tree is **`$TM
 crate's own `target/`: this checkout can live on a network mount, and cargo cannot take its
 incremental-session lock there (`os error 45`), which failed EVERY edit with a "RELEASE-CONFIG
 BREAK" that was really a filesystem answer. Set `CARGO_TARGET_DIR` to override. Confirm it is wired in `.claude/settings.json` before relying on it, run
-the command by hand before shipping regardless, and prefer `crate::dev::latched_flag!` over
+`make check-nodef` by hand before shipping regardless (it builds in the checkout's own `target/`, not
+that `$TMPDIR` tree), and prefer `plx_base::devtrig::latched_flag!` over
 hand-rolling a `#[cfg]`/`#[cfg(not)]` pair.
 
 **Packaging.** Two ipk bugs shipped undetected until 2026-08-02 — a missing
@@ -328,8 +336,9 @@ built the package; a real release goes through the **`cut-release`** skill.
 
 ## Cheapest first, and why it is not just thrift
 
-Run `make check` before waking a television. It costs under a second, it needs no NDK, no lock and
-no set, and it is the **only signal you get without taking the mutex** — which matters because the
+Run `make check` before waking a television. It costs a few minutes warm, needs no NDK and no TV, and it is the **only signal you get without taking the television's mutex** — a
+different lock now bounds `make check` itself to two concurrent runs machine-wide
+(`tools/check-lock.py`), so a contended run waits on other worktrees rather than on the TV — which matters because the
 television is not merely slow, it is *shared*, and every minute you hold it is a minute another
 lane is queued behind you or, worse, colliding with you and producing data that looks fine. The
 ordering is therefore: host suite → simulator → device, and you move down a tier only when the one

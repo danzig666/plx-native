@@ -1,5 +1,7 @@
 # libavformat demuxer plan — replacing `mkv.rs`
 
+> Superseded for text subtitles: every text track now renders through libass; see `docs/ass-subtitles.md`.
+
 **Status: EXECUTED (all phases A–E landed; 2026-07-18).** `ff.rs` is the only demuxer;
 `mkv.rs`, the `cues_thread`/Cue-index apparatus, the second HTTP connection (`hs2`), and the
 `/tmp/plxnative-demux=mkv` bisect trigger are all deleted. Two knowing deviations from the spec
@@ -32,7 +34,9 @@ Push, into the single `AuQueue`:
 
 - **Video AUs** (`es=1`): H264/HEVC **Annex-B** — every NAL prefixed with a `00 00 00 01` start
   code; **SPS/PPS (H264) or VPS/SPS/PPS (HEVC) prepended at every keyframe**; `key=1` iff the AU
-  is an IDR (H264 NAL type 5) / IRAP (HEVC NAL types 16–23). One `aq_push` = one coded picture.
+  is an IDR (H264 NAL type 5) or an H264 non-IDR I-slice at a random access point (the packet is
+  flagged `AV_PKT_FLAG_KEY`, or an SPS precedes the slice in the AU) / IRAP (HEVC NAL types
+  16–23). One `aq_push` = one coded picture.
 - **Audio AUs** (`es=2`, `key=1` always): **raw** elementary-stream frames — AC3/EAC3 syncframes,
   **raw AAC (no ADTS)** — bytes verbatim from `av_read_frame`, no container framing, no BSF.
 - **PTS in nanoseconds of content time**: `pts_ns = av_rescale_q(pkt.pts, stream.time_base,
@@ -424,11 +428,11 @@ guessing, no missing param sets. The `feed_stream` rebase (first `es==1 && key!=
 
 ## 4. Integration — file-by-file changes
 
-### `rust-modules/src/ff.rs`
+### `rust-modules/media/src/ff.rs`
 - Add everything in §1. Keep `smoke()`. Add the `demux()` entry the thread calls, plus the AVIO
   glue, BSF setup, and cleanup. This module becomes the demuxer (its doc-comment already says so).
 
-### `rust-modules/src/player/threads.rs`
+### `rust-modules/media/src/player/threads.rs`
 - **`stream_thread` (60-144):** replace the **entire body** with the §2 flow. Keep the signature
   `(host, port, path, aq: SendPtr<AuQueue>, hs: SendPtr<HttpStream>)` and the trailing
   `aq_set_eof(aq_p)`. The 12 MiB `scratch` malloc (73-76) is **gone** (the BSF owns its buffers).
@@ -444,7 +448,7 @@ guessing, no missing param sets. The `feed_stream` rebase (first `es==1 && key!=
   HTTP connection (`hs2`).
 - `timeline_thread` / `subs_thread` / `timeline_path` / `push_vtt_cue`: **unchanged.**
 
-### `rust-modules/src/player/engine.rs`
+### `rust-modules/media/src/player/engine.rs`
 - **`start_bufferfeed` spawn block (218-249):** remove the `cues_th` spawn (238-243) and the `hs2`
   box (211, 225, 228) + `Engine.hs2` field. Keep `hs` (the demux socket, now wrapped by AVIO).
   **Payload/codec logic (189-207) unchanged** — see below.
@@ -464,7 +468,7 @@ improvement** (not required): source codec + dims from `codecpar` (`codec_id →
 dependency — but that requires moving payload construction *after* `avformat_find_stream_info`
 (open the input on the main thread, or defer `sf_load`). Defer this to a later cleanup.
 
-### `rust-modules/src/player/pump.rs`
+### `rust-modules/media/src/player/pump.rs`
 - **Direct-play seek branch (93-101):** replace `cue_byte_for(t)` / the CBR byte estimate /
   `SHARED.seek_byte.store(byte)` with `SHARED.seek_to_ns.store(t, Release)` (§3.2). Keep the
   `http_close(hs)` interrupt (102-104) — it now unblocks `read_cb` to bail out of `av_read_frame`.
@@ -475,7 +479,7 @@ dependency — but that requires moving payload construction *after* `avformat_f
   direct-play *value* semantics move to the new `seek_to_ns` atomic.)
 - ACB-bind state machine (118-154) and feed dispatch (159-165): unchanged.
 
-### `rust-modules/src/player/shared.rs`
+### `rust-modules/media/src/player/shared.rs`
 - **Add** `seek_to_ns: AtomicI64` (init `-1`; direct-play demux seek target in ns) to `Shared`,
   its `new()`, and `reset_session()`.
 - **Delete** (dead once cues are gone): `cues`, `cues_ready`, `cues_abort`, `segment_pos`,
@@ -483,7 +487,7 @@ dependency — but that requires moving payload construction *after* `avformat_f
   `disp_base`, `file_size`, `duration_ns`, `hs_ptr` **stay**. `seek_byte` **stays** (transcode
   reopen trigger).
 
-### `rust-modules/src/aq.rs`, `stream.rs`
+### `rust-modules/media/src/aq.rs`, `stream.rs`
 - **`aq.rs`: NO CHANGE** — the queue is the stable seam.
 - **`stream.rs`: NO CHANGE** — `http_open/read/close` are reused by the AVIO callbacks and by all
   non-demux code (`pms.rs`, `posters.rs`, `route.rs`, timeline/subs threads). Only the *demux

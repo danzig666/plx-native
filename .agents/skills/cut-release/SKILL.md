@@ -58,8 +58,8 @@ split-invocation mistake into a message *for the stable id* — see the next sec
 there: everywhere else `RELEASE=1` is still yours to remember.
 
 The one exception, and it is safe to lean on: a **pure query** — any of the
-`print-*` goals, and only those (`QUERY_GOALS` in the Makefile is the source; transcribing the list
-here is how it went one short the first time it was written) is exempted from that
+`print-*` goals, plus the other build-nothing goals (`SIDE_EFFECT_FREE` in the Makefile is the
+list: `grep '^SIDE_EFFECT_FREE' Makefile`; it has gone stale every time someone transcribed it here) is exempted from that
 parse-time deletion, precisely so that asking the Makefile a question mid-release cannot discard the
 binary you are about to publish. Mixing a query with a real goal is not a query and does stamp.
 
@@ -67,7 +67,7 @@ Whenever you assert something about "the release build", prove the bytes first:
 
 ```sh
 md5 -q pkg/plxnative
-sshpass -p alpine ssh root@$(cat .tv-host) \
+tools/tv-ssh ssh tv \
   "md5sum /media/developer/apps/usr/palm/applications/com.beb.plxnative/plxnative"
 ```
 
@@ -106,16 +106,17 @@ add `FLAVOR=stable` is backwards; the developer install is the one you get by ty
 
 This is §2 seen from the other side: a dev-featured binary under the shipped id carries the whole
 `/tmp` trigger surface, the world-writable `plxnative-remote` FIFO and the `:8910` capture
-listener (8910 is the *stable* install's port; a flavoured one defaults to 8911, which is exactly
-why the shipped id carrying a listener **at all** is the thing being ruled out here). Before the
-split that could only happen by publishing by hand, which is how v0.2.1's defects got out; now it
-is one forgotten `RELEASE=1` on a machine that also has a television, so it gets a mechanism.
+listener (8910 is the *stable* install's port; debug defaults to 8911 and nightly to 8912, which
+is exactly why the shipped id carrying a listener **at all** is the thing being ruled out here).
+Before the split that could only happen by publishing by hand, which is how v0.2.1's defects got
+out; now it is one forgotten `RELEASE=1` on a machine that also has a television, so it gets a
+mechanism.
 
 **`ci/check-package.py` grades the same rule on the packaged BYTES, and it now does so
 unconditionally** — the check sits outside the `pkg/.build-config` branch, gated on nothing but
 "this package is the stable id". That matters because the stamp cannot be trusted to be one of the
 two shipped configurations: the Makefile documents a third (`RUST_FEATFLAGS="--no-default-features
---features devtriggers"`, the README-screenshot recipe), and while the check was nested it would
+--features devtriggers"`, the on-device screenshot recipe), and while the check was nested it would
 have printed "SKIP — neither shipped configuration" and packaged a dev-trigger binary under the
 released id on a green run. So the gate genuinely holds against the two ways past the recipe: the
 documented `ALLOW_DEV_ON_STABLE=1` hatch, and a third feature set that satisfies `release-guard`
@@ -199,6 +200,22 @@ moves one line.** Do not widen it because a firmware "should" work, and never le
 loader check become a playback claim — it grades whether the process starts and cannot see a video
 plane. The note carries one line per tier; the matrix belongs to the audit.
 
+**Look at the screenshots; the release's own run commits them.** The README,
+`docs/ux-scenario.md` and the website's screenshots (`docs/screenshots/`, staged by `pages.yml`) and link-preview card (`site/media/`) show
+the release's own UI, so a release whose figures predate its changes advertises a different app. The `stills` job
+of `site-video.yml` regenerates them after the release (see "Site video" below); this Mac render is a PREVIEW, to
+open the figures and fix any caption they falsify in this release's commit, not to commit the images:
+
+```sh
+make screenshots SHOT_CHECK=1     # every figure and site still, rendered twice; fails unless within its bound
+git status --short docs/screenshots site/media
+```
+
+Open every changed image — a scene whose state drifted (a menu that opened on
+the wrong row, a shelf that moved) still passes its log checks. No account and no television are
+involved (`ui-sim` skill, "Documentation screenshots"). A caption the new figures made false is fixed in the release's own commit; do not commit the
+images or `CREDITS.md` (the bot's commit overwrites them with the runner's render).
+
 ### 3. Build locally to catch mistakes early — CI builds what ships
 
 ```sh
@@ -227,6 +244,22 @@ A local build is for fast feedback. It is **not** what ships: CI builds the arti
 local build embeds the local NDK path.
 
 ### 4. Publish through the workflow
+
+**Optionally, cut a release candidate first.** `rc.yml` takes the same inputs and builds the same
+stable package, published as a prerelease whose binary reports `X.Y.Z-rc.N` (tag
+`rc/vX.Y.Z-rc.N`, never `latest`, never in the Homebrew Channel; `docs/distribution.md` §7c):
+
+```sh
+gh workflow run rc.yml -f version=X.Y.Z            # rc.1; run it again after a fix for rc.2
+```
+
+Both documents must already be on the line, as for the release. Once a candidate has been tried,
+promote it — the release then refuses unless its bump produces the candidate's exact tree, so a
+commit that landed on the line since means cutting another candidate, not shipping untested code:
+
+```sh
+gh workflow run release.yml -f version=X.Y.Z -f candidate=rc/vX.Y.Z-rc.N
+```
 
 ```sh
 gh workflow run release.yml -f version=X.Y.Z     # or -f bump=minor (trunk cuts minors)
@@ -257,11 +290,12 @@ considering the patch done. There is no tooling for this yet; do it by hand and 
 `docs/known-issues.md` if a fix's port needs anything nontrivial, so the next person doesn't
 re-derive it.
 
-**There is no flavour input here, and you do not want one.** `release.yml` pins `FLAVOR: stable` in
-the build job's `env`, which is the right place for it: CI is the one context where the Makefile's
-`FLAVOR ?= debug` default is always wrong, and a value nobody can forget to type beats one they
-can. So the `FLAVOR=stable` you spell on every *local* command is already spelled for you in the
-workflow — do not try to pass it as `-f`. If you ever need to confirm which id a run actually
+**There is no flavour input here, and you do not want one.** `release.yml`'s `build` job pins
+`flavor: stable` in the `with:` block it hands to the shared `build-package.yml` workflow, which is
+the right place for it: CI is the one context where the Makefile's `FLAVOR ?= debug` default is
+always wrong, and a value nobody can forget to type beats one they can. So the `FLAVOR=stable` you
+spell on every *local* command is already spelled for you in the workflow — do not try to pass it
+as `-f`. If you ever need to confirm which id a run actually
 packaged, read it off the artifact filename, which the workflow asserts, rather than from what the
 job was meant to do.
 
@@ -311,8 +345,8 @@ Deploying over ssh does not exercise the package. Install the real `.ipk` — th
 packaging bugs were found that `make deploy` could never have surfaced:
 
 ```sh
-scp pkg/com.beb.plxnative_X.Y.Z_arm.ipk root@$(cat .tv-host):/tmp/
-ssh root@$(cat .tv-host) "script -qc \"luna-send -i -a com.webos.appInstallService \
+tools/tv-ssh scp pkg/com.beb.plxnative_X.Y.Z_arm.ipk tv:/tmp/
+tools/tv-ssh ssh tv "script -qc \"luna-send -i -a com.webos.appInstallService \
   luna://com.webos.appInstallService/dev/install \
   '{\\\"id\\\":\\\"com.beb.plxnative\\\",\\\"ipkUrl\\\":\\\"/tmp/com.beb.plxnative_X.Y.Z_arm.ipk\\\",\\\"subscribe\\\":true}'\" /dev/null"
 ```
@@ -364,4 +398,27 @@ advisory reaches people the old page never will. The same applies to an audit: i
 artifact, gains a dated erratum if it is wrong about itself, and gains nothing else.
 
 If a release is wrong enough to withdraw, say so in the note and publish a fixed one. Never delete
-a tag that has been public; the hash in someone's notes has to keep meaning something.
+a **stable** tag that has been public; the hash in someone's notes has to keep meaning something.
+
+This does not extend to nightly. `ci/nightly.py prune` deletes `nightly/v*` releases and their
+tags 30 days after publishing them, on purpose and by design — every nightly's own body says so
+("nightly builds are deleted after 30 days"), so nobody reading one is told a hash that later stops
+meaning anything without warning. The rule above is about a claim nobody was told was temporary;
+a nightly's claim always was.
+
+### The website's demo film and stills refresh by themselves after a stable release
+
+Nothing to run. When a stable `vX.Y.Z` release is published from main, `release.yml`'s last job
+dispatches `site-video.yml` ON that tag: it renders the tagged tree on Linux and, if the film's or the
+stills' inputs changed since what is committed, commits `Site: demo video and stills re-rendered for
+vX.Y.Z` (or `demo video` / `stills`) to main as the bot, then dispatches the page deploy. A release
+candidate, a nightly and a maintenance-line patch never start it, and it can never block or fail the
+release (a separate run). What a releaser checks afterwards: (1) the **Site video** run for the tag in
+the Actions tab is green ("nothing to render" is a green outcome; a red `render` job leaves the old
+film, a red `stills` job with a green `render` lands the film and keeps the old stills; re-run the red
+job with `gh workflow run site-video.yml --ref vX.Y.Z`); (2) **look at the film on the site**, since the
+gates prove determinism and quality, not taste; a bad one is `git revert <the bot's commit>` and a push
+to main (it takes the film and the stills together). Forcing a render, dry runs and the rest of the
+operation are in `docs/agent-reference.md`, "How the site demo video updates itself". Nothing in step 2
+needs committing by hand; `navblur-transition.jpg` is a photograph of the panel that no tool makes, so
+retake it only when the transition changes.

@@ -1,7 +1,8 @@
 //! Per-application consent resources. The owner supplies both sides of every logical transition;
-//! this adapter only performs persistence/publication side effects or records fixture effects.
+//! this adapter only performs persistence/publication side effects (telemetry's own, in
+//! `telemetry::transition`) or records fixture effects.
 
-use crate::telemetry::consent::Consent;
+use plx_telemetry::telemetry::consent::Consent;
 
 enum Resources {
     Live,
@@ -39,7 +40,7 @@ impl ConsentAdapter {
     /// logical authority.
     pub(crate) fn commit(&mut self, previous: &Consent, next: &Consent) {
         match &mut self.resources {
-            Resources::Live => commit_live(previous, next),
+            Resources::Live => plx_telemetry::telemetry::transition::commit(previous, next),
             #[cfg(test)]
             Resources::Fixture(resources) => {
                 resources.transitions.push((previous.clone(), next.clone()));
@@ -51,7 +52,7 @@ impl ConsentAdapter {
     /// boundary and for fixture evidence; live erasure remains prospective.
     pub(crate) fn forget(&mut self, prior: &Consent) {
         match &mut self.resources {
-            Resources::Live => forget_live(prior),
+            Resources::Live => plx_telemetry::telemetry::transition::forget(prior),
             #[cfg(test)]
             Resources::Fixture(resources) => resources.forgotten.push(prior.clone()),
         }
@@ -66,91 +67,10 @@ impl ConsentAdapter {
     }
 }
 
-fn effectively_allows_errors(consent: &Consent) -> bool {
-    consent.answered() && consent.errors
-}
-
-fn newly_enables_errors(previous: &Consent, next: &Consent) -> bool {
-    effectively_allows_errors(next) && !effectively_allows_errors(previous)
-}
-
-/// Apply prospective cleanup, publish, purge withdrawn records and synchronize the native backend,
-/// then persist. The canonical write is a storage-helper round trip on the television, so a
-/// withdrawal must not wait behind it with the old decision still published (0.6.6 published at
-/// once and wrote on its storage worker) — **and neither may this function's own caller**, the
-/// frame loop's message dispatch (`app::bridge::AppRig::deliver`). The write itself is queued onto
-/// `crate::storage_worker` for exactly that reason, same as `release/v0.6`'s
-/// `record_with_receipt`; only the in-memory publish above and the spool/native side effects run
-/// inline. A failed or refused write is logged and still honoured for this session; enabling
-/// detection remains a function of the owner's explicit transition.
-fn commit_live(previous: &Consent, next: &Consent) {
-    let enabling_errors = newly_enables_errors(previous, next);
-    if enabling_errors {
-        crate::telemetry::crashreport::discard_pending_before_opt_in();
-    }
-    crate::telemetry::consent::install(next.clone());
-    if !next.errors {
-        crate::player::report::clear_error_trace();
-    }
-    crate::telemetry::spool::purge_withdrawn(next);
-    crate::telemetry::native::sync_change(next);
-    persist_record_off_thread(next.clone());
-}
-
-/// Submit the canonical write to the shared persistence worker rather than running it on the
-/// caller's thread. Dropping the returned ticket only cancels the caller's interest in the
-/// result — per `storage_worker`'s own contract ("Dropping a ticket cancels interest, not an
-/// already accepted durable write") — the job still runs to completion.
-fn persist_record_off_thread(next: Consent) {
-    let submitted = crate::storage_worker::submit(move || {
-        let outcome = crate::telemetry::persistence::record(&next);
-        if outcome.write != crate::telemetry::persistence::PersistResult::Durable {
-            crate::log(&format!("telemetry: the decision is not durably persisted: {outcome:?}"));
-        }
-    });
-    if submitted.is_err() {
-        crate::log("telemetry: the decision could not be queued for persistence");
-    }
-    // Tests want the write's effect (and `persistence::last_call_thread()`) settled before the
-    // next assertion; production has no such deadline and never drains.
-    #[cfg(test)]
-    crate::storage_worker::drain_for_test();
-}
-
-/// Publish the prospective default before touching disk, then purge withdrawn records and stop
-/// native capture. The crash mark deliberately remains untouched by this path. The canonical
-/// clear, like `commit_live`'s write, is queued off the frame thread rather than run inline.
-fn forget_live(_prior: &Consent) {
-    let next = Consent::default();
-    crate::telemetry::consent::install(next.clone());
-    crate::player::report::clear_error_trace();
-    crate::telemetry::spool::purge_withdrawn(&next);
-    crate::telemetry::native::sync_change(&next);
-    persist_forget_off_thread();
-}
-
-fn persist_forget_off_thread() {
-    let submitted = crate::storage_worker::submit(|| {
-        let outcome = crate::telemetry::persistence::forget();
-        if !matches!(
-            outcome.write,
-            crate::telemetry::persistence::PersistResult::Durable
-                | crate::telemetry::persistence::PersistResult::Delegated
-        ) {
-            crate::log(&format!("telemetry: sign-out could not durably clear the decision: {outcome:?}"));
-        }
-    });
-    if submitted.is_err() {
-        crate::log("telemetry: sign-out could not be queued for persistence");
-    }
-    #[cfg(test)]
-    crate::storage_worker::drain_for_test();
-}
-
 #[cfg(test)]
 mod tests {
     use super::ConsentAdapter;
-    use crate::telemetry::consent::{self, Consent};
+    use plx_telemetry::telemetry::consent::{self, Consent};
 
     fn decision(id: &str) -> Consent {
         Consent {
@@ -193,7 +113,7 @@ mod tests {
 
     #[test]
     fn fixture_neither_reads_nor_publishes_the_global_snapshot() {
-        let _serial = crate::testlock::serial();
+        let _serial = plx_base::testlock::serial();
         let published_before = consent::current();
         let revision_before = consent::revision();
         let previous = decision("owned");
@@ -212,12 +132,12 @@ mod tests {
         struct Redirect(std::path::PathBuf);
         impl Drop for Redirect {
             fn drop(&mut self) {
-                crate::telemetry::redirect_for_test(None);
+                plx_telemetry::telemetry::redirect_for_test(None);
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 
-        let _serial = crate::testlock::serial();
+        let _serial = plx_base::testlock::serial();
         let dir = std::env::temp_dir().join(format!(
             "plxnative-consent-adapter-fixture-{}",
             std::process::id()
@@ -226,7 +146,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _redirect = Redirect(dir.clone());
         let file = dir.join("telemetry.json");
-        crate::telemetry::redirect_for_test(Some(file.clone()));
+        plx_telemetry::telemetry::redirect_for_test(Some(file.clone()));
         let previous = decision("owned");
         let next = Consent::default();
         let mut adapter = ConsentAdapter::fixture();
@@ -237,24 +157,24 @@ mod tests {
         assert!(!file.exists());
     }
 
-    /// Copilot review on PR #105, finding 6. `commit_live`/`forget_live` call
+    /// Copilot review on PR #105, finding 6. `transition::commit`/`transition::forget` call
     /// `telemetry::persistence::record`/`forget` — a genuine storage-helper round trip on the
     /// television — and must not run that call on the caller's own thread, since the caller here
     /// is the frame loop's message dispatch (`app::bridge::AppRig::deliver`). `release/v0.6`'s
     /// equivalent (`telemetry::mod.rs::record_with_receipt`/`forget_with_receipt`) submitted the
-    /// same work to `crate::storage_worker` for exactly this reason; this test pins the live
+    /// same work to `plx_base::storage_worker` for exactly this reason; this test pins the live
     /// adapter to the same off-thread contract.
     #[test]
     fn commit_live_persists_off_the_calling_thread() {
         struct Redirect(std::path::PathBuf);
         impl Drop for Redirect {
             fn drop(&mut self) {
-                crate::telemetry::redirect_for_test(None);
+                plx_telemetry::telemetry::redirect_for_test(None);
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 
-        let _serial = crate::testlock::serial();
+        let _serial = plx_base::testlock::serial();
         let dir = std::env::temp_dir().join(format!(
             "plxnative-consent-adapter-live-thread-{}",
             std::process::id()
@@ -263,7 +183,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _redirect = Redirect(dir.clone());
         let file = dir.join("telemetry.json");
-        crate::telemetry::redirect_for_test(Some(file));
+        plx_telemetry::telemetry::redirect_for_test(Some(file));
 
         let caller_thread = std::thread::current().id();
         let previous = decision("owned");
@@ -271,41 +191,127 @@ mod tests {
         let mut adapter = ConsentAdapter::live();
 
         adapter.commit(&previous, &next);
-        crate::storage_worker::drain_for_test();
+        plx_base::storage_worker::drain_for_test();
         assert_ne!(
-            crate::telemetry::persistence::last_call_thread(),
+            plx_telemetry::telemetry::persistence::last_call_thread(),
             Some(caller_thread),
-            "commit_live must persist off the frame thread, not inline"
+            "transition::commit must persist off the frame thread, not inline"
         );
 
         adapter.forget(&next);
-        crate::storage_worker::drain_for_test();
+        plx_base::storage_worker::drain_for_test();
         assert_ne!(
-            crate::telemetry::persistence::last_call_thread(),
+            plx_telemetry::telemetry::persistence::last_call_thread(),
             Some(caller_thread),
-            "forget_live must persist off the frame thread, not inline"
+            "transition::forget must persist off the frame thread, not inline"
         );
     }
 
+    /// **Sign-out and Delete all local data erase a queued one-off report**, which a withdrawal
+    /// (`transition::commit` → `spool::purge_withdrawn`) deliberately keeps.
     #[test]
-    fn enabling_detection_uses_the_explicit_previous_decision() {
-        let stale_yes = Consent {
-            asked_version: consent::POLICY_VERSION.saturating_sub(1),
-            errors: true,
-            ..Consent::default()
+    fn forget_live_erases_a_queued_one_off_report_that_a_withdrawal_keeps() {
+        use plx_telemetry::telemetry::queue::{Category, Dest, Record};
+        use plx_telemetry::telemetry::spool;
+        struct Redirect(std::path::PathBuf);
+        impl Drop for Redirect {
+            fn drop(&mut self) {
+                spool::set_test_path(None);
+                plx_telemetry::telemetry::redirect_for_test(None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let _serial = plx_base::testlock::serial();
+        let saved = consent::current();
+        let dir = std::env::temp_dir().join(format!(
+            "plxnative-consent-adapter-oneoff-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _redirect = Redirect(dir.clone());
+        plx_telemetry::telemetry::redirect_for_test(Some(dir.join("telemetry.json")));
+        spool::set_test_path(Some(dir.join("spool.bin")));
+        let one_off = Record {
+            category: Category::OneOff,
+            dest: Dest::Sentry,
+            event_id: "one-off".into(),
+            body: b"{}".to_vec(),
         };
-        let current_yes = decision("current");
-        let current_no = Consent {
+        assert!(spool::append(&one_off));
+
+        let mut adapter = ConsentAdapter::live();
+        let previous = decision("owned");
+        let withdrawn = Consent {
             asked_version: consent::POLICY_VERSION,
             ..Consent::default()
         };
+        adapter.commit(&previous, &withdrawn);
+        let kept: Vec<String> = spool::read().into_iter().map(|r| r.event_id).collect();
+        adapter.forget(&withdrawn);
+        let erased = spool::read().is_empty();
+        if let Some(c) = saved {
+            consent::install(c);
+        }
 
-        assert!(super::newly_enables_errors(
-            &Consent::default(),
-            &current_yes
+        assert_eq!(kept, vec!["one-off".to_string()], "a withdrawal purged the one-off report");
+        assert!(erased, "sign-out left the one-off report queued");
+    }
+
+    /// **Sign-in events held while consent was unanswered** are replayed by `transition::commit` once a
+    /// decision is published, and dropped unreplayed by `transition::forget`, so a departing account's
+    /// attempt can never reach the next account's decision.
+    #[test]
+    fn commit_live_replays_held_signin_events_and_forget_live_drops_them() {
+        use plx_telemetry::diag::schema::DiagEvent;
+        struct Redirect(std::path::PathBuf);
+        impl Drop for Redirect {
+            fn drop(&mut self) {
+                plx_telemetry::telemetry::redirect_for_test(None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let _serial = plx_base::testlock::serial();
+        let saved = consent::current();
+        let dir = std::env::temp_dir().join(format!(
+            "plxnative-consent-adapter-held-{}",
+            std::process::id()
         ));
-        assert!(super::newly_enables_errors(&stale_yes, &current_yes));
-        assert!(!super::newly_enables_errors(&current_yes, &current_yes));
-        assert!(!super::newly_enables_errors(&current_yes, &current_no));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _redirect = Redirect(dir.clone());
+        plx_telemetry::telemetry::redirect_for_test(Some(dir.join("telemetry.json")));
+
+        plx_telemetry::diag::clear_deferred();
+        consent::install(Consent::default());
+        plx_telemetry::diag::event(DiagEvent::SignInStarted);
+        assert_eq!(plx_telemetry::diag::deferred_len(), 1);
+
+        let mut adapter = ConsentAdapter::live();
+        let yes = Consent {
+            asked_version: consent::POLICY_VERSION,
+            usage: true,
+            install_id: Some("i".repeat(32)),
+            ..Consent::default()
+        };
+        adapter.commit(&Consent::default(), &yes);
+        let after_commit = plx_telemetry::diag::deferred_len();
+
+        plx_telemetry::diag::event(DiagEvent::SignInStarted); // consent is answered yes: sent, not held
+        consent::install(Consent::default());
+        plx_telemetry::diag::event(DiagEvent::SignInCancelled);
+        let held_before_forget = plx_telemetry::diag::deferred_len();
+        adapter.forget(&yes);
+        let after_forget = plx_telemetry::diag::deferred_len();
+
+        plx_telemetry::diag::clear_deferred();
+        if let Some(c) = saved {
+            consent::install(c);
+        }
+        assert_eq!(after_commit, 0, "transition::commit left the held event queued");
+        assert_eq!(held_before_forget, 1, "the unanswered sign-in event was not held");
+        assert_eq!(after_forget, 0, "transition::forget left the held event queued");
     }
 }

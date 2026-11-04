@@ -7,33 +7,33 @@ use super::test_support::{frame};
 
 #[test]
 fn library_strip_profile_navigation_and_armed_pill_use_the_actual_engine_identity() {
-    let _guard = crate::testlock::serial();
+    let _guard = plx_base::testlock::serial();
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            crate::plex::reset_servers_for_test();
+            plx_plex::plex::reset_servers_for_test();
         }
     }
     let _cleanup = Cleanup;
-    let session = crate::plex::session::TempSession::new("library-strip-navigation");
+    let session = plx_plex::plex::session::TempSession::new("library-strip-navigation");
     session.watching("u-library-strip-navigation");
-    crate::plex::reset_servers_for_test();
-    let own = crate::plex::register_for_test("strip-own", "127.0.0.1", 9, "synthetic", "fixture");
+    plx_plex::plex::reset_servers_for_test();
+    let own = plx_plex::plex::register_for_test("strip-own", "127.0.0.1", 9, "synthetic", "fixture");
     let shared =
-        crate::plex::register_for_test("strip-shared", "127.0.0.1", 10, "synthetic", "fixture");
-    crate::plex::set_current(own);
+        plx_plex::plex::register_for_test("strip-shared", "127.0.0.1", 10, "synthetic", "fixture");
+    plx_plex::plex::set_current(own);
     let mut d = Dispatcher::<AppHost>::new();
     let mut rig = Bridge::for_test(|| 0);
     rig.stores.browse.borrow_mut().seed_registered_table_for_test([own, shared]);
     rig.refresh_browse_directory();
-    rig.browse_run(crate::stores::browse::BrowseCmd::SetCur(0));
+    rig.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
     rig.stores.browse.borrow_mut().seed_items_for_test(12);
     for i in 0..80 {
         frame(&mut d, &mut rig, AppArg::Library, tick(i), vec![]);
     }
     let entry = d.nav.top_page().unwrap().id;
     let instance = d.nav.top_page().unwrap().inst.as_ref().unwrap().id;
-    let base = crate::ui::dispatch::STRIP_BASE;
+    let base = plx_ui::dispatch::STRIP_BASE;
     assert_eq!(
         d.nav
             .tabs
@@ -41,15 +41,15 @@ fn library_strip_profile_navigation_and_armed_pill_use_the_actual_engine_identit
             .iter()
             .map(|member| member.elem)
             .collect::<Vec<_>>(),
-        vec![base + 4, base, base + 1, base + 2, base + 3]
+        vec![base + 4, base, base + 1, base + 2, plx_ui::widgets::TAB_KEY_WATCHLIST, base + 3]
     );
     let seat = |d: &mut Dispatcher<AppHost>, elem| {
         d.emit(
             MachineId::Nav,
             Fx::Deliver(
                 MachineId::Instance(instance),
-                Delivery::Screen(ScreenEvent::Enter(crate::ui::screen::Enter::Fresh {
-                    focus: crate::ui::screen::FocusTarget::Elem(FocusKey { entry, elem }),
+                Delivery::Screen(ScreenEvent::Enter(plx_ui::screen::Enter::Fresh {
+                    focus: plx_ui::screen::FocusTarget::Elem(FocusKey { entry, elem }),
                 })),
             ),
         );
@@ -126,7 +126,7 @@ fn library_strip_profile_navigation_and_armed_pill_use_the_actual_engine_identit
             .strip
             .iter()
             .position(|member| member.elem == search.elem),
-        Some(4),
+        Some(5),
         "Search's displayed slot is not its stable control identity"
     );
     rig.take_library_reqs();
@@ -179,20 +179,22 @@ fn library_strip_profile_navigation_and_armed_pill_use_the_actual_engine_identit
         .collect();
     assert_eq!(
         tabs,
-        vec![(crate::screens::registry::HomeTab::Search, Some(search))],
+        vec![(plx_screens::registry::HomeTab::Search, Some(search))],
         "the emitted route and captured return focus name the armed pill, not display slot 4"
     );
 
     let id = rig.listing.view().id().unwrap();
-    d.nav.next_style = crate::ui::containers::modal::Style::Compact;
+    d.nav.next_style = plx_ui::containers::modal::Style::Compact;
     d.request(
         MachineId::Nav,
         NavOp::Present(AppArg::LibraryMenu(
-            crate::screens::registry::LibraryMenuArg {
+            plx_screens::registry::LibraryMenuArg {
                 host: instance,
-                kind: crate::screens::registry::LibraryMenuKind::Filter,
+                kind: plx_screens::registry::LibraryMenuKind::Filter,
                 anchor: [0; 4],
-                target: crate::stores::browse::SectionAddress {
+                folded: Vec::new(),
+                opener: None,
+                target: plx_data::stores::browse::SectionAddress {
                     epoch: id.epoch,
                     sid: id.sid,
                     section: id.section,

@@ -64,7 +64,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-LADDER_RS = REPO / "rust-modules" / "src" / "abr" / "ladder.rs"
+LADDER_RS = REPO / "rust-modules" / "media" / "src" / "abr" / "ladder.rs"
 PROBE = REPO / "tools" / "pms-hls-probe.py"
 
 
@@ -97,7 +97,7 @@ def read_ladder():
 
     raster_body = table("raster")
     raster = {}
-    for arm in re.findall(r"((?:\s*\|?\s*Rung::\w+)+)\s*=>\s*\((\d+),\s*(\d+)\)", raster_body):
+    for arm in re.findall(r"\s*(?:\|\s*)?(Rung::\w+(?:\s*\|\s*Rung::\w+)*)\s*=>\s*\((\d+),\s*(\d+)\)", raster_body):
         names, w, h = arm
         for name in re.findall(r"Rung::(\w+)", names):
             raster.setdefault(name, (int(w), int(h)))
@@ -277,7 +277,7 @@ def verdict(rows, key):
 
     # **A residual is only readable if the ladder's span exceeds the measurement's own noise.**
     # Not a chosen threshold: it is the same comparison `BufferEstimate::draining` makes against
-    # `DRAIN_EPS_MS_PER_S` and `ui::idle` makes against a visibility floor — judge the signal
+    # `DRAIN_EPS_MS_PER_S` and `plx_machine::idle` makes against a visibility floor — judge the signal
     # against the dispersion of the instrument, not against zero. Against a 1080p SOURCE every
     # rung's warm rho lands within a couple of per mille of every other, because the encoder is
     # not downscaling and the fetch is measuring transport; dividing a 2 pm span by itself

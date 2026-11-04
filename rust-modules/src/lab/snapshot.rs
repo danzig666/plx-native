@@ -7,8 +7,8 @@
 //!
 //! # What may appear, and what may not
 //!
-//! The envelope is assembled from [`crate::player::Diag`], [`crate::webos`] and
-//! [`crate::devcaps`], whose fields are numbers, bools, enums and short platform strings.
+//! The envelope is assembled from [`plx_media::player::Diag`], [`plx_platform::tv::device`] and
+//! [`plx_platform::devcaps`], whose fields are numbers, bools, enums and short platform strings.
 //! `app::diagnostics`'s module doc states the rule those types already live under and the reasoning
 //! behind each clause; it applies here unchanged and for a stronger reason, since an upload
 //! crosses the public internet rather than a room:
@@ -24,13 +24,13 @@
 //! # Defence in depth: [`scrub`]
 //!
 //! Ring records are ordinary log lines, and the log's own policy — *no call site formats a URL into
-//! a line* — has been violated before (`crate::redact_tokens`'s doc carries that history: one
+//! a line* — has been violated before (`plx_base::eventlog::redact_tokens`'s doc carries that history: one
 //! `-> {url}` in `route::retranscode`, reached by an ordinary audio-track switch, live for months).
 //! So every record passes a second, broader pass on the way out. It is deliberately not the same
 //! function as the log's: that one is a hot-path backstop for one parameter name, this one is a
 //! wider sweep that runs once per upload on a worker thread and can afford to be thorough.
-use crate::diag::ring::Rec;
-use crate::diag::scrub::{scrub, Scrubbed};
+use plx_base::eventlog::ring::Rec;
+use plx_base::eventlog::scrub::{scrub, Scrubbed};
 use serde::Serialize;
 
 // ---- the envelope -----------------------------------------------------------------------------
@@ -80,7 +80,7 @@ pub(crate) struct Device {
     pub hw_revision: String,
 }
 
-/// What the SoC's own table says it decodes ([`crate::devcaps`]) — the field that separates "this
+/// What the SoC's own table says it decodes ([`plx_platform::devcaps`]) — the field that separates "this
 /// firmware refuses the stream" from "this set was never going to decode it".
 #[derive(Serialize)]
 pub(crate) struct Caps {
@@ -88,11 +88,13 @@ pub(crate) struct Caps {
     pub hevc_max_w: u32,
     pub hevc_max_h: u32,
     pub vp9: bool,
+    /// the device table lists an AV1 decoder row (false on the assumed set)
+    pub av1: bool,
     /// the direct-playable audio subset, in `plex::DP_AUDIO_CODECS`'s comma form
     pub audio: String,
 }
 
-/// The playback state, out of one consistent [`crate::player::Diag`] read.
+/// The playback state, out of one consistent [`plx_media::player::Diag`] read.
 ///
 /// Enums are sent as the STRINGS the diagnostics panel prints rather than as their raw
 /// discriminants: the receiving agent should not have to hold this crate's numbering in its head,
@@ -138,8 +140,8 @@ struct Line<'a> {
     m: &'a str,
 }
 
-impl From<&crate::player::Diag> for Player {
-    fn from(d: &crate::player::Diag) -> Self {
+impl From<&plx_media::player::Diag> for Player {
+    fn from(d: &plx_media::player::Diag) -> Self {
         Player {
             vp_mode: d.vp_mode_str(),
             window_id: d.window_id.clone(),
@@ -190,16 +192,16 @@ fn features() -> Vec<&'static str> {
 }
 
 /// Build the whole body. **Main thread**: `player::diag` is main-thread by contract, and the
-/// ring clone is a memcpy of at most [`crate::diag::ring::MAX_BYTES`].
+/// ring clone is a memcpy of at most [`plx_base::eventlog::ring::MAX_BYTES`].
 pub(crate) fn build(
     seq: u32,
     reason: &str,
     session: &str,
     route: &'static str,
-    ps: &crate::route::PlaybackSession,
+    ps: &plx_media::route::PlaybackSession,
 ) -> String {
-    let d = crate::player::diag(ps);
-    let (recs, dropped) = crate::diag::ring::take();
+    let d = plx_media::player::diag(ps);
+    let (recs, dropped) = plx_base::eventlog::ring::take();
     body(seq, reason, session, route, &d, recs, dropped)
 }
 
@@ -210,11 +212,11 @@ pub(crate) fn body(
     reason: &str,
     session: &str,
     route: &'static str,
-    d: &crate::player::Diag,
+    d: &plx_media::player::Diag,
     recs: Vec<Rec>,
     dropped: u64,
 ) -> String {
-    let now = crate::diag::ring::t_ms();
+    let now = plx_base::eventlog::ring::t_ms();
     let mut lines: Vec<String> = Vec::with_capacity(recs.len() + 1);
     let mut refused = 0u64;
     let mut kept: Vec<Line> = Vec::with_capacity(recs.len());
@@ -239,8 +241,8 @@ pub(crate) fn body(
         sent_at_ms: now,
         app: App {
             version: env!("PLX_VERSION"),
-            id: crate::paths::app_id(),
-            flavour: crate::paths::flavour().unwrap_or("stable"),
+            id: plx_base::paths::app_id(),
+            flavour: plx_base::paths::flavour().unwrap_or("stable"),
             features: features(),
             uptime_ms: now,
         },
@@ -269,8 +271,8 @@ pub(crate) fn body(
 }
 
 fn device() -> Device {
-    let i = crate::webos::info();
-    let d = crate::webos::device();
+    let i = plx_platform::tv::device::info();
+    let d = plx_platform::tv::device::device();
     Device {
         webos_release: i.release.clone(),
         webos_codename: i.codename.clone(),
@@ -283,12 +285,13 @@ fn device() -> Device {
 }
 
 fn caps() -> Caps {
-    let c = crate::devcaps::caps();
+    let c = plx_platform::devcaps::caps();
     Caps {
         hevc: c.hevc,
         hevc_max_w: c.hevc_max.0,
         hevc_max_h: c.hevc_max.1,
         vp9: c.vp9,
+        av1: c.av1,
         audio: c.audio.clone(),
     }
 }
@@ -301,7 +304,7 @@ mod tests {
     /// drop is counted in the envelope so the document says a line is missing.
     ///
     /// Lives here rather than beside `scrub` because the assertion that matters is about the
-    /// DOCUMENT — `refused` and `records` in the envelope — not about the predicate. `diag::scrub`
+    /// DOCUMENT — `refused` and `records` in the envelope — not about the predicate. `eventlog::scrub`
     /// carries the twin proving the LOCAL exit keeps the same line.
     ///
     /// **The REMOTE exit only.** Gated with its function: the local exit is contractually forbidden
@@ -328,7 +331,7 @@ mod tests {
             "key",
             "s",
             "home",
-            &crate::player::Diag::default(),
+            &plx_media::player::Diag::default(),
             recs,
             0,
         );
@@ -357,7 +360,7 @@ mod tests {
             "key",
             "a1b2c3d4",
             "player",
-            &crate::player::Diag::default(),
+            &plx_media::player::Diag::default(),
             recs,
             7,
         );
@@ -392,7 +395,7 @@ mod tests {
             "menu",
             "s",
             "home",
-            &crate::player::Diag::default(),
+            &plx_media::player::Diag::default(),
             recs,
             0,
         );

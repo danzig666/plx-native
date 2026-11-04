@@ -14,29 +14,79 @@ the useful part.
 
 ## 1. What ships
 
-| Profile | Base layer | On the dev server | What we do |
-|---|---|---|---|
-| **5** (`dvhe.05`) | none — IPT-PQ, CCID 0 | 1 | **declare + direct play** |
-| **8** (`dvhe.08`) | HDR10 (CCID 1) | 32 | **declare + direct play** |
-| **7** (`dvhe.07`) | dual-layer, CCID 6 | 1 | **refuse → transcode** |
+The declaration is conditional on one boot-time configd answer. Only an exact boolean `true` for
+`tv.config.supportDolbyHDRContents` is support; a refusal, timeout, malformed answer or an answer
+still pending is `Unknown` and follows the unsupported column.
 
-Census taken 2026-08-21 by fetching all 540 leaves and reading every `streamType: 1` stream: 551
-video streams, 34 of them Dolby Vision, in exactly those three shapes. 33 of the 34 direct-play
-with a declaration.
+The seated profile's Settings > Playback > Dolby Vision is the second input. `Off` plans every
+route as Unsupported (`DolbyVisionMode::gate`, captured in `ResolveEnv` beside the probe), so a
+confirmed-support set follows the unsupported column for that profile: no node, the base layer
+for P8/P7, P5 refused direct play and asked of the server, which may refuse it as well (code 2000,
+`docs/pms-api.md`). Only the presentation is gated: the route's `DvDecision` keeps the probe's own
+answer, so Off on a confirmed-support set logs `dv: capability=supported presentation=base-layer` and
+Diagnostics' Video row reads `base-layer (supported)`, which a failed probe or a set without Dolby
+Vision cannot produce (they read `unknown` and `unsupported`).
 
-**Profile 7 is the one real gap and it is structural, not policy.** Its picture is split across a
-base and an enhancement layer — two elementary streams — and BUFFERSTREAM buffer-feed hands the
-pipeline **one**. There is no payload key for the second; `Dovi::presentation` refuses on
-`el_present` before it reaches the declaration arm, which is also what keeps the emitted node's
-`trackType` at `"single"` and makes the pipeline's `dv-dual-svp` secure-video-path flag — which
-this app cannot satisfy — unreachable. Whether `gst_dvbin_pipeline_dovi_dual` (which sits beside
-the `_single` we do use) can be fed from a single appsrc is unexamined.
+**On webOS 3 a configd `true` is overridden to unsupported** (`webos::caps::platform_gate`, logged
+as `webos-caps: … answer=unsupported source=webos3`). Device-measured 2026-10-14 on an LG OLED C7
+(webOS 3.9.3, m16p) with a P8.1 film: configd answers `true`, the declared Load accepts every
+access unit and never starts its clock (0:00 forever), and the same build with the declaration
+removed plays. One set measured; webOS 4+ and an unreadable version keep configd's answer.
+
+| Source | Confirmed supported | Unsupported / unknown |
+|---|---|---|
+| **P8 single-layer, CCID 1/2/4** | declare + direct play | no node; direct-play the HDR10/SDR/HLG base |
+| **P5** | declare + direct play | refuse direct play and video copy; request a video re-encode |
+| **P7 dual-layer, CCID ≠ 0** (UHD Blu-ray) | convert to 8.1 in-app; declare 8.1 + direct play | convert to 8.1 in-app; no node; direct-play the HDR10 base |
+| **Any other enhancement layer** | refuse → transcode | refuse → transcode |
+| **Non-DV / insufficient metadata** | existing behavior | existing behavior |
+
+Historical census taken 2026-08-21 on the dev server by fetching all 540 leaves and reading every
+`streamType: 1` stream: 551 video streams, 34 of them Dolby Vision — one P5, 32 P8.1 and one P7.
+The old unconditional policy declared and direct-played 33 of 34. That census establishes the
+library shapes, not support on another television; current declarations additionally require the
+affirmative platform result above. The base-layer predicate accepts more compatibility identifiers
+than the measured 1/2/4 set, but reserved/unknown identifiers are not claimed here as validated
+fallback formats.
+
+**Profile 7 is played by converting it to Profile 8.1 on the feed path, as `dovi_tool -m 2`
+does.** Its picture is split across a base and an enhancement layer, and BUFFERSTREAM buffer-feed
+hands the pipeline **one** elementary stream; there is no payload key for the second. What the
+feed path can do instead is make the single-layer stream a Profile 8.1 file would have been:
+when the demuxer's configuration record says Profile 7 with an enhancement layer and a
+cross-compatible base layer (`ff::dovi_converts_to_p81`; a UHD Blu-ray remux carries CCID 6),
+`ff::packet_to_annexb` drops every enhancement-layer NAL — the `UNSPEC63` wrapper a single-track
+dual layer stores each one in, which is what `dovi_tool demux` splits on, and any NAL above
+`nuh_layer_id` 0 — and rewrites every RPU (`UNSPEC62`) to 8.1 with quietvoid's `dolby_vision`
+crate (`DoviRpu::parse_unspec62_nalu`, `convert_with_mode(To81)`, `write_hevc_unspec62_nalu`: the
+library `dovi_tool` itself is built on). An RPU that does not parse or convert is dropped, never
+forwarded as Profile 7. `Dovi::converts_to_p81` is the route-side twin of that test on the
+server's `DOVI*` fields: such a stream is declared as what is fed (`profileId 8`, `trackType
+"single"`) on a set with confirmed support, plays as its HDR10 base layer without a node
+otherwise, and is not `base_layer_unusable`, so the server may copy it. A host test holds the
+MEL rewrite to `dovi_tool`'s own mode-2 fixture byte for byte.
+
+**What it does not do.** The enhancement layer's own contribution is discarded: for a MEL that is
+nothing, for a FEL it is the residual detail the full enhancement layer adds above the base layer,
+exactly what `dovi_tool -m 2` discards — what reaches the panel is the base layer and the
+dynamic metadata. A dual layer whose base layer is not cross-compatible (CCID 0) has no picture
+the conversion could leave and is still refused on `el_present`, before the declaration arm,
+which is also what keeps the emitted node's `trackType` at `"single"` and makes the pipeline's
+`dv-dual-svp` secure-video-path flag — which this app cannot satisfy — unreachable. Whether
+`gst_dvbin_pipeline_dovi_dual` (which sits beside the `_single` we do use) can be fed from a
+single appsrc, which is what playing the enhancement layer would need, is unexamined.
 
 Profiles not present here: **4** is dual-layer and deprecated (P&L §1.1 p. 6); **9** is single-layer
-**AVC**, and would pass our gate but `with_dolby_hdr_info`'s `video != "H265"` guard would silently
-drop the node — harmless, since CCID 2 means the base layer is SDR-compatible, but it is a gate/
-payload disagreement the tests do not cover; **10** and **20** are AV1 and MV-HEVC, and this panel
-has no decoder for either.
+**AVC**, and now falls back without a node because codec eligibility is part of
+`Dovi::presentation` itself (the old gate/payload disagreement has a host regression); **10** and
+**20** are AV1 and MV-HEVC, and this panel has no Dolby Vision decoder for either.
+
+**Profile 10 on a set that decodes AV1** is declared like Profile 8: `metadata::dv_video_codec`
+admits `av1` beside `hevc`, the payload keeps `"video":"AV1"`, and the node is the same three
+fields with `profileId: 10`. Nothing here was decompiled: that libpf's AV1 caps branch reaches
+the same Dolby Vision tail was measured on a webOS 6 set (LG C1, webOS 6.5.3, 2026-10-18): an
+AV1 Profile 10.1 file direct-played with the node put the panel in Dolby Vision and played through,
+where without it the same file showed HDR10. It is unmeasured on any other firmware, and the webOS 4.5 dev set never reaches it (no AV1 row in its codec table).
 
 ---
 
@@ -67,10 +117,14 @@ Three things that look like they should change and do not:
   client also reports `codec.video = "H265"` for a Dolby Vision stream.
 - **`profileId` must be a JSON integer** (`getInt`). Quoting it leaves the pipeline's `-1` sentinel,
   which still yields `dolby-vision=TRUE` with only the profile hint missing — a legitimate fallback.
-- **nothing declares platform support.** `libplayerAPIs::generateJsonPayloadForPlayer` injects
-  `platformSupportDolbyVision` / `supportDolbyTVATMOS` itself from its configd cache, at the tree
-  ROOT as siblings of `option`. Sending our own would be a second opinion on a question the library
-  answers for itself.
+- **library-injected platform metadata is not protection.** On every Load,
+  `libplayerAPIs::generateJsonPayloadForPlayer` reads configd and injects
+  `platformSupportDolbyVision` / `supportDolbyTVATMOS` at the tree root. But `libpf` enables its DV
+  path from the presence of our `contents.DolbyHdrInfo` node regardless of that injected value.
+  We therefore do not send a duplicate root field, but we do make our own anonymous configd query
+  once at boot and require its exact affirmative answer before adding our node. The supplied ACL
+  proves a public permission exists on the dev firmware; it does not prove this app's anonymous
+  registration receives it on every set.
 
 ### 2b. `contents.immersive` — the audio half
 
@@ -128,7 +182,7 @@ frame-gated `setMediaVideoData`. No decoded frame is needed and no state is read
 
 ### The `SOUND_ERROR_019` retraction
 
-`src/starfish.c` and `rust-modules/src/player/CLAUDE.md` said, from the **initial commit**
+`src/starfish.c` and `rust-modules/media/src/player/CLAUDE.md` said, from the **initial commit**
 (`f2523483`), that audio must never be fed to ACB because it causes `SOUND_ERROR_019`, and that
 `setMediaAudioData` is therefore unused. The clause sat beside the 3-arg-taskId note, which does
 carry its evidence.
@@ -245,6 +299,14 @@ vs transcoded"; `/tmp/plxnative-nofps` withholds the esInfo fps rational (withho
 **worse** — 163/160 misses against 82/3 — which is how we learned the pipeline's lattice depends on
 what we send, shortly before learning it does not depend on it in the way we hoped).
 
+Capability experiments use two presence-only, boot-latched triggers:
+`/tmp/plxnative-dvcaps0` forces Unsupported and `/tmp/plxnative-dvcaps1` forces Supported. If both
+exist, `dvcaps0` wins and the conflict is logged. Restart the app between cases; changing a file
+cannot alter either the completed capability result or an installed playback decision. These
+overrides change capability only — they do not bypass `nodv`, the enhancement-layer refusal, the
+HEVC codec guard or a profile's Dolby Vision Off. `dvnonode` remains the deliberate diagnostic exception: it suppresses a node
+after a route has already frozen `Declare`, and logs that disagreement explicitly.
+
 ---
 
 ## 6. What the Dolby specifications actually say
@@ -274,6 +336,12 @@ cross-compatible sample entries; the one sentence permitting removal of DV eleme
 explicitly scoped to profiles with a cross-compatible base layer, which profile 5 is not; and the
 RPU is normatively required to stay **unencrypted** (ISOBMFF §5 p. 27), a rule only coherent if
 something downstream parses it in-band.
+
+That is why absent or unknown platform support rejects Profile 5 here. P5 has no independently
+displayable base-layer outcome; without an affirmative capability result the client requests a
+video re-encode and also forbids a remux/video copy of the same unusable bitstream. This is
+fail-closed and not cost-free: a server unable to perform the conversion may fail playback, and a
+successful PMS encode is not by itself proof that the returned colours are correct.
 
 ### 6b. "The RPU is HEVC NAL type 62" is our measurement, not a Dolby fact
 
@@ -381,10 +449,18 @@ Measured on the dev set (49SM9000PLA, webOS 4.10.2), one launch per row, `plxnat
 | **DV Profile 8** (bl_compat=1) | `DolbyHdrInfo profileId=8 trackType=single`, direct play | `DolbyVision` | **`dolbyHdr`** | **`dolbyHdrCinemaBright`** |
 | **DV Profile 7** (bl_compat=6, el=1) | *refused* — "dual-layer, base layer is not self-displayable; re-encoding (no copy)" | `HDR10` | `hdr` | `hdrVivid` |
 
+These are supported-set measurements made before the capability gate was added. They remain
+evidence that declaration drives the dev panel, but are not measurements of the new unforced
+anonymous query or of the base-layer path on a non-DV SKU. No supported/base-layer result is added
+to this table until those current paths are measured on hardware.
+
 Three distinct panel states, each the one the app asked for. That makes this a test of the whole
 chain rather than of Dolby Vision alone: **the Profile 7 refusal is confirmed by the same reading**,
 landing on HDR10 exactly as §1 says it should, which no amount of reading our own log could have
 shown. A log line proves what we sent; `dimension.dynamicRange` proves what the panel did with it.
+
+The Profile 7 row is the refusal as it was measured on 2026-08-22. That file now takes §1's
+conversion instead, and the conversion has not been measured with this read on the dev set.
 
 **Why this belongs beside §5's silent instruments.** §5 is about instruments that cannot see the
 thing they are pointed at. This is the opposite failure and worth naming as its own: an instrument
@@ -394,17 +470,34 @@ human at the panel, check whether the platform already publishes it.
 
 ## 7. Open
 
-- **Profile 7.** One film on the dev server. Would need to know whether `gst_dvbin_pipeline_dovi_dual`
-  can be fed from a single appsrc, or whether a second one can be created — unexamined. The REFUSAL
-  path is no longer open: §6a confirms it lands on HDR10 at the panel, which is the intended
-  outcome, so what remains is only whether Profile 7 could ever be played as DV rather than whether
-  declining it works.
-- **Profile 9's gate/payload disagreement.** `presentation` declares it, `with_dolby_hdr_info`'s
-  H265 guard silently drops the node. Costs nothing today (SDR-compatible base layer) and no such
-  asset exists here, but the "gate and payload can never disagree" test does not cover it.
+- **Profile 7.** Converted to 8.1 in-app (§1), which plays the base layer and the dynamic metadata
+  and discards a full enhancement layer's residual detail. Playing that detail would need to know
+  whether `gst_dvbin_pipeline_dovi_dual` can be fed from a single appsrc, or whether a second one
+  can be created — unexamined. Not measured on the dev set: the conversion's panel state
+  (`dimension.dynamicRange`, §6a), and its per-frame cost on that set's CPU.
+- **Anonymous configd access.** The key, parser and fail-closed policy are host-tested, but an
+  unforced query from this app's anonymous LS2 registration has not yet been measured on device.
+  The dev firmware ACL permits public `getConfigs`; that is not proof the registration receives it.
+- **Cross-firmware reply behavior.** The libplayerAPIs mechanism exists in the symbol/decompile
+  census from 3.9.2 through 11.2.0, but the key, ACL and reply semantics have not been exercised
+  across that range. Older or refusing firmware remains Unknown rather than being inferred from a
+  version or from unrelated `updateConfig` symbols. The one version rule is `platform_gate`: a
+  configd `true` on webOS 1..=3 is reported Unsupported, because that answer was measured wrong
+  on a C7 (webOS 3.9.3).
+- **Profile 9's gate/payload disagreement is closed in code.** `presentation` now takes the output
+  codec and an AVC stream cannot produce `Declare`; the regression covers the SDR-compatible
+  fallback and an unusable-base non-HEVC refusal. No Profile 9 asset has been measured on device.
 - **The 95-slot LUT ring is unlocked.** `DOVI_SWSync_Start` writes on the backend thread while
   `DOVI_SWSync_SetDoviLUTnMap` scans on the FW-comm thread, and the key sits at offset 0 of a
   0x71d0-byte `memcpy` into the slot. A lookup can match a slot whose LUT body is still being
   copied. Not our bug and not the one we fixed, but the same visible shape.
 - **A `GetOTTMetaData` index bug in LG's code**: case 3 indexes the 200-entry MD ring with `% 95`,
   the LUT ring's size. Our path is case 1, so it does not bite us.
+
+Operational risks which remain: a transient boot failure disables DV until restart by design;
+`Supported` identifies an SKU capability, not every profile, level or malformed stream; PMS P5
+re-encoding still needs picture validation; recovery/synthetic/codec seams are guarded by frozen
+decision regressions but remain high-value bypass points; and a stale forced-support trigger can
+reproduce the original corruption, which is why its `forced` provenance is visible in diagnostics.
+Atmos remains independent of this policy: E-AC3 JOC fallback properties do not establish that
+LG's complete `immersive=ATMOS` path is harmless on every non-Atmos SKU.

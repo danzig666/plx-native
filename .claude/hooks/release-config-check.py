@@ -5,7 +5,7 @@ nothing else in this project compiles until a release cut.
 THE GAP, MEASURED. `rust-modules/Cargo.toml` declares `default = ["devtools", "devtriggers"]`, and
 `make RELEASE=1` drops both (`RUST_FEATFLAGS = $(if $(RELEASE),--no-default-features,)`, Makefile
 line 304). Everything that routinely compiles this crate builds the DEFAULT set: `make check`
-(`cargo +$(RUST_NIGHTLY) test --lib`, line 666), `make lint` (line 699), the plain cross-build
+(`cargo +$(RUST_TOOLCHAIN) test --lib`, line 666), `make lint` (line 699), the plain cross-build
 (line 438), and `make sim` (line 875 — `--features hostsim` ON TOP of the defaults, not instead of
 them). So does CI's pull-request gate — `.github/workflows/ci.yml` runs `make check` (line 50),
 then the plain cross-build (line 98), then `make ipk FLAVOR=debug` (line 108), and never drops a
@@ -29,7 +29,7 @@ docstring, and Python 3.12 turns an invalid escape into a SyntaxWarning printed 
     grep -rho 'cfg(feature = "[a-z]*"' rust-modules/src --include='*.rs' | sort | uniq -c
     grep -rho 'cfg(not(feature = "[a-z]*"' rust-modules/src --include='*.rs' | sort | uniq -c
 
-And `[lints.rust] warnings = "deny"` makes the gap sharper, not softer: an import that only the
+And `[workspace.lints.rust] warnings = "deny"` makes the gap sharper, not softer: an import that only the
 `devtriggers` arm consumed does not warn in the release configuration, it FAILS it.
 
 WHY A HOOK AND NOT A CONVENTION. Because the convention exists, is written down, and did not fire.
@@ -43,7 +43,7 @@ editing session: nothing you can run reproduces it unless you already suspect it
 definition of a check that should not be a habit.
 
 WHAT IT COSTS. Measured on the dev Mac, 2026-08-23, warm target dir, after `touch`ing one source
-file: **0.52 / 0.54 / 0.60 s** over three trials for `cargo +nightly check --lib
+file: **0.52 / 0.54 / 0.60 s** over three trials for `cargo +<pinned> check --lib
 --no-default-features`, and **0.52 s** for the same command with the default set — call it 0.55 s
 for either. An edit to anything else costs **0.02 s**, the whole hook, measured both ways: a
 non-`.rs` path is rejected on the extension before even the `git rev-parse`, and a `.rs` outside
@@ -127,11 +127,13 @@ build directory") rather than fail. On timeout the hook prints a note and exits 
 wait as a broken build would be a lie that costs the model a debugging detour, and the next edit
 re-runs the check anyway.
 
-WHICH NIGHTLY. The same one the Makefile uses — `RUST_NIGHTLY` is parsed out of the Makefile
-(`?= nightly`, line 175; CI pins a date), and a `RUST_NIGHTLY` in the environment wins, matching
-make's `?=`. The toolchain is not incidental: CLAUDE.md records `task.rs`'s refused-spawn test
-passing 284/284 on stable while panicking inside `std` on nightly, and `-Z build-std` means
-nightly is what ships. If that toolchain is not installed the check is SKIPPED, not failed —
+WHICH TOOLCHAIN. The same one the Makefile uses — the repository's single pin, `channel` in
+`rust-modules/rust-toolchain.toml` (the Makefile reads the same line into `RUST_TOOLCHAIN`), and a
+`RUST_TOOLCHAIN` in the environment wins, matching make's `?=`. The toolchain is not incidental: the
+ARM build and the host checks use one release, so a check here compiles what ships. (CLAUDE.md
+once recorded `task.rs`'s refused-spawn test passing 284/284 on stable while panicking inside `std`
+on nightly; that was when nightly shipped. It no longer does.) If that toolchain is not installed
+the check is SKIPPED, not failed —
 and `RUSTUP_AUTO_INSTALL=0` is set for the subprocess so rustup refuses instead of quietly starting
 a several-hundred-MB download behind an ordinary Edit. Measured 2026-08-23 on rustup 1.29.0, with a
 name that does not exist: **0.24 s** of network ("info: syncing channel updates for …") before
@@ -178,7 +180,7 @@ import time
 # fail-open catch at the bottom turns a proven release break into exit 0. Measured 2026-08-23: with
 # a release-only `compile_error!` whose message carried an em-dash, the hook exited 0 saying
 # "internal error, allowing ('ascii' codec can't decode byte 0xe2 …)". Three separate readers had
-# to be fixed for one bug — cargo's output, the Makefile that `nightly()` parses, and the `dev.rs`
+# to be fixed for one bug — cargo's output, the toolchain file that `pinned_toolchain()` parses, and the `devtrig.rs`
 # that `has_latched_flag()` greps — because this repo's Makefile, sources and diagnostics are all
 # full of em-dashes, and each reader failed in turn as the previous one was corrected. The stream
 # reconfiguration below is the write half: an em-dash in the report itself would otherwise
@@ -269,7 +271,10 @@ def rust_src_target(payload, root, cwd=None):
     path = os.path.realpath(path)
 
     src = os.path.realpath(os.path.join(root, "rust-modules", "src"))
-    if not path.startswith(src + os.sep):
+    # The layer crates split out of `src` (docs/module-layers.md) are compiled by the same
+    # `cargo check --lib` as a dependency, so an edit there is a release-configuration risk too.
+    layer_srcs = [os.path.realpath(os.path.join(root, "rust-modules", layer, "src")) for layer in ("base", "machine", "net", "platform", "gfx", "ui", "plex", "telemetry", "data", "session", "media", "appkit", "screens")]
+    if not any(path.startswith(s + os.sep) for s in [src] + layer_srcs):
         return None
     # `--lib` compiles no bin target, and `sim.rs` needs `hostsim`, which the release set never has.
     if path.startswith(os.path.join(src, "bin") + os.sep):
@@ -280,7 +285,7 @@ def rust_src_target(payload, root, cwd=None):
 def verdict(returncode, output):
     """'ok' | 'broken' | 'unusable' — the last meaning cargo never got as far as compiling.
 
-    PURE. 'unusable' is the fail-open bucket: an uninstalled pinned nightly, no cargo on PATH, a
+    PURE. 'unusable' is the fail-open bucket: an uninstalled pinned toolchain, no cargo on PATH, a
     corrupt lock, a build directory cargo cannot lock or fill. Those must not be reported to the
     model as a release-configuration break, because they are not one and the fix is nowhere near
     the edit.
@@ -300,7 +305,7 @@ def verdict(returncode, output):
 def target_dir(env=None, tmp=None):
     """Where cargo should put its artifacts, or None to leave cargo's own default alone. PURE.
 
-    An explicit `CARGO_TARGET_DIR` wins untouched — same rule as `RUSTFLAGS` and `RUST_NIGHTLY`,
+    An explicit `CARGO_TARGET_DIR` wins untouched — same rule as `RUSTFLAGS` and `RUST_TOOLCHAIN`,
     and the escape hatch for anyone who wants the crate's own `target/` back. Otherwise: one
     shared directory under `$TMPDIR`, which on macOS is local, per-user, and lockable even when the
     checkout is not (see the docstring's WHERE IT BUILDS).
@@ -338,28 +343,30 @@ def trim(text, cap=DIAG_CAP):
     return body
 
 
-def nightly(root):
-    """The toolchain the Makefile would use. Env wins, matching make's `RUST_NIGHTLY ?=`."""
-    env = os.environ.get("RUST_NIGHTLY", "").strip()
+def pinned_toolchain(root):
+    """The toolchain the Makefile would use: the `channel` of rust-modules/rust-toolchain.toml.
+
+    Env wins, matching make's `RUST_TOOLCHAIN ?=`. A tree with no readable pin falls back to `stable`.
+    """
+    env = os.environ.get("RUST_TOOLCHAIN", "").strip()
     if env:
         return env
     try:
-        with open(os.path.join(root, "Makefile"), encoding="utf-8", errors="replace") as f:
-            for line in f:
-                m = re.match(r"^RUST_NIGHTLY\s*\??=\s*(\S+)", line)
-                if m:
-                    return m.group(1)
+        with open(os.path.join(root, "rust-modules", "rust-toolchain.toml"), encoding="utf-8", errors="replace") as f:
+            m = re.search(r'^channel\s*=\s*"([^"]+)"', f.read(), re.M)
+            if m:
+                return m.group(1)
     except OSError:
         pass
-    return "nightly"
+    return "stable"
 
 
 def has_latched_flag(root):
-    """Whether `dev::latched_flag!` is really in this tree — the message must not cite a ghost."""
+    """Whether `devtrig::latched_flag!` is really in this tree — the message must not cite a ghost."""
     try:
-        with open(os.path.join(root, "rust-modules", "src", "dev.rs"),
+        with open(os.path.join(root, "rust-modules", "base", "src", "devtrig.rs"),
                   encoding="utf-8", errors="replace") as f:
-            return "macro_rules! latched_flag" in f.read()
+            return "macro_rules! __latched_flag" in f.read()
     except OSError:
         return False
 
@@ -453,9 +460,9 @@ def report(root, edited, diags, default_also_broken, toolchain):
             "that shape is what produced this class of break on 2026-08-21, when a function spliced\n"
             "in between an attribute and its `fn` swallowed the neighbour's gate (E0428, only under\n"
             "--no-default-features, 786/786 tests green). Most such pairs are unnecessary —\n"
-            "`dev::flag` is already compile-time `false` and `dev::read` `None` without the feature,\n"
-            "so a helper that only wraps them needs no cfg at all. Prefer `crate::dev::latched_flag!`\n"
-            "(rust-modules/src/dev.rs) over hand-rolling a pair.\n")
+            "`devtrig::flag` is already compile-time `false` and `devtrig::read` `None` without the feature,\n"
+            "so a helper that only wraps them needs no cfg at all. Prefer `plx_base::devtrig::latched_flag!`\n"
+            "(rust-modules/base/src/devtrig.rs) over hand-rolling a pair.\n")
     return msg
 
 
@@ -483,7 +490,7 @@ def main():
     if not edited:
         return 0
 
-    toolchain, secs = nightly(root), timeout_secs()
+    toolchain, secs = pinned_toolchain(root), timeout_secs()
     t0 = time.monotonic()
     res = run_check(root, ["--no-default-features"], toolchain, secs)
     if res is None:

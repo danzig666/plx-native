@@ -110,6 +110,44 @@ else
   # nothing", and the check would pass vacuously forever.
   [ "$DMB" -gt 100 ] || fail "only $DMB dmb instructions — the disassembly scan is not working"
   ok "0 CP15 barriers, $DMB dmb (scan verified live)"
+
+  echo "== VFP (the -soft-float codegen flag took effect) =="
+  # `-C target-feature=-soft-float` is what gives OUR crates VFP instructions on the armv7 target,
+  # which defaults to +soft-float (every float op a libcall). On stable rustc it is an UNSTABLE
+  # feature flag (rustc prints "unstable feature specified for -Ctarget-feature: soft-float ...
+  # its behavior can change in the future"), so a rustc release is free to stop honouring it. The
+  # binary then still links and runs, only every float multiply in the app becomes a call to
+  # __aeabi_fmul: nothing fails, the UI just gets slower. ci/check-vfp.py catches the flag
+  # directly with a probe compile; this is the same question asked of the linked binary.
+  # Measured on the stable build (2026-10-16, -lm ahead of the staticlib): 3057 `vmul.f32` against
+  # 2 `bl __aeabi_fmul`, both in core's float PARSING (std is prebuilt, its float code stays soft).
+  # So the test is a ratio, not zero. Both objdumps (GNU, llvm) print `bl\t<addr> <__aeabi_fmul>`.
+  VFPMUL=$(grep -cE '[[:space:]]vmul\.f32[[:space:]]+s[0-9]' <<<"$D" || true)
+  SOFTMUL=$(grep -cE '[[:space:]]bl[[:space:]].*<__aeabi_fmul' <<<"$D" || true)
+  # Positive control, as for dmb: a floor far below the measured count but far above noise, so an
+  # objdump that printed the instructions in another form fails here instead of passing vacuously.
+  [ "$VFPMUL" -gt 100 ] || fail "only $VFPMUL vmul.f32 instructions — our crates are not using VFP (is -C target-feature=-soft-float still in RUST_CODEGEN?) or the disassembly scan is not working"
+  [ $((SOFTMUL * 20)) -lt "$VFPMUL" ] || fail "$SOFTMUL calls to __aeabi_fmul against $VFPMUL vmul.f32 — float math is going through software libcalls"
+  ok "$VFPMUL vmul.f32, $SOFTMUL __aeabi_fmul calls (core's float parsing)"
+
+  echo "== libm calls reach glibc, not compiler_builtins' soft-float copies =="
+  # round/floor/ceil/trunc/fmod/cbrt (and C's sqrtf) are CALLS on ARMv7: there is no VFPv3
+  # instruction for them. The prebuilt armv7 std ships WEAK definitions of those names inside
+  # compiler_builtins, compiled +soft-float (roundf's body is a call to __aeabi_fadd). A weak
+  # definition taken from an archive member is a regular-object definition, which a shared library
+  # later on the command line never overrides, so with `-lm` only at the end of the link every
+  # roundf in the app (119 call sites, text and layout among them) ran soft. The Makefile names -lm
+  # AHEAD of the staticlib so the names are already defined by libm.so and those members are never
+  # extracted. The residue is about 9 soft arithmetic calls in core's prebuilt float parsing (the
+  # bound below is 16), and the i64<->float conversions (__aeabi_d2lz, __aeabi_l2d & co), which are
+  # libcalls on ARMv7 whatever the float ABI, VFPv3 having no instruction for them; the pattern
+  # below leaves those out.
+  LOCALMATH=$(grep -oE '^[0-9a-f]+ <(roundf?|floorf?|ceilf?|truncf?|sqrtf?|fmaf?|cbrtf?|fmodf?)>:$' <<<"$D" \
+    | sed -E 's/.*<(.*)>:/\1/' | tr '\n' ' ' || true)
+  [ -z "$LOCALMATH" ] || fail "local definitions of libm functions ($LOCALMATH) — compiler_builtins' soft-float copies won over glibc's libm; is -lm still ahead of the Rust staticlib on the link?"
+  SOFTARITH=$(grep -cE '[[:space:]]bl[[:space:]].*<__aeabi_[fd](add|sub|rsub|mul|div|cmp[a-z]*|2f|2d)>' <<<"$D" || true)
+  [ "$SOFTARITH" -le 16 ] || fail "$SOFTARITH soft-float arithmetic libcalls (measured 9: core's float parsing) — some float code is running in software"
+  ok "no local libm bodies, $SOFTARITH soft-float arithmetic calls"
 fi
 
 echo "== DT_NEEDED =="
@@ -129,6 +167,38 @@ if ! diff -u ci/expected-dt-needed.txt "$AUDIT_TMP/dt-needed.actual"; then
 fi
 ok "$(wc -l < "$AUDIT_TMP/dt-needed.actual" | tr -d ' ') entries, unchanged"
 
+echo "== storage helper =="
+# pkg/plxnative-storage ships to the TV beside the app and links the same way, through the same stub
+# .so trick: a library it quietly starts needing is a binary that will not start on a firmware
+# without it, which `tools/fwcompat.py` would only say if somebody ran it by hand. It is a separate
+# executable with its own list (libluna-service2 and glib are its, and it needs none of the app's
+# media libraries), so it gets its own expectation file rather than a shared one. Only the identity
+# and DT_NEEDED are graded here: the barrier, interposer, crash-report and host-identity checks
+# above are about the application. The list is the fat-LTO `release` profile's, which is what CI and
+# every shipped package build; a local `tvdev` build links two entries more (ld-linux.so.3 and
+# libdl.so.2) and reads as drift, so grade a local helper after `make ARM_PROFILE=release`.
+#
+# Absent is a failure in CI, where `make ipk` has just built it, and a skip anywhere else, where
+# `./ci/check-elf.sh` is run on a tree that built the application alone.
+STORAGE="${STORAGE_BIN:-$(dirname "$BIN")/plxnative-storage}"
+if [ ! -f "$STORAGE" ]; then
+  [ "${CI:-}" != "true" ] || fail "$STORAGE is missing — the storage helper ships in the package and must be graded"
+  echo "  SKIP — $STORAGE not built"
+else
+  SH=$("$READELF" -h "$STORAGE") || fail "readelf -h failed on the storage helper"
+  grep -q 'Class: *ELF32'      <<<"$SH" || fail "storage helper is not ELF32"
+  grep -q 'Machine: *ARM'      <<<"$SH" || fail "storage helper is not ARM"
+  grep -q 'Flags:.*soft-float' <<<"$SH" || fail "storage helper is not the soft-float ABI (the NDK's softfp convention)"
+  SA=$("$READELF" -A "$STORAGE") || fail "readelf -A failed on the storage helper"
+  grep -q 'Tag_CPU_arch: v7' <<<"$SA" || fail "storage helper is not ARMv7 (Tag_CPU_arch)"
+  SDYNAMIC=$("$READELF" -d "$STORAGE") || fail "readelf -d failed on the storage helper"
+  sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' <<<"$SDYNAMIC" | LC_ALL=C sort > "$AUDIT_TMP/storage-dt-needed.actual"
+  if ! diff -u ci/expected-dt-needed-storage.txt "$AUDIT_TMP/storage-dt-needed.actual"; then
+    fail "storage helper DT_NEEDED drifted. If intended, confirm with tools/fwcompat.py that it exists on every supported release, then update ci/expected-dt-needed-storage.txt"
+  fi
+  ok "storage helper: ELF32 / ARM / soft-float / ARMv7, $(wc -l < "$AUDIT_TMP/storage-dt-needed.actual" | tr -d ' ') DT_NEEDED entries, unchanged"
+fi
+
 echo "== build-host identity =="
 # docs/distribution.md §4: a public build must not carry the developer's LAN or home directory.
 # Those are TWO independent properties and this section used to conflate them, which is how the
@@ -138,9 +208,10 @@ echo "== build-host identity =="
 #   (src/app.h's __has_include falls back to YOUR_PMS_HOST only in a clean checkout) — so those
 #   assertions genuinely can only hold in CI;
 #
-#   the HOME DIRECTORY has nothing to do with config.local.h. It arrives through `-Z build-std`
-#   compiling std and every dependency from absolute paths under $RUSTUP_HOME/$CARGO_HOME, and
-#   it is fixed by the Makefile's --remap-path-prefix. That check can and should run everywhere.
+#   the HOME DIRECTORY has nothing to do with config.local.h. It arrives through every dependency being
+#   compiled from absolute paths under $CARGO_HOME (and $HOME for the workspace; the prebuilt std
+#   only carries /rustc/<hash> paths, but under the old `-Z build-std` it was compiled from
+#   $RUSTUP_HOME too), and it is fixed by the Makefile's --remap-path-prefix. That check can and should run everywhere.
 #
 # Skipping the whole section on a dev machine meant the host-path gate had never once executed
 # against a real build. It also cannot be left CI-only now: the remap is the thing that makes the
@@ -160,8 +231,13 @@ if [ -f src/config.local.h ] && [ "${CI:-}" != "true" ]; then
   echo "all ELF assertions passed (config-dependent assertions skipped)"
   exit 0
 fi
-if grep -qE '\b(10|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}\b' "$AUDIT_TMP/strings"; then
-  grep -oE '\b(10|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}\b' "$AUDIT_TMP/strings" | sort -u | sed -n '1,10p'
+# All alternatives include the first TWO octets. A bare `10` alternative would match
+# three-component locale/version data such as `10.11.12`, not an IPv4 address.
+# Dots also belong to the token: do not extract four components out of a longer
+# dotted number sequence. URL separators and ports still delimit real IPv4 literals.
+PRIVATE_IPV4_RE='(^|[^[:alnum:]_.])(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}($|[^[:alnum:]_.])'
+if grep -qE "$PRIVATE_IPV4_RE" "$AUDIT_TMP/strings"; then
+  grep -oE "$PRIVATE_IPV4_RE" "$AUDIT_TMP/strings" | sort -u | sed -n '1,10p'
   fail "private IP address baked into the binary — was this built with src/config.local.h present?"
 fi
 grep -q YOUR_PMS_HOST "$AUDIT_TMP/strings" \
