@@ -868,8 +868,14 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                     // dismissal, which is how a Magic Remote user finds the HUD over full-screen
                     // video. `app/run.rs`'s own motion arm did this and then RETURNED, so the page
                     // never saw a pointer event at all.
-                    InputKind::Pointer { .. } => {
+                    //
+                    // A transport BACK hid stays hidden until the remote really moves — the
+                    // jitter of a hand holding it is motion too (`input::BackHide`).
+                    InputKind::Pointer { x, y, .. } => {
                         self.end_jump_gesture();
+                        if !input::pointer_may_reveal(&mut self.hud.back_hidden, input.at.ms, *x, *y) {
+                            return Handled::Yes;
+                        }
                         self.hud.dismissed = false;
                         self.hud.extend(input.at.ms, input::HUD_LINGER_MS);
                         self.publish();
@@ -1066,6 +1072,8 @@ impl PlayerScreen {
     ) -> Handled {
         use player_hud::{ELEM_FAILURE_BASE, ELEM_FAILURE_END, ELEM_SCRUB, ELEM_TAB_BASE};
         let failed = plx_appkit::player_hud::transport_hidden(ps);
+        // A click is a deliberate act, never jitter: it ends a BACK-hide's pointer gate.
+        self.hud.back_hidden = None;
         let Some(elem) = hit else {
             // **A click that lands on no control at all toggles play/pause** — the `else` arm of
             // the old pointer block, and the reason clicking the PICTURE works: over full-screen
@@ -1347,6 +1355,7 @@ impl PlayerScreen {
                 self.scrub.ns = -1;
                 self.scrub.disengage();
                 self.hud.hide(plx_media::player::loading(ps));
+                self.hud.back_hidden = Some(input::BackHide { at: now, anchor: None });
                 self.publish();
                 Handled::Yes
             }
@@ -3518,6 +3527,20 @@ mod step_ladder_tests {
         assert!(page.hud.dismissed, "the transport is dismissed");
         assert_eq!(page.hud.nav.focus, GROUP_SCRUB, "ring parked on the scrubber");
         assert_eq!(page.scrub.ns, -1, "no scrub target left behind");
+        assert!(page.hud.back_hidden.is_some(), "and the Magic Remote jitter gate is armed");
+        // the remote's jitter right after the press does not raise it back
+        let mut out = Vec::new();
+        let mut present = plx_machine::present::Present::new();
+        page.step(
+            &ScreenEvent::<TestHost>::Input(InputEvent {
+                kind: InputKind::Pointer { x: 900.0, y: 500.0, hit: None },
+                at: Tick { ms: 50, dt_us: 0 },
+                source: Source::Sdl,
+            }),
+            &cx(),
+            &mut Effects::new(&mut out, MachineId::Instance(INST), &mut present),
+        );
+        assert!(page.hud.dismissed, "a hand's jitter does not bring the transport back");
         // A bound key un-dismisses; BACK itself is bound, so the second press must sample the
         // dismissed state BEFORE that, which is what `visible_at_press` is for.
         page.hud.note_fresh_press(TestHost::session(&cx()), 1_000, false);
