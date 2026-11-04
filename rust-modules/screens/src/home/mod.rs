@@ -97,14 +97,6 @@ pub const STRIP_ACCOUNT_ELEM: u32 = plx_ui::dispatch::STRIP_BASE + 4;
 pub const STRIP_WATCHLIST_ELEM: u32 = plx_ui::dispatch::STRIP_BASE + 5;
 
 const MAX_ITEMS: usize = plx_data::pms::MAX_SHELF_ITEMS;
-/// **How much of a resting shelf's posters must stand above the bottom margin for the pointer to take
-/// focus onto them**, from the poster's top (0..1). The page rests the focused shelf at one fixed
-/// line (`rest_scroll`), so the shelf below it stands cut by the bottom margin by a few tens of px
-/// and the shelf above it is off the top: a rule that wanted a shelf WHOLE on screen
-/// left the pointer nothing it could take focus onto (a shelf cut by the TOP still never takes it,
-/// so one passing under the pointer on its way off does not steal focus). The wheel moves the
-/// focus shelf by shelf either way (`bridge::wheel_input`, an Up or Down key).
-const POINTER_REACH: f32 = 0.5;
 
 const HERO_FLIP_CD: f32 = 0.35;
 const HERO_AUTO_S: f32 = 8.0;
@@ -2346,9 +2338,12 @@ impl HomeScreen {
                 );
             }
         }
-        // The shelves have stops under the hero too: the first one peeks under it, and a click on
-        // a peeking card opens it where it stands. A hover there takes no focus from the hero
-        // (`OnlyIfFocused`, `pointable` is false while the hero is up).
+        // The shelves have stops under the hero too: the first one peeks under it. Every poster on
+        // screen takes the pointer, a card the screen shows only part of included (the peeking
+        // shelf, a shelf cut by either edge), the way the Library's grid does: a hover moves focus
+        // and never the page, and the edge glide holds the hover while it moves the page
+        // (`app::input::EdgeScroll`), so a card sliding under a resting pointer takes nothing.
+        // The stops are clipped to the content under the top bar (`section`).
         {
             let hero_up = self.snap.pos < 0.5;
             let focused_row = self.focused_grid(focus).map(|(row, _)| row).filter(|_| !hero_up);
@@ -2360,17 +2355,7 @@ impl HomeScreen {
                 if !row_focused && !self.shelf_on_screen(row_index) {
                     continue;
                 }
-                // Every tile of the row shares one y, so one answer says whether a pointer passing
-                // over the row may take its focus: its posters stand clear of the top margin and
-                // their upper part clears the bottom one ([`POINTER_REACH`]), which is what the shelf
-                // below the focused one is at rest.
-                let rest = Rect::new(0.0, self.grid.base_y(row_index) + CARD_DY, CARD_W, CARD_H)
-                    .scaled(RowStyle::HOME.focus_scale);
-                let pointable = !hero_up && rest.y >= 40.0 && rest.y + rest.h * POINTER_REACH <= SCR_H - 20.0;
-                let src = HomeCards {
-                    hover: if pointable || row_focused { Hover::Focus } else { Hover::OnlyIfFocused },
-                    ..self.cards(view, row_index)
-                };
+                let src = HomeCards { hover: Hover::Focus, ..self.cards(view, row_index) };
                 if let Some(shelf) = self.grid.shelves.get(row_index) {
                     shelf.record_stops(f, f.painter, &src, self.section(row_index));
                 }

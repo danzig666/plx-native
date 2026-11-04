@@ -1965,7 +1965,7 @@ fn holding_a_shelf_card_opens_the_item_menu_without_activation() {
 }
 
 #[test]
-fn a_partially_visible_focused_row_allows_hover_to_its_neighbors_only() {
+fn a_row_cut_by_the_top_takes_the_pointer_focused_or_not() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -1978,7 +1978,7 @@ fn a_partially_visible_focused_row_allows_hover_to_its_neighbors_only() {
     s.layout_grid();
     s.grid.shelves[0].set_base_y(-20.0);
     let neighbor = s.rows[0].elems[1];
-    for (focus, expected) in [(Some(first), Hover::Focus), (None, Hover::OnlyIfFocused)] {
+    for (focus, expected) in [(Some(first), Hover::Focus), (None, Hover::Focus)] {
         let context = cx(snapshot.view(), focus);
         let mut frame = DrawFrame::new(&context, Painter::root());
         s.record_stops(&mut frame, snapshot.view());
@@ -5795,13 +5795,15 @@ fn a_card_peeking_under_the_hero_is_clickable_and_its_click_opens_it_in_place() 
     let stops = frame.into_stops();
     let stop = *stops.iter().find(|stop| stop.key == card).expect("the peeking card is a stop");
     assert!(stop.rect.y < SCR_H && stop.rect.y + stop.rect.h > SCR_H, "premise: the card peeks, cut by the bottom: {:?}", stop.rect);
-    assert_eq!(stop.hover, Hover::OnlyIfFocused, "a hover there takes no focus from the hero");
+    assert_eq!(stop.hover, Hover::Focus, "a hover there takes focus, as a partly shown poster does in the Library");
     let mut map = HitMap::new();
     map.fill(stops);
     map.swap();
     let (x, y) = (stop.rect.cx(), (stop.rect.y + SCR_H) / 2.0);
     let hit = map.resolve(Some(card.entry), PointerKind::Click, x, y, Some(hero));
     assert_eq!((hit.focus, hit.activate), (Some(card), Some((card, Activate::Press))), "its visible part takes the click");
+    let hover = map.resolve(Some(card.entry), PointerKind::Move, x, y, Some(hero));
+    assert_eq!(hover.focus, Some(card), "and a hover over it takes focus, as in the Library");
     // the click as the dispatcher delivers it: focus by the pointer, then the click itself
     step(&mut s, view, Some(card), &ScreenEvent::FocusMoved { from: Some(hero), to: card, by: By::Pointer });
     step(&mut s, view, Some(card), &ScreenEvent::Input(InputEvent { at: Tick::default(),
