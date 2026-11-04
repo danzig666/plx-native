@@ -37,6 +37,8 @@ pub enum SettingsPage {
     AudioSubtitles,
     /// Favorite libraries — the onboard screen in Settings mode.
     Favourites,
+    /// The shared favorites editor opened from Library, returning directly to that page.
+    LibraryFavourites,
     /// Privacy & data — the consent screen in Settings mode.
     Privacy,
     /// The Legal index.
@@ -51,6 +53,12 @@ pub enum SettingsPage {
     ConsentStage(u8),
     /// One playback / account preference's choice list, pushed from Playback or Audio & Subtitles.
     Picker(PickerKind),
+    /// The Player HUD page: the installed packages, the drop folder and the chosen HUD (`hud_settings`).
+    PlayerHud,
+    HudGallery,
+    HudDetail(plx_data::hudpacks::Sha),
+    HudAbout(plx_data::hudpacks::Sha),
+    HudPreview(plx_data::hudpacks::Sha),
 }
 
 /// Which preference a [`SettingsPage::Picker`] edits. The parent page (`Playback` for the local ones,
@@ -67,8 +75,6 @@ pub enum PickerKind {
     NextEpisode,
     SkipInterval,
     DeckPress,
-    SkipIntro,
-    SkipCredits,
     AudioLanguage,
     SubtitleMode,
     SubtitleLanguage,
@@ -77,16 +83,23 @@ pub enum PickerKind {
     UiResolution,
     /// Optional immediate D-pad jumps.
     InstantDpadSeeking,
+    /// Manual Dolby Vision override (Auto / Off).
+    DolbyVision,
+    IntroSkip,
+    CreditsSkip,
 }
 
 impl SettingsPage {
-    /// The pages a boot target opens the surface over, root first: `plxnative-settings=picker-…`
-    /// is reached as root → Playback → the picker (root → the picker for a root row's), so BACK from it
-    /// lands where an interactive visit would. Every other page is booted as the surface's root.
+    /// The pages a boot target asks the surface to stand on, root first: `plxnative-settings=picker-…` and
+    /// `player-hud` name root → Playback → the page (root → the picker for a root row's), the stack an interactive visit
+    /// builds. `RouteSurface::new` issues one request per page and the inner stack keeps only the newest request, so
+    /// what stands is the LAST page alone and BACK from it dismisses the surface instead of popping to its parent
+    /// (seen for the Player HUD page and two pickers). Every other page is booted as the surface's root.
     pub fn boot_trail(self) -> Vec<SettingsPage> {
         match self {
             SettingsPage::Picker(kind) if kind.parent() == SettingsPage::Root => vec![SettingsPage::Root, self],
             SettingsPage::Picker(kind) => vec![SettingsPage::Root, kind.parent(), self],
+            SettingsPage::PlayerHud => vec![SettingsPage::Root, SettingsPage::Playback, self],
             page => vec![page],
         }
     }
@@ -96,7 +109,7 @@ impl PickerKind {
     /// The page that lists this field (its picker is pushed from there and returns there).
     pub fn parent(self) -> SettingsPage {
         match self {
-            PickerKind::Quality | PickerKind::DirectPlay | PickerKind::SubtitleSize | PickerKind::SubtitlePosition | PickerKind::HdrOverlay | PickerKind::NextEpisode | PickerKind::SkipIntro | PickerKind::SkipCredits | PickerKind::DeckPress | PickerKind::SkipInterval | PickerKind::InstantDpadSeeking => SettingsPage::Playback,
+            PickerKind::Quality | PickerKind::DirectPlay | PickerKind::SubtitleSize | PickerKind::SubtitlePosition | PickerKind::HdrOverlay | PickerKind::NextEpisode | PickerKind::DeckPress | PickerKind::SkipInterval | PickerKind::InstantDpadSeeking | PickerKind::DolbyVision | PickerKind::IntroSkip | PickerKind::CreditsSkip => SettingsPage::Playback,
             PickerKind::AudioLanguage | PickerKind::SubtitleMode | PickerKind::SubtitleLanguage | PickerKind::ForcedSubtitles => SettingsPage::AudioSubtitles,
             PickerKind::UiResolution => SettingsPage::Root,
         }
@@ -117,6 +130,7 @@ impl ScreenArg for SettingsPage {
             SettingsPage::UnderPosters => 113,
             SettingsPage::UnderPostersDetails => 114,
             SettingsPage::Favourites => 101,
+            SettingsPage::LibraryFavourites => 116,
             SettingsPage::Privacy => 102,
             SettingsPage::Legal => 103,
             SettingsPage::About => 104,
@@ -124,6 +138,11 @@ impl ScreenArg for SettingsPage {
             SettingsPage::Preview(_) => 106,
             SettingsPage::ConsentStage(_) => 107,
             SettingsPage::Picker(_) => 112,
+            SettingsPage::PlayerHud => 115,
+            SettingsPage::HudGallery => 117,
+            SettingsPage::HudDetail(..) => 118,
+            SettingsPage::HudAbout(..) => 119,
+            SettingsPage::HudPreview(..) => 120,
         })
     }
     fn title(&self) -> Option<&str> {
@@ -143,13 +162,18 @@ impl ScreenArg for SettingsPage {
 /// would silently hash two different documents as one, which is exactly the class of miss the
 /// recorder exists to catch.
 ///
-/// The kind is [`ScreenArg::id`]'s number rather than a second numbering of the same question —
-/// that is already the id the container keys page KIND on. The index is written for EVERY variant,
-/// `0` where there is none, so a payload-less variant that later grows one cannot keep hashing
-/// identically to its old self.
+/// The kind is [`ScreenArg::id`]'s number, the container's own page kind. Document and picker pages
+/// append their index; HUD detail pages append their archive digest; payload-less pages append zero.
+/// A page's destination payload always participates in its identity.
 impl LogicalState for SettingsPage {
     fn write(&self, w: &mut Canon) {
         w.discriminant(ScreenArg::id(self).0);
+        match self {
+            SettingsPage::HudDetail(sha) | SettingsPage::HudAbout(sha) | SettingsPage::HudPreview(sha) => {
+                w.str(&sha.hex()); return;
+            }
+            _ => (),
+        }
         w.u8(match self {
             SettingsPage::Root
             | SettingsPage::Language
@@ -159,11 +183,15 @@ impl LogicalState for SettingsPage {
             | SettingsPage::Playback
             | SettingsPage::AudioSubtitles
             | SettingsPage::Favourites
+            | SettingsPage::LibraryFavourites
             | SettingsPage::Privacy
             | SettingsPage::Legal
+            | SettingsPage::PlayerHud
+            | SettingsPage::HudGallery
             | SettingsPage::About => 0,
             SettingsPage::Document(i) | SettingsPage::Preview(i) | SettingsPage::ConsentStage(i) => *i,
             SettingsPage::Picker(kind) => *kind as u8,
+            SettingsPage::HudDetail(..) | SettingsPage::HudAbout(..) | SettingsPage::HudPreview(..) => unreachable!("written above"),
         });
     }
     fn probe(&self, out: &mut String) {
@@ -176,6 +204,7 @@ impl LogicalState for SettingsPage {
             SettingsPage::Playback => "playback",
             SettingsPage::AudioSubtitles => "audio-subtitles",
             SettingsPage::Favourites => "favourites",
+            SettingsPage::LibraryFavourites => "library-favourites",
             SettingsPage::Privacy => "privacy",
             SettingsPage::Legal => "legal",
             SettingsPage::About => "about",
@@ -183,6 +212,11 @@ impl LogicalState for SettingsPage {
             SettingsPage::Preview(_) => "preview",
             SettingsPage::ConsentStage(_) => "stage",
             SettingsPage::Picker(_) => "picker",
+            SettingsPage::PlayerHud => "player-hud",
+            SettingsPage::HudGallery => "hud-gallery",
+            SettingsPage::HudDetail(..) => "hud-detail",
+            SettingsPage::HudAbout(..) => "hud-about",
+            SettingsPage::HudPreview(..) => "hud-preview",
         });
         if let SettingsPage::Document(i) | SettingsPage::Preview(i) | SettingsPage::ConsentStage(i) = self {
             out.push_str(&format!("[{i}]"));
@@ -197,6 +231,16 @@ impl LogicalState for SettingsPage {
 /// its Onboard child reads. It has no initial conditions of its own (the surface's `LogicalState`
 /// covers its pages).
 pub struct InnerHost;
+#[derive(Clone, Copy)]
+pub struct InnerViews<'a> {
+    pub directory: plx_data::stores::browse::DirectoryView<'a>,
+    pub marker_prefs: plx_appkit::skip_policy::MarkerPrefsView,
+}
+impl<'a> From<plx_data::stores::browse::DirectoryView<'a>> for InnerViews<'a> {
+    fn from(directory: plx_data::stores::browse::DirectoryView<'a>) -> Self {
+        Self { directory, marker_prefs: Default::default() }
+    }
+}
 
 #[derive(Default)]
 pub struct NoInit;
@@ -211,7 +255,7 @@ impl Host for InnerHost {
     type Fx = AppFx;
     type Msg = AppMsg;
     type Elem = u32;
-    type Views<'a> = plx_data::stores::browse::DirectoryView<'a>;
+    type Views<'a> = InnerViews<'a>;
     type Init = NoInit;
     // No family page remembers anything on its own `ReturnState` today (`machine/src/machine.rs`'s
     // `Host::Memory` doc) — the surface's own `NavStack<InnerHost>` restores its child pages by
@@ -221,8 +265,9 @@ impl Host for InnerHost {
 
 impl DirectoryLike for InnerHost {
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a> {
-        cx.views
+        cx.views.directory
     }
+    fn marker_prefs(cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { cx.views.marker_prefs }
 }
 
 /// The outer context as the inner pages see it, carrying the same retained Browse directory the
@@ -232,7 +277,7 @@ impl DirectoryLike for InnerHost {
 /// borrow to hand it to a `DrawFrame`.
 pub fn inner_cx<'o, 'a: 'o, H: DirectoryLike>(cx: &Cx<'a, H>) -> Cx<'o, InnerHost> {
     Cx {
-        views: H::directory(cx),
+        views: InnerViews { directory: H::directory(cx), marker_prefs: H::marker_prefs(cx) },
         tick: cx.tick,
         measure: cx.measure,
         press: cx.press,
@@ -336,6 +381,7 @@ mod tests {
             SettingsPage::Playback,
             SettingsPage::AudioSubtitles,
             SettingsPage::Favourites,
+            SettingsPage::LibraryFavourites,
             SettingsPage::Privacy,
             SettingsPage::Legal,
             SettingsPage::About,
@@ -343,6 +389,11 @@ mod tests {
             SettingsPage::Preview(0),
             SettingsPage::ConsentStage(0),
             SettingsPage::Picker(PickerKind::Quality),
+            SettingsPage::PlayerHud,
+            SettingsPage::HudGallery,
+            SettingsPage::HudDetail(plx_data::hudpacks::Sha::of(b"test")),
+            SettingsPage::HudAbout(plx_data::hudpacks::Sha::of(b"test")),
+            SettingsPage::HudPreview(plx_data::hudpacks::Sha::of(b"test")),
         ];
         let mut ids: Vec<u32> = pages.iter().map(|p| plx_ui::screen::ScreenArg::id(p).0).collect();
         ids.sort_unstable();

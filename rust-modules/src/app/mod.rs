@@ -6,6 +6,7 @@
 //! The only application subsystem left in C is the starfish.c C++/ACB seam (the engine itself is
 //! Rust: plx_media::player).
 #![allow(non_upper_case_globals)]
+pub(crate) mod hud_source;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -239,6 +240,16 @@ pub(crate) struct App {
     #[cfg(feature = "devtools")]
     fps_shown: i32,
     play_prev: Option<(i64, u32)>,
+    /// The compiled HUD the player page draws from (`player_hud::loaded`), in the language the process
+    /// started in (a label's width sets a pill's width; the language cannot change while it runs). Compiled at boot (`boot::enter_application`), outside any frame, and handed to
+    /// the mount through the mounter's seed (`Bridge::seed_player_compiled`); `None` only in a controlled
+    /// replay or record run, which measures nothing outside a frame and compiles on its first player frame
+    /// (`run::refresh_hud`, inside the frame iteration). It is replaced by the package the seated profile chose when
+    /// that one fits the language and the cost ceilings (`Bridge::huds_tick`, in the frame's prepare window, never in the draw), and a
+    /// `plxnative-hud=<path>` package replaces whatever is chosen.
+    hud: Option<plx_appkit::player_hud::loaded::LoadedHud>,
+    /// the `plxnative-hud=<path>` package, read once on the first player frame (`run::refresh_hud`)
+    dev_hud: plx_appkit::player_hud::loaded::DevHud,
     running: bool,
     window_activity: window_activity::WindowActivity,
     #[cfg(feature = "devtools")]

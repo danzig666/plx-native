@@ -555,7 +555,7 @@ impl<K: Copy + Eq> Stack<K> {
                 match (s.kind, kept) {
                     (Kind::Shelf { .. }, Some((_, b @ Body::Shelf(_)))) => b,
                     (Kind::Grid { .. }, Some((_, b @ Body::Grid(_)))) => b,
-                    (Kind::Shelf { style, .. }, _) => Body::Shelf(Shelf::new(self.entry, style)),
+                    (Kind::Shelf { style, .. }, _) => Body::Shelf(Shelf::new(self.entry, *style)),
                     (Kind::Grid { spec }, _) => Body::Grid(Grid::new(self.entry, spec.external())),
                     _ => Body::Plain,
                 }
@@ -743,8 +743,8 @@ impl<K: Copy + Eq> Stack<K> {
                     reported = Some(StackEvent::Card(k, CardEvent::Want(r)));
                 }
             }
-            // A hover moves focus, never the page: the pointer scrolls by the screen's edges, and a
-            // click acts where it stands. Every other move brings the page to the focus.
+            // A hover moves focus, never the page: the pointer scrolls by the screen's edges (and
+            // a click by what it clicked, below). Every other move brings the page to the focus.
             ScreenEvent::FocusMoved { by: plx_machine::machine::By::Pointer, .. } => self.wheeled = true,
             ScreenEvent::FocusMoved { to, .. } if self.on_move => self.reveal_on(p, cx, *to),
             ScreenEvent::FocusMoved { .. } => self.wheeled = false,
@@ -763,6 +763,14 @@ impl<K: Copy + Eq> Stack<K> {
                             shelf.glide(dx, n);
                             fx.invalidate(plx_machine::present::Provenance::Input);
                         }
+                    }
+                }
+            }
+            ScreenEvent::Input(input) if matches!(input.kind, plx_machine::machine::InputKind::Click { hit: Some(_), .. }) => {
+                if let plx_machine::machine::InputKind::Click { hit: Some(elem), .. } = input.kind {
+                    self.wheeled = false;
+                    if self.on_move {
+                        self.reveal_on(p, cx, FocusKey { entry: self.entry, elem });
                     }
                 }
             }

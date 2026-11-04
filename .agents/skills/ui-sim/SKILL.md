@@ -291,8 +291,9 @@ make screenshots SHOT_HERO_VARIANTS=1 # also home-hero-<film>.jpg for each hero 
   type of the page's grid; `collections` and `recommended` press the header control that opens that
   page; applied before `libgrid`/`libshelf`/`libmenu` act), `libmenu=<sortfilter|sort|filter|type>,<ms>`, and under `hostsim` `clockstop=<ms>`: the clock sink's clock stops at that
   position while the player stays PLAYING (Up Next only shows while playing; `autopause` would
-  take it down). The settled capture waits for every armed seat, menu and clock stop to land, so
-  a scene that seeks does not rest before it. `stillclock` also holds the Up Next countdown.
+  take it down). The settled capture waits for every armed seat, menu, clock stop and
+  `autopause` pause to land, so a scene that seeks does not rest before it (a busy host can leave a
+  loading player still for longer than the capture's quiet). `stillclock` also holds the Up Next countdown.
 - **The capture is the app's, once the screen is at rest.** `PLXNATIVE_SHOT_SETTLE=<ms>` makes the
   simulator write one PNG after the screen has not changed for that long (and not before
   `PLXNATIVE_SHOT_AFTER`), then exit with `PLXNATIVE_SHOT_EXIT=1`. The driver waits on that
@@ -350,6 +351,8 @@ Report these ONLY from the device, via the **`tv-session`** skill (and `wake-tv`
   `loop=` from a simulator as evidence about performance.
 - **Text rasterization truth.** Different FreeType, so stem/bar weight, hinting and the
   `theme::size` ladder stay device questions — `tools/font-hint-audit.py` and a device capture.
+  Arabic and Hebrew runs are the exception for shape and order: libass-plx draws them with the same
+  pinned FreeType and HarfBuzz in the simulator and on the TV, and `make check-ass` checks their ink.
   The window is no longer at an arbitrary fitted scale (`scale≈0.86` was the old fitted size): it
   opens at an exact divisor of the 1920x1080 canvas and is not resizable, so on a Retina display
   the drawable is 1920x1080 and `scale` is exactly 1.0 — whatever the display's size and with or

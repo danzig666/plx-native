@@ -342,8 +342,10 @@ machine name (`nas-home`) only in the Sources list and the failure read-out.
   once/sec heartbeat's `route=` field no longer reads `onboard` for the Settings-opened case — only
   for the first-run one. A picker that could
   turn into an editor would let a library be un-favourited from inside the list of favourites and
-  then vanish out of it under the cursor. **Browse** is a picker — one tick, OK closes, scoped to
-  the FAVOURITES of the type being browsed. **On Home** is a toggle — the word `On`/`Off` at the
+  then vanish out of it under the cursor. **Browse** is a picker — one tick, OK closes. The "+N"
+  panel scopes it to the favourites the header fold hid; the Library's Sort & Filter menu draws the
+  same level over every library of the type that is a favourite or sits on a server the list would
+  open. **On Home** is a toggle — the word `On`/`Off` at the
   trailing edge, OK flips, the list stays open.
   Grouped by server: header = machine, accessory = person. The last favourite library uses `value_dim`;
   an unreachable server's whole group dims at .52, header included. "Check for shared libraries" sits last
@@ -390,7 +392,15 @@ not move with the words: `BrowseSection::pinned`, `HomePins`, `plex/pins.rs` and
 `home_pins` key are all unchanged, deliberately — renaming the persisted key breaks ROLLBACK rather
 than upgrade. What still comes from the GRANT and not from the setting: access itself, the grid,
 sort, the A–Z rail, and Search, which stays grant-wide and only RANKS favourite-library hits first.
-The grant decides what you can reach; the favourite decides what the app offers.
+The grant decides what you can reach; the favourite decides what the app offers, with one
+exception: Library options (the persistent ellipsis) offers hidden favorites and available
+non-favorites of the viewed type. Favorite shortcuts stay in their original positions; a hidden
+current library appears as a selected temporary pill before the ellipsis and is ticked in the
+picker. A non-favorite visit survives child-page returns, including Settings, without replacing
+the saved favorite. Leaving Library or switching media types clears that visit; the next entry
+returns to the last-used favorite. Sort & Filter changes only the listing.
+Library options also refreshes shared libraries and opens the favorites editor with a library
+breadcrumb. Back and Done return directly to that opener.
 
 **Two divergences between the canvas and main, both because main moved while it was drawn**, neither
 requiring the design to change: its toolbar frames include an `Unwatched` chip that `0d9a4f6f`
@@ -741,9 +751,9 @@ writes for retry when the worker queue cannot admit them. `browse.rs` is the plu
 around them, and a selection PERSISTS: every flip was in-memory before 2026-08-21, so a selection
 made in the Sources panel was gone by the next boot and the default came back, which reads as the
 switch not working. Since 2026-09-04 the write
-is `browse::apply_pins_from`, once, when the Home editor's `Done`/`Start watching` commits its draft — a
-flip edits the in-memory draft and nothing is written until then (`toggle_pin`, the old per-press
-write, is a test-only fixture now).
+is `browse::apply_pins_from`. First run stages the choices until `Start watching`; the Settings
+and contextual Library editors send `ApplyPins` on each switch, so Back and Done both retain the
+changes. `toggle_pin`, the old direct mutator, remains a test-only fixture.
 
 ### Where the implementation reinterprets the canvas
 

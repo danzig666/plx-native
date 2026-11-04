@@ -1,10 +1,12 @@
 //! Live executor for Settings preference effects. The bridge's controlled-IO guard must admit
 //! the effect before this entrypoint: profile capture, thread admission and persistence all live
 //! here, never in a screen constructor or step.
+mod marker_access;
+pub(crate) use marker_access::MarkerAccessRunner;
 use plx_media::route::{choose, Choice, How};
 use plx_plex::plex::account::{PreferenceError, PreferenceRequest};
-use plx_plex::plex::session::{InstantDpadSeekingPref, DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, QualityPref,
-    SkipCreditsPref, SkipIntervalPref, SkipIntroPref, SubtitlePositionPref, SubtitleSizePref, TrailerAutoplayPref, UnderPostersPref};
+use plx_plex::plex::session::{IntroSkipPref, CreditsSkipPref, DolbyVisionModePref, InstantDpadSeekingPref, DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, QualityPref,
+    SkipIntervalPref, SubtitlePositionPref, SubtitleSizePref, TrailerAutoplayPref, UnderPostersPref};
 use plx_screens::registry::{AccountPreferenceReply, PreferenceCmd};
 use std::sync::mpsc::Sender;
 
@@ -12,14 +14,15 @@ use std::sync::mpsc::Sender;
 /// (`How::settings`) decides whether the pick is confirmed first or published at once.
 fn choose_setting(choice: Choice, reply: Sender<bool>) {
     match choice {
+        Choice::IntroSkip(v) => choose::<IntroSkipPref>(v, How::settings::<IntroSkipPref>(reply)),
+        Choice::CreditsSkip(v) => choose::<CreditsSkipPref>(v, How::settings::<CreditsSkipPref>(reply)),
         Choice::Quality(v) => choose::<QualityPref>(v, How::settings::<QualityPref>(reply)),
         Choice::DirectPlay(v) => choose::<DirectPlayModePref>(v, How::settings::<DirectPlayModePref>(reply)),
         Choice::NextEpisode(v) => choose::<NextEpisodeModePref>(v, How::settings::<NextEpisodeModePref>(reply)),
         Choice::InstantDpadSeeking(v) => choose::<InstantDpadSeekingPref>(v, How::settings::<InstantDpadSeekingPref>(reply)),
+        Choice::DolbyVision(v) => choose::<DolbyVisionModePref>(v, How::settings::<DolbyVisionModePref>(reply)),
         Choice::SkipInterval(v) => choose::<SkipIntervalPref>(v, How::settings::<SkipIntervalPref>(reply)),
         Choice::DeckPress(v) => choose::<DeckPressPref>(v, How::settings::<DeckPressPref>(reply)),
-        Choice::SkipIntro(v) => choose::<SkipIntroPref>(v, How::settings::<SkipIntroPref>(reply)),
-        Choice::SkipCredits(v) => choose::<SkipCreditsPref>(v, How::settings::<SkipCreditsPref>(reply)),
         Choice::UnderPosters(v) => choose::<UnderPostersPref>(v, How::settings::<UnderPostersPref>(reply)),
         Choice::TrailerAutoplay(v) => choose::<TrailerAutoplayPref>(v, How::settings::<TrailerAutoplayPref>(reply)),
         Choice::SubtitleSize(v) => choose::<SubtitleSizePref>(v, How::settings::<SubtitleSizePref>(reply)),
@@ -30,6 +33,10 @@ fn choose_setting(choice: Choice, reply: Sender<bool>) {
 
 pub(super) fn execute(command: PreferenceCmd) {
     match command {
+        // These commands need the Bridge's admitted, profile-scoped feature publication.
+        PreferenceCmd::EnsureMarkerAccess => {}
+        PreferenceCmd::ChooseMarker { reply, .. } => { let _ = reply.send(false); }
+        PreferenceCmd::Choose(Choice::IntroSkip(_) | Choice::CreditsSkip(_), reply) => { let _ = reply.send(false); }
         PreferenceCmd::Load { reply } => {
             let Some(request) = PreferenceRequest::capture() else {
                 let _ = reply.send(AccountPreferenceReply {
@@ -67,5 +74,15 @@ pub(super) fn execute(command: PreferenceCmd) {
                 plx_machine::idle::invalidate();
             });
         }
+    }
+}
+
+pub(super) fn execute_marker(command: PreferenceCmd, view: plx_appkit::skip_policy::MarkerPrefsView) {
+    if let PreferenceCmd::ChooseMarker { kind, mode, scope, reply } = command {
+        if scope == 0 || scope != view.scope || !view.granted(kind) {
+            let _ = reply.send(false); return;
+        }
+        choose_setting(match kind { plx_data::metadata::MarkerKind::Intro => Choice::IntroSkip(mode),
+            plx_data::metadata::MarkerKind::Credits => Choice::CreditsSkip(mode) }, reply);
     }
 }

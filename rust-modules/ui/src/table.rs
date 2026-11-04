@@ -573,6 +573,8 @@ fn next_rev() -> u32 {
 
 pub struct TableView {
     pub sections: Vec<Section>,
+    /// Optional empty-state copy; an empty string leaves it to the surrounding narrative.
+    empty_text: Option<CString>,
     pub sel: i32, // global index across all sections' rows (headers are not selectable)
     /// Does the LIST hold focus? `false` draws no selection pill at all — the "nothing selected"
     /// mode this widget did not have.
@@ -630,7 +632,7 @@ impl TableView {
     /// The owner records its row data separately. These fields determine layout, the selected
     /// face and subsequent motion; no text/texture cache or renderer pointer is traversed.
     pub fn write_motion(&self, c: &mut plx_machine::machine::Canon) {
-        let Self { sections: _, sel, list_focused, compact, tall, header_ink, hl_top, hl_bot, scroll, title: _, min_panel_w: _, rev: _ } = self;
+        let Self { sections: _, sel, list_focused, compact, tall, header_ink, hl_top, hl_bot, scroll, title: _, min_panel_w: _, rev: _, empty_text: _ } = self;
         c.u32(*sel as u32).bool(*list_focused).bool(*compact).bool(*tall);
         for component in header_ink { c.f32(*component); }
         for spring in [hl_top, hl_bot, scroll] { c.f32(spring.pos).f32(spring.vel); }
@@ -655,6 +657,7 @@ impl TableView {
     pub const fn new() -> Self {
         Self {
             sections: Vec::new(),
+            empty_text: None,
             sel: 0,
             list_focused: true,
             compact: false,
@@ -676,6 +679,9 @@ impl TableView {
         self
     }
 
+    /// Override the default track-menu empty state for a table in another context.
+    pub fn set_empty_text(&mut self, text: Option<&str>) { self.empty_text = text.and_then(|s| CString::new(s).ok()); }
+
     /// **An empty table dressed like this one**: the same size class, header ink, row height and
     /// panel-width floor, with no rows, no title and every spring at rest. A panel that moves its
     /// outgoing page aside for a transition (`ui::panel_motion`) swaps this in for the page it
@@ -688,6 +694,7 @@ impl TableView {
         t.tall = self.tall;
         t.header_ink = self.header_ink;
         t.min_panel_w = self.min_panel_w;
+        t.empty_text = self.empty_text.clone();
         t
     }
 
@@ -1450,7 +1457,7 @@ impl TableView {
     fn draw_in(&self, p: Painter, frame: Rect, page: bool, measure: &dyn plx_machine::machine::Measure) {
         if self.n_rows() == 0 {
             Label::new(
-                plx_platform::i18n::msg::widgets_tracks_empty_c().as_ptr(),
+                self.empty_text.as_ref().map_or_else(|| plx_platform::i18n::msg::widgets_tracks_empty_c().as_ptr(), |s| s.as_ptr()),
                 theme::size::BODY,
                 theme::TEXT_TERTIARY,
             )
@@ -1807,9 +1814,11 @@ impl TableView {
                     // scissored to the label's column on the row's band; nests inside the table's
                     // own frame clip and restores it on drop
                     let _clip = crate::screen::ClipScope::open_in(p, Rect::new(label_x, sy, text_w, h));
-                    p.text(cs.as_ptr(), label_x - off, y, msz, base, 0, mbold);
-                    let follower = label_x - off + full_w + crate::marquee::GAP;
-                    p.text(cs.as_ptr(), follower, y, msz, base, 0, mbold);
+                    // the shared placement rule: an Arabic or Hebrew label glides mirrored
+                    let rtl = plx_gfx::text::is_rtl_paragraph(&row.label);
+                    let (run, follower) = crate::marquee::placements(full_w, text_w, off, rtl);
+                    p.text(cs.as_ptr(), label_x + run, y, msz, base, 0, mbold);
+                    p.text(cs.as_ptr(), label_x + follower, y, msz, base, 0, mbold);
                 }
             } else {
                 if focused {
@@ -2544,6 +2553,44 @@ mod tests {
         let x1 = gliding.iter().copied().fold(f32::MAX, f32::min);
         assert!(x1 < x0, "the run has moved left: {x0} -> {x1}");
         assert!(plx_machine::idle::take_local_damage() > 0, "a gliding frame reports");
+    }
+
+    /// **An Arabic release name scrolls mirrored**: it rests with its right edge (its first
+    /// words) on the column's, its follower one gap to the left, and glides right.
+    #[test]
+    fn a_focused_right_to_left_label_rests_on_its_first_words_and_scrolls_right() {
+        let _serial = plx_base::testlock::serial();
+        use plx_machine::machine::Measure as _;
+        let frame = Rect::new(0.0, 0.0, 500.0, 400.0);
+        let long = "مسلسل الهيبة الموسم الثالث الحلقة الأولى ترجمة عربية كاملة بجودة عالية";
+        let mut t = TableView::new();
+        t.set_sections(vec![Section::new("S").row(Row::new(long).server_label()).row(Row::new("Off"))], 0, false);
+        let draw = || {
+            let mut runs: Vec<crate::draw_census::Run> = crate::draw_census::capture_runs(|| {
+                t.draw(crate::Painter::recording(), frame, &crate::fixture::FixtureMeasure)
+            })
+            .into_iter()
+            .filter(|r| r.text == long)
+            .collect();
+            runs.sort_by(|a, b| a.at.x.total_cmp(&b.at.x));
+            runs
+        };
+        // the label's column: its left edge is where a Latin label rests, its width the row's
+        ROW_MARQUEE.with(|c| c.release());
+        plx_machine::idle::frame_begin(1.0 / 60.0);
+        let col_x = row_text_xs(&marquee_table(0), frame, 0).into_iter().fold(f32::MAX, f32::min);
+        let col_w = t.label_width(&Row::new(long).server_label(), frame.w, &crate::fixture::FixtureMeasure);
+        ROW_MARQUEE.with(|c| c.release());
+        let rest = draw();
+        assert_eq!(rest.len(), 2, "a run and its follower: {rest:?}");
+        let w = crate::fixture::FixtureMeasure.width_str(long, rest[1].size, rest[1].bold);
+        assert!(w > col_w, "the fixture label overflows its column");
+        assert!((rest[1].at.x + w - (col_x + col_w)).abs() < 0.01, "flush right: {rest:?} w {w} column {col_x}+{col_w}");
+        assert!((rest[0].at.x + w + crate::marquee::GAP - rest[1].at.x).abs() < 0.01, "follower on the left");
+        plx_machine::idle::frame_begin((crate::marquee::ROW.hold_ms + 500.0) / 1000.0);
+        let moved = draw();
+        assert!((moved[1].at.x - rest[1].at.x - 20.0).abs() < 0.01, "it glides right: {rest:?} -> {moved:?}");
+        ROW_MARQUEE.with(|c| c.release());
     }
 
     /// **And nothing else moves**: a focused label that fits, and an overflowing label on a row

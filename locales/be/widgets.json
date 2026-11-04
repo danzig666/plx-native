@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Звычайная",
   "widgets.menu.stats": "Статыстыка",
   "widgets.menu.diagnostics": "Даслаць дыягностыку",
+  "widgets.menu.previous_episode": "Папярэдняя серыя",
   "widgets.badge.forced": "ПРЫМУСОВЫЯ",
   "widgets.toggle.on": "Укл.",
   "widgets.toggle.off": "Выкл.",
@@ -42,8 +43,6 @@
   "widgets.chapters.number": "Раздзел {number}",
   "widgets.skip.intro": "Прапусціць застаўку",
   "widgets.skip.credits": "Прапусціць цітры",
-  "widgets.skip.intro_skipped": "Застаўка прапушчана",
-  "widgets.skip.credits_skipped": "Цітры прапушчаны",
   "widgets.next.episode": "Наступная серыя",
   "widgets.next.credits": "Глядзець цітры",
   "widgets.next.caption": "Далей · {episode}",
@@ -259,5 +258,6 @@
   "widgets.region.nl": "Нідэрланды",
   "widgets.region.latin_america": "Лацінская Амерыка",
   "widgets.failure.play_auto": "Уключыць «Аўтаматычна» і прайграць",
-  "widgets.failure.change_quality": "Змяніць якасць"
+  "widgets.failure.change_quality": "Змяніць якасць",
+  "widgets.watch.intro": "Глядзець уступ"
 }

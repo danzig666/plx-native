@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Normál",
   "widgets.menu.stats": "Részletes statisztika",
   "widgets.menu.diagnostics": "Diagnosztika küldése",
+  "widgets.menu.previous_episode": "Előző epizód",
   "widgets.badge.forced": "KÉNYSZERÍTETT",
   "widgets.toggle.on": "Be",
   "widgets.toggle.off": "Ki",
@@ -42,8 +43,6 @@
   "widgets.chapters.number": "{number}. fejezet",
   "widgets.skip.intro": "Főcím kihagyása",
   "widgets.skip.credits": "Stáblista kihagyása",
-  "widgets.skip.intro_skipped": "Főcím kihagyva",
-  "widgets.skip.credits_skipped": "Stáblista kihagyva",
   "widgets.next.episode": "Következő epizód",
   "widgets.next.credits": "Stáblista megtekintése",
   "widgets.next.caption": "Következik · {episode}",
@@ -251,5 +250,6 @@
   "widgets.region.nl": "Hollandia",
   "widgets.region.latin_america": "Latin-Amerika",
   "widgets.failure.play_auto": "Automatikusra váltás és lejátszás",
-  "widgets.failure.change_quality": "Minőség módosítása"
+  "widgets.failure.change_quality": "Minőség módosítása",
+  "widgets.watch.intro": "Bevezető megtekintése"
 }

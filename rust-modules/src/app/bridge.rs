@@ -56,7 +56,7 @@ use plx_machine::machine::{
 };
 use plx_machine::present::Present;
 use plx_ui::screen::{
-    At, FocusSource, ReturnState, Screen, ScreenEvent,
+    At, Enter, FocusSource, FocusTarget, ReturnState, Screen, ScreenEvent,
 };
 
 
@@ -97,6 +97,7 @@ fn refresh_chrome(
 
 #[derive(Clone, Copy)]
 pub(crate) struct AppViews<'a> {
+    pub(crate) marker_prefs: plx_appkit::skip_policy::MarkerPrefsView,
     pub(crate) auth: plx_session::auth::SessionRead<'a>,
     pub(crate) hubs: plx_data::pms::HubsView<'a>,
     pub(crate) listing: plx_data::stores::browse::ListingView<'a>,
@@ -117,14 +118,16 @@ pub(crate) struct AppViews<'a> {
     /// a screen reads them here. A screen that wants to CHANGE the playback emits an effect
     /// (`AppFx::Player`, `ContentReq::Play`) — there is no `&mut` on this path by construction.
     pub(crate) session: &'a plx_media::route::PlaybackSession,
+    /// **Today's calendar date as this frame's publication**, `[year, month, day]` in the viewer's
+    /// time zone: published by the loop once per iteration ([`Bridge::publish_today`]) the way the
+    /// playback session is, so a screen RECEIVES the date it words ("Today", "27 Oct") and fetches
+    /// none. `None` before the first publication and when the platform cannot say.
+    pub(crate) today: Option<[i32; 3]>,
     /// **The kind of page beneath the page these views are read for** on the navigation stack,
     /// folded in by the dispatcher per page ([`Host::views_over`]); `None` for a root, and for
     /// every context that is not a page's own. What a page that names where BACK goes reads
     /// ([`super::page_title`]).
     pub(crate) beneath: Option<plx_machine::machine::ScreenId>,
-    /// The time of day this frame was published with (`Bridge::publish_playback`), for the
-    /// player HUD's corner clock; `None` off the player and wherever no loop read one.
-    pub(crate) wall: Option<plx_base::wallclock::WallTime>,
 }
 
 impl Bridge {
@@ -137,10 +140,10 @@ impl Bridge {
     /// [`Self::views`] reading `session` as the playback publication — what a test rig with no
     /// player of its own passes.
     pub(crate) fn views_with<'a>(&'a self, session: &'a plx_media::route::PlaybackSession) -> AppViews<'a> {
-        AppViews { auth: self.session.read(), hubs: self.hubs.view(), listing: self.listing.view(),
+        AppViews { marker_prefs: self.marker_prefs, auth: self.session.read(), hubs: self.hubs.view(), listing: self.listing.view(),
             directory: self.directory.view(), section_hubs: self.section_hubs.view(),
             search: self.search.view(), metadata: self.stores.metadata_view(),
-            person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session, beneath: None, wall: self.wall }
+            person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session, today: self.today, beneath: None }
     }
 }
 
@@ -240,7 +243,6 @@ fn execute_endpoint_outcomes_with(
 
 impl plx_screens::registry::PlayerLike for AppHost {
     fn session<'a>(cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession { cx.views.session }
-    fn wall(cx: &Cx<'_, Self>) -> Option<plx_base::wallclock::WallTime> { cx.views.wall }
 }
 
 impl plx_screens::registry::SearchLike for AppHost {
@@ -248,12 +250,14 @@ impl plx_screens::registry::SearchLike for AppHost {
 }
 
 impl plx_screens::registry::LibraryLike for AppHost {
+    fn marker_prefs(cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { cx.views.marker_prefs }
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a> { cx.views.listing }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a> { cx.views.directory }
     fn section_hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::HubsView<'a> { cx.views.section_hubs }
     fn collections_count(cx: &Cx<'_, Self>, section: usize) -> Option<Result<u32, plx_screens::registry::Forbidden>> {
         super::collections_probe::count(cx.views.directory, section, cx.tick.ms)
     }
+    fn today(cx: &Cx<'_, Self>) -> Option<[i32; 3]> { cx.views.today }
 }
 
 impl plx_screens::registry::PersonLike for AppHost {
@@ -374,6 +378,9 @@ impl SeatWatch {
 
 /// What the bridge lends the dispatcher, and what it collects for the loop.
 pub(crate) struct Bridge {
+    marker_access: super::preferences::MarkerAccessRunner,
+    marker_prefs: plx_appkit::skip_policy::MarkerPrefsView,
+    marker_now: u32,
     /// Endpoint refreshes a store step had no room to emit (`EndpointRefreshSet::emit`).
     endpoint_carry: plx_data::stores::EndpointRefreshSet,
     session_cache_generation: u64,
@@ -391,6 +398,13 @@ pub(crate) struct Bridge {
     session_ready: Option<(u64, plx_session::auth::owner::ProfileScope, plx_plex::plex::session::ServerRef, String, plx_session::auth::owner::ReadyInstall)>,
     /// The seat the per-profile cells (the player settings and trailer autoplay) were last restored for ([`SeatWatch`]).
     seat_watch: SeatWatch,
+    /// The player-HUD package store, its runner and the compile of the selection ([`super::adapters::huds`]). Off until boot starts it.
+    huds: super::adapters::huds::HudDriver,
+    /// The open Player HUD page's channel and what it was last sent ([`Bridge::huds_publish`]).
+    huds_pages: Vec<(std::sync::mpsc::Sender<plx_screens::hud_settings::HudList>, u64)>,
+    /// What the last install or removal said, for the page, until it is opened again.
+    huds_notice: Option<plx_data::hudpacks::Notice>,
+    trace_save: Option<(MachineId, u64, plx_base::storage_worker::TypedTicket<plx_platform::playback_trace::Status>)>,
     consent_adapter: super::adapters::consent::ConsentAdapter,
     /// Starts the jobs the stores emit (`adapters::stores`). Chosen when the Bridge is built: `Live`
     /// in production, the `Held` runner in a host test.
@@ -411,9 +425,9 @@ pub(crate) struct Bridge {
     /// Was the publication above refreshed on the last frame? The one bit that lets the retirement
     /// of a stale publication be a single assignment rather than a per-frame one.
     playback_live: bool,
-    /// The time of day the loop read for this frame, published with the playback (only while the
-    /// player is mounted, the one reader): `AppViews::wall`.
-    wall: Option<plx_base::wallclock::WallTime>,
+    /// This frame's publication of the calendar date — see `AppViews::today`. Refreshed by
+    /// [`Bridge::publish_today`] from the loop, once per iteration; `None` until the first one.
+    today: Option<[i32; 3]>,
     /// **Is the hardware video plane bound?** `Player::video_plane_bound`, published here by the
     /// loop on its edges — the rig's own copy of the one bit, for the privileged call at draw
     /// entry (`clear_opaque_region`), which the `Rig` trait gives no argument.
@@ -477,6 +491,9 @@ pub(crate) struct Bridge {
 impl Bridge {
     #[cfg(test)]
     pub(crate) fn measurement_queries(&self)->Vec<plx_ui::rec::MetricKey> { self.measure.queries() }
+    /// The measurer every screen of this bridge lays out with (a host test's has no fonts): the HUD
+    /// package is compiled with it, outside the draw, so the plan's widths are the draw's.
+    pub(crate) fn measure(&self) -> &dyn Measure { &self.measure }
     pub(crate) fn prepare_measurements(&mut self, replay: Option<&std::collections::HashMap<plx_ui::rec::MetricKey,u32>>) {
         self.measure.prepare(replay);
     }
@@ -650,6 +667,7 @@ impl Bridge {
         Self {
             session_cache_generation: plx_plex::plex::session::visible_generation(),
             cache_refresh_begun: None,
+            marker_access: Default::default(), marker_prefs: Default::default(), marker_now: 0,
             endpoint_carry: Default::default(),
             home_io: None,
             recorded_clients: std::collections::BTreeMap::new(),
@@ -658,6 +676,10 @@ impl Bridge {
             session_adapter,
             session_ready: None,
             seat_watch: SeatWatch::new(),
+            huds: super::adapters::huds::HudDriver::off(),
+            huds_pages: Vec::new(),
+            huds_notice: None,
+            trace_save: None,
             consent_adapter,
             store_runner,
             late_store_jobs: 0,
@@ -666,7 +688,7 @@ impl Bridge {
             mounter: AppMounter::default(),
             playback: plx_media::route::PlaybackSession::IDLE,
             playback_live: false,
-            wall: None,
+            today: None,
             video_plane: false,
             measure: plx_ui::rec::Measurements::Live(measure),
             hubs: reads.hubs,
@@ -883,14 +905,15 @@ impl Bridge {
     /// the dip brings up an empty page and the grid appears in one frame when the image is
     /// replaced. The target is the page's own (`DirectoryView::kind_address`, which its first tick
     /// sends too, so the second select is the same command on a store already there). A store
-    /// already on a library of this kind stays on it (the reader's last pick), as
-    /// `LibraryScreen::sync` keeps it. Not for a Library already on top: its `LibraryCmd::Enter` saves the outgoing
+    /// already on the preferred library stays there; a departed non-favorite visit is restored to
+    /// the last-used favorite. Not for a Library already on top: its `LibraryCmd::Enter` saves the outgoing
     /// section's cursor from the listing it is still showing, before it switches.
     pub(crate) fn aim_library(&mut self, kind: plx_data::browse::SecKind) {
         let target = {
             let directory = self.directory.view();
-            let current = directory.current().map(|i| directory.sections()[i].kind);
-            directory.kind_address(kind).filter(|_| current != Some(kind))
+            let current = directory.current().and_then(|index| directory.sections().get(index))
+                .and_then(|section| section.sid.map(|sid| (sid, section.key)));
+            directory.kind_address(kind).filter(|target| Some((target.sid, target.section)) != current)
         };
         if let Some(target) = target {
             self.browse_run(plx_data::stores::browse::BrowseCmd::Addressed { target,
@@ -930,6 +953,172 @@ impl Bridge {
     /// [`AppMounter::player_hud_ms`]. Set by `start_playback` and consumed by the mount.
     pub(crate) fn seed_player_hud(&mut self, ms: u32) {
         self.mounter.player_hud_ms = Some(ms);
+    }
+
+    /// The compiled HUD every player instance from now on is constructed with — see
+    /// [`AppMounter::player_compiled`]. Set at boot, again by `run::refresh_hud` when a controlled run or a dev package compiles on the first player frame, and by every hand-over of `huds_tick` (the profile's chosen package).
+    pub(crate) fn seed_player_compiled(&mut self, compiled: std::sync::Arc<plx_appkit::hud_format::compile::Compiled>) {
+        self.mounter.player_compiled = compiled;
+    }
+
+    /// Begin the player-HUD store with the compiled classic as what draws until a package lands, and read
+    /// what is installed. Boot calls it once, outside any frame; a controlled run never does.
+    pub(crate) fn huds_start(&mut self, classic: plx_appkit::player_hud::loaded::LoadedHud) {
+        self.huds.start(classic, plx_plex::plex::identity::version());
+        self.huds_refresh();
+    }
+
+    /// Read the installed packages again for the profile seated now (HUD settings opened, boot).
+    pub(crate) fn huds_refresh(&mut self) {
+        let seat = plx_plex::plex::session::current_seat();
+        self.huds_refresh_for(&seat);
+    }
+
+    fn huds_refresh_for(&mut self, seat: &plx_plex::plex::session::Seat) {
+        let stored = plx_plex::plex::session::stored_effective_hud(&plx_plex::plex::session::peek(), seat);
+        let selected = self.huds.selected_for(seat.user().is_some(), stored);
+        self.huds.refresh(selected);
+    }
+
+    /// One tick of the HUD driver, from the frame's prepare window: the compiled HUD the player must now draw, when
+    /// it changed. Three flag tests while nothing is in flight, and no compile while a player is up.
+    pub(crate) fn huds_tick(&mut self, route_player: bool) -> Option<plx_appkit::player_hud::loaded::LoadedHud> {
+        let env = super::adapters::huds::Env {
+            measure: &self.measure,
+            cx: plx_platform::i18n::current(),
+            app_version: plx_plex::plex::identity::version(),
+            // a player page is mounted, or a playback is live (starting included): no compile runs now
+            player: route_player || self.playback_live,
+        };
+        let hud = self.huds.tick(&env);
+        self.huds_settle();
+        hud
+    }
+
+    /// The viewer's commands on the HUD store, from the Settings page.
+    pub(crate) fn huds_command(&mut self, command: plx_screens::registry::HudCmd) {
+        use plx_screens::registry::HudCmd;
+        match command {
+            HudCmd::Open(page) => {
+                self.huds_notice = None;
+                self.huds_watch(page);
+                self.huds_refresh();
+                if !self.playback_live && (plx_base::paths::ENV_STEERABLE || plx_base::paths::flavour().is_some()) {
+                    self.huds.open_catalog(plx_telemetry::telemetry::crashreport::now_secs());
+                }
+            }
+            HudCmd::Watch(page) => self.huds_watch(page),
+            HudCmd::CancelRegistry(sha) => self.huds.cancel_registry(sha),
+            HudCmd::FetchRegistry(sha) => {
+                self.huds_notice = None;
+                self.huds.fetch_registry(sha, plx_plex::plex::identity::version(), plx_platform::i18n::current().language().tag());
+            }
+            HudCmd::Select(id) => self.huds.select(id),
+            HudCmd::Remove(id) => {
+                self.huds_notice = None;
+                self.huds.remove(id);
+            }
+            HudCmd::InstallDrop(sha) => {
+                self.huds_notice = None;
+                self.huds.install_drop(sha, plx_telemetry::telemetry::crashreport::now_secs());
+            }
+            HudCmd::Fetch(address) => {
+                self.huds_notice = None;
+                self.huds.fetch(address);
+            }
+            HudCmd::InstallOffer(sha) => {
+                self.huds_notice = None;
+                self.huds.install_offer(sha, plx_telemetry::telemetry::crashreport::now_secs());
+            }
+            HudCmd::DeclineOffer(sha) => self.huds.decline_offer(sha),
+        }
+        self.huds_settle();
+    }
+
+    fn huds_watch(&mut self, page: std::sync::mpsc::Sender<plx_screens::hud_settings::HudList>) {
+        // Re-probe older subscribers when a page opens so dead receivers do not accumulate at an idle revision.
+        for (_, sent) in &mut self.huds_pages { *sent = u64::MAX; }
+        self.huds_pages.push((page, u64::MAX));
+    }
+
+    /// Persist the picks the store made and log what the driver reports: the two things the driver
+    /// leaves to its owner.
+    fn huds_settle(&mut self) {
+        for id in self.huds.take_selections() {
+            match plx_plex::plex::session::ProfileWrite::capture() {
+                Some(write) => {
+                    let _ = plx_base::storage_worker::submit_retained(move || {
+                        if !plx_plex::plex::session::persist_profile_hud(&write, &id) {
+                            plx_base::eventlog::log("hud: selection not saved: the write was refused");
+                        }
+                    });
+                }
+                None => {
+                    plx_base::eventlog::log("hud: selection not saved: no profile is seated; it stays until a profile is");
+                    self.huds.note_unsaved(id);
+                }
+            }
+        }
+        for line in self.huds.take_log() {
+            plx_base::eventlog::log(&line);
+        }
+        if let Some(last) = self.huds.take_notices().pop() {
+            self.huds_notice = Some(last);
+        }
+        self.huds_publish();
+    }
+
+    /// Send the open page the store's listing when anything it draws changed since the last send; a page that
+    /// closed (its end of the channel dropped) is forgotten.
+    fn huds_publish(&mut self) {
+        if self.huds_pages.is_empty() { return }
+        let (revision, notice) = (self.huds.revision(), self.huds_notice.as_ref().map_or(0, |_| 1));
+        let stamp = revision * 2 + notice;
+        if self.huds_pages.iter().all(|(_, sent)| *sent == stamp) {
+            return;
+        }
+        let tag = plx_platform::i18n::current().language().tag();
+        let list = plx_screens::hud_settings::HudList {
+            catalog: self.huds.store().catalog().clone(),
+            catalog_date: self.huds.store().catalog().checked_at.and_then(|s| i64::try_from(s).ok())
+                .and_then(plx_platform::i18n::local_calendar_date)
+                .and_then(|[y,m,d]| plx_platform::i18n::current().date_medium(y, m as u8, d as u8)).unwrap_or_default(),
+            gallery_enabled: plx_base::paths::ENV_STEERABLE || plx_base::paths::flavour().is_some(),
+            app_version: plx_plex::plex::identity::version().into(),
+            language_tag: tag.into(),
+            entries: self.huds.store().entries(),
+            drops: self.huds.store().drops(),
+            unfit: self.huds.unfit_shas(tag),
+            language: plx_platform::i18n::Preference::SHIPPED
+                .into_iter()
+                .find(|p| p.tag() == tag)
+                .map_or_else(|| tag.to_owned(), |p| p.native_name().to_owned()),
+            notice: self.huds_notice.clone(),
+            offer: self.huds.store().offer(),
+            fetching: self.huds.store().fetching(),
+            package_busy: self.huds.store().busy(),
+        };
+        let mut delivered = false;
+        self.huds_pages.retain_mut(|(page, sent)| {
+            if *sent == stamp { return true }
+            *sent = stamp;
+            let sent = page.send(list.clone()).is_ok();
+            delivered |= sent;
+            sent
+        });
+        if delivered { plx_machine::idle::invalidate(); }
+    }
+
+    /// The rect the next player menu hangs from — see [`AppMounter::player_menu_anchor`]. `None` clears it,
+    /// so an open that has no anchor (or retargets a panel already up) never leaves one for a later mount.
+    pub(crate) fn seed_player_menu_anchor(&mut self, anchor: Option<plx_ui::Rect>) {
+        self.mounter.player_menu_anchor = anchor;
+    }
+
+    /// The folded rows the next More menu lists — see [`AppMounter::player_more_folds`]. Empty clears them, for the
+    /// reason [`Self::seed_player_menu_anchor`] clears its rect.
+    pub(crate) fn seed_player_more_folds(&mut self, folded: Vec<plx_appkit::more_menu::FoldedRow>) {
+        self.mounter.player_more_folds = folded;
     }
 
     fn home_focus(d: &Dispatcher<AppHost>) -> Option<FocusKey<u32>> {
@@ -1138,6 +1327,15 @@ impl Bridge {
             let sid = match &e.arg { AppArg::Content(ContentArg::Detail { sid, .. }) => *sid, _ => return None };
             let rect = page.focused_rect::<AppHost>(ret.focus, &cx, At::Drawn);
             let meta = <AppHost as plx_screens::registry::MetadataLike>::metadata(&cx);
+            if let Some((ep, mark)) = page.hero_menu_episode(ret.focus, meta) {
+                let mut arg = strip_menu_arg(sid, &ep.rk,
+                    ItemMenuKind::Episode { mark, versions: ep.versions.clone() }, entry, ret.focus, rect);
+                // The on-deck episode need not be in the loaded season window. The ordinary
+                // addressed item path fetches it, rather than the filmstrip's loaded-only path.
+                arg.loaded_episode = false;
+                arg.watchlist = self.watchlist_face(page.watchlist_hex(), plx_data::watchlist::model::Kind::Show, true);
+                return Some(arg);
+            }
             if let Some((rk, show_rk, index, mark)) = page.focused_season(ret.focus, meta) {
                 // the season's address rides on the menu: the strip's item is no catalog row, so
                 // the write's scope cannot be read off one (`apply_item_action`)
@@ -1988,15 +2186,7 @@ impl Bridge {
         self.video_plane = bound;
     }
 
-    /// `wall` is the corner clock's time of day, read by the loop (never by a screen) and only
-    /// while the player that draws it is mounted.
-    pub(crate) fn publish_playback(
-        &mut self,
-        session: &plx_media::route::PlaybackSession,
-        live: bool,
-        wall: Option<plx_base::wallclock::WallTime>,
-    ) {
-        self.wall = wall.filter(|_| live);
+    pub(crate) fn publish_playback(&mut self, session: &plx_media::route::PlaybackSession, live: bool) {
         if live {
             self.playback = session.publication();
             self.playback_live = true;
@@ -2004,6 +2194,27 @@ impl Bridge {
             self.playback = plx_media::route::PlaybackSession::IDLE;
             self.playback_live = false;
         }
+    }
+
+    pub(crate) fn marker_preferences(&self) -> plx_appkit::skip_policy::MarkerPrefsView { self.marker_prefs }
+    /// Runner boundary: capture the seated profile and live choices once, then publish values.
+    pub(crate) fn publish_marker_preferences(&mut self, now: u32) {
+        self.marker_now = now;
+        if self.home_io.is_some() {
+            self.marker_prefs = Default::default(); return;
+        }
+        let view = self.marker_access.poll(&Self::seated_profile(), now,
+            plx_media::route::intro_skip(), plx_media::route::credits_skip());
+        if view != self.marker_prefs { plx_machine::idle::invalidate(); }
+        self.marker_prefs = view;
+    }
+
+    /// **Publish this frame's calendar date** — see `AppViews::today`. Called once per iteration by
+    /// the loop, beside [`Self::publish_playback`] and before the dispatcher frame and the draw, with
+    /// `clock::today()` (the loop is that door's one caller). Time arrives as an input: a screen
+    /// that words a date reads it from its views and reads no clock.
+    pub(crate) fn publish_today(&mut self, today: Option<[i32; 3]>) {
+        self.today = today;
     }
 }
 
@@ -2040,6 +2251,11 @@ impl Bridge {
             }
             return Handled::Yes;
         }
+        if let AppMsg::Huds(command) = msg {
+            if to != MachineId::Huds { return Handled::No; }
+            self.huds_command(command.clone());
+            return Handled::Yes;
+        }
         if let AppMsg::Session(event) = msg {
             use plx_session::auth::owner::SessionEvent;
             if to != MachineId::Session { return Handled::No; }
@@ -2054,9 +2270,9 @@ impl Bridge {
             // The owner reads its retained publication, not a borrow through its own mutable
             // field. Every other view still comes from this same Bridge frame boundary.
             let publication = self.session.publication();
-            let cx = parts.cx::<AppHost>(AppViews { auth: publication.read(),
+            let cx = parts.cx::<AppHost>(AppViews { marker_prefs: self.marker_prefs, auth: publication.read(),
                 hubs: self.hubs.view(), listing: self.listing.view(), directory: self.directory.view(),
-                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, beneath: None, wall: self.wall,
+                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, today: self.today, beneath: None,
             }, &self.measure);
             let handled = self.session.step(event, &cx, fx);
             // #132: the owner logs nothing, and the Profiles screen cannot see a read-out that
@@ -2250,11 +2466,11 @@ impl Rig<AppHost> for Bridge {
     fn split(&mut self) -> Split<'_, AppHost> {
         Split {
             mounter: &mut self.mounter,
-            views: AppViews { auth: self.session.read(),
+            views: AppViews { marker_prefs: self.marker_prefs, auth: self.session.read(),
                 hubs: self.hubs.view(),
                 listing: self.listing.view(),
                 directory: self.directory.view(),
-                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, beneath: None, wall: self.wall,
+                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, today: self.today, beneath: None,
             },
             measure: &self.measure,
         }
@@ -2330,7 +2546,48 @@ impl Rig<AppHost> for Bridge {
 }
 
 impl Bridge {
+    fn playback_trace_command(&mut self, from: MachineId, command: plx_platform::playback_trace::Command)
+        -> plx_platform::playback_trace::Status {
+        use plx_platform::playback_trace::{self as trace, Command, Status};
+        if self.trace_save.is_some() { return Status::Saving; }
+        if command != Command::Export { return trace::execute(command); }
+        let generation = trace::prepare_export();
+        match plx_base::storage_worker::submit(move || trace::save_export(generation)) {
+            Ok(ticket) => { self.trace_save = Some((from, generation, ticket)); Status::Saving }
+            Err(error) => {
+                use plx_base::storage_worker::SubmitError;
+                use trace::SaveWorkerFailure as Failure;
+                trace::fail_export(generation, match error {
+                    SubmitError::Full => Failure::QueueFull,
+                    SubmitError::Stopped => Failure::QueueStopped,
+                    SubmitError::StartFailed => Failure::StartFailed,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn playback_trace_poll(&mut self) -> Option<(MachineId, plx_platform::playback_trace::Status)> {
+        use std::sync::mpsc::TryRecvError;
+        let (_, generation, ticket) = self.trace_save.as_ref()?;
+        let status = match ticket.try_recv() {
+            Ok(status) => status,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => plx_platform::playback_trace::fail_export(
+                *generation, plx_platform::playback_trace::SaveWorkerFailure::Disconnected),
+        };
+        let (to, _, _) = self.trace_save.take()?;
+        Some((to, status))
+    }
+
     fn app_effect(&mut self, from: MachineId, fx: AppFx, out: &mut Effects<'_, AppHost>) {
+        // Controlled replay cannot start recording. Its only authorized status is Off;
+        // opening Settings must not consult a live native recorder or become unsupported IO.
+        if self.home_io.is_some() && matches!(fx,
+            AppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status)) {
+            out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::PlaybackTrace(
+                plx_platform::playback_trace::Status::Off)))));
+            return;
+        }
         if let Some(io) = &mut self.home_io {
             if let Err(reason) = super::bootstrap::effects::app(&fx) {
                 io.failure = Some(reason);
@@ -2341,7 +2598,20 @@ impl Bridge {
             AppFx::Session(command) => out.push(Fx::Deliver(MachineId::Session,
                 Delivery::Machine(AppMsg::Session(plx_session::auth::owner::SessionEvent::Command(command))))),
             AppFx::SessionEffect(effect) => self.session_effect(effect, out),
-            AppFx::Preferences(command) => super::preferences::execute(command),
+            AppFx::Preferences(command) => {
+                let profile = Self::seated_profile();
+                self.publish_marker_preferences(self.marker_now);
+                match command {
+                    plx_screens::registry::PreferenceCmd::EnsureMarkerAccess => self.marker_access.ensure(&profile, self.marker_now),
+                    command @ plx_screens::registry::PreferenceCmd::ChooseMarker { .. } => super::preferences::execute_marker(command, self.marker_prefs),
+                    other => super::preferences::execute(other),
+                }
+            },
+            AppFx::PlaybackTrace(command) => {
+                let status = self.playback_trace_command(from, command);
+                out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::PlaybackTrace(status)))));
+            }
+            AppFx::Huds(command) => out.push(Fx::Deliver(MachineId::Huds, Delivery::Machine(AppMsg::Huds(command)))),
             AppFx::Store(id, cmd) => out.push(Fx::Deliver(MachineId::Store(id.ord()), Delivery::Machine(AppMsg::Store(cmd)))),
             AppFx::StoreWork(work) => out.push(Fx::Deliver(
                 MachineId::Store(work.store().ord()), Delivery::Machine(AppMsg::StoreWork(work)))),
@@ -2417,7 +2687,10 @@ impl Bridge {
             SessionFx::PublishProfile(publication) => {
                 if self.session.publication_is_current(&publication) {
                     if let Some(seat) = self.session_adapter.publish_profile(publication) {
-                        self.seat_watch.arrive(seat);
+                        let arrived = seat.clone();
+                        if self.seat_watch.arrive(seat) {
+                            self.huds_refresh_for(&arrived);
+                        }
                     }
                     if let Some(io) = &mut self.home_io {
                         io.profile = self.session_adapter.profile_resource_view().expect("controlled publisher");
@@ -2840,7 +3113,7 @@ fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
     // Library's, Search's and the content pages' fields are.
     //
     // The panel fields keep the spellings the characterization line has always used
-    // (`menu=`/`msel=`/`taudio=`/`tsub=`/`info=`/`isel=`/`infolast=`/`chap=`/`csel=`/`more=`/
+    // (`menu=`/`msel=`/`taudio=`/`tsub=`/`info=`/`isel=`/`chap=`/`csel=`/`more=`/
     // `osel=`), because a recording taken before this phase and one taken after must be
     // comparable. `haschap=` stays in `push_player`: it is a fact about the ITEM, not the panel.
     if matches!(page.arg, AppArg::Player) {
@@ -2860,16 +3133,26 @@ fn page_probe(d: &Dispatcher<AppHost>, rig: &Bridge) -> String {
             Some(Panel::Tracks(t)) => (t.active_audio(), t.active_sub()),
             _ => (0, -1),
         };
-        let infolast = matches!(surface.map(|s| s.panel()), Some(Panel::Info(p)) if p.at_last());
         let menu = is(|k| matches!(k, OverlayKind::Tracks { .. }));
-        let info = is(|k| matches!(k, OverlayKind::Info));
-        let chap = is(|k| matches!(k, OverlayKind::Chapters));
+        // Info and Chapters are the page's own sections (`hud.sections`), not surfaces; the spellings stay so a
+        // recording taken before and one taken after remain comparable.
+        let sections = player.map(|p| p.hud.sections).unwrap_or(plx_screens::player::input::Sections::NONE);
+        let info = sections.contains(plx_appkit::player_hud::command::Section::Info);
+        let chap = sections.contains(plx_appkit::player_hud::command::Section::Chapters);
+        // the section's own cursor: Info's button, or the chapter card the engine holds
+        let section_sel = if sections.contains(plx_appkit::player_hud::command::Section::Chapters) {
+            d.input.engine.current(InputOwner::Entry(page.id))
+                .and_then(|k| k.elem.checked_sub(plx_appkit::player_hud::ELEM_CHAPTER_BASE)).unwrap_or(0) as usize
+        } else {
+            player.map_or(0, |p| p.hud.nav.btn.max(0) as usize)
+        };
+        let sel = if sections.any() { section_sel as i32 } else { sel };
         let more = is(|k| matches!(k, OverlayKind::More { .. }));
         let _ = write!(
             out,
-            " menu={} msel={} taudio={taudio} tsub={tsub} info={} isel={} infolast={} chap={} csel={} more={} osel={}",
+            " menu={} msel={} taudio={taudio} tsub={tsub} info={} isel={} chap={} csel={} more={} osel={}",
             u8::from(menu), if menu { sel } else { 0 },
-            u8::from(info), if info { sel } else { 0 }, u8::from(infolast),
+            u8::from(info), if info { sel } else { 0 },
             u8::from(chap), if chap { sel } else { 0 },
             u8::from(more), if more { sel } else { 0 },
         );
@@ -3145,11 +3428,19 @@ pub(crate) fn player_hud_policy(d: &Dispatcher<AppHost>) -> HudPolicy {
     }
 }
 
+/// Is a HUD section of the player page up, one still fading out included? Chapters and Info are the page's own
+/// state, not surfaces, so [`player_overlay_up`] cannot see them; the presented set is the logical one plus what
+/// has not finished fading ([`HudMotion::presented`](plx_appkit::player_hud::motion::HudMotion::presented)), the
+/// way a closing panel still counted as up.
+pub(crate) fn player_section_up(d: &Dispatcher<AppHost>) -> bool {
+    player(d).is_some_and(|p| p.hud.sections.any() || p.row.presented() != 0)
+}
+
 /// Should the player's diagnostics ("Stats for nerds") panel draw this frame?
 ///
-/// No, while any of the player's own overlay panels (`OverlayKind::Tracks`/`Info`/
-/// `Chapters`/`More`/`Timing`) is up. `app/diagnostics.rs`'s panel is sized to its content rather than to
-/// the screen, but during playback that content routinely spans ~90% of the screen's width from
+/// No, while any of the player's own panels is up: an overlay (`OverlayKind::Tracks`/`More`/`Timing`) or an open
+/// HUD section (Info, Chapters; fading ones count). `app/diagnostics.rs`'s panel is sized to its content rather than
+/// to the screen, but during playback that content routinely spans ~90% of the screen's width from
 /// the left safe margin — wide enough to reach every one of those panels' bottom-right-anchored
 /// rects — and on the player route it has always painted genuinely last, i.e. on TOP of them.
 /// `More` is the sharpest case: it carries the very "Stats for nerds" toggle this panel answers
@@ -3157,9 +3448,10 @@ pub(crate) fn player_hud_policy(d: &Dispatcher<AppHost>) -> HudPolicy {
 /// routes never had this problem because `app/run.rs`'s other `diagnostics.draw()` call already
 /// sits UNDER that route's own popovers (the account/item menu carries the same toggle there) —
 /// this is the player route catching up to a rule the rest of the app already keeps, now that one
-/// of its own panels carries a control too.
+/// of its own panels carries a control too. Info and Chapters were surfaces when this rule was made and
+/// are sections now; the rule did not change, only where it reads them.
 pub(crate) fn player_diagnostics_visible(d: &Dispatcher<AppHost>) -> bool {
-    !player_overlay_up(d)
+    !player_overlay_up(d) && !player_section_up(d)
 }
 
 /// Dismiss every player panel — the exit ritual's half of `close_player_overlays`.
@@ -3413,6 +3705,16 @@ pub(crate) fn top_settled_on(d: &Dispatcher<AppHost>, arg: &AppArg) -> bool {
     d.nav.tabs.stack.root_settled(arg)
 }
 
+/// **Is the player the page the stack is about to land on?** A play start parks its push and the
+/// dip-out then runs for a few frames during which `top_arg()` still names the page it was pressed
+/// on. Two callers must not treat that page as unchanged: [`enter_player`](super::playback::enter_player)
+/// (a second start in the dip must not mint a second player and lose the first one's origin seed)
+/// and [`follow_auth_landing`] (a push over the sign-in or picker page is not "not settled" to
+/// undo). One answer for both, so they cannot drift apart.
+pub(crate) fn player_arriving(d: &Dispatcher<AppHost>) -> bool {
+    matches!(d.nav.tabs.stack.pending_dest(), Some(AppArg::Player))
+}
+
 /// **`nav_root`, made edge-triggered** — a no-op while `arg` is already the settled top.
 ///
 /// `NavStack::request`'s dedup already drops the redundant request before it touches `pending` or
@@ -3444,7 +3746,17 @@ pub(crate) fn nav_root_if_unsettled(d: &mut Dispatcher<AppHost>, arg: AppArg) {
 /// guard is one `matches!` either way, and keeping it at the call site is what let the two tests
 /// below read `d.top_arg()` themselves before deciding whether to call this at all — asserting
 /// "outside the phase this asks nothing" needs no help from the function it is testing.
+///
+/// **It stands aside while the player is arriving** ([`player_arriving`]). The `playurl` dev trigger
+/// starts a playback from a boot with no session, so the player is pushed over this very page, and
+/// until the dip-out commits `top_arg()` still reads Login: the per-frame follower would see a
+/// pending op, call the page "not settled" and park a `Root` that replaced the push, so the player
+/// never mounted. Standing aside withholds nothing: the handoff stays in the bridge until the
+/// follower runs again, and once the player is the top it is not asked at all.
 pub(crate) fn follow_auth_landing(pages: &mut Dispatcher<AppHost>, bridge: &mut Bridge) {
+    if player_arriving(pages) {
+        return;
+    }
     if let Some(c) = bridge.take_session_ready() {
         // A sign-out followed by a fresh sign-in can replace the session without restarting the
         // process. Re-read only at this one credentials handoff so the old account's in-memory
@@ -3795,8 +4107,8 @@ pub(crate) fn open_settings(d: &mut Dispatcher<AppHost>) {
     open_settings_at(d, SettingsPage::Root);
 }
 
-/// …and the DEV boot target's door: the same surface, rooted at `page` (see [`AppArg`] for why
-/// the target is a root rather than a push).
+/// …and the door for a surface rooted at `page`: the DEV boot target, and the Library's Favorite
+/// libraries row (see [`AppArg`] for why the target is a root rather than a push).
 pub(crate) fn open_settings_at(d: &mut Dispatcher<AppHost>, page: SettingsPage) {
     if surface_up(d, is_settings) {
         return;
@@ -3977,6 +4289,79 @@ pub(crate) fn player_mut(
         .screen
         .as_any_mut()?
         .downcast_mut::<plx_screens::player::PlayerScreen>()
+}
+
+/// **Ask the player page to toggle a section** (Chapters, Info): the `toggle_section` command's performer
+/// (`app::playback::perform_hud_command`) addresses the page with `AppMsg::HudSection`. The page owns the
+/// sections, so it opens or closes under the package's policy and seats its own focus; the app writes nothing of
+/// it. A no-op when no player page is mounted.
+pub(crate) fn toggle_player_section(d: &mut Dispatcher<AppHost>, section: plx_appkit::player_hud::command::Section) {
+    let Some(instance) = d.top_page() else { return };
+    let page = MachineId::Instance(instance);
+    d.emit(
+        page,
+        Fx::Deliver(page, Delivery::Screen(ScreenEvent::App(AppMsg::HudSection(section)))),
+    );
+}
+
+/// **Close every open HUD section of the player page**: one addressed `AppMsg::HudSectionsClose`, which the page
+/// answers by closing each open section the way a press on its opener does (focus handed back through its own
+/// `close_section`). It names no section and reads none, so it is idempotent: WILL and DID both park the film in
+/// one drain, and a close built from the set as it is NOW (one toggle per open section, applied at the step)
+/// would reopen what the first park closed. The app switch and the decoder park use it where the overlay panels'
+/// `dismiss_player_overlays` once took the Info card and the Chapters strip down: a section is the page's state,
+/// not a surface, and the page stays mounted.
+pub(crate) fn close_player_sections(d: &mut Dispatcher<AppHost>) {
+    let Some(instance) = d.top_page() else { return };
+    let page = MachineId::Instance(instance);
+    d.emit(page, Fx::Deliver(page, Delivery::Screen(ScreenEvent::App(AppMsg::HudSectionsClose))));
+}
+
+/// **Seat the player page's `FocusEngine` on the group its HUD cursor names** — the engine's half
+/// of an APP-SIDE write to `hud.nav.focus`.
+///
+/// Up, Down and OK on the HUD travel by the engine's groups, and `nav.focus` IS the group the engine
+/// sits on (the screen mirrors every move it is told of). The app writes the cursor itself in four
+/// places — the
+/// headless pin (`run::pin_headless_hud`), a fresh segment offer raising the row, the auto-hide
+/// park (in `run::update`) and the Skip / Up Next stand-in's departure (`run::follow_control_row`: the
+/// ring goes back to the scrubber, `standin_left_the_ring`'s contract) — and a bare write would leave
+/// the engine on the group it was on, so the next Up, Down or OK travelled from there. Each such
+/// write is followed by this, which hands the page
+/// the same `Enter::Fresh { ContainerGroup }` the screen's own `repair_focus` delivers. It rides
+/// the dispatcher's queue from outside a step and drains in the next frame, ahead of its input.
+///
+/// A no-op when no player page is mounted. The engine acts on an `Enter` only for the page that owns
+/// input at the moment it drains; for a page under a panel it only reaches the screen, which mirrors it.
+pub(crate) fn reseat_player_focus(d: &mut Dispatcher<AppHost>) {
+    reseat_player(d, |player, _| Some(FocusTarget::ContainerGroup(player.hud.nav.focus)));
+}
+
+/// Re-seat the player's ring on the element its row currently calls primary — the APP's half of a
+/// row swap, used after it re-resolves a slot the page changed while the frame was in flight
+/// (BACK over an offer), so the engine lands on the primary of the row the loop will draw.
+pub(crate) fn reseat_player_focus_on_primary(d: &mut Dispatcher<AppHost>) {
+    reseat_player(d, |player, entry| {
+        let elem = plx_appkit::player_hud::control_elem(player.row_primary());
+        entry.map(|entry| FocusTarget::Elem(FocusKey { entry, elem }))
+    });
+}
+
+/// The one delivery both re-seats make: hand the top page the `Enter::Fresh` that `target` names
+/// for the mounted player (given the page's entry, when it has one). Nothing is delivered when no
+/// player page is mounted or `target` answers `None`.
+fn reseat_player(
+    d: &mut Dispatcher<AppHost>,
+    target: impl FnOnce(&plx_screens::player::PlayerScreen, Option<EntryId>) -> Option<FocusTarget<u32>>,
+) {
+    let Some(instance) = d.top_page() else { return };
+    let entry = d.nav.entry_of_instance(instance);
+    let Some(focus) = player(d).and_then(|player| target(player, entry)) else { return };
+    let page = MachineId::Instance(instance);
+    d.emit(
+        page,
+        Fx::Deliver(page, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { focus }))),
+    );
 }
 
 /// **The top page answers its own keys** — the engine owns the input for it.
@@ -4318,6 +4703,10 @@ mod library_push_capture_tests;
 #[cfg(test)]
 #[path = "recommended_enter_tests.rs"]
 mod recommended_enter_tests;
+
+#[cfg(test)]
+#[path = "library_back_lift_tests.rs"]
+mod library_back_lift_tests;
 
 #[cfg(test)]
 #[path = "library_diagnostic_tests.rs"]

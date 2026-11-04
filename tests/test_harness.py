@@ -1150,6 +1150,50 @@ class FpsIdentity(unittest.TestCase):
         self.assertEqual(run.parse_fps(lines, "home", "privacy"), [59])
         self.assertEqual(run.parse_fps(lines, "home", "legal"), [58])
 
+    def test_a_scene_that_pins_a_section_grades_only_the_heartbeats_that_name_it(self):
+        """A section is the player page's state, not a surface: ` overlay=` stays `none` and the
+        heartbeat gains ` section=<word>` after it, which only a scene with a `"section"` key reads."""
+        lines = [
+            "loop=60 route=player overlay=none fps=60",
+            "loop=61 route=player overlay=none section=info fps=59",
+            "loop=62 route=player overlay=none section=chapters fps=58",
+            "loop=63 route=player overlay=none section=chapters_info fps=57",
+            "loop=64 route=player overlay=menu fps=56",
+            "coldopen screen=player ms=12",
+        ]
+        info = {"route": "player", "overlay": "none", "section": "info"}
+        picked = run.select_section(lines, info)
+        self.assertEqual(run.parse_fps(picked, "player", "none"), [59])
+        self.assertEqual(run.parse_loop(picked, "player", "none"), [61])
+        self.assertIn("coldopen screen=player ms=12", picked, "a line that is not a heartbeat is kept")
+        chapters = {"route": "player", "overlay": "none", "section": "chapters"}
+        self.assertEqual(run.parse_fps(run.select_section(lines, chapters), "player", "none"), [58])
+        # the word is exact: `chapters_info` is its own word, not a section named `chapters`
+        self.assertEqual(run.parse_fps(run.select_section(lines, {"section": "chapters_info"}), "player", "none"), [57])
+
+    def test_a_scene_without_a_section_key_reads_every_heartbeat_it_did_before(self):
+        lines = [
+            "loop=60 route=player overlay=none fps=60",
+            "loop=61 route=player overlay=none section=info fps=59",
+        ]
+        self.assertIs(run.select_section(lines, {"route": "player", "overlay": "none"}), lines)
+
+    def test_a_build_that_prints_no_section_word_gives_a_section_scene_no_samples(self):
+        """The failure the gate must keep loud: a heartbeat with no ` section=` field is `none`, so a
+        scene that pins a section finds nothing rather than grading the bare player as its card."""
+        lines = ["loop=60 route=player overlay=none fps=60"] * 8
+        picked = run.select_section(lines, {"route": "player", "overlay": "none", "section": "info"})
+        self.assertEqual(run.parse_fps(picked, "player", "none"), [])
+
+    def test_the_players_section_scenes_pin_a_bare_player_and_a_section_word(self):
+        scenes = {s["name"]: s for s in _manifest()["fps_scenes"]}
+        for name, word in (("info-panel", "info"), ("chapters-panel", "chapters")):
+            with self.subTest(scene=name):
+                self.assertEqual(scenes[name]["route"], "player")
+                self.assertEqual(scenes[name]["overlay"], "none",
+                                 "overlay= means a modal surface; the section is its own word")
+                self.assertEqual(scenes[name]["section"], word)
+
     def test_first_run_routes_have_the_50_fps_contract(self):
         lines = [
             "loop=60 route=home fps=7",
@@ -4831,6 +4875,54 @@ class LateAudioFixture(unittest.TestCase):
         self.assertFalse(run.a_audio_feed_ready(["feed v#1 sz=9 fed=0 reply=O qbytes=1"])[0])
 
 
+class DoviRandomAccessFixture(unittest.TestCase):
+    @staticmethod
+    def packet(pts, kind, rpu=True):
+        nals = [kind, 62] if rpu else [kind]
+        data = b"".join(b"\x00\x00\x00\x02" + bytes([n << 1, 1]) for n in nals)
+        return {"pts_time": str(pts), "flags": "K_", "data": "00000000: " + data.hex() + "  .."}
+
+    def test_dovi_builder_preserves_the_requested_gop_mode(self):
+        key = "pipe_hevc_eac3_4k_dovi_p8"
+        original = fixturegen.PIPE_SHAPES[key]
+        spec = dict(original, video=dict(original["video"], x265_extra="open-gop=0"))
+        captured = {}
+
+        def capture(_ctx, _key, shape, *_args, **_kwargs):
+            captured.update(shape["video"])
+            raise RuntimeError("stop before fixture IO")
+
+        with mock.patch.object(fixturegen, "build_generic", side_effect=capture):
+            with self.assertRaisesRegex(RuntimeError, "stop before fixture IO"):
+                fixturegen.build_dovi(mock.Mock(), key, spec, 60, None,
+                                      fixturegen.Path("out.mkv"), fixturegen.Path("work"))
+        self.assertIn("open-gop=0", captured["x265_extra"])
+        self.assertIn("aud=1", captured["x265_extra"])
+
+    def test_the_pair_is_distinguished_by_read_back_nals_not_container_key_flags(self):
+        cra = fixturegen.hevc_random_access_packets([self.packet(0, 20), self.packet(2, 21)])
+        idr = fixturegen.hevc_random_access_packets([self.packet(0, 20), self.packet(2, 20)])
+        self.assertEqual(fixturegen.random_access_problems(cra, "cra", 60), [])
+        self.assertEqual(fixturegen.random_access_problems(idr, "idr", 60), [])
+        self.assertTrue(fixturegen.random_access_problems(idr, "cra", 60))
+        self.assertTrue(fixturegen.random_access_problems(cra, "idr", 60))
+        false_key = fixturegen.hevc_random_access_packets([self.packet(0, 1)])
+        self.assertTrue(fixturegen.random_access_problems(false_key, "cra", 60))
+
+    def test_a_missing_later_key_or_rpu_is_not_a_verified_fixture(self):
+        initial = fixturegen.hevc_random_access_packets([self.packet(0, 20)])
+        self.assertTrue(fixturegen.random_access_problems(initial, "cra", 60))
+        self.assertEqual(fixturegen.random_access_problems(initial, "cra", 1), [])
+        no_rpu = fixturegen.hevc_random_access_packets([self.packet(0, 20), self.packet(2, 21, rpu=False)])
+        self.assertTrue(fixturegen.random_access_problems(no_rpu, "cra", 60))
+        self.assertEqual(fixturegen.hevc_random_access_packets([self.packet("nan", 20)]), [])
+
+    def test_shared_packet_reader_retains_h264_and_accepts_hevc_annexb(self):
+        self.assertEqual(fixturegen.h264_nal_types(b"\x00\x00\x00\x01\x65\x80"), [5])
+        self.assertEqual(fixturegen._packet_nal_types(b"\x00\x00\x01\x2a\x01", True), [21])
+        self.assertEqual(fixturegen._packet_nal_types(b"\x00\x00\x00\x01\x2a", True), [])
+
+
 class AudioTailFixture(unittest.TestCase):
     """The clip whose audio outlasts its picture and its case (#865): 20 s of video, 23 s of audio.
 
@@ -6551,7 +6643,8 @@ impl PersonOwnerGateFixture {
 
     def test_forks_ledger_catches_a_new_production_test_fork(self):
         """RED: a `#[cfg(not(test))]` / `cfg!(not(test))` / `not(feature = \"test-support\")` fork in
-        data/, plex/, media/ or session/ that no ci/allow/forks/<area>.txt names fails `forks`, keyed by
+        any machine crate (data/, plex/, media/, session/, screens/, ui/, appkit/, machine/) that no
+        ci/allow/forks/<area>.txt names fails `forks`, keyed by
         the item it sits on, or the fn around a statement or an inline `cfg!`."""
         name = "_check_deps_selftest_forks.rs"
         body = ("#[cfg(not(test))]\npub fn real_only() {}\n\n"
@@ -6570,6 +6663,35 @@ impl PersonOwnerGateFixture {
             with self.subTest(item=item):
                 self.assertIn(f"{key}::{item}  (ledger: ", out)
         self.assertIn("ci/allow/forks/session.txt", out)
+
+    def test_forks_ledger_reads_every_machine_crate_not_only_the_four_that_own_the_data(self):
+        """RED: a machine in screens/, ui/, appkit/ or machine/ forks on `cfg(test)` as surely as one in data/ does
+        (`screens/src/legal.rs` `build_sha`, `screens/src/login.rs` `harness_driven` were the live cases), so the
+        `forks` scope is every machine crate. A production fork planted in each -- an attribute production can
+        satisfy and an inline `cfg!(test)` -- is a new site naming the area file its crate owns, and an item only
+        a test can see (`#[cfg(test)]`, `any(test, feature = \"test-support\")`) is still no fork there. A field under
+        a cfg has no fn around it, so it is keyed by its struct (`Holder`), never the unnamed `?`."""
+        body = ("#[cfg(not(any(test, feature = \"test-support\")))]\nfn production_only() {}\n\n"
+                "pub fn inline_test() -> bool {\n    if cfg!(test) { true } else { false }\n}\n\n"
+                "pub struct Holder {\n    kept: u8,\n    #[cfg(not(test))]\n    live: u8,\n}\n\n"
+                "#[cfg(test)]\nfn test_only() {}\n\n"
+                "#[cfg(any(test, feature = \"test-support\"))]\nfn support_only() {}\n")
+        name = "_check_deps_selftest_machine_forks.rs"
+        for crate in ("screens", "ui", "appkit", "machine"):
+            with open(os.path.join(self.tree, "rust-modules", crate, "src", name), "w", encoding="utf-8") as f:
+                f.write(body)
+        r = self._deps()
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("forks:", out)
+        for crate in ("screens", "ui", "appkit", "machine"):
+            key = f"rust-modules/{crate}/src/{name}"
+            for item in ("production_only", "inline_test", "Holder"):
+                with self.subTest(crate=crate, item=item):
+                    self.assertIn(f"{key}::{item}  (ledger: ci/allow/forks/{crate}.txt)", out)
+            for item in ("test_only", "support_only"):
+                with self.subTest(crate=crate, test_item=item):
+                    self.assertNotIn(f"{key}::{item}", out, "an item only a test can see is no fork\n" + out)
 
     def test_fxlanes_ledger_fails_a_new_appfx_side_queue_but_not_a_deliver_arm(self):
         """RED: in `Bridge::app_effect` an `AppFx` arm that pushes `Fx::Deliver(` rides the ordered
@@ -6786,6 +6908,105 @@ impl PersonOwnerGateFixture {
             with self.subTest(not_a_read=stem):
                 self.assertNotIn(f"{base}{stem}.rs", out,
                                  "a `caps` parameter or an unimported `caps(` is not the capability answer\n" + out)
+
+    def test_globals_ledger_sees_the_registry_readers_the_old_closed_list_missed(self):
+        """RED: the server registry's roster readers (`server_ids`, `server_roster_gen`, `server_facts_gen`,
+        `server_probe_result`), the session cache's two readers (`session::peek_settled`, `session::current_gen`)
+        and the controlled-run switch `tape::active` read process-wide state behind a free function, as
+        surely as `client_for` does, and docs/sans-io.md listed them as the reads the rule did not see.
+        Planted in a store file (data/src/stores/) they are sites: qualified, bare after an import (singly, in a
+        group, through a glob), and the rename that would hide the calls fails outright. A method or a local of
+        the same name (`it.active()`, `it.server_ids()`, a struct field `active`, a local `fn active()`) is no
+        read; `active` and `current_gen` count only where the file imports them from `tape` / `session`.
+        `plex/src/plex/session.rs` calls its own `peek_settled()` / `current_gen()` with no `use` to say so, as
+        it always did for `peek`; a bare call planted there is a site. `data/src/stores/tape.rs` is the
+        registry the stores call through, not a machine, so its own bare `active()` is NOT one. All of it is
+        graded by ONE gate run (a run is ~14 s)."""
+        crate = "data"
+        session = "rust-modules/plex/src/plex/session.rs"
+        tape = "rust-modules/data/src/stores/tape.rs"
+        with open(os.path.join(self.tree, session), "a", encoding="utf-8") as f:
+            f.write("\nfn planted_settled() -> bool {\n    peek_settled().is_some() && current_gen() > 0\n}\n")
+        with open(os.path.join(self.tree, tape), "a", encoding="utf-8") as f:
+            # the `client_for` read gets the file past the candidate prefilter (a bare `active()` alone holds
+            # none of its tokens), so the scan really reads the file and the bare `active()` is graded
+            f.write("\nfn planted_active() -> bool {\n    let _ = it.active();\n    active()\n}\n"
+                    "pub fn real() { let _ = plx_plex::plex::client_for(0); }\n")
+        r = self._plant_many({
+            "stores/_check_deps_selftest_qualified.rs": (
+                "pub fn qualified() {\n"
+                "    let _ = plx_plex::plex::server_ids();\n"
+                "    let _ = plx_plex::plex::server_roster_gen();\n"
+                "    let _ = plx_plex::plex::server_facts_gen();\n"
+                "    let _ = plx_plex::plex::server_probe_result(1);\n"
+                "    let _ = plx_plex::plex::session::peek_settled();\n"
+                "    let _ = plx_plex::plex::session::current_gen();\n"
+                "    let _ = crate::stores::tape::active();\n}\n"),
+            "stores/_check_deps_selftest_renamed.rs": (
+                "use plx_plex::plex::server_ids as ids;\n"
+                "use plx_plex::plex::session::peek_settled as settled;\n"
+                "use plx_plex::plex::session::current_gen as generation;\n"
+                "use crate::stores::tape::active as armed;\n"
+                "use crate::stores::tape as controlled;\n\n"
+                "pub fn renamed() {\n    let _ = (ids(), settled(), generation(), armed());\n}\n"),
+            "stores/_check_deps_selftest_bare.rs": (
+                "use plx_plex::plex::{server_ids, server_probe_result};\n"
+                "use plx_plex::plex::session::{self, current_gen, peek_settled};\n"
+                "use crate::stores::tape::{self, active};\n\n"
+                "pub fn bare() {\n    let _ = (server_ids(), server_probe_result(1), current_gen(), peek_settled());\n"
+                "    let _ = active();\n    let _ = it.active();\n    let _ = it.server_ids();\n}\n"),
+            "stores/_check_deps_selftest_globbed.rs": (
+                "use crate::stores::tape::*;\nuse plx_plex::plex::session::*;\n\n"
+                "pub fn globbed() {\n    let _ = (active(), current_gen());\n}\n"),
+            "stores/_check_deps_selftest_no_import.rs": (
+                "use plx_media::player::claim_hold::active as _unused;\n"
+                "use plx_media::player::subside::{self, active};\n\n"
+                "pub struct Pane {\n    active: bool,\n}\nimpl Pane {\n"
+                "    pub fn active(&self) -> bool {\n        self.active\n    }\n}\n"
+                "fn local() -> bool {\n    true\n}\n"
+                "pub fn no_import(p: &Pane, current_gen: u32) -> bool {\n"
+                "    let _ = (p.active(), current_gen, helper::active(), local());\n    active()\n}\n"
+                "pub fn real() { let _ = plx_plex::plex::client_for(0); }\n"),
+            "stores/_check_deps_selftest_defines.rs": (
+                "fn active() -> bool {\n    true\n}\n\n"
+                "pub fn defines() -> bool {\n    active()\n}\n"
+                "pub fn real() { let _ = plx_plex::plex::client_for(0); }\n"),
+        }, crate)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("globals:", out)
+        base = f"rust-modules/{crate}/src/stores/_check_deps_selftest_"
+        for spelling in ("server_ids", "server_roster_gen", "server_facts_gen", "server_probe_result",
+                         "session::peek_settled", "session::current_gen", "tape::active"):
+            with self.subTest(qualified=spelling):
+                self.assertIn(f"{base}qualified.rs::qualified::{spelling}  (ledger: ", out)
+        for line in (1, 2, 3, 4, 5):
+            with self.subTest(rename_line=line):
+                self.assertIn(f"{base}renamed.rs:{line}\n", out + "\n")
+        for fn, spelling in (("bare", "server_ids"), ("bare", "server_probe_result"), ("bare", "current_gen"),
+                             ("bare", "peek_settled"), ("bare", "active"),
+                             ("globbed", "active"), ("globbed", "current_gen")):
+            with self.subTest(fn=fn, spelling=spelling):
+                self.assertIn(f"{base}{fn}.rs::{fn}::{spelling}  (ledger: ", out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::active  (ledger: "), 1,
+                         "`it.active()` is not a registry read\n" + out)
+        self.assertEqual(out.count(f"{base}bare.rs::bare::server_ids  (ledger: "), 1,
+                         "`it.server_ids()` is not a registry read\n" + out)
+        for stem in ("no_import", "defines"):
+            with self.subTest(not_a_read=stem):
+                # each fixture also holds one real read, so the file reaches the scan and the only line that
+                # names it is that read: its `active` (a method, a field, a local, another module's) is no site
+                self.assertIn(f"{base}{stem}.rs::real::client_for  (ledger: ", out)
+                naming = [line for line in out.splitlines() if f"{base}{stem}.rs" in line]
+                self.assertEqual(len(naming), 1,
+                                 "a method, a field, a local or another module's `active` is no registry read\n"
+                                 + out)
+        self.assertIn(f"{session}::planted_settled::peek_settled  (ledger: ci/allow/globals/plex.txt)", out)
+        self.assertIn(f"{session}::planted_settled::current_gen  (ledger: ci/allow/globals/plex.txt)", out)
+        self.assertIn(f"{tape}::real::client_for  (ledger: ", out)
+        naming = [line for line in out.splitlines() if tape in line]
+        self.assertEqual(len(naming), 1,
+                         "`stores/tape.rs` is the registry, not a machine: its own bare `active()` is no site\n" + out)
 
     def test_a_bare_name_that_ends_a_braced_import_is_still_imported(self):
         """RED: `use plx_base::task::{self, spawn};` imports `spawn` as surely as `{spawn, self}` does, and
@@ -7395,8 +7616,9 @@ impl PersonOwnerGateFixture {
     # Phase 12 (P8-H): a per-file PIN, on top of the self-consistency check above. That check
     # only proves a file's own `# count: N` line matches its own entry count — it cannot see an
     # allowlist and its count grow TOGETHER, correctly, in the same edit, past the number this
-    # phase actually measured. This table is that second line of defence: growing any file below
-    # means also raising its number HERE, in the same diff, so a reviewer sees the move rather
+    # phase actually measured. This table is that second line of defence, and a raised number
+    # fails `ci/check-ledger-ratchet.py` against the base branch: growing any file below is the
+    # owner's call, made by merging past that check, so a reviewer sees the move rather
     # than an allowlist quietly absorbing a new violation. Shrinking is always allowed (update
     # the number down). The weave that merged P8-H also retired `ci/allow/statics-migration.txt`
     # to 0 — its one entry (ui/widgets.rs) was the 11 top-bar/glass-band statics named individually
@@ -7448,8 +7670,9 @@ impl PersonOwnerGateFixture {
     }
 
     # The Sans-IO ledgers' pins, one number per RULE (the sum over its area files): a ledger only
-    # shrinks, so growing one means raising its number here, in the same diff, where a reviewer sees
-    # the move. A migration PR lowers the number with the lines it deletes. Seeded 2026-10-24 from
+    # shrinks, and a raised number fails `ci/check-ledger-ratchet.py` against the base branch, so
+    # growing one is the owner's call, made by merging past that check. A migration PR lowers the
+    # number with the lines it deletes. Seeded 2026-10-24 from
     # the tool's own output on the tree this table was written for.
     PINNED_LEDGER_TOTALS = {
         # Browse B-A (the section hubs' list and row reads leave as `StoreJob::BrowseHubs`): -2 here (`hubs_spawn`,
@@ -7479,8 +7702,15 @@ impl PersonOwnerGateFixture {
         # fan-out's `fan_out` and `ask_sources`, which now reach the other servers through the key-checked `KeyedClients`.
         # Attempt-caps (#1044) moved the pin by nothing: the spellings widened to `devcaps::caps` and the zero-argument
         # `is_dp_audio` / `is_dp_audio_track` (a coverage expansion, not a shrink), and the planner reads none of them.
-        "globals": 57,  # production process-global reads inside machines (`ci/allow/globals/`)
-        "forks": 58,  # production test/production forks in data/, plex/, media/, session/ (`ci/allow/forks/`)
+        # Ledger widening (a one-time coverage expansion that RECORDS sites that already existed; no new code and no
+        # new read): the globals rule gained the registry readers its closed list had missed (`server_ids`,
+        # `server_roster_gen`, `server_facts_gen`, `server_probe_result`, `session::peek_settled`,
+        # `session::current_gen`, `tape::active`), +57 (57 -> 114); the forks rule gained the machine crates
+        # screens/, ui/, appkit/ and machine/ (it read only data/, plex/, media/, session/), +17 (58 -> 75).
+        "globals": 114,  # production process-global reads inside machines (`ci/allow/globals/`)
+        # Dolby Vision setting (#1156): -1 on forks (`build_stream` takes the DV probe from `ResolveEnv`, captured
+        # at the request, so its test/production read of `devcaps::dv::capability` is gone).
+        "forks": 74,  # production test/production forks in every machine crate: data/, plex/, media/, session/, screens/, ui/, appkit/, machine/ (`ci/allow/forks/`)
         "fxlanes": 11,  # Bridge::app_effect arms that do not push Fx::Deliver (`ci/allow/fxlanes/`)
     }
 
@@ -7519,9 +7749,10 @@ impl PersonOwnerGateFixture {
                 declared = int(f.readline().split(":")[1])
             self.assertLessEqual(
                 declared, pinned,
-                f"{fn} grew from the pinned {pinned} to {declared} — if this growth is "
-                "deliberate (a real, reasoned new entry, not a workaround), raise the number in "
-                "PINNED_ALLOWLIST_COUNTS in the same change so a reviewer sees it move",
+                f"{fn} grew from the pinned {pinned} to {declared}: an allowlist only shrinks, and "
+                "ci/check-ledger-ratchet.py fails a raised pin as well as the new entry. Remove the "
+                "entry, or stop and explain in the PR why the site seems to need one (an exception "
+                "is the owner's call)",
             )
 
 

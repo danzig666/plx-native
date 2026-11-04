@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Normal",
   "widgets.menu.stats": "Statistiken für Nerds",
   "widgets.menu.diagnostics": "Diagnosedaten senden",
+  "widgets.menu.previous_episode": "Vorherige Episode",
   "widgets.badge.forced": "ERZWUNGEN",
   "widgets.toggle.on": "An",
   "widgets.toggle.off": "Aus",
@@ -250,6 +251,5 @@
   "widgets.region.latin_america": "Lateinamerika",
   "widgets.failure.play_auto": "Auf „Automatisch“ stellen und abspielen",
   "widgets.failure.change_quality": "Qualität ändern",
-  "widgets.skip.intro_skipped": "Intro übersprungen",
-  "widgets.skip.credits_skipped": "Abspann übersprungen"
+  "widgets.watch.intro": "Vorspann ansehen"
 }

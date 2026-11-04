@@ -36,8 +36,7 @@
 //! frozen top-level keys: no pick in this module ever writes one.
 use super::plan::{supported_quality, Quality, QUALITY_LADDER};
 use plx_plex::plex::session::{
-    InstantDpadSeeking, InstantDpadSeekingPref, effective, own_prefs, persist_profile_pref, AudioEnhancementsPref, DeckPress, DeckPressPref, DirectPlayMode,
-    MarkerSkip, SkipCreditsPref, SkipIntroPref,
+    MarkerSkipMode, IntroSkipPref, CreditsSkipPref, DolbyVisionMode, DolbyVisionModePref, InstantDpadSeeking, InstantDpadSeekingPref, effective, own_prefs, persist_profile_pref, AudioEnhancementsPref, DeckPress, DeckPressPref, DirectPlayMode,
     DirectPlayModePref, HdrOverlayBrightness, HdrOverlayBrightnessPref, NextEpisodeMode, NextEpisodeModePref, Preferences, ProfilePrefs, ProfilePrefsRecord,
     ProfileSetting, ProfileWrite, QualityPref, Row, Setting, SkipInterval, SkipIntervalPref, SubtitlePosition,
     SubtitlePositionPref, SubtitleSize, SubtitleSizePref, SubtitleTone, SubtitleTonePref, TrailerAutoplayPref, UnderPosters,
@@ -143,7 +142,7 @@ macro_rules! packed_by_index {
         }
     )*};
 }
-packed_by_index!(InstantDpadSeeking = 0, NextEpisodeMode = 0, SkipInterval = 1, DeckPress = 0, MarkerSkip = 0, SubtitleSize = 1, SubtitlePosition = 0, SubtitleTone = 0, HdrOverlayBrightness = 1);
+packed_by_index!(MarkerSkipMode = 1, DolbyVisionMode = 0, InstantDpadSeeking = 0, NextEpisodeMode = 0, SkipInterval = 1, DeckPress = 0, SubtitleSize = 1, SubtitlePosition = 0, SubtitleTone = 0, HdrOverlayBrightness = 1);
 
 impl Packed for DirectPlayMode {
     const SEED: u8 = 0;
@@ -164,7 +163,8 @@ impl Packed for DirectPlayMode {
 }
 
 /// Under posters is one byte: the title switch in bit 0, the details' ladder index in bits 1-3
-/// ([`UnderPosters::pack`]). The seed, 0, is the default (no title, year and length), so a read
+/// and "sort value Off" in bit 4 ([`UnderPosters::pack`]). The seed, 0, is the default (no title,
+/// year and length, sort value On), so a read
 /// before any restore is what the install did before the setting existed.
 impl Packed for UnderPosters {
     const SEED: u8 = 0;
@@ -231,6 +231,9 @@ impl Packed for AudioEnhancements {
 }
 
 live_cell!(pub(super) INSTANT_DPAD_SEEKING: InstantDpadSeeking, "instant D-pad seeking");
+live_cell!(pub(super) INTRO_SKIP: MarkerSkipMode, "intro skip");
+live_cell!(pub(super) CREDITS_SKIP: MarkerSkipMode, "credits skip");
+live_cell!(pub(super) DOLBY_VISION_MODE: DolbyVisionMode, "Dolby Vision mode");
 
 // ---- the cells ------------------------------------------------------------------------------
 
@@ -254,15 +257,6 @@ live_cell!(
     /// the Library's) and by the item menu when it builds its rows; `DeckPress::press_plays` is the
     /// one question they all ask of it.
     pub(super) DECK_PRESS: DeckPress, "deck press preference"
-);
-live_cell!(
-    /// What an intro marker does: offer the Skip pill, or skip it as it starts. Read by the app's
-    /// marker-offer edge every frame (`app::run`).
-    pub(super) SKIP_INTRO: MarkerSkip, "skip intro preference"
-);
-live_cell!(
-    /// [`SKIP_INTRO`]'s twin for a credits marker.
-    pub(super) SKIP_CREDITS: MarkerSkip, "skip credits preference"
 );
 live_cell!(
     /// What sits under the focused poster (Settings > Libraries > Under posters). Read by every
@@ -334,9 +328,10 @@ macro_rules! live_setting {
 
 live_setting!(DirectPlayModePref, DIRECT_PLAY_MODE, "direct play mode");
 live_setting!(InstantDpadSeekingPref, INSTANT_DPAD_SEEKING, "instant D-pad seeking");
+live_setting!(IntroSkipPref, INTRO_SKIP, "intro skip");
+live_setting!(CreditsSkipPref, CREDITS_SKIP, "credits skip");
+live_setting!(DolbyVisionModePref, DOLBY_VISION_MODE, "Dolby Vision mode");
 live_setting!(DeckPressPref, DECK_PRESS, "deck press");
-live_setting!(SkipIntroPref, SKIP_INTRO, "skip intro");
-live_setting!(SkipCreditsPref, SKIP_CREDITS, "skip credits");
 live_setting!(UnderPostersPref, UNDER_POSTERS, "under posters");
 live_setting!(SubtitleSizePref, SUBTITLE_SIZE, "subtitle size");
 live_setting!(SubtitlePositionPref, SUBTITLE_POSITION, "subtitle position");
@@ -396,9 +391,10 @@ pub const LIVE_ROWS: &[LiveRow] = &[
     LiveRow::of::<NextEpisodeModePref>(),
     LiveRow::of::<SkipIntervalPref>(),
     LiveRow::of::<InstantDpadSeekingPref>(),
+    LiveRow::of::<DolbyVisionModePref>(),
+    LiveRow::of::<IntroSkipPref>(),
+    LiveRow::of::<CreditsSkipPref>(),
     LiveRow::of::<DeckPressPref>(),
-    LiveRow::of::<SkipIntroPref>(),
-    LiveRow::of::<SkipCreditsPref>(),
     LiveRow::of::<UnderPostersPref>(),
     LiveRow::of::<AudioEnhancementsPref>(),
     LiveRow::of::<TrailerAutoplayPref>(),
@@ -782,9 +778,10 @@ choices! {
     NextEpisode => NextEpisodeModePref,
     SkipInterval => SkipIntervalPref,
     InstantDpadSeeking => InstantDpadSeekingPref,
+    DolbyVision => DolbyVisionModePref,
+    IntroSkip => IntroSkipPref,
+    CreditsSkip => CreditsSkipPref,
     DeckPress => DeckPressPref,
-    SkipIntro => SkipIntroPref,
-    SkipCredits => SkipCreditsPref,
     UnderPosters => UnderPostersPref,
     TrailerAutoplay => TrailerAutoplayPref,
     SubtitleSize => SubtitleSizePref,
@@ -906,6 +903,9 @@ pub fn set_next_episode_mode(mode: NextEpisodeMode) -> bool { confirm::<NextEpis
 pub fn instant_dpad_seeking() -> InstantDpadSeeking { InstantDpadSeekingPref::live() }
 pub fn restore_instant_dpad_seeking(seeking: InstantDpadSeeking) { restore_live::<InstantDpadSeekingPref>(seeking) }
 
+pub fn dolby_vision_mode() -> DolbyVisionMode { DolbyVisionModePref::live() }
+pub fn restore_dolby_vision_mode(mode: DolbyVisionMode) { restore_live::<DolbyVisionModePref>(mode) }
+
 pub fn skip_interval() -> SkipInterval { SkipIntervalPref::live() }
 pub fn restore_skip_interval(interval: SkipInterval) { restore_live::<SkipIntervalPref>(interval) }
 /// Blocking persistence seam, as [`set_next_episode_mode`].
@@ -916,15 +916,6 @@ pub fn restore_deck_press(mode: DeckPress) { restore_live::<DeckPressPref>(mode)
 /// Blocking persistence seam, as [`set_next_episode_mode`].
 pub fn set_deck_press(mode: DeckPress) -> bool { confirm::<DeckPressPref>(mode) }
 
-pub fn skip_intro() -> MarkerSkip { SkipIntroPref::live() }
-pub fn restore_skip_intro(mode: MarkerSkip) { restore_live::<SkipIntroPref>(mode) }
-/// Blocking persistence seam, as [`set_next_episode_mode`].
-pub fn set_skip_intro(mode: MarkerSkip) -> bool { confirm::<SkipIntroPref>(mode) }
-
-pub fn skip_credits() -> MarkerSkip { SkipCreditsPref::live() }
-pub fn restore_skip_credits(mode: MarkerSkip) { restore_live::<SkipCreditsPref>(mode) }
-/// Blocking persistence seam, as [`set_next_episode_mode`].
-pub fn set_skip_credits(mode: MarkerSkip) -> bool { confirm::<SkipCreditsPref>(mode) }
 /// What sits under the focused poster, for the seated profile. Safe from any thread; a reader takes
 /// no lock.
 pub fn under_posters() -> UnderPosters { UnderPostersPref::live() }
@@ -986,3 +977,6 @@ pub fn set_default_quality(q: Quality) -> bool { confirm::<QualityPref>(q) }
 #[cfg(test)]
 #[path = "prefs_tests.rs"]
 mod prefs_tests;
+
+pub fn intro_skip() -> MarkerSkipMode { IntroSkipPref::live() }
+pub fn credits_skip() -> MarkerSkipMode { CreditsSkipPref::live() }

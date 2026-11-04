@@ -7,6 +7,7 @@
   "widgets.menu.quality_converted_note": "Сервер Plex преобразует это видео.",
   "widgets.menu.stats": "Статистика для гиков",
   "widgets.menu.diagnostics": "Отправить диагностику",
+  "widgets.menu.previous_episode": "Предыдущая серия",
   "widgets.badge.forced": "ПРИНУДИТЕЛЬНЫЕ",
   "widgets.toggle.on": "Вкл.",
   "widgets.toggle.off": "Выкл.",
@@ -42,8 +43,6 @@
   "widgets.chapters.number": "Глава {number}",
   "widgets.skip.intro": "Пропустить заставку",
   "widgets.skip.credits": "Пропустить титры",
-  "widgets.skip.intro_skipped": "Заставка пропущена",
-  "widgets.skip.credits_skipped": "Титры пропущены",
   "widgets.next.episode": "Следующая серия",
   "widgets.next.credits": "Смотреть титры",
   "widgets.next.caption": "Далее · {episode}",
@@ -259,5 +258,6 @@
   "widgets.region.nl": "Нидерланды",
   "widgets.region.latin_america": "Латинская Америка",
   "widgets.failure.play_auto": "Включить «Авто» и смотреть",
-  "widgets.failure.change_quality": "Изменить качество"
+  "widgets.failure.change_quality": "Изменить качество",
+  "widgets.watch.intro": "Смотреть заставку"
 }

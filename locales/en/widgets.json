@@ -46,6 +46,10 @@
     "value": "Send diagnostics",
     "description": "Option or section label in the player overflow menu."
   },
+  "widgets.menu.previous_episode": {
+    "value": "Previous Episode",
+    "description": "Row in the player overflow menu, shown when the playing episode has an earlier one (or can restart): starts the previous episode, or this one over. Same noun as widgets.next.episode, in the same capitalisation."
+  },
   "widgets.badge.forced": {
     "value": "FORCED",
     "description": "Compact media-track badge. This describes a subtitle or audio track."
@@ -200,14 +204,6 @@
   "widgets.skip.credits": {
     "value": "Skip Credits",
     "description": "Player action that skips the currently offered introduction or credits marker."
-  },
-  "widgets.skip.intro_skipped": {
-    "value": "Intro skipped",
-    "description": "A short notice at the top of the player after the intro was skipped automatically (Settings, Skip intros)."
-  },
-  "widgets.skip.credits_skipped": {
-    "value": "Credits skipped",
-    "description": "A short notice at the top of the player after the credits were skipped automatically (Settings, Skip credits)."
   },
   "widgets.next.episode": {
     "value": "Next Episode",
@@ -1128,5 +1124,9 @@
   "widgets.failure.change_quality": {
     "value": "Change quality",
     "description": "Failed-playback button: opens the quality ladder; picking a rung retries at it."
+  },
+  "widgets.watch.intro": {
+    "value": "Watch Intro",
+    "description": "Playback marker skipping preference or cancellation action."
   }
 }

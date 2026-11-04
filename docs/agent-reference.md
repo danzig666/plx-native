@@ -371,7 +371,7 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
     counted the layer crates' `test-support` optional dependencies (rcgen, rustls, ...) that only a
     `[dev-dependencies]` entry switches on. A fourth, the line count of `rust-modules/src` and every
     layer crate's `src`, only warns. Each entry records the value it was set
-    from and the date (10% headroom on sizes, +3 on counts). **To raise a budget deliberately, edit
+    from, the date and its declared headroom. **To raise a budget deliberately, edit
     the json in the same PR, update `measured`/`measured_on`, and justify the growth in the PR body**;
     the failing message says the same. Run it locally with
     `python3 ci/check-build-budgets.py --graph --src rust-modules/src` plus one `--src` per layer crate,
@@ -645,7 +645,7 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   popover or modal, any title flagged `not_in_video` opened (`gates` checks the mock's request log,
   and that no stream, transcode, timeline, scrobble or play-queue request was made), and the
   hold-hint capsule: the film is shot with the hint taught. The capsule is a one-time teaching
-  overlay (it stands after 1.5 s of rest on a card, once per install across every card screen, Home included, and once more on the Detail season pill after a shorter rest, and for the length of an `ok` held on a card), and a film has no
+  overlay (it stands after 1.5 s of rest on a card, once per install across every card screen, Home included, and once more on the Detail season pill after a shorter rest). A hidden hint also appears after 200 ms of an `ok` hold, with a fill in its cap; a short click leaves it hidden. A film has no
   viewer to teach, so `render --storyboard` writes the `plxnative-hintoff` trigger
   (`HINT_OFF` in `site_video.py`; the app reads it once at boot, in `devtriggers` builds only, and
   calls `hold_hint::teach_all_for_dev`, which marks the hint learned and both of its showings spent for the run) and `render.json` records `hold_hint: suppressed`. The hint's own timing is unchanged,
@@ -1085,16 +1085,20 @@ video shows through.
 
 **UI (the Rust app core — the frame loop in `app/run.rs::run`, entered via `plex_run()` in `port.rs`, which installs the port and runs `app::run_application`, after `app/boot.rs::boot()`):** SDL2 window + GLES2
 context. All UI is drawn with two tiny shaders — an SDF rounded-rect/triangle shader (cards, focus
-glow, HUD widgets, seven-segment FPS) and a text shader that samples SDL2_ttf-rendered glyph
-textures (cached by string+size). Critically-damped springs animate focus scale and shelf scroll.
-Fonts are `appfont.ttf` / `appfont-bold.ttf` deployed next to the binary; the subtitle renderer additionally loads the per-script Noto faces from `fonts/subs/` (`docs/ass-subtitles.md`, cut by `tools/cut-noto-subs.py`, staged by `SUBS_FONT_FILES` in the Makefile). (Wayland surface setup +
+glow, HUD widgets, seven-segment FPS) and a text shader that samples glyph
+textures (cached by string+size): SDL2_ttf renders every run except Arabic and Hebrew, which libass-plx
+shapes and rasterizes into the same texture (`gfx/src/rtl.rs`).
+Critically-damped springs animate focus scale and shelf scroll.
+Fonts are the `appfont*.ttf` faces deployed next to the binary, in the fallback chain `gfx/src/text.rs` opens (Inter, CJK, emoji, Arabic, Hebrew; Inter, Arabic and Hebrew with bold cuts; `ci/test_shipped_faces.py` holds every staging list to it), so a missing libass-plx costs Arabic and Hebrew UI text as well as text subtitles; the subtitle renderer additionally loads the per-script Noto faces from `fonts/subs/` (`docs/ass-subtitles.md`, cut by `tools/cut-noto-subs.py`, staged by `SUBS_FONT_FILES` in the Makefile). (Wayland surface setup +
 input decoding live in `system.rs` / `app/events.rs` + `app/input.rs`, not the C shim — see the gotchas below.)
 
 **Video playback (summary — `rust-modules/media/src/player/CLAUDE.md` is the deep-dive: pipeline,
 threading model, the Starfish/ACB ABI + bind-order gotchas, seek/PTS rebase. Read it before
 touching playback):** LG's in-process **StarfishMediaAPIs** (`libplayerAPIs.so`) in
 `BUFFERSTREAM` **buffer-feed** mode, the decoded sink bound to the hardware video plane via
-**`libAcbAPI` (ACB)** — in-process is what lets ACB bind the app-owned sink. The media pipeline
+**`libAcbAPI` (ACB)**. Normal playback uses this in-process buffer-feed path; the controlled
+[URI experiment](measurements/uri-acb-dass-2026-11-02.md) also displayed its SDR720p24 fixture
+through ACB on the webOS 4.5 dev set, with and without `connectDass`. The normal media pipeline
 is all Rust: `PMS HTTP GET` → demux (**`ff.rs`, over a custom AVIO on the
 FFmpeg the app BUNDLES** — not the television's; see the linking section, and note ours is built
 `--disable-network`, so the AVIO is the *only* way bytes reach it) → AU queues with backpressure
@@ -1191,7 +1195,7 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
 - `rust-modules/ui/src/` (workspace crate `plx_ui`) — **the UI, as a shared design system**: `theme.rs` tokens, the retui core
   (`lib.rs` `Painter`/`View`), reusable components (`widgets.rs`/`table.rs`/`label.rs`/`icons.rs`),
   and, since phase 9 (Player was the last), no legacy screens at all — every route mounts an owned
-  screen under `screens/` (`rust-modules/screens/src/`, workspace crate `plx_screens`). The player's drawing/state modules (`appkit/player_hud.rs`,
+  screen under `screens/` (`rust-modules/screens/src/`, workspace crate `plx_screens`). The player's drawing/state modules (`appkit/player_hud/`,
   `track_menu.rs`, `info_panel.rs`, `chapters_panel.rs`, `up_next.rs`, `more_menu.rs`,
   `timing_capsule.rs`, `skip_pill.rs`) and the Sources row model (`appkit/source_list.rs`) live in
   `rust-modules/appkit/src/` (workspace crate `plx_appkit`), the layer between `ui/` and `screens/` for
@@ -1275,19 +1279,22 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   pages; `metadata` reads go through `MetadataView`, which borrows from the owner (`&'a`), not
   a compatibility global or mailbox.
 - `rust-modules/base/src/dynlib.rs` — the runtime library binder (`dlopen`, by SONAME candidate list or
-  by absolute path). **Four** callers in a lab build and three in every other, each for its own
+  by absolute path). **Six** callers in a lab build and five in every other, each for its own
   reason: `net.rs` binds **curl** by candidate list because its SONAME moves between releases;
   `ff.rs` binds the **bundled FFmpeg** by absolute path because ours ships beside the binary, on
   no library search path — not because any
-  version varies; and `curlio.rs` binds **`curl_multi_*` in a SECOND table of its own**, from the
+  version varies; `player/ass.rs` and `gfx/src/rtl.rs` bind the **bundled libass-plx** the same way,
+  the subtitle surface and the UI text surface in two tables, each checking the facade ABI against
+  its own `NATIVE_ABI`, so a facade bump edits both;
+  and `curlio.rs` binds **`curl_multi_*` in a SECOND table of its own**, from the
   same candidate list, because `load_into` is all-or-nothing and a set missing one multi symbol
   must still be able to SIGN IN. That table is frozen to the oldest supported set:
   `curl_multi_poll`/`curl_multi_wakeup` resolve on the dev Mac, are absent on the dev television,
   and first appear at webOS 7.4.0 — so binding them would have emptied this table on four of the
-  nine gated releases. The fourth is `plx_base::diag::zlib` (`rust-modules/base/src/diag/zlib.rs`), which binds **one** symbol — `compress2` — in
+  nine gated releases. The sixth is `plx_base::diag::zlib` (`rust-modules/base/src/diag/zlib.rs`), which binds **one** symbol — `compress2` — in
   a table of its own so that a television without libz degrades to an uncompressed upload rather
   than emptying anybody else's table; it exists only in a `lab-diagnostics` build, which is not the
-  default set, so an ordinary binary really does have three. (**ACB** is the same idea but not this
+  default set, so an ordinary binary really does have five. (**ACB** is the same idea but not this
   module: `src/starfish.c` is C and does its own `dlopen`.) Replaced `stub/`, which is deleted.
   `tools/fwcompat.py` grades the result;
   `docs/webos5-port.md` is the full account.
@@ -1528,7 +1535,8 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   inside `is_back`, in `consts.rs` itself, beside the constant and the comment explaining it).
   Preserve this raw-offset reading if you touch input.
 - **Starfish/ACB ABI + bind-order rules** (the C++-from-C mangled-symbol seam, `Load` with
-  `uid=NULL`, the exact ACB bind sequence, sourceInfo-verbatim (one exception: PQ VP9 is rewritten to HDR10), never feed audio to ACB, the
+  `uid=NULL`, the exact ACB bind sequence, buffer-feed sourceInfo-verbatim (PQ VP9 is rewritten to HDR10;
+  the developer URI ACB fixture uses a separate experimental descriptor), never feed audio to ACB, the
   3-arg taskId ABI) — moved to **`rust-modules/media/src/player/CLAUDE.md`**; read it before touching
   playback or `src/starfish.c`.
 - **Wayland transparency** (`system.rs`)**:** the UI surface is forced to a 32-bit RGBA config and
@@ -2183,11 +2191,15 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   through it once the route no longer gets a free pass.
 - **The heartbeat's WIRE ORDER, since phase 11** (`rust-modules/base/src/diag/heartbeat.rs::heartbeat_tail` is the one
   definition; anything here that disagrees with it is this file being stale):
-  `loop= route= [overlay=] [pos= play=] [vtick= vgap=] fps= [load= snap= period=] [worstframe=
+  `loop= route= [overlay=] [section=] [pos= play=] [vtick= vgap=] fps= [load= snap= period=] [worstframe=
   worstprep=] carried= dropped= budget=<admitted>/<refused>[/solo:<class>] evicted_hot= [rec=]
   [sim=1]`. **Nothing may be inserted ahead of `fps=` or `worstframe=`** — `tests/run.py`'s
   `FPS_RE` and `WORST_RE` anchor on `loop=`/`route=`/`overlay=` and then reach forward with a lazy
-  `.*?`, so appending is free and inserting is not. The bracketed pairs are conditional;
+  `.*?`, so appending is free and inserting is not. `section=<chapters|info|chapters_info>` is the player page's
+  open HUD section (`app/words.rs::section_word`), printed right after `overlay=` only while one is open; a
+  section is the page's state and not a surface, so `overlay=` stays the topmost modal surface's name (`none` over
+  a bare player) and a scene that needs a section carries its own `"section"` key (`tests/run.py::select_section`).
+  The bracketed pairs are conditional;
   `worstframe=`/`worstprep=` need `plxnative-framedrop`, and the four frame-plan fields do NOT —
   they print in every build, because each is a counter its owner already keeps rather than a
   measurement anybody pays for. `budget=`'s `/solo:<class>` third field appears only when a solo
@@ -2295,10 +2307,8 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   oscillator added or taken away. A scene with no motion and only a `loop_floor`
   gates nothing — **`home-hero` carries an `_idle_gate_note` saying exactly that, and it is the only
   one left**; this line said "three" long after the other two (`home-grid`, `library-scroll`) were
-  given oscillators and real `fps_floor`s, which is the fix that note asks for. The other three
-  `loop_floor`-only scenes are the player-tier overlays (`info-panel`, `track-menu`, `chapters-panel` — take the list from `./tests/run.py --list --server`, not from here) and need no note, because
-  the video plane stays bound for the whole scene, so `fps=` grades neither an animator nor an
-  idle screen. Every run also reports
+  given oscillators and real `fps_floor`s, which is the fix that note asks for. The other `loop_floor`-only scenes need no note: the video plane stays bound for the whole scene, so `fps=` grades neither an animator nor an
+  idle screen. Take the list from `./tests/run.py --list --server`, not from here. Among them, `info-panel` and `chapters-panel` are HUD sections of the player page (they pin `overlay=none` and a `section` word), and `track-menu` is still an overlay. Every run also reports
   **`drift`** (last-third minus first-third mean): sorting used to destroy sample ORDER, so a
   monotone 60→53 decay and a flat 53 were byte-identical output. It is reported, never asserted —
   18–36 s is far too short to gate a thermal ramp on, and **the "the panel thermally throttles"
@@ -2433,6 +2443,18 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   reader demuxes the Part's subtitle packets over a fresh-session range read and the client
   renderer draws that track; logs `subside: open|anchor|reopen|failed|stop …`, never a URL, token
   or session; `media::player::subside`, `ff_subside.rs`),
+  `/tmp/plxnative-uriprobe[=load|late|none|drive]` (the webOS 5+ URI-mode probe, issue #1064: the
+  next Play hands its stream URL to `com.webos.media` over the platform bus instead of building an
+  Engine, to learn whether the exported window id is honoured and where it may go. The content
+  picks the variant: empty or `load` puts `windowId` in the `load` payload, `late` sends it with
+  `setWindowId` after `loadCompleted`, `none` sends no window at all, and `drive` binds like `load`
+  and then exercises the transport — pause, resume, a seek 20 s ahead, a text and an audio
+  `selectTrack`, `setSubtitleEnable` — logging the position before and after each, so the summary
+  says whether the pipeline accepts them; text naming no variant leaves the probe unarmed and the
+  play normal. Read at each playback start, no relaunch; skipped for a hero preview. No Engine
+  runs, so nothing is reported to Plex (no timeline, scrobble or unscrobble). The event log gets `uriprobe: …` lines ending in one `summary` line, never the URL,
+  token, host or a service payload; a tester sends those lines and removes the file.
+  `dev::DIAG`, so it does not move the boot screen; `media::player::uriprobe`, `uriprobe_drive`),
   `/tmp/plxnative-url` (override the streamed part
   URL) and **`/tmp/plxnative-playurl`** (the same, plus the LOAD DECLARATION — one JSON object,
   `{"url":…,"vcodec":…,"acodec":…,"fps":…,"dovi":{…},"atmos":…}`, which is what the pipeline test
@@ -2489,8 +2511,7 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   within seconds — and two comparisons were silently mis-paired that way before it did.
   And the Library browse set: `/tmp/plxnative-library[=N]` (boot straight into the
   library on section N), **`/tmp/plxnative-libosc`** (a perpetual focus sweep of that library's
-  whole DOCUMENT — the library pill strip at the head where there is one (two or more eligible
-  libraries; a lone favourite draws no selector at all), each published shelf, the grid's control
+  whole DOCUMENT — the favorite library strip and persistent Library options at the head, each published shelf, the grid's control
   row, then the poster grid — reversing at the document's own ENDS rather than on a clock, which is
   the one
   oscillator here that does. The owned Library handles `LibraryCmd::Sweep`; the rule dates to

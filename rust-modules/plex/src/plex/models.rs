@@ -328,6 +328,9 @@ pub struct Metadata {
     pub guid: String,
     #[serde(default)]
     pub title: String,
+    /// PMS's edition label, kept separate from the title (e.g. Director's Cut).
+    #[serde(rename = "editionTitle", default, deserialize_with = "de_str")]
+    pub edition_title: String,
     /// The LIBRARY this row lives in, on the server that answered ("Movies", "Film Club"). Sent on
     /// a cross-library query such as `/library/all?guid=…`, which is the one place the app asks a
     /// server something without already knowing which of its libraries will answer.
@@ -467,6 +470,9 @@ pub struct Metadata {
     pub audience_rating: f64,
     #[serde(rename = "audienceRatingImage", default)]
     pub audience_rating_image: String,
+    /// The seated viewer's own score, independent of both review-score fields.
+    #[serde(rename = "userRating", default, deserialize_with = "de_f64")]
+    pub user_rating: f64,
 }
 
 /// The 12 bytes of a catalog id, from a `plex://movie/<hex>` or `plex://show/<hex>` guid. `None` for

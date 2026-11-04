@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Normale",
   "widgets.menu.stats": "Statistiques avancées",
   "widgets.menu.diagnostics": "Envoyer les diagnostics",
+  "widgets.menu.previous_episode": "Épisode précédent",
   "widgets.badge.forced": "FORCÉ",
   "widgets.toggle.on": "On",
   "widgets.toggle.off": "Off",
@@ -42,8 +43,6 @@
   "widgets.chapters.number": "Chapitre {number}",
   "widgets.skip.intro": "Passer l’intro",
   "widgets.skip.credits": "Passer le générique",
-  "widgets.skip.intro_skipped": "Intro passée",
-  "widgets.skip.credits_skipped": "Générique passé",
   "widgets.next.episode": "Épisode suivant",
   "widgets.next.credits": "Voir le générique",
   "widgets.next.caption": "À suivre · {episode}",
@@ -255,5 +254,6 @@
   "widgets.region.nl": "Pays-Bas",
   "widgets.region.latin_america": "Amérique latine",
   "widgets.failure.play_auto": "Passer en Auto et lire",
-  "widgets.failure.change_quality": "Changer la qualité"
+  "widgets.failure.change_quality": "Changer la qualité",
+  "widgets.watch.intro": "Regarder le générique"
 }

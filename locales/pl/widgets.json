@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Normalna",
   "widgets.menu.stats": "Statystyki dla nerdów",
   "widgets.menu.diagnostics": "Wyślij diagnostykę",
+  "widgets.menu.previous_episode": "Poprzedni odcinek",
   "widgets.badge.forced": "WYMUSZONE",
   "widgets.toggle.on": "Wł.",
   "widgets.toggle.off": "Wył.",
@@ -42,8 +43,6 @@
   "widgets.chapters.number": "Rozdział {number}",
   "widgets.skip.intro": "Pomiń czołówkę",
   "widgets.skip.credits": "Pomiń napisy końcowe",
-  "widgets.skip.intro_skipped": "Pominięto czołówkę",
-  "widgets.skip.credits_skipped": "Pominięto napisy końcowe",
   "widgets.next.episode": "Następny odcinek",
   "widgets.next.credits": "Obejrzyj napisy końcowe",
   "widgets.next.caption": "Następnie · {episode}",
@@ -259,5 +258,6 @@
   "widgets.region.nl": "Holandia",
   "widgets.region.latin_america": "Ameryka Łacińska",
   "widgets.failure.play_auto": "Ustaw Auto i odtwórz",
-  "widgets.failure.change_quality": "Zmień jakość"
+  "widgets.failure.change_quality": "Zmień jakość",
+  "widgets.watch.intro": "Oglądaj czołówkę"
 }

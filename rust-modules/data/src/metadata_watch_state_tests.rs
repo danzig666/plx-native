@@ -658,7 +658,7 @@ fn the_servers_facts_and_offset_patch_related_and_collection_tiles_only_where_th
     }));
     let adapter = std::sync::Arc::new(MetadataAdapter::default());
     let run = |rk: &str, sid, edit| super::run(test_state(), &adapter, MetadataCmd::ApplyView { at: ViewAt::leaf(sid, rk), edit });
-    let facts = ViewEdit::Facts { watched: true, unwatched: false, resume_ms: 0 };
+    let facts = ViewEdit::Facts { watched: true, unwatched: false, resume_ms: 0, sort: None };
     assert!(run("r1", SRV_A, facts));
     assert!(!run("r1", SRV_A, facts), "facts that agree with the tile change nothing");
     assert!(!run("r0", SRV_B, facts), "another server's r0 names nothing here");
@@ -704,4 +704,24 @@ fn an_offset_moves_the_loaded_item_and_the_episode_it_names_and_only_when_it_dif
     assert_eq!(d.resume_ms, 7_000);
     assert_eq!((d.episodes.get(0).unwrap().resume_ms, d.episodes.get(1).unwrap().resume_ms), (42_000, 6), "no other episode moved");
     clear(test_state(), test_adapter());
+}
+
+#[test]
+fn pdf_proposal_on_deck_watch_flip_is_immediate_outside_the_loaded_season() {
+    let _guard = plx_base::testlock::serial();
+    let mut state = MetadataState::default();
+    state.current = Some(Detail {
+        sid: SRV_A, rk: "show".into(), kind: "show".into(), is_show: true,
+        on_deck: Some(Episode { rk: "next".into(), season: 2, resume_ms: 60_000, dur_ms: 120_000, ..Default::default() }),
+        ..Default::default()
+    });
+    assert!(!set_watched_local(&mut state, &crate::viewstate::ViewAt::leaf(SRV_B, "next"), true));
+    let at = crate::viewstate::ViewAt::leaf(SRV_A, "next");
+    assert!(set_watched_local(&mut state, &at, true), "the on-deck copy is a mounted view of this leaf");
+    let ep = state.current.as_ref().unwrap().on_deck.as_ref().unwrap();
+    assert!(ep.watched);
+    assert_eq!(ep.resume_ms, 0);
+    assert!(!state.current.as_ref().unwrap().watched, "one episode never marks the whole show");
+    assert!(set_watched_local(&mut state, &at, false));
+    assert!(!state.current.as_ref().unwrap().on_deck.as_ref().unwrap().watched);
 }

@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Normal",
   "widgets.menu.stats": "Estatísticas avançadas",
   "widgets.menu.diagnostics": "Enviar diagnósticos",
+  "widgets.menu.previous_episode": "Episódio anterior",
   "widgets.badge.forced": "FORÇADAS",
   "widgets.toggle.on": "Ligado",
   "widgets.toggle.off": "Desligado",
@@ -254,6 +255,5 @@
   "widgets.region.latin_america": "América Latina",
   "widgets.failure.play_auto": "Mudar para Automático e reproduzir",
   "widgets.failure.change_quality": "Mudar qualidade",
-  "widgets.skip.intro_skipped": "Introdução saltada",
-  "widgets.skip.credits_skipped": "Genérico saltado"
+  "widgets.watch.intro": "Assistir à introdução"
 }

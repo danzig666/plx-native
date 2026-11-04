@@ -70,7 +70,7 @@ impl Pointer {
 
 /// How far from the top or bottom of the screen the pointer scrolls the page ([`EdgeScroll`]).
 /// 80 px: at 120 the glide started too readily while the pointer was only on its way to the top
-/// or bottom row (the owner's call on the C2 and C3).
+/// or bottom row (tried on an LG C2 and C3).
 pub(crate) const EDGE_BAND: f32 = 80.0;
 /// How far from the left or right edge the pointer glides the row under it ([`EdgeScroll::pan`]).
 pub(crate) const EDGE_SIDE_BAND: f32 = 120.0;
@@ -96,7 +96,7 @@ const EDGE_MIN_SHARE: f32 = 0.35;
 /// the page, over cards or not: after [`EDGE_DWELL_MS`] every frame hands the page a fractional
 /// `InputKind::Wheel` (+ up, - down, the wheel's sign), easing in over [`EDGE_RAMP_MS`] to a speed
 /// that grows toward the edge. Only the navigation bar's buttons are the bar's own pointer: over
-/// one the glide stops (it starts again, easing in, once the pointer is off it). Stepping FOCUS a row at a time (fork.2) could not glide:
+/// one the glide stops (it starts again, easing in, once the pointer is off it). Stepping FOCUS a row at a time could not glide:
 /// the critically damped scroll spring settles between steps, so the page pulsed (a simulation of
 /// `gfx::spring` at `K_SCROLL`: still a 2:1 speed swing at a step every 160 ms).
 ///
@@ -111,8 +111,8 @@ pub(crate) struct EdgeScroll {
     glide: Option<(i32, u32)>,
     /// The last frame [`step`](Self::step) ran on: the glide times its own frames. It runs in
     /// `run::playback_tick`, before the loop has worked out `Frame::dt` (still 0 there), and a
-    /// glide that took the frame's dt moved the page by nothing on every frame (fork.3 to fork.5
-    /// never glided on the television; the host rigs set `dt` by hand and hid it).
+    /// glide that took the frame's dt would move the page by nothing on every frame (the host rigs
+    /// set `dt` by hand, which hid exactly that during development).
     last: Option<u32>,
     /// The sideways glide under way ([`pan`](Self::pan)): its direction (+1 right, -1 left) and
     /// when the pointer came to the side band.
@@ -1542,6 +1542,8 @@ fn sweep_local_files(persistent: impl IntoIterator<Item = std::path::PathBuf>,
 
 pub(crate) fn delete_all_local_data(meta: &mut plx_data::stores::metadata::MetadataStore,
     mut failures: Vec<String>) -> Vec<String> {
+    // Retire the writer before the privacy sweep unlinks its log files.
+    plx_platform::playback_trace::retire();
     failures.extend(sweep_local_files(
         plx_base::paths::obsolete_last_place_candidates()
             .into_iter()
@@ -1716,73 +1718,6 @@ pub(crate) fn chip_activate(
     super::bridge::open_account_menu(pages);
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn key_ok(
-    ps: &plx_media::route::PlaybackSession,
-    pa: &mut plx_media::player::adapter::PlayerAdapter,
-    now: u32,
-    _ptr: &mut Pointer,
-    ok_armed: &mut bool,
-    press: &mut plx_ui::press::Press,
-    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
-    bridge: &mut super::bridge::Bridge,
-) {
-    // The shared top bar's PROFILE CHIP used to be answered here, ahead of the per-route ladder
-    // below, off `top_focus` — retired with that function (Home/Library/Search are all owned
-    // screens now, so an OK on the chip is taken by `tree_owns_key` in `app/run.rs`'s ingest,
-    // well above this chain, and never reaches here).
-    if super::bridge::player(pages).is_some() {
-        // The cursor and the pre-press visibility are the mounted screen's, read ONCE into copies
-        // so the arms below are free to present a panel on the same container (`open_player_overlay`
-        // takes it mutably). The pre-press sample is the one the other player arms take too:
-        // `begin_fresh_press` has already cleared `dismissed`, so re-asking calls a hand-hidden
-        // transport visible and this arm would open a panel from behind it
-        // (`HudState::visible_at_press`).
-        let Some((vis, focus, tab)) = super::bridge::player(pages)
-            .map(|player| (player.hud.visible_at_press, player.hud.nav.focus, player.hud.nav.tab))
-        else {
-            return;
-        };
-        // Row 1 is the transport's CONTROL ROW — the Subtitles / Audio / ⋯ discs, or whichever
-        // stand-in has taken their place (Skip, Up Next). Every occupant is a control FACE with a
-        // pop of its own (`player_hud::ROW_POP`), so OK takes the tvOS press: dip now, act on the
-        // spring-back, in `activate_player_row` from the per-frame loop. Both of its arms open
-        // something OVER this HUD rather than leaving the route, which makes this the one control
-        // row in the app where the whole dip → ring is on screen either side of the activation.
-        if vis && focus == 1 {
-            press.begin_ctl(now);
-            *ok_armed = true;
-        } else if vis && focus == 2 {
-            if tab == 0 {
-                super::bridge::open_player_overlay(ps, bridge.metadata_view(), pages, plx_screens::player::overlay::OverlayKind::Info);
-            } else if tab == 1 {
-                super::bridge::open_player_overlay(ps, bridge.metadata_view(), pages, plx_screens::player::overlay::OverlayKind::Chapters);
-            }
-        } else {
-            let np = !super::lifecycle::viewer_paused();
-            if np {
-                if set_transport_paused(pa, true) {
-                    plx_telemetry::diag::event(plx_telemetry::diag::schema::DiagEvent::FeatureUsed {
-                        feature: plx_telemetry::diag::schema::Feature::Pause,
-                    });
-                }
-            } else {
-                set_transport_paused(pa, false);
-            }
-        }
-        if let Some(player) = super::bridge::player_mut(pages) {
-            player.hud.extend(now, HUD_LINGER_MS);
-            player.publish();
-        }
-    }
-    // `Route::Search` is deliberately absent here (phase 7 Search cutover, mirroring
-    // `Route::Library`'s own removal): Search is unconditionally an owned screen, so its OK key —
-    // the field, the recents rows and a result tile's tvOS press alike — was already taken by
-    // `tree_owns_key` in `app/run.rs`'s ingest, well above this chain, and this function is never
-    // reached for it.
-}
-
-
 /// webOS BACK: this Magic Remote sends wcode 482 (0x1E2); 461 kept for others.
 ///
 /// Back stack: player -> the PAGE STACK (detail/person, at any depth) -> library -> grid -> hero ->
@@ -1932,7 +1867,8 @@ mod edge_scroll_tests {
         (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16).map(|d| (t0 + i * 16, d))).collect()
     }
 
-    /// The reported bug: the pointer near the TOP of a scrolled page moved nothing. Resting in the
+    /// The pointer near the TOP of a scrolled page moved nothing (a page rests its focused row at
+    /// the top, so nothing hoverable is left above it). Resting in the
     /// top band over no control glides the page up after the dwell, on EVERY frame (continuous,
     /// not a row at a time), easing in and then holding a steady speed.
     #[test]
@@ -1979,7 +1915,7 @@ mod edge_scroll_tests {
         assert!(run(&mut fresh, false, 0, 2000).is_empty(), "no pointer yet");
     }
 
-    /// The owner's ask: the glide stops while the pointer is on the top bar's buttons (the profile
+    /// The glide stops while the pointer is on the top bar's buttons (the profile
     /// chip, Home / Movies / Watchlist / Search), even mid-glide, and goes on once it is off them.
     #[test]
     fn the_glide_stops_on_the_bar_buttons_and_goes_on_off_them() {

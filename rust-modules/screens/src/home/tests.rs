@@ -1199,7 +1199,7 @@ fn every_settled_row_keeps_its_focused_label_block_above_the_overscan_bottom() {
     use plx_plex::plex::session::{UnderPosters, UnderPostersDetails as Details};
     // Every block the Under posters setting can draw: two lines, one line, nothing.
     for (title, details) in [(true, Details::Genre), (false, Details::YearLength), (false, Details::None)] {
-        crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details })));
+        crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details, sort_value: false })));
         let lines = crate::registry::captions::policy().max_lines();
         crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(None));
         let block = if lines == 0 { 0.0 } else { ui_cards::TileLabel::height(lines == 2) };
@@ -1370,161 +1370,6 @@ fn each_heading_run_carries_its_own_size_weight_and_ink() {
         "the dot and the handle are one annotation: same rung, same weight, so they drop onto the title's baseline together"
     );
     assert!(runs[1].sz < runs[0].sz, "the annotation is a rung DOWN from the title — the drop is why it must be baseline-aligned");
-}
-
-struct MetaRun {
-    text: String,
-    dx: f32,
-    budget: f32,
-    sz: i32,
-    bold: i32,
-    ink: [f32; 4],
-}
-fn meta_flow(base: f32, source: &str) -> (f32, Vec<MetaRun>) {
-    let mut runs = Vec::new();
-    let width = meta_source_flow(base, source, |text, dx, budget, size, bold, ink| {
-        runs.push(MetaRun {
-            text: text.into(),
-            dx,
-            budget,
-            sz: size,
-            bold,
-            ink,
-        });
-        width_of(text, size, bold).min(budget.max(0.0))
-    });
-    (width, runs)
-}
-
-#[test]
-fn a_hero_from_our_own_server_draws_no_source_run_at_all() {
-    let (w, runs) = meta_flow(420.0, "");
-    assert!(
-        runs.is_empty(),
-        "an empty source must produce no runs, no pad and no dot"
-    );
-    assert_eq!(w, 420.0, "…and must not move the line's own end by a pixel");
-}
-
-#[test]
-fn a_borrowed_hero_states_its_owner_as_the_last_run_on_the_line() {
-    let base = 420.0;
-    let (w, runs) = meta_flow(base, "friend");
-    assert_eq!(runs.len(), 2, "the separator and the run, and nothing else");
-    assert_eq!(runs[0].text, "\u{b7}");
-    assert_eq!(
-        runs[0].dx,
-        base + SOURCE_PAD,
-        "the dot is one pad past the facts"
-    );
-    assert_eq!(
-        runs[1].text, "Shared by friend",
-        "the person, not the machine"
-    );
-    assert_eq!(
-        runs[1].dx,
-        runs[0].dx + width_of("\u{b7}", theme::size::BODY, 0) + SOURCE_PAD,
-        "the run is one pad past the dot"
-    );
-    assert_eq!(
-        w,
-        base + 2.0 * SOURCE_PAD
-            + width_of("\u{b7}", theme::size::BODY, 0)
-            + width_of("Shared by friend", theme::size::BODY, 0),
-        "the line grows by exactly the dot, the run and one pad either side of the dot"
-    );
-}
-
-#[test]
-fn the_hero_source_run_keeps_the_lines_rung_and_takes_one_step_of_ink() {
-    let (_, runs) = meta_flow(420.0, "friend");
-    for r in &runs {
-        assert_eq!(
-            (r.sz, r.bold),
-            (theme::size::BODY, 0),
-            "'{}' left the meta line's own rung",
-            r.text
-        );
-        assert_ne!(
-            r.sz,
-            theme::size::CAPTION,
-            "the hero line is BODY — it is not E's line and must not shrink to it"
-        );
-    }
-    assert_eq!(
-        runs[0].ink,
-        theme::TEXT_SEPARATOR,
-        "the middot carries the separator token's own .45"
-    );
-    assert_eq!(
-        runs[1].ink,
-        theme::TEXT_TERTIARY,
-        "one step under the line's TEXT_SECONDARY, never level with it"
-    );
-    assert_ne!(runs[1].ink, theme::TEXT_SECONDARY);
-}
-
-#[test]
-fn an_over_long_handle_truncates_rather_than_wrapping() {
-    let ridiculous = "a-very-long-plex-account-handle-that-nobody-would-ever-choose";
-    for base in [0.0f32, 420.0, HERO_COL_W] {
-        let (w, runs) = meta_flow(base, ridiculous);
-        assert_eq!(
-            runs.len(),
-            2,
-            "base {base}: a long handle is still ONE run — there is no second line to go to"
-        );
-        for r in &runs {
-            assert!(
-                r.budget > 0.0,
-                "base {base}: '{}' was given no room at all ({})",
-                r.text,
-                r.budget
-            );
-            assert!(
-                r.dx + r.budget <= META_FLOW_W + 1e-3,
-                "base {base}: '{}' may elide past the bound",
-                r.text
-            );
-        }
-        assert!(
-            w <= META_FLOW_W + 1e-3,
-            "base {base}: the line ran to {w}, past its {META_FLOW_W} bound"
-        );
-    }
-    // …and the room left at that worst case is a real annotation's worth rather than a stub —
-    // a QUARTER of the whole line, which is the guard that a future widening of the hero column
-    // (or a tightening of the bound) cannot quietly starve the run into a bare ellipsis. It is
-    // stated as a share of the line and not in pixels of text because the synthetic metric here
-    // is roughly twice the shipped font's advance; the share is a claim about the geometry,
-    // which is the part the host can actually speak for.
-    let (_, worst) = meta_flow(HERO_COL_W, "friend");
-    assert!(
-        worst[1].budget >= 0.25 * META_FLOW_W,
-        "a meta line whose facts fill the column leaves the run only {} of {META_FLOW_W}",
-        worst[1].budget
-    );
-}
-
-#[test]
-fn the_meta_lines_bound_keeps_the_run_inside_the_hero_wedge() {
-    use plx_ui::widgets::hero_scrim_a;
-    assert!(
-        hero_scrim_a(HERO_META_R, 1.0) > 0.0,
-        "the line ends where the wedge has already given up"
-    );
-    let wedge_end = (0..=SCR_W as i32)
-        .map(|x| x as f32)
-        .find(|&x| hero_scrim_a(x, 1.0) <= 0.0)
-        .expect("the wedge must end inside the frame");
-    assert!(
-        HERO_META_R <= wedge_end - 0.2 * SCR_W,
-        "the bound ({HERO_META_R}) must stay a fifth of the panel short of the wedge's end ({wedge_end})"
-    );
-    assert!(
-        HERO_META_R > MARGIN_X + HERO_COL_W,
-        "…and past the text column, or the run has nowhere to go"
-    );
 }
 
 // Additional phase-8 ownership proofs: real engine movement, stable identity, effects and map.
@@ -4002,8 +3847,10 @@ fn the_hint_does_not_stand_up_by_itself_while_the_screenshot_clocks_are_held() {
         plx_machine::motion::hold_phase_clocks(Some(4000));
         let ms = hint_ticks(&mut s, view, card, None, 0, hint_secs(8.0));
         assert!(!s.hold_hint.visible(), "pinned clocks: no self-appearing hint in a documentation figure");
-        hint_ticks(&mut s, view, card, Some(100), ms, 30);
-        assert!(s.hold_hint.visible(), "a real hold is input and still shows it");
+        let ms = hint_ticks(&mut s, view, card, Some(100), ms, 30);
+        assert!(!s.hold_hint.visible(), "a short click stays hidden even with pinned clocks");
+        hint_ticks(&mut s, view, card, Some(plx_ui::press::LONG_MS / 2), ms, 30);
+        assert!(s.hold_hint.visible(), "a deliberate hold is input and still shows it");
         plx_machine::motion::hold_phase_clocks(None);
     });
 }
@@ -5767,7 +5614,7 @@ fn home_hands_the_continue_watching_shelf_the_deck_policy_under_nothing() {
     plx_data::pms::seed_continue_window_for_test(&mut state, &adapter, 12, true);
     let snapshot = plx_data::pms::hubs_snapshot(&state);
     for (title, tall) in [(false, plx_ui::caption_policy::BAND_ONE_LINE), (true, plx_ui::caption_policy::BAND_TWO_LINES)] {
-        TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details: UnderPostersDetails::None })));
+        TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details: UnderPostersDetails::None, sort_value: false })));
         let s = screen(snapshot.view());
         assert_eq!(s.rows[0].identity, HomeHubIdentity::ContinueWatching);
         assert_eq!(s.grid.shelves[0].band_h(), tall, "title {title}: the deck keeps its progress line's band");
@@ -5789,7 +5636,7 @@ fn home_opens_its_focused_shelf_band_by_the_policys_band_h() {
     use crate::registry::captions::TEST_UNDER_POSTERS;
     for (title, details, tall) in [(false, UnderPostersDetails::None, 0.0), (false, UnderPostersDetails::Genre, 80.0),
         (true, UnderPostersDetails::YearLength, 112.0)] {
-        TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details })));
+        TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details, sort_value: false })));
         let opened = shelf_top_settled(1, 0, band_open_of(false)) - shelf_top_settled(1, 1, band_open_of(false));
         let policy = crate::registry::captions::policy();
         TEST_UNDER_POSTERS.with(|cell| cell.set(None));
@@ -5815,7 +5662,7 @@ fn a_caption_input_that_changes_under_a_kept_row_reaches_the_drawn_block() {
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
     plx_data::pms::seed_ring_for_test(&mut state, &adapter, rows, items, &|_| 0, (0, rows - 1));
-    let setting = |title, details| TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details })));
+    let setting = |title, details| TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details, sort_value: false })));
     // The block the shelf draws under card `col` of `row`, as the card source words it.
     let block = |s: &HomeScreen, state: &plx_data::pms::PmsState, row: usize, col: usize| {
         let snapshot = plx_data::pms::hubs_snapshot(state);
@@ -5875,13 +5722,12 @@ fn a_caption_input_that_changes_under_a_kept_row_reaches_the_drawn_block() {
     TEST_UNDER_POSTERS.with(|cell| cell.set(None));
 }
 
-/// **The pointer moves Home by its edges, never by a hover.** The reported bug: Home did not
-/// scroll under the Magic Remote at all once the edge glide held hover back, and before that every
-/// hover pulled the page to the shelf it touched. Now a wheel (the edge glide, fractional, every
+/// **The pointer moves Home by its edges, never by a hover.** A hover used to pull the page to the
+/// shelf it touched. Now a wheel (the edge glide, fractional, every
 /// frame) slides the page out of the hero into the shelves and through them and back, a hover
 /// moves focus and nothing else, a click brings the page to its card, and a key rests its row.
 #[test]
-fn the_edge_glide_moves_home_evenly_a_hover_does_not_and_a_click_moves_nothing() {
+fn the_edge_glide_moves_home_a_hover_does_not_and_a_click_rests_its_card() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -5896,15 +5742,11 @@ fn the_edge_glide_moves_home_evenly_a_hover_does_not_and_a_click_moves_nothing()
         for _ in 0..3 { step(s, view, Some(focus), &ScreenEvent::Tick(Tick { ms: 16, dt_us: 16_667 })); }
     };
     let input = |kind| ScreenEvent::Input(InputEvent { at: Tick::default(), source: plx_machine::machine::Source::Script, kind });
-    // the glide down moves through the hero-to-grid dive at the wheel's own pixels (no jump to
-    // the shelves), then scrolls through them, focus staying put
+    // the glide down leaves the hero for the shelves, then scrolls through them, focus staying put
     step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 }));
-    let first = 0.05 * ROW_PITCH / HERO_DIVE_PX;
-    assert!((s.snap_target - first).abs() < 1e-4, "one glide step moves the dive by its pixels, not to the shelves: {}", s.snap_target);
-    assert_eq!(s.grid.scroll_target, 0.0, "the shelves do not scroll before the dive is through");
-    for _ in 0..400 { step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 })); }
+    assert_eq!(s.snap_target, 1.0, "down from the hero goes to the shelves");
+    for _ in 0..60 { step(&mut s, view, Some(hero), &input(InputKind::Wheel { dy: -0.05 })); }
     tick(&mut s, hero);
-    assert_eq!(s.snap_target, 1.0, "the dive is through");
     let glided = s.grid.scroll_target;
     assert!(glided > 100.0, "the shelves glide by the wheel: {glided}");
     // a hover on a shelf card moves focus, not the page
@@ -5912,12 +5754,12 @@ fn the_edge_glide_moves_home_evenly_a_hover_does_not_and_a_click_moves_nothing()
     step(&mut s, view, Some(near), &ScreenEvent::FocusMoved { from: Some(hero), to: near, by: By::Pointer });
     tick(&mut s, near);
     assert_eq!(s.grid.scroll_target, glided, "a hover moves focus, not the page");
-    // a click moves nothing: the card opens where it stands
+    // a click brings the page to its card
     step(&mut s, view, Some(near), &input(InputKind::Click { x: 0.0, y: 0.0, hit: Some(near.elem) }));
     tick(&mut s, near);
-    assert_eq!((s.grid.scroll_target, s.snap_target), (glided, 1.0), "a click moves no page");
-    // the glide up goes back through the shelves, then up the dive, to the hero
-    for _ in 0..1200 { step(&mut s, view, Some(near), &input(InputKind::Wheel { dy: 0.05 })); }
+    assert_eq!(s.grid.scroll_target, rest_scroll(1, rows, band_open_of(false)), "a click rests its card's row");
+    // the glide up goes back through the shelves to the hero
+    for _ in 0..400 { step(&mut s, view, Some(near), &input(InputKind::Wheel { dy: 0.05 })); }
     assert_eq!((s.grid.scroll_target, s.snap_target), (0.0, 0.0), "up through the shelves to the hero");
     // a key rests its row again
     let deep = card(&s, rows - 1);
@@ -5926,12 +5768,14 @@ fn the_edge_glide_moves_home_evenly_a_hover_does_not_and_a_click_moves_nothing()
     assert_eq!((s.grid.scroll_target, s.snap_target), (rest_scroll(rows - 1, rows, band_open_of(false)), 1.0));
 }
 
-/// **The shelf peeking under the hero is clickable, and its click opens the card where it stands.**
-/// On the top of Home the first shelf's posters show at the bottom of the screen; its cards are
-/// stops (hovering them takes no focus from the hero), and a click on one opens it without moving
-/// the page first (the owner's call, 2026-10-29: no scroll to a tile on a click).
+/// **The shelf peeking under the hero is clickable, and its click brings it into view.** On the
+/// top of Home the first shelf's posters show at the bottom of the screen, but nothing could be
+/// clicked there until the page was scrolled (the shelves registered no stops
+/// while the hero was up). Now its cards are stops (hovering them takes no focus from the hero), a
+/// click on one scrolls the page down to it, and that click does not open it; once in view, a click
+/// opens it as usual.
 #[test]
-fn a_card_peeking_under_the_hero_is_clickable_and_its_click_opens_it_in_place() {
+fn a_card_peeking_under_the_hero_is_clickable_and_its_click_brings_it_into_view() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -5960,18 +5804,20 @@ fn a_card_peeking_under_the_hero_is_clickable_and_its_click_opens_it_in_place() 
     step(&mut s, view, Some(card), &ScreenEvent::FocusMoved { from: Some(hero), to: card, by: By::Pointer });
     step(&mut s, view, Some(card), &ScreenEvent::Input(InputEvent { at: Tick::default(),
         source: plx_machine::machine::Source::Script, kind: InputKind::Click { x, y, hit: Some(card.elem) } }));
-    assert_eq!(s.snap_target, 0.0, "the click moves no page");
+    assert_eq!(s.snap_target, 1.0, "the click brings the page down to the shelf");
     let commit = |s: &mut HomeScreen, id| step(s, view, Some(card), &ScreenEvent::PressCommit(plx_machine::machine::PressId(id))).1;
-    let opened = commit(&mut s, 1);
-    assert!(has_home(&opened, |r| matches!(r, HomeReq::Detail { .. })), "the click opens the card");
-    assert!(!has_home(&opened, |r| matches!(r, HomeReq::Play { .. })), "and never plays the hero behind it");
+    assert!(!has_home(&commit(&mut s, 1), |r| matches!(r, HomeReq::Detail { .. })), "that click does not open the card");
+    for i in 1..=90 { step(&mut s, view, Some(card), &ScreenEvent::Tick(Tick { ms: i * 16, dt_us: 16_667 })); }
+    assert!(s.snap.pos > 0.99, "the page has come down to the shelf: {}", s.snap.pos);
+    assert!(has_home(&commit(&mut s, 2), |r| matches!(r, HomeReq::Detail { .. })), "a click once it is in view opens it");
 }
 
 /// **The pointer's sideways glide moves the shelf under it, and the shelf stays there.** A shelf
 /// wider than the screen glides by the `Pan` the application sends while the pointer rests at a
-/// side edge; neither its focus, a hover nor a click pulls it back, and a key's move along it does.
+/// side edge; neither its focus nor a hover pulls it back, and a click on one of its cards brings
+/// it to that card again.
 #[test]
-fn the_sideways_glide_moves_the_shelf_under_the_pointer_and_only_a_key_brings_it_back() {
+fn the_sideways_glide_moves_the_shelf_under_the_pointer_and_a_click_brings_it_back() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -6002,10 +5848,6 @@ fn the_sideways_glide_moves_the_shelf_under_the_pointer_and_only_a_key_brings_it
     step(&mut s, view, Some(first), &ScreenEvent::Input(InputEvent { at: Tick::default(),
         source: plx_machine::machine::Source::Script, kind: InputKind::Click { x: 0.0, y, hit: Some(first.elem) } }));
     tick(&mut s, first);
-    assert_eq!(s.grid.shelves[0].scroll(), 500.0, "nor does a click");
-    let next = card(&s, 0, 1);
-    step(&mut s, view, Some(next), &ScreenEvent::FocusMoved { from: Some(first), to: next, by: By::Dir });
-    tick(&mut s, next);
-    tick(&mut s, next);
-    assert!(s.grid.shelves[0].scroll() < 499.0, "a key's move along it brings the shelf back to its focus: {}", s.grid.shelves[0].scroll());
+    tick(&mut s, first);
+    assert!(s.grid.shelves[0].scroll() < 1.0, "a click on its first card brings the shelf back to it: {}", s.grid.shelves[0].scroll());
 }

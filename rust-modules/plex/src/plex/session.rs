@@ -53,11 +53,10 @@
 use super::origin::Origin;
 use super::probe::Location;
 mod playback_options;
-pub use playback_options::InstantDpadSeeking;
+pub use playback_options::{MarkerSkipMode, DolbyVisionMode, InstantDpadSeeking};
 
-pub use prefs::{InstantDpadSeekingPref, HoldHintTaughtPref, effective, own_prefs, persist_profile_pref, put_own, stored_effective, tenure, AudioEnhancementsPref,
+pub use prefs::{IntroSkipPref, CreditsSkipPref, DolbyVisionModePref, InstantDpadSeekingPref, HoldHintTaughtPref, effective, effective_hud, own_prefs, persist_profile_hud, persist_profile_pref, put_own, stored_effective, stored_effective_hud, tenure, HudSelectionPref, AudioEnhancementsPref,
     DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, Preferences, ProfilePrefs, ProfilePrefsPref,
-    SkipCreditsPref, SkipIntroPref,
     ProfilePrefsRecord, ProfileSetting, ProfileWrite, QualityPref, Row, Setting, SkipIntervalPref,
     SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref, UiResolutionPref, UnderPostersPref};
 use prefs::ProfileMemory;
@@ -1074,7 +1073,7 @@ impl SubtitleSize {
 
 /// The persisted subtitle vertical placements, lowest first — one per profile, like [`SubtitleTone`].
 /// Absence is `Low`, which is where every build before this preference drew the caption
-/// (`media::player::text_style`'s fixed `SUB_BASE_Y`/`SUB_CEIL_Y` baseline). Only the plain-text caption draw
+/// (`media::player::text_style`'s fixed `SUB_BASE_Y` baseline, lifted to the HUD's `HudBand` ceiling). Only the plain-text caption draw
 /// moves with this; image (PGS/VobSub) captions and native ASS/SSA keep their own placement
 /// (`docs/ass-subtitles.md`).
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1278,18 +1277,45 @@ impl UnderPostersDetails {
 }
 
 /// **What sits under the focused poster** — one setting for every poster grid and row (Library,
-/// Collections, Home, Search, Watchlist): whether the title shows, and which fact the details
-/// line carries. Per profile, like [`DeckPress`]. The default is no title and the year and length.
+/// Collections, Home, Search, Watchlist): whether the title shows, which fact the details line
+/// carries, and whether a library grid sorted by something other than Title or Random shows the
+/// value it is sorted by on one line under every poster (`sort_value`). Per profile, like
+/// [`DeckPress`]. The default is no title, the year and length, and the sort value On.
 ///
 /// Each field is soft-parsed on its own, so a spelling a later build wrote for `details` costs the
-/// details alone and never the title.
-#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+/// details alone and never the title. `sort_value` is stored as its OFF state only (the key is
+/// absent while it is On), so a profile that never chose it, and one that persisted the retired
+/// `show_sort_info` key of the earlier sort-information switch (ignored, never written), reads On.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct UnderPosters {
     #[serde(deserialize_with = "de_soft_under_posters_title")]
     pub title: bool,
     #[serde(deserialize_with = "de_soft_under_posters_details")]
     pub details: UnderPostersDetails,
+    /// A library grid sorted by something other than Title or Random shows the sort's value under
+    /// every card (the Movies, TV Shows, Seasons and Episodes grids; the Library's `registry::sort_info`). On by default.
+    #[serde(rename = "sort_value_off", with = "sort_value_off", skip_serializing_if = "sort_value_off::is_on")]
+    pub sort_value: bool,
+}
+
+impl Default for UnderPosters {
+    fn default() -> Self { Self::DEFAULT }
+}
+
+/// `sort_value` on the wire: the key `sort_value_off` is written only while the value is Off, and
+/// any absent, malformed or non-boolean entry reads as On (the default), the way every other
+/// field of the setting is soft-parsed.
+mod sort_value_off {
+    use serde::{Deserializer, Serializer};
+
+    pub fn is_on(on: &bool) -> bool { *on }
+
+    pub fn serialize<S: Serializer>(on: &bool, s: S) -> Result<S::Ok, S::Error> { s.serialize_bool(!*on) }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        super::de_soft_bool(d).map(|off| !off)
+    }
 }
 
 fn de_soft_under_posters_title<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -1304,16 +1330,17 @@ fn de_soft_under_posters_details<'de, D: Deserializer<'de>>(d: D) -> Result<Unde
 
 impl UnderPosters {
     /// The defaults, as a `const` for callers that compare against them.
-    pub const DEFAULT: UnderPosters = UnderPosters { title: false, details: UnderPostersDetails::YearLength };
+    pub const DEFAULT: UnderPosters = UnderPosters { title: false, details: UnderPostersDetails::YearLength, sort_value: true };
 
-    /// One byte for the media layer's live cell: the title in bit 0, the details' index in bits 1-3.
+    /// One byte for the live cell: title in bit 0, details in bits 1-3, "sort value Off" in bit 4
+    /// (so a zero byte is the default's On).
     pub fn pack(self) -> u8 {
-        u8::from(self.title) | (self.details.index() << 1)
+        u8::from(self.title) | (self.details.index() << 1) | (u8::from(!self.sort_value) << 4)
     }
 
     /// The inverse of [`UnderPosters::pack`]; an out-of-range details index is the default.
     pub fn unpack(b: u8) -> UnderPosters {
-        UnderPosters { title: b & 1 != 0, details: UnderPostersDetails::from_index((b >> 1) & 0b111) }
+        UnderPosters { title: b & 1 != 0, details: UnderPostersDetails::from_index((b >> 1) & 0b111), sort_value: b & 16 == 0 }
     }
 }
 
@@ -1453,39 +1480,6 @@ impl HdrOverlayBrightness {
     /// The rung's percentage, for its label.
     pub fn percent(self) -> i64 {
         (self.factor() * 100.0).round() as i64
-    }
-}
-
-/// What happens when an intro or credits marker begins — one setting each for intros and credits,
-/// per profile like [`DeckPress`]. Absence is `Button`: the Skip pill is offered and the viewer
-/// presses it, which is what every build before this preference did. `Automatic` jumps past the
-/// marker as it starts (or, at an episode's closing credits, starts the next episode when the Up Next
-/// countdown would have) and shows a short "skipped" notice.
-#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MarkerSkip {
-    #[default]
-    #[serde(rename = "button")]
-    Button,
-    #[serde(rename = "auto")]
-    Automatic,
-}
-
-impl MarkerSkip {
-    /// Every option, the order the picker lists them in.
-    pub const LADDER: [MarkerSkip; 2] = [MarkerSkip::Button, MarkerSkip::Automatic];
-
-    /// An in-memory index back to an option — out of range is the default, for the reason
-    /// [`SubtitleTone::from_index`] gives: the ladder can grow or shrink.
-    pub fn from_index(i: u8) -> MarkerSkip {
-        Self::LADDER.get(i as usize).copied().unwrap_or_default()
-    }
-
-    pub fn index(self) -> u8 {
-        Self::LADDER.iter().position(|&m| m == self).unwrap_or(0) as u8
-    }
-
-    pub fn is_automatic(self) -> bool {
-        self == MarkerSkip::Automatic
     }
 }
 
@@ -2599,14 +2593,6 @@ impl Session {
 
     pub fn deck_press(&self) -> DeckPress {
         self.prefs.deck_press
-    }
-
-    pub fn skip_intro(&self) -> MarkerSkip {
-        self.prefs.skip_intro
-    }
-
-    pub fn skip_credits(&self) -> MarkerSkip {
-        self.prefs.skip_credits
     }
 
     pub fn under_posters(&self) -> UnderPosters {

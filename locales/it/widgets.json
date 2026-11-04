@@ -7,6 +7,7 @@
   "widgets.speed.normal": "Normale",
   "widgets.menu.stats": "Statistiche per nerd",
   "widgets.menu.diagnostics": "Invia dati diagnostici",
+  "widgets.menu.previous_episode": "Episodio precedente",
   "widgets.badge.forced": "FORZATI",
   "widgets.toggle.on": "Sì",
   "widgets.toggle.off": "No",
@@ -254,6 +255,5 @@
   "widgets.region.latin_america": "America Latina",
   "widgets.failure.play_auto": "Passa ad Automatico e riproduci",
   "widgets.failure.change_quality": "Cambia qualità",
-  "widgets.skip.intro_skipped": "Intro saltata",
-  "widgets.skip.credits_skipped": "Titoli di coda saltati"
+  "widgets.watch.intro": "Guarda introduzione"
 }

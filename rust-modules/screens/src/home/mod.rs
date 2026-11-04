@@ -11,7 +11,6 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
 use std::sync::Arc;
 
 use plx_data::pms::{HeroRef, HubIdentity, HubRef, HubsView, PmsMovie};
@@ -20,12 +19,11 @@ use plx_data::stores::{StoreCmd, StoreId, StoreWork};
 use plx_ui::cards::{self as ui_cards, RowStyle};
 use plx_ui::cards::{CardSource, SectionFrame, Shelf};
 use plx_ui::consts::*;
-use plx_ui::hstack::{Align, HStack, Item};
+use plx_ui::hstack::Item;
 use plx_ui::frame::Budget;
 use plx_ui::hero_logo::{self, HeroLogo, LogoRung};
 use plx_ui::hold_hint::{HintInput, HoldHint};
 use plx_ui::icons::Icon;
-use plx_ui::label::{Label, VAlign};
 use plx_ui::linked_heading::{self, LinkedHeading};
 use plx_ui::landing_hero::{
     base_scrim_ramp, hero_stack, COL_W as HERO_COL_W,
@@ -41,7 +39,6 @@ use plx_ui::screen::{
     GroupKind, GroupSpec, Hover, Link, Placed, RenderStrategy, Screen, ScreenEvent, Seat, Step,
     Stop,
 };
-use plx_ui::text_view::TextView;
 use plx_ui::theme;
 use plx_ui::widgets::{
     AmbientWash, Art, Button, CircleButton, ControlPalette, CtlPop, PageDots, PageGround,
@@ -131,14 +128,11 @@ const HERO_WASH_W: [f32; 4] = [0.55, 0.55, 0.40, 0.40];
 const HERO_ROW_Y: f32 = HERO_TEXT_BOTTOM + theme::space::MD;
 const HERO_CTRL_D: f32 = StatusOverlay::CTRL_H;
 const HERO_CTRL_GAP: f32 = plx_ui::widgets::CONTROL_GAP;
+#[cfg(test)]
+const SOURCE_PAD: f32 = theme::space::XS;
 const HERO_PAGER_D: f32 = HERO_CTRL_D * plx_ui::widgets::DISC_ICON_RATIO;
 const HERO_PAGER_BEARING: f32 =
     HERO_PAGER_D * plx_ui::icons::ink_x(plx_ui::icons::Icon::Chevron).0;
-const HERO_PAGER_PAD: f32 = HERO_CTRL_GAP - HERO_PAGER_BEARING;
-
-const HERO_META_R: f32 = 0.60 * SCR_W;
-const META_FLOW_W: f32 = HERO_META_R - MARGIN_X;
-const SOURCE_PAD: f32 = theme::space::XS;
 
 /// Each row's `motion` bytes are its `Shelf`'s (`Shelf::write`), the L0 row's motion write unchanged
 /// (`base_y` included), so the text, `SCREEN_SHAPES_PIN` and the replay anchors stay what they were;
@@ -628,10 +622,13 @@ pub struct HomeScreen {
     snap_target: f32,
     /// **The page is where the pointer put it, not where focus would rest it.** Set by a wheel (the
     /// pointer's edge glide, `app::input::EdgeScroll`) and by a hover, which moves focus but never
-    /// the page; cleared by a key's move, which brings the page back to the focused shelf. A click
-    /// moves nothing: it opens what it clicked where it stands. While set, the tick does not pull
-    /// `grid.scroll_target` to the focused row.
+    /// the page; cleared by a key's move and by a click, which bring the page back to the focused
+    /// shelf. While set, the tick does not pull `grid.scroll_target` to the focused row.
     free: bool,
+    /// **A click that only brings a card into view.** A click on a shelf card the screen shows only
+    /// part of (the shelf peeking under the hero, a shelf cut by the bottom edge) scrolls the page to
+    /// it and does not open it: its press is dropped when it commits. Cleared by any key.
+    reveal_press: Option<u32>,
     /// Stable element still visible while the engine has already crossed the hero/grid door.
     /// This is a press landing policy, not current focus, and retires at the visual midpoint.
     visible_activation: Option<u32>,
@@ -693,6 +690,7 @@ impl HomeScreen {
             covered: false,
             snap_target: 0.0,
             free: false,
+            reveal_press: None,
             visible_activation: None,
             cta_available: false,
             strip_chosen: false,
@@ -1006,7 +1004,7 @@ impl HomeScreen {
             for (row, projection) in rows.iter().enumerate() {
                 // a shelf stays with its identity, wherever the row went
                 let kept = matched[row].and_then(|old| old_shelves.get_mut(old)?.take());
-                let shelf = kept.unwrap_or_else(|| Shelf::new(self.entry, &RowStyle::HOME).cull_margin(GLOW_PAD)
+                let shelf = kept.unwrap_or_else(|| Shelf::new(self.entry, RowStyle::HOME).cull_margin(GLOW_PAD)
                     .animate_landings(projection.identity == HomeHubIdentity::ContinueWatching));
                 self.grid.shelves.push(shelf);
             }
@@ -1480,11 +1478,6 @@ impl HomeScreen {
     /// on a linked heading, and `fallback` (the row a hero→grid door would open) otherwise.
     /// The band the shelf at `row` opens when focused (`None`, a linked heading focused, opens none):
     /// the Continue Watching deck's is its own ([`shelf_policy`]).
-    /// How far a wheel may scroll the shelves: the last shelf's rest, with its caption band.
-    fn wheel_max_scroll(&self) -> f32 {
-        grid_max_scroll(self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)))
-    }
-
     fn band_open_at(&self, row: Option<usize>) -> f32 {
         row.and_then(|row| self.rows.get(row)).map_or_else(|| band_open_of(false),
             |hub| band_open_of(hub.identity == HomeHubIdentity::ContinueWatching))
@@ -2156,10 +2149,18 @@ impl HomeScreen {
             self.draw_hero_actions(hero.item, env, p, 0.0, true, page_alpha, focus, measure, press_scale);
         }
         if view.hero_count() > 1 {
-            PageDots::new(view.hero_count())
-                .active(self.carousel_index(view))
-                .centered_at(SCR_W * 0.5, HERO_ROW_Y + HERO_CTRL_D + theme::space::SM)
-                .draw(env, p);
+            let resumes = plx_data::metadata::resume_ns(hero.item.resume_ms, hero.item.dur_ns / 1_000_000) > 0;
+            let info = hero_rects(measure, hero.item, plx_appkit::hero_layout::play_label(resumes)).info;
+            let dots = PageDots::new(view.hero_count()).active(self.carousel_index(view));
+            let items = [Item::new(dots.width()), Item::glyph(Icon::Chevron, HERO_PAGER_D)];
+            let row = plx_ui::hstack::HStack::new(&items, HERO_CTRL_GAP,
+                plx_ui::hstack::Align::Leading(info.x + info.w + theme::space::LG));
+            let (x, _) = row.span(0).unwrap();
+            dots.centered_y(x, HERO_ROW_Y + HERO_CTRL_D * 0.5).draw(env, p);
+            let (x, _) = row.span(1).unwrap();
+            plx_ui::icons::draw(p, Icon::Chevron,
+                Rect::new(x - HERO_PAGER_BEARING, HERO_ROW_Y + (HERO_CTRL_D - HERO_PAGER_D) * 0.5,
+                    HERO_PAGER_D, HERO_PAGER_D), theme::TEXT_SECONDARY);
         }
     }
 
@@ -2178,21 +2179,7 @@ impl HomeScreen {
         let resumes = plx_data::metadata::resume_ns(hero.resume_ms, hero.dur_ns / 1_000_000) > 0;
         let label = plx_appkit::hero_layout::play_label(resumes);
         let HeroRects { play: pill, disc, info } = hero_rects(measure, hero, label);
-        let mark_d = HERO_PAGER_D.round();
-        let mark = Rect::new(
-            info.x + info.w + HERO_PAGER_PAD,
-            HERO_ROW_Y + (HERO_CTRL_D - mark_d) * 0.5,
-            mark_d,
-            mark_d,
-        );
-        if !on_axis(
-            MARGIN_X + dx,
-            mark.x + mark.w + HERO_PAGER_PAD - MARGIN_X,
-            SCR_W,
-            0.0,
-        ) {
-            return;
-        }
+        if !on_axis(MARGIN_X + dx, info.x + info.w - MARGIN_X, SCR_W, 0.0) { return; }
         let may_read = live && dx.abs() < 0.5 && page_alpha >= 0.999;
         let palette = plx_gfx::gfx::sample_control_ground(
             [pill.x + dx, pill.y, info.x + info.w - pill.x, pill.h],
@@ -2231,7 +2218,6 @@ impl HomeScreen {
             .palette(palette)
             .scale(pop(1))
             .draw(env, p);
-        plx_ui::icons::draw(p, Icon::Chevron, mark, theme::TEXT_SECONDARY);
     }
 
     /// Whether shelf `row` overlaps the screen vertically. The shelf spans from its heading's
@@ -2360,8 +2346,8 @@ impl HomeScreen {
             }
         }
         // The shelves have stops under the hero too: the first one peeks under it, and a click on
-        // a peeking card opens it where it stands. A hover there takes no focus from the hero
-        // (`OnlyIfFocused`, `pointable` is false while the hero is up).
+        // a peeking card brings the page down to it (`reveal_press`). A hover there takes no focus
+        // from the hero (`OnlyIfFocused`, `pointable` is false while the hero is up).
         {
             let hero_up = self.snap.pos < 0.5;
             let focused_row = self.focused_grid(focus).map(|(row, _)| row).filter(|_| !hero_up);
@@ -2524,8 +2510,11 @@ impl LogicalState for HomeScreen {
             snap_target: _,
             // Whether the tick pulls the scroll to the focused shelf. What it decides is
             // `grid.scroll_target`, encoded below, and it is a hand-off from the pointer's events
-            // (a wheel, a hover) to the next `Tick`, like a shelf's `seen`.
+            // (a wheel, a hover, a click) to the next `Tick`, like a shelf's `seen`.
             free: _,
+            // A press hand-off from a click to its commit, like `free`: what it decides (whether
+            // the commit opens the card) is an effect, and the page it moves is `snap_target`.
+            reveal_press: _,
             visible_activation: _, cta_available: _, strip_chosen: _, snap: _, status_ms: _,
             hero_pop: _, backdrop: _, grid: _,
             // The disc's membership is the Watchlist store's (the application feeds it); the flip
@@ -2578,7 +2567,7 @@ impl LogicalState for HomeScreen {
             // a row with no shelf yet (the grid trails the rows by a sync) hashes as a resting one
             match self.grid.shelves.get(index) {
                 Some(shelf) => shelf.write(c),
-                None => Shelf::new(self.entry, &RowStyle::HOME).write(c),
+                None => Shelf::new(self.entry, RowStyle::HOME).write(c),
             }
         }
         c.seq(self.restored_scroll.len());
@@ -3031,11 +3020,29 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
         if let ScreenEvent::Input(InputEvent { at, kind: InputKind::Key { key, edge, .. }, .. }) = ev {
             self.backdrop.note_key(*key, *edge, at.ms);
         }
-        // A click moves nothing: it opens what it clicked where it stands, a card the screen shows
-        // only part of included. Only a key's move brings the page to the focus.
+        if let ScreenEvent::Input(InputEvent { kind: InputKind::Key { .. }, .. }) = ev {
+            self.reveal_press = None;
+        }
+        // A click brings the page to what it clicked, the way a key's move does; a click on a
+        // card the screen shows only part of does only that (`reveal_press`).
+        if let ScreenEvent::Input(InputEvent { kind: InputKind::Click { hit: Some(elem), .. }, .. }) = ev {
+            if let Some(loc) = self.locate(*elem) {
+                self.reveal_press = matches!(loc, Located::Item(..))
+                    .then(|| Focusable::<H>::place(self, elem, cx, At::Drawn))
+                    .flatten()
+                    .filter(|placed| placed.rect.y < 0.0 || placed.rect.y + placed.rect.h > SCR_H)
+                    .map(|_| *elem);
+                self.free = false;
+                self.snap_target = if loc.on_grid() { 1.0 } else { 0.0 };
+                if let Located::Item(row, _) = loc {
+                    if let Some(shelf) = self.grid.shelves.get_mut(row) { shelf.unfree(); }
+                }
+                fx.invalidate(Provenance::Input);
+            }
+        }
         match ev {
             // The pointer's sideways glide moves the shelf under it, which stays where it put it
-            // until a key moves along it (`Shelf::glide`).
+            // until a key moves along it or a click lands on one of its cards (`Shelf::glide`).
             ScreenEvent::Input(InputEvent { kind: InputKind::Pan { dx, y, .. }, .. }) => {
                 if dx.is_finite() {
                     let under = (0..self.grid.shelves.len()).find(|&row| {
@@ -3052,19 +3059,26 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 Handled::Yes
             }
             // A wheel (the pointer's edge glide, a fractional one every frame) moves the page
-            // itself, focus staying where it is, at one speed all the way: down from the hero into
-            // the shelves (the hero-to-grid dive travels `HERO_DIVE_PX` and is moved through
-            // fractionally, never jumped), then through them by `ROW_PITCH` a row; up through the
-            // shelves, then back up the dive to the hero.
+            // itself, focus staying where it is: down from the hero into the shelves, then through
+            // them by `ROW_PITCH` a row; up through the shelves, then back to the hero.
             ScreenEvent::Input(InputEvent { kind: InputKind::Wheel { dy }, .. }) => {
                 if !dy.is_finite() || self.rows.is_empty() {
                     return Handled::Yes;
                 }
                 self.free = true;
-                let (snap, scroll) =
-                    wheel_page(self.snap_target, self.grid.scroll_target, *dy, self.wheel_max_scroll());
-                self.snap_target = snap;
-                self.grid.scroll_target = scroll;
+                let max = grid_max_scroll(self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)));
+                let to = self.grid.scroll_target - dy * ROW_PITCH;
+                if *dy > 0.0 {
+                    if self.snap_target >= 0.5 && self.grid.scroll_target > 0.0 {
+                        self.grid.scroll_target = to.max(0.0);
+                    } else {
+                        self.snap_target = 0.0;
+                    }
+                } else if self.snap_target < 0.5 {
+                    self.snap_target = 1.0;
+                } else {
+                    self.grid.scroll_target = to.min(max.max(self.grid.scroll_target));
+                }
                 fx.invalidate(Provenance::Input);
                 Handled::Yes
             }
@@ -3122,18 +3136,13 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 self.feed_shelves(ev, cx, fx);
                 let from_loc = from.and_then(|key| self.locate(key.elem));
                 let to_loc = self.locate(to.elem);
-                // A key's move across the hero/grid door leaves the control on screen as what OK
-                // acts on until the picture follows. A pointer's does not: it moved focus onto what
-                // it points at, which is on screen (a card peeking under the hero), and a click
-                // there opens that card, never the hero's Play.
                 if let (Some(a), Some(b)) = (from_loc, to_loc) {
                     if a.on_grid() != b.on_grid() {
-                        self.visible_activation = (*by != By::Pointer).then(|| from.map(|key| key.elem)).flatten();
+                        self.visible_activation = from.map(|key| key.elem);
                     }
                 }
-                // A hover moves focus, never the page: the pointer scrolls by the screen's edges,
-                // and a click opens what it clicked where it stands. Every other move brings the
-                // page to the focus.
+                // A hover moves focus, never the page: the pointer scrolls by the screen's edges
+                // (and a click by what it clicked). Every other move brings the page to the focus.
                 if *by == By::Pointer {
                     self.free = true;
                 } else {
@@ -3185,7 +3194,10 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                     .filter(|k| k.entry == self.entry)
                     .map(|k| k.elem)
                 {
-                    self.activate(elem, cx, fx);
+                    // the click that brought a partly shown card into view does not open it
+                    if self.reveal_press.take() != Some(elem) {
+                        self.activate(elem, cx, fx);
+                    }
                 }
                 Handled::Yes
             }
@@ -3398,31 +3410,6 @@ fn write_item_identity(identity: &HomeItemIdentity, c: &mut Canon) {
     }
 }
 
-/// The page travel of the hero-to-grid dive: the first shelf's top from where it peeks under the
-/// hero (`PEEK_Y`) to where the grid rests it (`GRID_TOP_Y`). A wheel moves `snap_target` through
-/// it at the pixels per step it moves the grid, so the edge glide's speed does not change at the door.
-const HERO_DIVE_PX: f32 = PEEK_Y - GRID_TOP_Y;
-
-/// One wheel step of Home's page: `(snap_target, grid scroll_target)` after `dy` rows
-/// (`dy > 0` up). Down spends the dive first, then the grid's scroll up to `max`; up spends the
-/// grid's scroll first, then the dive, at `ROW_PITCH` pixels a row throughout.
-fn wheel_page(snap: f32, scroll: f32, dy: f32, max: f32) -> (f32, f32) {
-    let mut px = -dy * ROW_PITCH;
-    let (mut snap, mut scroll) = (snap.clamp(0.0, 1.0), scroll);
-    if px > 0.0 {
-        let dive = ((1.0 - snap) * HERO_DIVE_PX).min(px);
-        snap += dive / HERO_DIVE_PX;
-        px -= dive;
-        scroll = (scroll + px).min(max.max(scroll));
-    } else if px < 0.0 {
-        let up = scroll.max(0.0).min(-px);
-        scroll -= up;
-        px += up;
-        snap = (snap + px / HERO_DIVE_PX).max(0.0);
-    }
-    (snap, scroll)
-}
-
 fn pinned_snap(target: f32, rows: usize) -> f32 {
     if rows == 0 {
         0.0
@@ -3587,17 +3574,13 @@ struct HeroRects {
 fn hero_rects(measure: &dyn Measure, item: &PmsMovie, label: &std::ffi::CStr) -> HeroRects {
     // One row: Play, the watchlist disc when the title has one (absent: no room, no gap), Info.
     let has_disc = disc_hex(item).is_some();
-    let items = [
-        Item::new(plx_appkit::hero_layout::pill_w(measure, label, theme::size::BODY, true, None)),
-        if has_disc { Item::new(HERO_CTRL_D) } else { Item::absent() },
-        Item::new(HERO_CTRL_D),
-    ];
-    let row = HStack::new(&items, HERO_CTRL_GAP, Align::Leading(MARGIN_X));
-    let at = |i: usize| row.span(i).map(|(x, w)| Rect::new(x, HERO_ROW_Y, w, HERO_CTRL_D));
+    let widths = [plx_appkit::hero_layout::play_width(measure, label), HERO_CTRL_D, HERO_CTRL_D];
+    let row = &widths[..if has_disc { 3 } else { 2 }];
+    let at = |i| plx_appkit::hero_layout::row_rect(row, i, HERO_ROW_Y);
     HeroRects {
-        play: at(0).unwrap_or_default(),
-        disc: at(1),
-        info: at(2).unwrap_or_default(),
+        play: at(0),
+        disc: has_disc.then(|| at(1)),
+        info: at(if has_disc { 2 } else { 1 }),
     }
 }
 
@@ -3759,66 +3742,10 @@ fn display_source(real: &str) -> &str {
         .unwrap_or(real)
 }
 
-fn shared_by(source: &str) -> String {
-    plx_ui::fmt::shared_by(source).unwrap_or_default()
-}
-fn meta_source_flow(
-    base_w: f32,
-    source: &str,
-    mut run: impl FnMut(&str, f32, f32, i32, i32, [f32; 4]) -> f32,
-) -> f32 {
-    if source.is_empty() {
-        return base_w;
-    }
-    let mut dx = base_w + SOURCE_PAD;
-    dx += run(
-        "\u{b7}",
-        dx,
-        META_FLOW_W - dx,
-        theme::size::BODY,
-        0,
-        theme::TEXT_SEPARATOR,
-    );
-    dx += SOURCE_PAD;
-    dx += run(
-        &shared_by(source),
-        dx,
-        META_FLOW_W - dx,
-        theme::size::BODY,
-        0,
-        theme::TEXT_TERTIARY,
-    );
-    dx
-}
-fn draw_meta_source(p: Painter, source: &str, x: f32, y: f32, base_w: f32, measure: &dyn Measure) {
-    meta_source_flow(base_w, source, |text, dx, budget, size, bold, ink| {
-        let elided = plx_gfx::text::elide_by(text, budget, false, |t| {
-            measure.width_str(t, size, bold != 0)
-        });
-        let Ok(text) = CString::new(elided) else {
-            return 0.0;
-        };
-        let mut label = Label::new(text.as_ptr(), size, ink).v(VAlign::CapTop);
-        if bold == 1 {
-            label = label.bold();
-        }
-        label.draw(p, Rect::new(x + dx, y, budget, 0.0))
-    });
-}
-fn meta_drawn_w(view: &TextView<'_>, text: &str, width: f32, measure: &dyn Measure) -> f32 {
-    if view.truncates(width) {
-        return width;
-    }
-    measure.width_str(text, theme::size::BODY, false).min(width)
-}
 fn hero_content(hero: &PmsMovie, source: &str, p: Painter, dx: f32, measure: &dyn Measure) {
     if !on_axis(
         MARGIN_X + dx,
-        if source.is_empty() {
-            HERO_COL_W
-        } else {
-            META_FLOW_W
-        },
+        HERO_COL_W,
         SCR_W,
         0.0,
     ) {
@@ -3831,46 +3758,28 @@ fn hero_content(hero: &PmsMovie, source: &str, p: Painter, dx: f32, measure: &dy
         &hero.title
     };
     let title_h = hero_logo::band_h(LogoRung::Hero);
-    let meta = if episode {
-        let mut text = plx_ui::fmt::episode_address(i64::from(hero.season_index), i64::from(hero.ep_index));
-        if !text.is_empty() && !hero.title.is_empty() {
-            text.push_str(" \u{b7} ");
-        }
-        text.push_str(&hero.title);
-        text
-    } else {
-        format!(
-            "{} \u{b7} {} \u{b7} {}",
-            if hero.kind == 1 { plx_platform::i18n::msg::browse_kind_show() } else { plx_platform::i18n::msg::browse_kind_movie() },
-            hero.year,
-            if hero.rating.is_empty() {
-                plx_platform::i18n::msg::browse_detail_unrated()
-            } else {
-                &hero.rating
-            }
-        )
-    };
-    let meta_view = TextView::new(&meta, theme::size::BODY, theme::TEXT_SECONDARY).max_lines(1);
-    let meta_h = meta_view.measure_h(HERO_COL_W);
-    let synopsis = (!hero.summary.is_empty()).then(|| plx_ui::hero_synopsis(&hero.summary, ""));
-    let stack = hero_stack(title_h, meta_h, synopsis.as_ref().map(|v| v.measure_h(HERO_COL_W)));
+    let lead = if episode {
+        plx_appkit::hero_layout::episode_lead(i64::from(hero.season_index), i64::from(hero.ep_index), &hero.title)
+    } else { String::new() };
+    let synopsis = (!hero.summary.is_empty() || !lead.is_empty())
+        .then(|| plx_ui::hero_synopsis(&hero.summary, &lead));
+    let stack = hero_stack(title_h, plx_ui::widgets::BADGE_H, synopsis.as_ref().map(|v| v.measure_h(HERO_COL_W)));
     HeroLogo::new(hero.sid.raw(), hero_logo_rk(hero), title, LogoRung::Hero)
         .draw(p, Rect::new(MARGIN_X, stack.title.y, HERO_COL_W, title_h), measure);
-    let y = stack.meta.y;
-    meta_view.draw(p, Rect::new(MARGIN_X, y, HERO_COL_W, 0.0));
-    if !source.is_empty() {
-        draw_meta_source(
-            p,
-            source,
-            MARGIN_X,
-            y,
-            meta_drawn_w(&meta_view, &meta, HERO_COL_W, measure),
-            measure,
-        );
-    }
+    let kind = if episode || hero.kind == 1 { plx_platform::i18n::msg::browse_kind_tv_show() }
+        else { plx_platform::i18n::msg::browse_kind_movie() };
+    let parts = [hero.edition.as_str(), kind, hero.genre.as_deref().unwrap_or(""), hero.rating.as_str()];
+    let parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+    let resolution = plx_ui::fmt::resolution(hero.video_resolution.as_deref().unwrap_or(""), 0, 0);
+    plx_ui::widgets::hero_identity(p, Rect::new(MARGIN_X, stack.meta.y, HERO_COL_W, stack.meta.h),
+        &parts, resolution.as_deref(), &[], measure);
     if let (Some(view), Some(span)) = (synopsis, stack.synopsis) {
         view.draw(p, Rect::new(MARGIN_X, span.y, HERO_COL_W, 0.0));
     }
+    let (date, length) = plx_appkit::hero_layout::listing_facts(hero);
+    let credit = plx_ui::fmt::shared_by(source).unwrap_or_default();
+    plx_ui::widgets::hero_facts(p, Rect::new(MARGIN_X, stack.facts.y, HERO_COL_W, stack.facts.h),
+        &date, length.as_deref().unwrap_or(""), plx_data::metadata::resume_ns(hero.resume_ms, hero.dur_ns / 1_000_000) > 0, &credit, measure);
 }
 
 #[cfg(test)]
