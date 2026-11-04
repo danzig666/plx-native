@@ -157,7 +157,7 @@ fn a_package_with_no_state_for_the_frame_answers_the_empty_report() {
     for _ in 0..3 {
         let (cx, ) = (cx(), );
         let df = plx_ui::screen::DrawFrame::new(&cx, plx_ui::Painter::root());
-        let drawn = plx_ui::draw_census::capture(|| page.draw_hud(&ps, 0, &df, store.view()));
+        let drawn = plx_ui::draw_census::capture(|| page.draw_hud(&ps, 0, &df, store.view(), None));
         assert!(drawn.is_empty(), "nothing is drawn for a frame the package has no state for: {drawn:?}");
     }
     assert!(page.render.no_state_logged, "…and it was reported");
