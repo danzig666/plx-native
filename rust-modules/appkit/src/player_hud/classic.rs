@@ -341,6 +341,37 @@ pub fn draw_scrim(p: Painter) {
 
 /// [`draw_scrim`] over any rect: the compiled package's scrim (`CompiledState::scrim`) is classic's
 /// rect for `builtin:classic`, and a package's own for another.
+/// The top ramp the corner clock stands on: the HUD's bottom scrim's twin, shallower and lighter,
+/// because it carries one line of text and not the transport.
+pub const TOP_SCRIM_H: f32 = 200.0;
+/// The corner clock's rung.
+pub const WALL_CLOCK_SZ: std::os::raw::c_int = theme::size::HEADLINE;
+
+/// **The time of day, top right**, while the transport is up (`Plex HTPC` puts it there too). The
+/// caller fades it with the title block (`chrome_alpha`), so a scrub's preview card has the frame to
+/// itself. `t` is the frame's publication (`PlayerLike::wall`), never a read made here. A package
+/// cannot place it: the 1.0 format anchors a HUD to the bottom only (`hud_format::schema`, D13).
+pub fn draw_wall_clock(p: Painter, t: plx_base::wallclock::WallTime) {
+    p.rect(
+        Rect::new(0.0, 0.0, SCR_W, TOP_SCRIM_H),
+        0.0,
+        theme::scrim_black(0.55),
+        theme::scrim_black(0.0),
+        0.0,
+    );
+    if let Ok(cs) = CString::new(plx_ui::fmt::time_of_day(t)) {
+        p.text(
+            cs.as_ptr(),
+            SCR_W - plx_ui::consts::MARGIN_X,
+            plx_ui::consts::MARGIN_Y,
+            WALL_CLOCK_SZ,
+            theme::TEXT_PRIMARY,
+            2,
+            1,
+        );
+    }
+}
+
 pub fn draw_scrim_at(p: Painter, rect: Rect) {
     p.rect(
         rect,

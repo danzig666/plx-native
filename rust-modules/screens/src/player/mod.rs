@@ -319,6 +319,7 @@ impl PlayerScreen {
         now: u32,
         df: &DrawFrame<'_, '_, H>,
         meta: plx_data::metadata::MetadataView<'_>,
+        wall: Option<plx_base::wallclock::WallTime>,
     ) where
         H::Elem: IndexElem,
     {
@@ -343,6 +344,16 @@ impl PlayerScreen {
             meta,
         };
         let receipt = plx_appkit::player_hud::render::draw_with_receipt(&self.compiled, &frame, df, &mut self.row, plx_ui::Painter::root());
+        // The corner clock rides the transport: drawn while it is, faded with its title block, never
+        // under a failure read-out (which owns the frame).
+        if let Some(t) = wall.filter(|_| frame.transport && receipt.state_exists
+            && !plx_appkit::player_hud::state::readout_owns_frame(self.busy))
+        {
+            let chrome_a = self.row.chrome_alpha(now);
+            if chrome_a > 0.004 {
+                plx_appkit::player_hud::classic::draw_wall_clock(plx_ui::Painter::root().alpha(chrome_a), t);
+            }
+        }
         self.drawn_watch = if receipt.offer_drawn && self.watch_visible() {
             self.auto_skip.presented();
             self.draw_slot().marker().map(|marker| plx_appkit::skip_policy::OfferId {
@@ -2585,6 +2596,9 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Screen<H> for PlayerScreen {
             // ran before this pass), so the prewarm and the draw agree on it.
             self.model.scrub_ns = self.published_scrub();
             self.clock_warm.queue(&self.model);
+            if let Some(t) = H::wall(cx) {
+                self.clock_warm.queue_wall(t);
+            }
         }
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, H>) {
@@ -2624,7 +2638,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Screen<H> for PlayerScreen {
         // at all, and the tabs, which ask their section's toggle at once with no dip to wait for.
         let hud_drawn = self.hud_drawn(ps, now);
         if hud_drawn {
-            self.draw_hud(ps, now, f, H::metadata(f.cx));
+            self.draw_hud(ps, now, f, H::metadata(f.cx), H::wall(f.cx));
         } else {
             self.row.reset_title();
         }

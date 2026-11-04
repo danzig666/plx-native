@@ -36,6 +36,28 @@ thread_local! {
     static REPLAY: Cell<Option<u32>> = const { Cell::new(None) };
     /// The last read of the platform's calendar date and the minute (of the frame clock) it was read in.
     static TODAY: Cell<Option<(u32, Option<[i32; 3]>)>> = const { Cell::new(None) };
+    /// The last read of the platform's time of day and the second (of the frame clock) it was read in.
+    static TIME: Cell<Option<(u32, Option<plx_base::wallclock::WallTime>)>> = const { Cell::new(None) };
+}
+
+/// The time of day every replay frame answers, for the same reason as [`REPLAY_DATE`].
+pub(crate) const REPLAY_TIME: plx_base::wallclock::WallTime = plx_base::wallclock::WallTime { hour: 12, minute: 0 };
+
+/// **The time of day now** in the OS time zone, for the player's corner clock: read from the platform
+/// at most once a second of the frame clock ([`now`]), so a new minute shows within a second.
+/// [`REPLAY_TIME`] under a replay. Like [`today`], only the loop calls it and publishes the answer
+/// (`Bridge::publish_wall_clock`); a screen reads it from its views.
+pub(crate) fn time_of_day() -> Option<plx_base::wallclock::WallTime> {
+    if REPLAY.with(|c| c.get()).is_some() {
+        return Some(REPLAY_TIME);
+    }
+    let second = now() / 1_000;
+    if let Some((at, time)) = TIME.with(|c| c.get()) {
+        if at == second { return time; }
+    }
+    let time = plx_platform::i18n::local_time_of_day();
+    TIME.with(|c| c.set(Some((second, time))));
+    time
 }
 
 /// The date every replay frame answers: a recording has no calendar of its own, and a fixed one keeps
@@ -83,6 +105,13 @@ pub(crate) fn today() -> Option<[i32; 3]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_replay_pins_the_time_of_day() {
+        super::set_replay(4242);
+        assert_eq!(super::time_of_day(), Some(super::REPLAY_TIME), "a recording draws the same corner clock every run");
+        super::REPLAY.with(|c| c.set(None));
+    }
+
     #[test]
     fn a_replay_tick_overrides_the_clock_for_the_thread() {
         super::set_replay(4242);

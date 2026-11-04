@@ -123,6 +123,9 @@ pub(crate) struct AppViews<'a> {
     /// playback session is, so a screen RECEIVES the date it words ("Today", "27 Oct") and fetches
     /// none. `None` before the first publication and when the platform cannot say.
     pub(crate) today: Option<[i32; 3]>,
+    /// **The time of day as this frame's publication**, for the player HUD's corner clock: published
+    /// by the loop once per iteration ([`Bridge::publish_wall_clock`]), like [`Self::today`].
+    pub(crate) wall: Option<plx_base::wallclock::WallTime>,
     /// **The kind of page beneath the page these views are read for** on the navigation stack,
     /// folded in by the dispatcher per page ([`Host::views_over`]); `None` for a root, and for
     /// every context that is not a page's own. What a page that names where BACK goes reads
@@ -143,7 +146,7 @@ impl Bridge {
         AppViews { marker_prefs: self.marker_prefs, auth: self.session.read(), hubs: self.hubs.view(), listing: self.listing.view(),
             directory: self.directory.view(), section_hubs: self.section_hubs.view(),
             search: self.search.view(), metadata: self.stores.metadata_view(),
-            person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session, today: self.today, beneath: None }
+            person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session, today: self.today, wall: self.wall, beneath: None }
     }
 }
 
@@ -243,6 +246,7 @@ fn execute_endpoint_outcomes_with(
 
 impl plx_screens::registry::PlayerLike for AppHost {
     fn session<'a>(cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession { cx.views.session }
+    fn wall(cx: &Cx<'_, Self>) -> Option<plx_base::wallclock::WallTime> { cx.views.wall }
 }
 
 impl plx_screens::registry::SearchLike for AppHost {
@@ -428,6 +432,8 @@ pub(crate) struct Bridge {
     /// This frame's publication of the calendar date — see `AppViews::today`. Refreshed by
     /// [`Bridge::publish_today`] from the loop, once per iteration; `None` until the first one.
     today: Option<[i32; 3]>,
+    /// This frame's publication of the time of day — see `AppViews::wall`.
+    wall: Option<plx_base::wallclock::WallTime>,
     /// **Is the hardware video plane bound?** `Player::video_plane_bound`, published here by the
     /// loop on its edges — the rig's own copy of the one bit, for the privileged call at draw
     /// entry (`clear_opaque_region`), which the `Rig` trait gives no argument.
@@ -689,6 +695,7 @@ impl Bridge {
             playback: plx_media::route::PlaybackSession::IDLE,
             playback_live: false,
             today: None,
+            wall: None,
             video_plane: false,
             measure: plx_ui::rec::Measurements::Live(measure),
             hubs: reads.hubs,
@@ -2216,6 +2223,12 @@ impl Bridge {
     pub(crate) fn publish_today(&mut self, today: Option<[i32; 3]>) {
         self.today = today;
     }
+
+    /// **Publish this frame's time of day** — see `AppViews::wall`: the twin of
+    /// [`Self::publish_today`], with `clock::time_of_day()`, for the player's corner clock.
+    pub(crate) fn publish_wall_clock(&mut self, wall: Option<plx_base::wallclock::WallTime>) {
+        self.wall = wall;
+    }
 }
 
 impl Bridge {
@@ -2272,7 +2285,7 @@ impl Bridge {
             let publication = self.session.publication();
             let cx = parts.cx::<AppHost>(AppViews { marker_prefs: self.marker_prefs, auth: publication.read(),
                 hubs: self.hubs.view(), listing: self.listing.view(), directory: self.directory.view(),
-                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, today: self.today, beneath: None,
+                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, today: self.today, wall: self.wall, beneath: None,
             }, &self.measure);
             let handled = self.session.step(event, &cx, fx);
             // #132: the owner logs nothing, and the Profiles screen cannot see a read-out that
@@ -2470,7 +2483,7 @@ impl Rig<AppHost> for Bridge {
                 hubs: self.hubs.view(),
                 listing: self.listing.view(),
                 directory: self.directory.view(),
-                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, today: self.today, beneath: None,
+                section_hubs: self.section_hubs.view(), search: self.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.playback, today: self.today, wall: self.wall, beneath: None,
             },
             measure: &self.measure,
         }

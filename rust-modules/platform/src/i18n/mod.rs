@@ -713,6 +713,20 @@ pub fn local_calendar_today() -> Option<[i32; 3]> {
     local_calendar_date(i64::try_from(seconds).ok()?)
 }
 
+/// **The time of day now** in the operating system's timezone (the zone [`local_calendar_today`]
+/// reads), for the player's corner clock. `None` when the platform cannot say. Called by the
+/// application's clock only (`app::clock::time_of_day`), never by a screen.
+pub fn local_time_of_day() -> Option<plx_base::wallclock::WallTime> {
+    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let stamp = libc::time_t::try_from(seconds).ok()?;
+    let mut out = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers are valid for localtime_r; the result is read only on success.
+    if unsafe { libc::localtime_r(&stamp, out.as_mut_ptr()) }.is_null() { return None; }
+    let tm = unsafe { out.assume_init() };
+    let (hour, minute) = (u8::try_from(tm.tm_hour).ok()?, u8::try_from(tm.tm_min).ok()?);
+    (hour < 24 && minute < 60).then_some(plx_base::wallclock::WallTime { hour, minute })
+}
+
 /// A Unix timestamp as a calendar date in the operating system's timezone. Called while building
 /// cached presentation labels, never by data parsers or once per card per frame. Checked time_t conversion
 /// matters on the 32-bit television: an unrepresentable date remains unknown.

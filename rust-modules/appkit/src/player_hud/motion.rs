@@ -46,9 +46,27 @@ pub struct ClockWarm {
     key: Option<(i64, i64)>,
     /// `(text, bold, size)` exactly as [`draw_playbar`] hands them to `Painter::text`.
     strings: Vec<(CString, c_int, c_int)>,
+    /// The time of day [`Self::queue_wall`] formatted, and that minute's and the next one's strings.
+    wall: Option<(plx_base::wallclock::WallTime, [Option<CString>; 2])>,
 }
 
 impl ClockWarm {
+    /// Queue the corner clock ([`draw_wall_clock`](super::classic::draw_wall_clock)) for `t` and the
+    /// minute after it, so the draw never meets a new minute cold.
+    pub fn queue_wall(&mut self, t: plx_base::wallclock::WallTime) {
+        if self.wall.as_ref().map(|(k, _)| *k) != Some(t) {
+            let next = {
+                let m = (u16::from(t.hour) * 60 + u16::from(t.minute) + 1) % (24 * 60);
+                plx_base::wallclock::WallTime { hour: (m / 60) as u8, minute: (m % 60) as u8 }
+            };
+            let text = |t| CString::new(plx_ui::fmt::time_of_day(t)).ok();
+            self.wall = Some((t, [text(t), text(next)]));
+        }
+        for s in self.wall.iter().flat_map(|(_, s)| s.iter().flatten()) {
+            plx_gfx::text::queue_prewarm(s.as_ptr(), super::classic::WALL_CLOCK_SZ, 1);
+        }
+    }
+
     /// Queue the clocks for the playhead the playbar would draw this frame, from the frame's
     /// [`HudModel`]: the same samples [`Playbar::live`](super::classic::Playbar) resolves its
     /// position from, so the prewarm and the draw agree.
@@ -206,6 +224,12 @@ fn faded(spring: &PopoverMotion) -> bool {
 }
 
 impl HudMotion {
+    /// The title block's alpha this frame: it fades while a scrub's preview card is up (the walk's
+    /// `chrome_alpha`), for an overlay that rides with the title, the corner clock.
+    pub fn chrome_alpha(&self, now: u32) -> f32 {
+        self.preview.motion.chrome_alpha(now)
+    }
+
     pub fn new() -> Self {
         Self {
             pop: RowPop::new(),

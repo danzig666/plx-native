@@ -317,6 +317,7 @@ pub(crate) unsafe fn run(app: &mut App) {
 fn publish_frame(bridge: &mut super::bridge::Bridge, session: &plx_media::route::PlaybackSession, was_player: bool) {
     bridge.publish_playback(session, was_player);
     bridge.publish_today(clock::today());
+    bridge.publish_wall_clock(clock::time_of_day());
 }
 
 /// **The frame's clock and the click's spring** (spec §3.3 step 3's head).

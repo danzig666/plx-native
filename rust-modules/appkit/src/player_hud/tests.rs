@@ -2007,3 +2007,34 @@ mod caption_rise_pins {
         }
     }
 }
+
+/// **The corner clock stands in the top-right of the safe frame**, over a ramp from the top edge,
+/// and its minute and the next one are resident before the draw (midnight wraps).
+#[test]
+fn the_wall_clock_draws_top_right_and_its_next_minute_is_warm() {
+    use super::classic::{draw_wall_clock, TOP_SCRIM_H, WALL_CLOCK_SZ};
+    use plx_base::wallclock::WallTime;
+    use plx_ui::consts::{MARGIN_X, MARGIN_Y, SCR_W};
+    let _g = plx_base::testlock::serial();
+    let log = plx_ui::draw_census::capture(|| {
+        draw_wall_clock(plx_ui::Painter::recording(), WallTime { hour: 21, minute: 5 });
+    });
+    let texts: Vec<plx_ui::Rect> = log.iter().filter(|(tag, _)| *tag == 100).map(|(_, r)| *r).collect();
+    assert_eq!(texts.len(), 1, "one line: {log:?}");
+    let t = texts[0];
+    // A recorded run keeps its anchor: right-aligned, `x` is the line's right edge.
+    assert!(t.x <= SCR_W - MARGIN_X + 0.5 && t.x - t.w > SCR_W / 2.0, "right side, inside the frame: {t:?}");
+    assert!(t.y >= MARGIN_Y - 0.5 && t.y + t.h <= TOP_SCRIM_H, "on the ramp, inside the frame: {t:?}");
+
+    plx_gfx::text::reset_prewarm_for_test();
+    let mut warm = super::motion::ClockWarm::default();
+    warm.queue_wall(WallTime { hour: 23, minute: 59 });
+    while plx_gfx::text::prewarm_pending() {
+        plx_ui::panel_motion::PanelMotion::drain_queued_text_for_test();
+    }
+    for t in [WallTime { hour: 23, minute: 59 }, WallTime { hour: 0, minute: 0 }] {
+        let text = plx_ui::fmt::time_of_day(t);
+        assert!(plx_gfx::text::prewarm_resident_for_test(text.as_bytes(), WALL_CLOCK_SZ, 1), "{text:?} was left cold");
+    }
+    plx_gfx::text::reset_prewarm_for_test();
+}
