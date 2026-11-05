@@ -468,6 +468,11 @@ impl PreferenceRequest {
         if !current() { return Err(PreferenceError::Stale); }
         let features: Vec<ViewerFeature> = serde_json::from_slice(&read("/api/v2/features")?)
             .map_err(|_| PreferenceError::InvalidResponse)?;
+        // Which feature names plex.tv granted the viewer: the evidence the marker settings' visibility
+        // rests on, and the first thing to read when a viewer cannot find them. Feature ids are Plex's
+        // product names, not personal data.
+        let ids: Vec<&str> = features.iter().map(|f| f.id.as_str()).collect();
+        plx_base::eventlog::log(&format!("marker grants: plex.tv features ({}): {}", ids.len(), ids.join(",")));
         if !current() { return Err(PreferenceError::Stale); }
         Ok(MarkerAccess { intro: features.iter().any(|f| f.id == "intro-markers"),
             credits: features.iter().any(|f| f.id == "credits-markers") })

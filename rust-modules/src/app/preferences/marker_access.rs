@@ -130,11 +130,12 @@ impl MarkerAccessRunner {
                 Err(mpsc::TryRecvError::Empty) => None,
             };
             if let Some(answer) = answer {
+                plx_base::eventlog::log(&format!("marker grants: {answer:?}"));
                 self.state.land(*scope, answer, now);
                 self.pending = None;
             }
         }
-        self.state.view(now, intro, credits)
+        fork_grants(self.state.view(now, intro, credits))
     }
     pub fn ensure(&mut self, profile: &CurrentProfile, now: u32) {
         if self.state.align(profile) {
@@ -158,9 +159,36 @@ impl MarkerAccessRunner {
         });
     }
 }
+/// **This fork offers the marker settings to every seated profile** (the owner's call, 2026-11-05).
+/// Upstream shows Skip intros / Skip credits, and lets Automatic act, only when plex.tv grants the
+/// VIEWER the `intro-markers` / `credits-markers` features (`MarkerAccess`); the fork had offered
+/// them to everyone before upstream's version, and the markers themselves come from the household's
+/// own server. The plex.tv check still runs and its answer is logged (`marker grants:`); it no
+/// longer hides anything. A view with no profile seated (`scope == 0`) is left as it is.
+fn fork_grants(mut view: MarkerPrefsView) -> MarkerPrefsView {
+    if view.scope != 0 {
+        view.intro_granted = true;
+        view.credits_granted = true;
+    }
+    view
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fork_offers_marker_settings_to_a_seated_profile_whatever_plex_tv_answers() {
+        let mut state = AccessState::default();
+        state.seat(Some(profile(1)));
+        let scope = state.begin(0).unwrap();
+        state.land(scope, Ok(MarkerAccess { intro: false, credits: false }), 1);
+        let view = fork_grants(state.view(1, MarkerSkipMode::Automatic, MarkerSkipMode::Manual));
+        assert!(view.intro_granted && view.credits_granted, "a denied grant hides nothing on the fork");
+        assert_eq!((view.intro, view.credits), (MarkerSkipMode::Automatic, MarkerSkipMode::Manual), "the choices stay the viewer's");
+        let unseated = fork_grants(AccessState::default().view(1, MarkerSkipMode::Automatic, MarkerSkipMode::Automatic));
+        assert!(!unseated.intro_granted, "no profile, no settings");
+    }
     fn profile(generation: u32) -> ProfileKey {
         ProfileKey {
             generation,
