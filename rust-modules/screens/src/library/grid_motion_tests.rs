@@ -52,6 +52,33 @@ fn an_all_grid_tile_and_its_rows_animate_back_when_focus_leaves() {
     assert!(strictly_between(page.layout.row_expansion(3), 0.0, 1.0), "leaving the grid closes its band over frames");
 }
 
+/// Focus leaving the grid's cards for the header: the frame that handles the key draws before any
+/// tick, and still shows the card lifted. It eases down from there, never at rest for one frame and
+/// lifted again.
+#[test]
+fn the_card_focus_leaves_for_the_header_keeps_its_lift_on_the_key_frame() {
+    let _guard = plx_base::testlock::serial();
+    let fixture = Fixture::new();
+    let mut page = fixture.screen();
+    page.initial = false;
+    let mut engine = FocusEngine::new();
+    let first = page.key(page.pair.detail.elem_at(0).unwrap());
+    engine.set(OWNER, first, Some(page.pair.groups_config().detail), By::Restore);
+    deliver(&mut page, &mut engine, &fixture, ScreenEvent::FocusMoved { from: None, to: first, by: By::Restore });
+    settle(&mut page, &mut engine, &fixture, 0);
+    let lifted = page.pair.detail.rect_at(&fixture.cx(engine.current(OWNER)), 0).w;
+    direction(&mut page, &mut engine, &fixture, Dir::Up);
+    assert!(engine.current(OWNER).is_some_and(|key| page.pair.detail.index_of(key.elem).is_none()), "focus left the grid");
+    let left = page.pair.detail.rect_at(&fixture.cx(engine.current(OWNER)), 0).w;
+    assert!((left - lifted).abs() < 1.0e-3, "the card keeps its lift until a tick eases it: {left} against {lifted}");
+    let series: Vec<f32> = (0..12).map(|i| {
+        frame(&mut page, &mut engine, &fixture, 3000 + i * 16);
+        page.pair.detail.rect_at(&fixture.cx(engine.current(OWNER)), 0).w
+    }).collect();
+    assert!(series.windows(2).all(|w| w[1] <= w[0] + 1.0e-3), "and only ever shrinks: {series:?}");
+    assert!(series[0] < lifted - 1.0e-3, "and is under way on the first tick: {series:?}");
+}
+
 /// Owner report items 8 and 9: switching TYPE (Shows / Seasons / Episodes) in an All grid
 /// scrolled to its heading. The grid fades out, the store empties on the commit, and the answer
 /// lands some frames later. Across that wait the chrome around the dark grid — heading,
@@ -120,7 +147,7 @@ fn a_section_switch_settles(items: usize, restore: Option<f32>) -> LibraryScreen
     stores.browse_run_for_test(BrowseCmd::SetCur(1));
     let publish = |fixture: &mut Fixture, grid: bool| {
         if grid { stores.browse.borrow_mut().seed_items_for_test(items); }
-        let publication = stores.capture_browse(&mut fixture.directory);
+        let publication = stores.capture_seeded_browse_for_test(&mut fixture.directory, plx_plex::plex::current_server());
         fixture.listing = publication.listing;
         if !grid { fixture.listing = fixture.listing.clone().with_fetch(SecFetch::Loading, -1).with_total(0); }
         if let Some(scroll) = restore {
@@ -272,6 +299,25 @@ fn effects_of(page: &mut LibraryScreen, engine: &mut FocusEngine<u32>, fixture: 
     output
 }
 
+/// BACK as the app delivers it: the screen steps the key, and the reseat it asks for reaches the
+/// engine and comes back as a `FocusMoved` (after a frame's tick when `tick_between` names one, as
+/// the app delivers it on the frame after the key).
+fn press_back(page: &mut LibraryScreen, engine: &mut FocusEngine<u32>, fixture: &Fixture, tick_between: Option<u32>) {
+    let back = ScreenEvent::Input(plx_machine::machine::InputEvent {
+        at: Tick::default(),
+        source: plx_machine::machine::Source::Script,
+        kind: InputKind::Key { key: Key::Back, sym: 0, wcode: 0, edge: Edge::Down, at_edge: false },
+    });
+    let out = effects_of(page, engine, fixture, back);
+    if let Some(ms) = tick_between { frame(page, engine, fixture, ms); }
+    for effect in out {
+        let Fx::Deliver(_, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { focus }))) = effect.fx else { continue };
+        if let Outcome::Moved { from, to, by } = engine.enter(OWNER, &*page, focus, None, &fixture.cx(engine.current(OWNER))) {
+            deliver(page, engine, fixture, ScreenEvent::FocusMoved { from, to, by });
+        }
+    }
+}
+
 fn saved_cursors(effects: &[plx_machine::machine::Stamped<HostFixture>]) -> Vec<plx_data::browse::CursorAt> {
     effects.iter().filter_map(|effect| match &effect.fx {
         Fx::App(AppFx::Store(StoreId::Browse, StoreCmd::Browse(BrowseCmd::Addressed {
@@ -341,7 +387,7 @@ fn a_membership_requery_under_a_page_keeps_focus_and_scroll_when_refilled_after_
 /// focusing a tile moves no row below it, while the default opens one and pushes them down.
 #[test]
 fn the_under_posters_policy_sizes_the_focused_rows_band() {
-    use plx_plex::plex::session::{UnderPosters, UnderPostersDetails};
+    use plx_plex::plex::session::{UnderPosters, UnderPostersLadder};
     let _guard = plx_base::testlock::serial();
     let below_focus = |setting: UnderPosters| {
         crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(Some(setting)));
@@ -356,9 +402,9 @@ fn the_under_posters_policy_sizes_the_focused_rows_band() {
         settle(&mut page, &mut engine, &fixture, 0);
         page.layout.row_y(4, 0.0) - rest
     };
-    let nothing = below_focus(UnderPosters { title: false, details: UnderPostersDetails::None, show_details: UnderPostersDetails::None.for_shows(), sort_value: false });
-    let one_line = below_focus(UnderPosters { title: false, details: UnderPostersDetails::Genre, show_details: UnderPostersDetails::Genre.for_shows(), sort_value: false });
-    let two_lines = below_focus(UnderPosters { title: true, details: UnderPostersDetails::Genre, show_details: UnderPostersDetails::Genre.for_shows(), sort_value: false });
+    let nothing = below_focus(UnderPosters { title: false, details: UnderPostersLadder::None.movie_parts(), show_details: UnderPostersLadder::None.show_parts(), sort_value: false });
+    let one_line = below_focus(UnderPosters { title: false, details: UnderPostersLadder::Genre.movie_parts(), show_details: UnderPostersLadder::Genre.show_parts(), sort_value: false });
+    let two_lines = below_focus(UnderPosters { title: true, details: UnderPostersLadder::Genre.movie_parts(), show_details: UnderPostersLadder::Genre.show_parts(), sort_value: false });
     crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(None));
     assert!(nothing.abs() < 0.01, "a policy showing nothing opens no band: {nothing}");
     assert!((one_line - 40.0).abs() < 0.01, "one line opens 80 - 40 px: {one_line}");
@@ -372,7 +418,7 @@ fn the_under_posters_policy_sizes_the_focused_rows_band() {
 #[test]
 fn a_single_kind_grid_is_banded_by_its_own_details_line() {
     use plx_data::browse::LibraryType;
-    use plx_plex::plex::session::{UnderPosters, UnderPostersDetails};
+    use plx_plex::plex::session::{UnderPosters, UnderPostersLadder};
     use plx_ui::caption_policy::{band_h, BAND_NONE, BAND_ONE_LINE, BAND_TWO_LINES};
     let _guard = plx_base::testlock::serial();
     let fixture = Fixture::new();
@@ -381,8 +427,8 @@ fn a_single_kind_grid_is_banded_by_its_own_details_line() {
         crate::registry::captions::TEST_UNDER_POSTERS.with(|cell| cell.set(Some(setting)));
         page.grid_policy().as_ref().map(band_h)
     };
-    let movies_off = UnderPosters { title: false, details: UnderPostersDetails::None, show_details: UnderPostersDetails::YearLength, sort_value: false };
-    let shows_off = UnderPosters { details: UnderPostersDetails::YearLength, show_details: UnderPostersDetails::None, ..movies_off };
+    let movies_off = UnderPosters { title: false, details: UnderPostersLadder::None.movie_parts(), show_details: UnderPostersLadder::YearLength.show_parts(), sort_value: false };
+    let shows_off = UnderPosters { details: UnderPostersLadder::YearLength.movie_parts(), show_details: UnderPostersLadder::None.show_parts(), ..movies_off };
     for (kind, listed, off, on, line) in [
         (SecKind::Movie, LibraryType::Primary, movies_off, shows_off, "Movies"),
         (SecKind::Show, LibraryType::Primary, shows_off, movies_off, "TV shows"),
@@ -600,4 +646,59 @@ fn relist_regression_reenabling_after_a_query_cut_adopts_current_rows() {
     frame(&mut page, &mut engine, &fixture, 9016);
     assert_eq!(page.pair.detail.relist_probe().1, [Some("10".to_string())],
         "the new answer still plays against the current query's rows");
+}
+
+/// BACK from deep in the grid: the first-row card focus lands on rises from rest on the lift spring,
+/// as it does when UP walks onto it, instead of appearing lifted in one frame, though the app
+/// delivers the reseat a frame after the key, behind a tick.
+#[test]
+fn back_to_the_top_raises_the_new_card_over_frames() {
+    let _guard = plx_base::testlock::serial();
+    let fixture = Fixture::new();
+    let mut page = fixture.screen();
+    page.initial = false;
+    let mut engine = FocusEngine::new();
+    let elem = deep(&mut page, &fixture, 20);
+    let deep_key = page.key(elem);
+    page.relayout(Some(deep_key));
+    page.scroll_target = page.target_layout.row_reveal(20 / page.layout.cols());
+    page.scroll.jump(page.scroll_target);
+    page.relayout(Some(deep_key));
+    engine.set(OWNER, deep_key, Some(page.pair.groups_config().detail), By::Restore);
+    deliver(&mut page, &mut engine, &fixture, ScreenEvent::FocusMoved { from: None, to: deep_key, by: By::Restore });
+    settle(&mut page, &mut engine, &fixture, 0);
+    let full = page.pair.detail.rect_at(&fixture.cx(engine.current(OWNER)), page.pair.detail.index_of(elem).unwrap()).w;
+    // the app delivers the reseat's FocusMoved on the frame after the key, behind that frame's tick
+    press_back(&mut page, &mut engine, &fixture, Some(2984));
+    let landed = engine.current(OWNER).and_then(|key| page.pair.detail.index_of(key.elem)).expect("focus is on a grid card");
+    assert!(landed < page.layout.cols(), "focus is on the first row");
+    // the frame that delivers the move draws before its next tick: the new card is not lifted there
+    let first_draw = page.pair.detail.rect_at(&fixture.cx(engine.current(OWNER)), landed).w;
+    assert!(first_draw < full - 1.0e-3, "the new card is not drawn lifted before the tick: {first_draw} against {full}");
+    let series: Vec<f32> = (0..12).map(|i| {
+        frame(&mut page, &mut engine, &fixture, 3000 + i * 16);
+        page.pair.detail.rect_at(&fixture.cx(engine.current(OWNER)), landed).w
+    }).collect();
+    assert!(series[0] < full - 1.0e-3, "the new card is not lifted whole on the first frame: {series:?}");
+    assert!(series.windows(2).all(|w| w[1] >= w[0] - 1.0e-3), "and only ever grows: {series:?}");
+}
+
+/// BACK from the first row to the header closes the row's caption band over frames, as UP does,
+/// though the move it makes is a restore.
+#[test]
+fn back_from_the_first_row_closes_its_band_over_frames() {
+    let _guard = plx_base::testlock::serial();
+    let fixture = Fixture::new();
+    let mut page = fixture.screen();
+    page.initial = false;
+    let mut engine = FocusEngine::new();
+    let first = page.key(page.pair.detail.elem_at(0).unwrap());
+    engine.set(OWNER, first, Some(page.pair.groups_config().detail), By::Restore);
+    deliver(&mut page, &mut engine, &fixture, ScreenEvent::FocusMoved { from: None, to: first, by: By::Restore });
+    settle(&mut page, &mut engine, &fixture, 0);
+    assert_eq!(page.layout.row_expansion(0), 1.0, "the focused first row is open");
+    press_back(&mut page, &mut engine, &fixture, None);
+    assert!(engine.current(OWNER).is_some_and(|key| page.pair.detail.index_of(key.elem).is_none()), "focus left the grid");
+    frame(&mut page, &mut engine, &fixture, 3000);
+    assert!(strictly_between(page.layout.row_expansion(0), 0.0, 1.0), "BACK closes the band over frames");
 }

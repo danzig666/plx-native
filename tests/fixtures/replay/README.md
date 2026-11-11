@@ -466,7 +466,7 @@ moved (`plxnative-rec check` refused the fresh recording for one 13-character st
 the committed one refused a measurement table miss from frame 304); `6-settings-family` and
 `12-filmography-detail-return` replayed `verdict=SAME` on the new tree. The owner decided the
 alphabet's answer (2026-10-20): ONE general pattern, `[0-9]{4} · ([0-9]+h )?[0-9]+m`, not the one
-literal (sourced in `_sources.year_length_caption`: `year_length`, `fmt::duration_minutes_in`,
+literal (sourced in `_sources.year_length_caption`: `caption_policy::part_value` (Year, Length), `fmt::duration_minutes_in`,
 `core.duration_hours` / `core.duration_minutes`, and `tests/mock_pms.py` `_base` / `_movie`, which draw
 the year and the length). The fresh recording (`tests/focusfp.sh --rec --only 1`) passed
 `plxnative-rec check` with that pattern and nothing else added, and only
@@ -645,3 +645,41 @@ anchor was recorded afresh (`tests/focusfp.sh --rec --only 6`, old fixture remov
 import`, `anchor: true` restored, manifest byte-identical) and replayed SAME in Targets and Resolve
 on three consecutive runs. The closed alphabet adds `Legal`, `Privacy` and `Privacy &` (the page
 titles, measured word by word; `_sources.settings_v2`).
+
+The Continue Watching redesign (the stills row, the page that stays on the hero while a Continue Watching
+tile holds focus, the one-line still footer with the episode tag) changed recorded behaviour without moving the shape
+(`state_fp` 5612583773909772043): all three committed anchors were observed diverging on frame 3, where the
+hubs land (`replay: diverge f=3 ...`), then refusing (`replay: REFUSED — replay measurement table miss`), in both
+modes, on CI's macOS simulator job and locally (`make check-replay`, six failures). The `hero_auto` gate was ruled
+out by replaying against a build with it disabled (the same `got` hash on all three); the measurement delta
+is exactly ten new Width keys, the footer's started lines (`32m left`, `S2 E2 · 32m left` and four more pairs; the old
+`S2 · E2 · 32m left` is gone), and the row's geometry is hashed shelf state. The recordings' input key
+sequences are unchanged. The anchors were recorded afresh on the unchanged shape (`tests/focusfp.sh --rec --only 1,6,12`, 350 ms
+keys, 1 s boot settle, 1.5 s final settle), checked, and only each recording segment replaced (the manifests are
+byte-identical, `anchor: true` kept), then replayed SAME in Targets and Resolve on three consecutive runs and at the
+CI window (960x540). `focusfp_check.py` flow 1 now expects the first shelf, Continue Watching, to hold the page
+(`snapt=0 row=0`) and the second shelf to dive (`snapt=1 row=1`). The closed alphabet gains `[0-9]+m left` and
+`S[0-9]+ E[0-9]+ · [0-9]+m left` (`_sources.cw_stills_footer`).
+
+The Home hero (owner's board CW-13 v2: Home's own text ladder over the action row, the Continue Watching
+tiles at a 40 px gap with their footer below the art, the flat action row with the pager following Info in it
+(the anchors were recorded while it still stood at the right margin; the board's correction then moved it into
+the row), and the content-following hero shade) changed recorded behaviour without moving the shape (`state_fp`
+5612583773909772043): all three committed anchors were observed diverging on Home's first drawn frames
+(`replay: diverge f=3` on `1-boot-home-chip-grid`, f=4 on `12-filmography-detail-return`, f=5 on
+`6-settings-family`), then refusing (`replay: REFUSED — replay measurement table miss`), in both modes
+(`make check-replay`, six failures). The anchors were recorded afresh on the unchanged shape
+(`tests/focusfp.sh --rec --only 1,6,12`, 350 ms keys, 1 s boot settle, 1.5 s final settle), and
+`plxnative-rec check` refused all three for one string, an episode hero's one bold label ("S<n>, E<n> ·" and the
+mock's synthetic title, `ui/src/fmt.rs` `episode_kicker`), which the closed alphabet gains as
+`S[0-9]+, E[0-9]+ · s[0-9a-f]{8}` (`_sources.hero_episode_label`). Only each `rec-0000.jsonl` was replaced (the
+manifests equal the new recorder's header field for field, `anchor: true` kept); the replays are SAME in
+Targets and Resolve with every difference counter at zero on three consecutive runs, one of them at the CI
+window (960x540).
+
+The Home Resume pill measures a compact remaining duration, and the episode hero measures a season
+and episode address as part of its metadata row. Both replay modes refused all three old anchors
+with a measurement table miss. The anchors were re-recorded with
+`tests/focusfp.sh --rec --only 1,6,12`, keeping the same inputs and manifests. The closed alphabet
+adds the three exact strings from the seed-1 mock. Targets and Resolve both match all frames at
+960x540.

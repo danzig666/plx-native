@@ -36,10 +36,10 @@
 //! frozen top-level keys: no pick in this module ever writes one.
 use super::plan::{supported_quality, Quality, QUALITY_LADDER};
 use plx_plex::plex::session::{
-    MarkerSkipMode, IntroSkipPref, CreditsSkipPref, DolbyVisionMode, DolbyVisionModePref, InstantDpadSeeking, InstantDpadSeekingPref, effective, own_prefs, persist_profile_pref, AudioEnhancementsPref, DeckPress, DeckPressPref, DirectPlayMode,
+    MarkerSkipMode, IntroSkipPref, CreditsSkipPref, DolbyVisionMode, DolbyVisionModePref, InstantDpadSeeking, InstantDpadSeekingPref, UriEngine, UriEnginePref, effective, own_prefs, persist_profile_pref, AudioEnhancementsPref, DeckPress, DeckPressPref, DirectPlayMode,
     DirectPlayModePref, HdrOverlayBrightness, HdrOverlayBrightnessPref, NextEpisodeMode, NextEpisodeModePref, Preferences, ProfilePrefs, ProfilePrefsRecord,
     ProfileSetting, ProfileWrite, QualityPref, Row, Setting, SkipInterval, SkipIntervalPref, SubtitlePosition,
-    SubtitlePositionPref, SubtitleSize, SubtitleSizePref, SubtitleTone, SubtitleTonePref, TrailerAutoplayPref, UnderPosters,
+    SubtitlePositionPref, SubtitleSize, SubtitleSizePref, SubtitleTone, SubtitleTonePref, TrailerAutoplayPref, HudEndTimePref, UnderPosters,
     UnderPostersPref,
 };
 use plx_plex::plex::session::prefs::{
@@ -48,27 +48,28 @@ use plx_plex::plex::session::prefs::{
 use plx_plex::plex::session::{self, Seat, Session, SubtitleOffsetEntry};
 use plx_plex::plex::AudioEnhancements;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, Ordering::Relaxed};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 // ---- the cell -------------------------------------------------------------------------------
 
-/// A value that packs into the one byte a [`LiveCell`] holds. The mapping is each type's own
+/// A value that packs into the 16 bits a [`LiveCell`] holds (most types use only the low byte; Under
+/// posters uses all sixteen). The mapping is each type's own
 /// in-memory index (the quality ladder's position, a tone's rung, an enhancement's two bits), so a
-/// cell reads exactly what the atomic it replaced read, and an out-of-range byte falls back to the
+/// cell reads exactly what the atomic it replaced read, and an out-of-range value falls back to the
 /// type's documented default, never to a neighbouring rung.
 pub trait Packed: Copy {
     /// What the cell holds before anything has restored it.
-    const SEED: u8;
-    fn to_u8(self) -> u8;
-    fn from_u8(b: u8) -> Self;
+    const SEED: u16;
+    fn to_bits(self) -> u16;
+    fn from_bits(b: u16) -> Self;
 }
 
 /// One live setting's process-global value. `set` is the ONLY writer, so there is one place a
 /// test-lock assertion, a publish counter or a future change notification goes.
 pub struct LiveCell<T: Packed> {
-    a: AtomicU8,
+    a: AtomicU16,
     /// Names the global in the test-lock panic.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     name: &'static str,
@@ -80,7 +81,7 @@ pub struct LiveCell<T: Packed> {
 impl<T: Packed> LiveCell<T> {
     pub const fn new(name: &'static str) -> Self {
         LiveCell {
-            a: AtomicU8::new(T::SEED),
+            a: AtomicU16::new(T::SEED),
             name,
             #[cfg(any(test, feature = "test-support"))]
             publishes: std::sync::atomic::AtomicU32::new(0),
@@ -90,7 +91,7 @@ impl<T: Packed> LiveCell<T> {
 
     /// Safe from any thread; a reader takes no lock.
     pub fn get(&self) -> T {
-        T::from_u8(self.a.load(Relaxed))
+        T::from_bits(self.a.load(Relaxed))
     }
 
     /// Publish `v`. A cell is a process global read without a lock, so in tests a write without
@@ -106,12 +107,12 @@ impl<T: Packed> LiveCell<T> {
             self.publishes.fetch_add(1, Relaxed);
             plx_base::testlock::assert_held(self.name);
         }
-        self.a.store(v.to_u8(), Relaxed);
+        self.a.store(v.to_bits(), Relaxed);
     }
 
-    /// The raw byte, for the tests that pin the packing.
+    /// The raw 16-bit value, for the tests that pin the packing.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn raw(&self) -> u8 {
+    pub fn raw(&self) -> u16 {
         self.a.load(Relaxed)
     }
 
@@ -136,24 +137,24 @@ macro_rules! live_cell {
 macro_rules! packed_by_index {
     ($($ty:ty = $seed:literal),* $(,)?) => {$(
         impl Packed for $ty {
-            const SEED: u8 = $seed;
-            fn to_u8(self) -> u8 { self.index() }
-            fn from_u8(b: u8) -> Self { <$ty>::from_index(b) }
+            const SEED: u16 = $seed;
+            fn to_bits(self) -> u16 { u16::from(self.index()) }
+            fn from_bits(b: u16) -> Self { <$ty>::from_index(u8::try_from(b).unwrap_or(u8::MAX)) }
         }
     )*};
 }
-packed_by_index!(MarkerSkipMode = 1, DolbyVisionMode = 0, InstantDpadSeeking = 0, NextEpisodeMode = 0, SkipInterval = 1, DeckPress = 0, SubtitleSize = 1, SubtitlePosition = 0, SubtitleTone = 0, HdrOverlayBrightness = 1);
+packed_by_index!(MarkerSkipMode = 1, DolbyVisionMode = 0, InstantDpadSeeking = 0, UriEngine = 0, NextEpisodeMode = 0, SkipInterval = 1, DeckPress = 0, SubtitleSize = 1, SubtitlePosition = 0, SubtitleTone = 0, HdrOverlayBrightness = 1);
 
 impl Packed for DirectPlayMode {
-    const SEED: u8 = 0;
-    fn to_u8(self) -> u8 {
+    const SEED: u16 = 0;
+    fn to_bits(self) -> u16 {
         match self {
             DirectPlayMode::Auto => 0,
             DirectPlayMode::Forced => 1,
             DirectPlayMode::Disabled => 2,
         }
     }
-    fn from_u8(b: u8) -> Self {
+    fn from_bits(b: u16) -> Self {
         match b {
             1 => DirectPlayMode::Forced,
             2 => DirectPlayMode::Disabled,
@@ -162,16 +163,17 @@ impl Packed for DirectPlayMode {
     }
 }
 
-/// Under posters is one byte: the title switch in bit 0, the movie details' ladder index in bits 1-3,
-/// "sort value Off" in bit 4 and the TV show details' ladder index in bits 5-7 ([`UnderPosters::pack`]). The seed, 0, is the default (no title,
-/// year and length, sort value On), so a read
-/// before any restore is what the install did before the setting existed.
+/// Under posters is two bytes (the cell is 16 bits wide for it): the title switch in bit 0, "sort value
+/// Off" in bit 1, the movie parts in bits 2-8 and the TV show parts in bits 9-15, one bit per
+/// [`plx_plex::plex::session::DetailPart`] ([`UnderPosters::pack`]). The seed is the default's own
+/// packing (no title, year and length of a movie, year and seasons of a show, sort value On), so a
+/// read before any restore is what the install did before the setting existed.
 impl Packed for UnderPosters {
-    const SEED: u8 = 0;
-    fn to_u8(self) -> u8 {
+    const SEED: u16 = UnderPosters::DEFAULT.pack();
+    fn to_bits(self) -> u16 {
         self.pack()
     }
-    fn from_u8(b: u8) -> Self {
+    fn from_bits(b: u16) -> Self {
         UnderPosters::unpack(b)
     }
 }
@@ -179,11 +181,11 @@ impl Packed for UnderPosters {
 /// The hero trailer switch is one byte, 0 or 1. The seed is ON, the product default, so a read before
 /// any restore is what the install did before the setting existed.
 impl Packed for bool {
-    const SEED: u8 = 1;
-    fn to_u8(self) -> u8 {
-        self as u8
+    const SEED: u16 = 1;
+    fn to_bits(self) -> u16 {
+        self as u16
     }
-    fn from_u8(b: u8) -> Self {
+    fn from_bits(b: u16) -> Self {
         b != 0
     }
 }
@@ -194,12 +196,12 @@ impl Packed for bool {
 /// gate restores the session: no call path may turn a missing preference into Auto simply because
 /// initialization order changed.
 impl Packed for Quality {
-    const SEED: u8 = 1;
-    fn to_u8(self) -> u8 {
-        quality_index(self)
+    const SEED: u16 = 1;
+    fn to_bits(self) -> u16 {
+        u16::from(quality_index(self))
     }
-    fn from_u8(b: u8) -> Self {
-        quality_from_index(b)
+    fn from_bits(b: u16) -> Self {
+        quality_from_index(u8::try_from(b).unwrap_or(u8::MAX))
     }
 }
 
@@ -216,21 +218,22 @@ pub(super) fn quality_index(q: Quality) -> u8 {
 const ENH_BOOST_DIALOG: u8 = 1;
 const ENH_NORMALIZE_LOUDNESS: u8 = 2;
 impl Packed for AudioEnhancements {
-    const SEED: u8 = 0;
-    fn to_u8(self) -> u8 {
+    const SEED: u16 = 0;
+    fn to_bits(self) -> u16 {
         let boost = if self.boost_dialog { ENH_BOOST_DIALOG } else { 0 };
         let normalize = if self.normalize_loudness { ENH_NORMALIZE_LOUDNESS } else { 0 };
-        boost | normalize
+        u16::from(boost | normalize)
     }
-    fn from_u8(bits: u8) -> Self {
+    fn from_bits(bits: u16) -> Self {
         AudioEnhancements {
-            boost_dialog: bits & ENH_BOOST_DIALOG != 0,
-            normalize_loudness: bits & ENH_NORMALIZE_LOUDNESS != 0,
+            boost_dialog: bits & u16::from(ENH_BOOST_DIALOG) != 0,
+            normalize_loudness: bits & u16::from(ENH_NORMALIZE_LOUDNESS) != 0,
         }
     }
 }
 
 live_cell!(pub(super) INSTANT_DPAD_SEEKING: InstantDpadSeeking, "instant D-pad seeking");
+live_cell!(pub(super) URI_ENGINE: UriEngine, "playback engine");
 live_cell!(pub(super) INTRO_SKIP: MarkerSkipMode, "intro skip");
 live_cell!(pub(super) CREDITS_SKIP: MarkerSkipMode, "credits skip");
 live_cell!(pub(super) DOLBY_VISION_MODE: DolbyVisionMode, "Dolby Vision mode");
@@ -276,6 +279,10 @@ live_cell!(
     /// How bright the player's overlay and captions are drawn while the picture is HDR. Read once per
     /// frame by the app's player draw (`route::overlay_gain`).
     pub(super) HDR_OVERLAY_BRIGHTNESS: HdrOverlayBrightness, "HDR overlay brightness preference"
+);
+live_cell!(
+    /// Whether the player HUD shows the projected local end time beside the remaining clock.
+    pub(super) HUD_END_TIME: bool, "estimated playback end time"
 );
 live_cell!(
     /// The seated profile's current quality pick. An atomic rather than a field on `Session` because it
@@ -328,6 +335,7 @@ macro_rules! live_setting {
 
 live_setting!(DirectPlayModePref, DIRECT_PLAY_MODE, "direct play mode");
 live_setting!(InstantDpadSeekingPref, INSTANT_DPAD_SEEKING, "instant D-pad seeking");
+live_setting!(UriEnginePref, URI_ENGINE, "playback engine");
 live_setting!(IntroSkipPref, INTRO_SKIP, "intro skip");
 live_setting!(CreditsSkipPref, CREDITS_SKIP, "credits skip");
 live_setting!(DolbyVisionModePref, DOLBY_VISION_MODE, "Dolby Vision mode");
@@ -339,6 +347,7 @@ live_setting!(HdrOverlayBrightnessPref, HDR_OVERLAY_BRIGHTNESS, "HDR overlay bri
 live_setting!(SubtitleTonePref, crate::player::SUBTITLE_TONE, "subtitle tone");
 live_setting!(AudioEnhancementsPref, crate::player::AUDIO_ENHANCEMENTS, "audio enhancements");
 live_setting!(TrailerAutoplayPref, crate::player::preview::TRAILER_AUTOPLAY, "hero trailer autoplay");
+live_setting!(HudEndTimePref, HUD_END_TIME, "estimated playback end time");
 live_setting!(NextEpisodeModePref, NEXT_EPISODE_MODE, "next episode mode",
     fn after_saved(mode: NextEpisodeMode) {
         plx_telemetry::diag::event(plx_telemetry::diag::schema::DiagEvent::FeatureUsed {
@@ -391,6 +400,7 @@ pub const LIVE_ROWS: &[LiveRow] = &[
     LiveRow::of::<NextEpisodeModePref>(),
     LiveRow::of::<SkipIntervalPref>(),
     LiveRow::of::<InstantDpadSeekingPref>(),
+    LiveRow::of::<UriEnginePref>(),
     LiveRow::of::<DolbyVisionModePref>(),
     LiveRow::of::<IntroSkipPref>(),
     LiveRow::of::<CreditsSkipPref>(),
@@ -398,6 +408,7 @@ pub const LIVE_ROWS: &[LiveRow] = &[
     LiveRow::of::<UnderPostersPref>(),
     LiveRow::of::<AudioEnhancementsPref>(),
     LiveRow::of::<TrailerAutoplayPref>(),
+    LiveRow::of::<HudEndTimePref>(),
 ];
 
 // ---- restore --------------------------------------------------------------------------------
@@ -778,12 +789,14 @@ choices! {
     NextEpisode => NextEpisodeModePref,
     SkipInterval => SkipIntervalPref,
     InstantDpadSeeking => InstantDpadSeekingPref,
+    UriEngine => UriEnginePref,
     DolbyVision => DolbyVisionModePref,
     IntroSkip => IntroSkipPref,
     CreditsSkip => CreditsSkipPref,
     DeckPress => DeckPressPref,
     UnderPosters => UnderPostersPref,
     TrailerAutoplay => TrailerAutoplayPref,
+    HudEndTime => HudEndTimePref,
     SubtitleSize => SubtitleSizePref,
     SubtitlePosition => SubtitlePositionPref,
     HdrOverlayBrightness => HdrOverlayBrightnessPref,
@@ -903,6 +916,11 @@ pub fn set_next_episode_mode(mode: NextEpisodeMode) -> bool { confirm::<NextEpis
 pub fn instant_dpad_seeking() -> InstantDpadSeeking { InstantDpadSeekingPref::live() }
 pub fn restore_instant_dpad_seeking(seeking: InstantDpadSeeking) { restore_live::<InstantDpadSeekingPref>(seeking) }
 
+/// The seated profile's playback engine: `On` is the viewer's opt-in to the URI engine. The route
+/// owner snapshots it into `ResolveEnv` at the press, as the quality and the direct-play mode.
+pub fn uri_engine() -> UriEngine { UriEnginePref::live() }
+pub fn restore_uri_engine(engine: UriEngine) { restore_live::<UriEnginePref>(engine) }
+
 pub fn dolby_vision_mode() -> DolbyVisionMode { DolbyVisionModePref::live() }
 pub fn restore_dolby_vision_mode(mode: DolbyVisionMode) { restore_live::<DolbyVisionModePref>(mode) }
 
@@ -915,6 +933,11 @@ pub fn deck_press() -> DeckPress { DeckPressPref::live() }
 pub fn restore_deck_press(mode: DeckPress) { restore_live::<DeckPressPref>(mode) }
 /// Blocking persistence seam, as [`set_next_episode_mode`].
 pub fn set_deck_press(mode: DeckPress) -> bool { confirm::<DeckPressPref>(mode) }
+
+/// Whether the seated profile shows the projected end time in the player HUD.
+pub fn hud_end_time() -> bool { HudEndTimePref::live() }
+/// Restore the end-time cell from the active profile without writing it back.
+pub fn restore_hud_end_time(v: bool) { restore_live::<HudEndTimePref>(v) }
 
 /// What sits under the focused poster, for the seated profile. Safe from any thread; a reader takes
 /// no lock.

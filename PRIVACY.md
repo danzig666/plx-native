@@ -1,6 +1,6 @@
 # PlxNative Privacy Policy
 
-Applies to PlxNative 0.6.0. Last updated 4 September 2026.
+Applies to PlxNative 0.6.0. Last updated 9 November 2026.
 
 ## Who is responsible for PlxNative data
 
@@ -14,6 +14,18 @@ account features, the app communicates directly with Plex services. Plex process
 received by those services under [Plex’s own Privacy
 Policy](https://www.plex.tv/about/privacy-legal/). PlxNative’s developer does not receive that
 information.
+
+Continue Watching artwork. For each title in a Continue Watching row, PlxNative asks Plex’s catalog
+(discover.provider.plex.tv) for the title’s own cover artwork. The request carries the title’s Plex
+catalog identifier (which your Plex Media Server lists with the title), the language of the app, the
+app’s client identifier and, only when the profile has one, its Plex account token, so it tells
+Plex which titles are in the Continue Watching row of the profile in use. Your Plex Media Server then fetches
+the picture itself from the image host that Plex’s answer names. The request is made when a
+title’s card is first shown and this television has no saved answer for it; again when the saved
+answer is more than a day old and the card is shown; again on a later start or after a profile
+switch when an earlier attempt saved nothing, and when the card is shown again after Plex’s catalog
+could not be reached (at most once every 45 seconds while it cannot be reached); and again after the saved artwork was removed to make room, by signing out, or
+by changing the app’s language. PlxNative’s developer does not receive these requests.
 
 ## Plex Media Servers
 
@@ -115,6 +127,8 @@ the Crash report ID below. It carries none of the library details above.
 
 A main-thread freeze (the app not responding for five seconds or more while it is open on screen) is reported like a crash, under the same choice: code addresses and register values, one of three duration ranges (5 to 10 s, 10 to 30 s, 30 s or more) or "unrecovered", and the details above, without stopping the app.
 
+When another part of the television's software ends PlxNative by calling `exit()` (for example the system closing it), the app records the call and reports it like a crash, under the same choice: the exit status (a number), which thread made the call (its number, whether it was the main thread, and its own name, a technical label set by PlxNative or a library), the library the call came from (its file name, never the folder, with its build identifier, load address and size, as for a crash report above) and the code address of the call, the time of the call to the second, and the details above.
+
 Every crash and error report carries a **Crash report ID**: a random identifier created on this
 television when you turn crash reports on, sent as the report's `user.id`. It exists so that
 repeated crashes under one Crash report ID are counted once rather than once each — Sentry's
@@ -191,7 +205,7 @@ Two more closed fields say why that attempt was made and which one it was, becau
 a Retry or a handoff reads differently from the first open: `attempt_origin`, one of `fresh` (the
 Play the viewer pressed) / `user_retry` (Retry, or *Switch to Auto and play*, on the failure
 screen) / `quality_change` (a quality the viewer picked, including one picked on the failure
-screen) / `auto_handoff` (a change of delivery the app made on its own) / `recovery` (the app
+screen) / `viewer_reconfigure` (a playback speed or audio-processing change the viewer requested) / `auto_handoff` (a change of delivery the app made on its own) / `recovery` (the app
 reopening the video after an attempt failed to open) / `resume` (reopening where playback left off
 after the app returned to the foreground) / `preview` (the trailer that plays quietly behind a
 detail page, which the viewer did not press Play for); and `attempt_ordinal`, which open of this
@@ -202,6 +216,14 @@ more: it is marked `preview`, it counts as the first open, it names direct play 
 delivery (the only route a preview ever opens), and its `started` and `attempt_started` fields
 say whether the trailer actually showed a picture before it failed. Sentry files it in an issue of
 its own, apart from playback failures.
+
+The report also names `backend` — `unknown` / `feed` / `uri` — and `terminal_stage` —
+`unknown` / `planning` / `open` / `decode` / `presentation` / `release`. These describe only the
+current logical request and its addressed terminal attempt. A new plan failure cannot inherit the
+previous URI or buffer-feed attempt's backend or failure stage. When no current physical attempt
+was proven, the backend is `unknown`; a known plan refusal can still name `planning`. They appear
+as closed tags and in the playback context. No attempt or request identifier, release disposition,
+URL or source text is sent with them.
 
 When the failure is the media server **refusing to play or convert the item** (`decision_refused`),
 that report also carries four closed fields about the refusal — and never the server's own
@@ -310,7 +332,7 @@ Every product analytics event also carries this bounded compatibility and connec
 | `enhancement.refused` | `boost_dialog` — `true` / `false`; `normalize_loudness` — `true` / `false` |
 | `playback.requested` | `playback_id` — a random number minted per attempt, never stored and never reused |
 | `playback.started` | `playback_id` — a random number minted per attempt, never stored and never reused; `mode` — `direct` / `transcode` / `unknown` — `unknown` when no route was installed, as for a plan the server or a playback setting refused; `raster` — `sd` / `hd` / `fhd` / `uhd` / `unknown` — never the raster; `fps` — a fixed rung: `24`/`25`/`30`/`50`/`60`/`100`/`other`/`unknown` — never the measured rate; `video` — a codec name from a fixed table; anything else is `other`; `audio` — a codec name from a fixed table; anything else is `other`; `startup` — `<1s` / `1-3s` / `3-10s` / `10s+` — never the interval |
-| `playback.failed` | `playback_id` — a random number minted per attempt, never stored and never reused; `mode` — `direct` / `transcode` / `unknown` — `unknown` when no route was installed, as for a plan the server or a playback setting refused; `kind` — `decision_refused` / `playback_policy` / `no_video_transcode_target` / `no_video_track` / `media_source` / `playback_interrupted` / `tv_pipeline` / `original_rollback` / `jail_missing_rtkmem` / `load_timeout` / `release_timeout` / `resolve_failed` / `preview_not_direct` / `unspecified`; `video` — a codec name from a fixed table; anything else is `other`; `audio` — a codec name from a fixed table; anything else is `other`; `pipeline_error` — the TV pipeline's first error number as a class: `0` (none) / `100` / `200` / `601` / `other`; `refusal` — `sync` (the TV's Load call itself refused) / `async` (the pipeline refused it before the first picture) / `none` |
+| `playback.failed` | `playback_id` — a random number minted per attempt, never stored and never reused; `mode` — `direct` / `transcode` / `unknown` — `unknown` when no route was installed, as for a plan the server or a playback setting refused; `kind` — `decision_refused` / `playback_policy` / `no_video_transcode_target` / `no_video_track` / `media_source` / `playback_interrupted` / `tv_pipeline` / `original_rollback` / `jail_missing_rtkmem` / `load_timeout` / `release_timeout` / `resolve_failed` / `preview_not_direct` / `server_stopped` / `unspecified`; `video` — a codec name from a fixed table; anything else is `other`; `audio` — a codec name from a fixed table; anything else is `other`; `pipeline_error` — the TV pipeline's first error number as a class: `0` (none) / `100` / `200` / `601` / `other`; `refusal` — `sync` (the TV's Load call itself refused) / `async` (the pipeline refused it before the first picture) / `none` |
 | `playback.cancelled` | `playback_id` — a random number minted per attempt, never stored and never reused; `mode` — `direct` / `transcode` / `unknown` — `unknown` when no route was installed, as for a plan the server or a playback setting refused |
 | `playback.abandoned` | `playback_id` — a random number minted per attempt, never stored and never reused; `mode` — `direct` / `transcode` / `unknown` — `unknown` when no route was installed, as for a plan the server or a playback setting refused |
 | `playback.quality` | `playback_id` — a random number minted per attempt, never stored and never reused; `rebuffers` — `0` / `1` / `2-3` / `4+`; `buffering` — `none` / `<2s` / `2-10s` / `10s+` — never the interval |

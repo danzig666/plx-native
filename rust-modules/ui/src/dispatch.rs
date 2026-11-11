@@ -668,6 +668,7 @@ where
     pub fn top_or_mounting_arg(&self) -> Option<&H::Arg> {
         self.top_arg().or_else(|| self.parked.iter().rev().find_map(|(s, _)| match &s.fx {
             Fx::Nav(NavOp::Root(a) | NavOp::Push(a) | NavOp::Replace(a) | NavOp::SelectTab(a)) => Some(a),
+            Fx::Nav(NavOp::SelectTabWithChild { child, .. }) => Some(child),
             _ => None,
         }))
     }
@@ -733,8 +734,14 @@ where
     /// shared bar ([`Screen::bar_opener`], hosted by the page on top), `false` for a page element
     /// ([`Screen::opener`]). One decision and one stand-down rule for both.
     fn lift_target(&self) -> Option<(EntryId, Option<FocusKey<H::Elem>>, bool)> {
-        use super::containers::modal::Phase;
-        let (surface, (entry, opener, bar)) = self.nav.modals.surfaces.iter().find_map(|s| {
+        use super::containers::modal::{Phase, Style};
+        let surfaces = &self.nav.modals.surfaces;
+        // Once an opaque surface paints its ground or its entrance dip, the lower openers
+        // belong underneath that paint too. The host cache policy changes only after the ramp.
+        let first = surfaces.iter().rposition(|s| matches!(s.style, Style::Opaque { .. })
+            && s.entry.inst.is_some() && s.phase != Phase::Hidden && !s.motion.held()
+            && (s.motion.appear > 0.0 || s.motion.floor() > 0.0)).unwrap_or(0);
+        let (surface, (entry, opener, bar)) = surfaces[first..].iter().find_map(|s| {
             let screen = &s.entry.inst.as_ref()?.screen;
             let found = screen.opener().map(|(entry, key)| (entry, key, false)).or_else(|| {
                 let host = self.nav.top_page()?.id;
@@ -1420,8 +1427,11 @@ where
                     transition.page_alpha(), self.last_tick.ms, valid,
                     self.page_quiescent);
                 if let Some(alpha) = paint.frozen_alpha() {
+                    // Only a held image blocks: the replacement capture walks the page live to take
+                    // the image it shows, and a blocking layer there refuses the page's own glass in
+                    // that walk, so the image held the glass's text over bare art for its one frame.
                     layers.push(Layer { z: Z(Z::CHROME.0 - 1), rect: canvas(),
-                        blocks: !paint.draws_live(),
+                        blocks: !paint.captures_page(),
                         revision: self.page_snapshot.revision(), composite_alpha: Some(alpha) });
                 } else if eligible && paint == super::containers::transition::PagePaint::Capture {
                     // A capture frame: the source walk draws the page live at full alpha and the
@@ -1637,9 +1647,7 @@ where
                     // the outgoing page while its destination only records text. The walk
                     // measures ahead of any frame that draws the page, so it is speculative to
                     // the recorder (`rec::speculative`).
-                    plx_base::diag::spans::span("warm", || plx_gfx::gfx::without_frame_clear(|| {
-                        super::rec::speculative(|| super::record_walk(|| inst.screen.draw(&mut f)))
-                    }));
+                    plx_base::diag::spans::span("warm", || warm_walk(|| inst.screen.draw(&mut f)));
                 }
             }
         }
@@ -1814,9 +1822,7 @@ where
                     // Recorded on the capture frame, drained only on the held frames after it.
                     drain_surface_text |= !s.motion.capture_frame();
                     capture_surface |= s.motion.capture_frame();
-                    backdrop::draw_span("surf", || plx_gfx::gfx::without_frame_clear(|| {
-                        super::rec::speculative(|| super::record_walk(|| inst.screen.draw(&mut f)))
-                    }));
+                    backdrop::draw_span("surf", || warm_walk(|| inst.screen.draw(&mut f)));
                     // …and what it already shows (its opener, which the page has left out) live.
                     let mut face = DrawFrame::with_navigation(&surface_cx, Painter::root(), navigation);
                     face.page_alpha = s.motion.appear;
@@ -1827,6 +1833,16 @@ where
                     backdrop::draw_span("surf", || {
                         crate::popover_glass::drawing_surface(index, || inst.screen.draw(&mut f));
                     });
+                    // **A visible surface may hold content back until its text is resident** (a
+                    // Settings push waiting at its start, `Screen::warms_text`): that content is
+                    // walked through the recorder now and drained below with the page's budget, so
+                    // the frame that first shows it finds its strings cached.
+                    if !source_pass && inst.screen.warms_text() {
+                        let mut warm = DrawFrame::with_navigation(&surface_cx, Painter::recording(), navigation);
+                        warm.page_alpha = s.motion.appear;
+                        backdrop::draw_span("surf", || warm_walk(|| inst.screen.draw_warm(&mut warm)));
+                        drain_surface_text = true;
+                    }
                 }
                 report.drawn.push(inst.id);
                 stops.extend(f.into_stops());
@@ -3577,6 +3593,14 @@ mod edge_back_tests {
         assert_eq!(rig.roots, 1, "…and the application heard it once");
         assert_eq!(d.nav.tabs.stack.depth(), 1, "the stack never moved");
     }
+}
+
+/// **An off-screen text walk**: `f` draws what is about to be shown through the recorder, which
+/// queues its strings (`plx_gfx::text::queue_prewarm`) and paints nothing. A raw screen clear
+/// bypasses `Painter::recording`, so none may reach the framebuffer, and the walk is speculative to
+/// the recorder (`rec::speculative`): a replay must not refuse on what it only warms.
+fn warm_walk<R>(f: impl FnOnce() -> R) -> R {
+    plx_gfx::gfx::without_frame_clear(|| super::rec::speculative(|| super::record_walk(f)))
 }
 
 /// Text preparation belongs to the visible frame, not each rendering of its blur source.

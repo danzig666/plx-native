@@ -36,7 +36,7 @@
 //! assignment. `subtitle_offsets` is the other tenant of the door and is declared the same way
 //! ([`SubtitleOffsetsPref`]).
 use super::{
-    MarkerSkipMode, DolbyVisionMode, InstantDpadSeeking, DeckPress, DirectPlayMode, HdrOverlayBrightness, LastLibrary, LibraryViews, NativeAudioRefusal, NextEpisodeMode, OpaqueExtensions,
+    MarkerSkipMode, DolbyVisionMode, InstantDpadSeeking, UriEngine, DeckPress, DirectPlayMode, HdrOverlayBrightness, LastLibrary, LibraryViews, NativeAudioRefusal, NextEpisodeMode, OpaqueExtensions,
     PlaintextConsent, HoldHintTaught, PlaybackQuality, ServerKeyPin, Session, SkipInterval, SubtitleOffsetEntry, SubtitleOffsets, SubtitlePosition,
     SubtitleSize, SubtitleTone, UiResolution, UnderPosters,
 };
@@ -125,6 +125,9 @@ pub struct Preferences {
     /// Hidden-HUD D-pad jumps; off by default.
     #[serde(default, deserialize_with = "de_soft_instant_dpad_seeking", skip_serializing_if = "InstantDpadSeeking::is_default")]
     pub instant_dpad_seeking: InstantDpadSeeking,
+    /// Opt-in to the URI engine (`On`); `Off` by default, the Feed engine every build had.
+    #[serde(default, deserialize_with = "de_soft_uri_engine", skip_serializing_if = "UriEngine::is_default")]
+    pub uri_engine: UriEngine,
     /// Dolby Vision override (`Auto` or `Off`); `Auto` by default.
     #[serde(default, deserialize_with = "de_soft_dolby_vision_mode", skip_serializing_if = "DolbyVisionMode::is_default")]
     pub dolby_vision_mode: DolbyVisionMode,
@@ -141,7 +144,7 @@ pub struct Preferences {
     pub deck_press: DeckPress,
     /// **What sits under the focused poster** — see [`UnderPosters`]. A frozen fallback like
     /// [`Preferences::deck_press`]: each profile keeps its own pick in `profile_prefs`. Absence is no
-    /// title and the year and length. Skipped at the default so a session predating this field —
+    /// title, the year and length of a movie and the year and seasons of a show. Skipped at the default so a session predating this field —
     /// committed replay fixtures included — serializes exactly as it did before.
     #[serde(default, deserialize_with = "de_soft_under_posters", skip_serializing_if = "is_default_under_posters")]
     pub under_posters: UnderPosters,
@@ -208,6 +211,11 @@ pub struct Preferences {
     /// has no mute, so this is also the only sound control.
     #[serde(default = "super::default_true", deserialize_with = "super::de_soft_bool_on")]
     pub trailer_autoplay: bool,
+    /// **Show the estimated local finish time beside the remaining clock.** The top-level value
+    /// is the frozen install fallback; profiles keep their own value in `profile_prefs`. `None`
+    /// means this build has never supplied a fallback, so the feature defaults ON.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_soft_opt")]
+    pub hud_end_time: Option<bool>,
     /// **Retired: nothing reads or writes it any more.** It was the last hero `UltraBlurColors`
     /// envelope Home rendered, which seeded the first-run routes' frozen ground; those routes now
     /// paint the authored default ambient (`theme::ROUTE_GROUND_FALLBACK`), because a hero-keyed
@@ -522,6 +530,8 @@ setting!(NextEpisodeModePref: NextEpisodeMode = next_episode_mode, "next_episode
     account false, live true, settings Some(SettingsWrite::Confirm), parse Soft);
 setting!(InstantDpadSeekingPref: InstantDpadSeeking = instant_dpad_seeking, "instant_dpad_seeking", Profile fallback LegacyInstallKey,
     account false, live true, settings Some(SettingsWrite::Confirm), parse Soft);
+setting!(UriEnginePref: UriEngine = uri_engine, "uri_engine", Profile fallback LegacyInstallKey,
+    account false, live true, settings Some(SettingsWrite::Confirm), parse Soft);
 setting!(IntroSkipPref: MarkerSkipMode = intro_skip, "intro_skip", Profile fallback LegacyInstallKey,
     account false, live true, settings Some(SettingsWrite::Confirm), parse Soft);
 setting!(CreditsSkipPref: MarkerSkipMode = credits_skip, "credits_skip", Profile fallback LegacyInstallKey,
@@ -564,6 +574,26 @@ impl Row for HudSelectionPref {
 // section saves it through the `choose` door (Confirm), and `player::preview::enabled` reads its cell every frame.
 setting!(TrailerAutoplayPref: bool = trailer_autoplay, "trailer_autoplay", Profile fallback LegacyInstallKey,
     account false, live true, settings Some(SettingsWrite::Confirm), parse BoolOn);
+
+/// Estimated playback end time in the player HUD. `None` on disk means the default, ON.
+pub struct HudEndTimePref;
+impl Row for HudEndTimePref {
+    const KEY: &'static str = "hud_end_time";
+    const SCOPE: Scope = Scope::Profile;
+    const ACCOUNT_BOUND: bool = false;
+    const LIVE: bool = true;
+    const SETTINGS: Option<SettingsWrite> = Some(SettingsWrite::Confirm);
+    const PARSE: Parse = Parse::OptionalSoft;
+    const FALLBACK: Fallback = Fallback::LegacyInstallKey;
+}
+impl Setting for HudEndTimePref {
+    type Stored = Option<bool>;
+    type Value = bool;
+    fn stored(p: &Preferences) -> &Option<bool> { &p.hud_end_time }
+    fn stored_mut(p: &mut Preferences) -> &mut Option<bool> { &mut p.hud_end_time }
+    fn get(p: &Preferences) -> bool { p.hud_end_time.unwrap_or(true) }
+    fn to_stored(v: bool) -> Option<bool> { Some(v) }
+}
 
 // ---- A5: the remaining preference keys (a separate block, below the ten) -----------------------
 //
@@ -658,6 +688,7 @@ pub const DESCRIPTORS: &[Descriptor] = &[
     Descriptor::of::<NextEpisodeModePref>(),
     Descriptor::of::<SkipIntervalPref>(),
     Descriptor::of::<InstantDpadSeekingPref>(),
+    Descriptor::of::<UriEnginePref>(),
     Descriptor::of::<DolbyVisionModePref>(),
     Descriptor::of::<IntroSkipPref>(),
     Descriptor::of::<CreditsSkipPref>(),
@@ -668,6 +699,7 @@ pub const DESCRIPTORS: &[Descriptor] = &[
     // A5: the remaining keys.
     Descriptor::of::<AutoSignInPref>(),
     Descriptor::of::<TrailerAutoplayPref>(),
+    Descriptor::of::<HudEndTimePref>(),
     Descriptor::of::<LastHeroBlurPref>(),
     Descriptor::of::<UiResolutionPref>(),
     Descriptor::of::<HoldHintTaughtPref>(),
@@ -1375,6 +1407,17 @@ where
         return Ok(InstantDpadSeeking::default());
     };
     Ok(serde_json::from_value::<InstantDpadSeeking>(v).unwrap_or_default())
+}
+
+/// The playback engine is a preference too: a spelling this build does not know degrades to Off.
+fn de_soft_uri_engine<'de, D>(d: D) -> Result<UriEngine, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Ok(v) = serde_json::Value::deserialize(d) else {
+        return Ok(UriEngine::default());
+    };
+    Ok(serde_json::from_value::<UriEngine>(v).unwrap_or_default())
 }
 
 /// Dolby Vision mode is a preference too: a spelling this build does not know degrades to Auto.

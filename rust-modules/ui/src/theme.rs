@@ -220,7 +220,8 @@ pub mod layout {
 pub mod hero {
     /// Both full-bleed heroes use the same reading column in the proposal.
     pub const TEXT_W: f32 = 943.0;
-    /// Edition, kind, genres and content rating in both heroes: regular 24 px, as in the PDF.
+    /// Edition, kind, genres and content rating on the Detail hero: regular 24 px, as in the PDF.
+    /// Home's hero draws no identity line (board CW-13 v2).
     pub const IDENTITY_SIZE: i32 = super::size::CAPTION;
     /// Long titles without a clearLogo wrap over at most two DISPLAY lines.
     pub const TITLE_LINES: usize = 2;
@@ -230,15 +231,88 @@ pub mod hero {
 
     /// Minimum Play/Resume capsule; translated labels may grow beyond it.
     pub const PLAY_MIN_W: f32 = 224.0;
-    /// Atmospheric midpoint, 62% of the distance from the 34% origin to the foot.
-    pub const SCRIM_MID_Y: f32 = (0.34 + (1.0 - 0.34) * 0.62) * crate::consts::SCR_H;
-    /// People-column corner weight: four wrapped credit lines retain the 2.5:1 pure-white
-    /// contrast floor under the lighter atmosphere; its feather starts higher for the raised credits.
-    pub const SCRIM_RIGHT_A: f32 = 0.78;
-    /// Opacity at the atmospheric midpoint. The corner wedges supply local contrast.
-    pub const SCRIM_MID_A: f32 = 0.55;
+    /// Detail's lower shade reaches the credits at this knee.
+    pub const SCRIM_MID_Y: f32 = 650.0;
+    /// Opacity at the atmospheric midpoint. The shade ([`super::shade`]) supplies local contrast.
+    pub const SCRIM_MID_A: f32 = 0.66;
     /// Opacity at the foot: retain the artwork's colour under the action row.
     pub const SCRIM_FOOT_A: f32 = 0.86;
+
+    // ---- Home's hero (owner's board CW-13, v2). Detail's ladder and scrim are NOT these. ----
+
+    /// Top of Home's action row: Play, the Watchlist disc, Info (the pager follows Info on the row's
+    /// centre line). Everything above it on Home is one ladder that grows up from this
+    /// line (`landing_hero::home_rows`).
+    pub const HOME_ACTIONS_Y: f32 = 668.0;
+    /// The Home pager recedes as the Continue Watching shelf gains focus.
+    pub const HOME_PAGER_SHELF_ALPHA: f32 = 0.85;
+    /// The block above the action row (the hero's one line: an episode label, a resumed movie's
+    /// time left, or an introduced hero's premise) ends this far above [`HOME_ACTIONS_Y`]: 638, the
+    /// board's own number (it is not a rung of `space`).
+    pub const HOME_ACTIONS_GAP: f32 = 30.0;
+    /// The title's foot stands this far above the block under it.
+    pub const HOME_TITLE_GAP: f32 = super::space::SM;
+    /// Home's premise (the first sentence of a summary, `landing_hero::first_sentence`) wraps to this
+    /// column, narrower than the shared [`TEXT_W`] reading column.
+    pub const HOME_SYNOPSIS_W: f32 = 700.0;
+    /// ...and to at most this many lines (a third would climb into the title's band).
+    pub const HOME_SYNOPSIS_LINES: usize = 2;
+}
+
+/// Shared ink and geometry for the continuous Home and Detail edge fields and Catalog's
+/// feathered content blocks. Both field types use `gfx::scrim::GroundShade`.
+pub mod shade {
+    /// Detail needs legibility farther into the art for its wider title and synopsis.
+    pub const DETAIL_SIDE_X: [f32; 2] = [600.0, 1700.0];
+    /// Normal vertical entrance of the Detail shade.
+    pub const DETAIL_SIDE_Y: [f32; 2] = [120.0, 400.0];
+    /// Shift the fade upward as the preview logo travels into the corner.
+    pub const DETAIL_PREVIEW_RISE: f32 = 260.0;
+    /// Full-width top fade behind the compact preview title and the full-screen hint.
+    pub const DETAIL_PREVIEW_TOP_Y: [f32; 2] = [20.0, 245.0];
+    pub const DETAIL_PREVIEW_TOP_A: f32 = 0.45;
+    /// Top and knee of the preview's bottom ramp, below the gap and behind the first lines of copy.
+    pub const DETAIL_PREVIEW_FOOT_Y: [f32; 2] = [520.0, 630.0];
+    /// Detail's edge shade strength before the preview boost.
+    pub const DETAIL_SIDE_A: f32 = 0.65;
+    /// Inactive pagination dots still need contrast against the art.
+    pub const PAGER_IDLE_A: f32 = 0.50;
+
+    /// Home starts feathering inside the copy column and keeps its right edge legible.
+    pub const HOME_SIDE_X: [f32; 2] = [850.0, 1650.0];
+    /// Where the edge shade begins and reaches full strength down the screen.
+    pub const HOME_SIDE_Y: [f32; 2] = [110.0, 405.0];
+    /// Strength at the left under the logo, metadata and actions.
+    pub const HOME_SIDE_A: f32 = 0.59;
+    /// Opacity difference over which the side and shelf shades softly join.
+    pub const EDGE_JOIN: f32 = 0.10;
+
+    /// How far a block's darkness falls away beyond the edge of the content's rounded box, in px:
+    /// it holds its full alpha inside the box and reaches exactly nothing this far out (a smoothstep,
+    /// so neither end has a visible edge). Generous on purpose: the shade should read as a soft
+    /// weather behind the copy, never as a plate with an outline.
+    pub const FEATHER: f32 = 140.0;
+    /// The corner radius of the box the shade holds its full alpha inside, in px.
+    pub const RADIUS: f32 = 32.0;
+    /// How far that box stands out past the content's own rect on every side, in px, so a glyph at
+    /// the content's edge still sits inside the held alpha, never on the feather.
+    pub const PAD: f32 = 24.0;
+    /// The darkness held behind copy and a logo or typed title (text over an unknown photograph):
+    /// the value `widgets_hero_scrim_tests`' legibility contract is graded at, on every line.
+    pub const COPY_A: f32 = 0.60;
+    /// The darkness held behind the action row: its pills carry their own glass, so the shade only
+    /// settles the ground the discs and the pager stand on.
+    pub const CONTROLS_A: f32 = 0.45;
+    /// **The shelf fade's foot**: how dark the hero photograph is held at the Continue Watching
+    /// row's caption line (`landing_hero::shelf_fade`), as a fraction of [`SCRIM_INK`]. Near-black on
+    /// purpose, 0.93 (the board asks for 0.92 to 0.95): the captions are small secondary-ink type
+    /// standing straight on the backdrop with no plate behind them, and a bright rock behind a bar
+    /// or a "5m left" competes with them at any lower value.
+    pub const SHELF_FOOT_A: f32 = 0.93;
+    /// The shelf fade's darkness at the tiles' own mid-line, the knee of its two segments: the ease
+    /// in. Low on purpose, so the fade starts at the tiles' top without a visible edge and does its
+    /// work in the lower half of the tiles, where the captions are.
+    pub const SHELF_MID_A: f32 = 0.25;
 }
 
 /// Shared logo presence: target bounding-box area, with independent width/height limits.
@@ -260,6 +334,19 @@ pub mod logo {
     pub const COMPACT_W_MAX: f32 = HERO_W_MAX * COMPACT_BAND_H / HERO_BAND_H;
     /// The compact strip's overscan and following content use this height limit too.
     pub const COMPACT_H_MAX: f32 = 72.0;
+    /// The Continue Watching deck card's logo (`card_art::compose`'s baked composite, 420x236). The
+    /// area is chosen so an ordinary wordmark lands where the covers Plex bakes put theirs (a 5.7:1
+    /// mark 232x41, a 6.7:1 one 253x38, a 3.7:1 one 189x51); tall marks clamp at [`CARD_H_MAX`].
+    pub const CARD_AREA: f32 = 9_600.0;
+    /// The card's logo slot is this tall, and no mark is taller.
+    pub const CARD_BAND_H: f32 = CARD_H_MAX;
+    /// Tall and square marks stop here instead of growing into the card's subject.
+    pub const CARD_H_MAX: f32 = 56.0;
+    /// Wide wordmarks stop here, well inside the 420 px card.
+    pub const CARD_W_MAX: f32 = 270.0;
+    /// The logo's BOTTOM edge sits this far above the card's bottom edge: 12 px clear of the 24 px
+    /// footer text line that rides 12 px above the card bottom.
+    pub const CARD_BOTTOM_INSET: f32 = 48.0;
 }
 
 // ── Accent / control ─────────────────────────────────────────────────────────
@@ -687,14 +774,8 @@ pub const SCRIM_BLACK_INK: [f32; 3] = [BLACK[0], BLACK[1], BLACK[2]];
 ///
 /// MEASURED, not chosen. The panel is plain 888 with no sRGB framebuffer anywhere in the tree, so a
 /// token value IS an sRGB code and GL's blend is a straight lerp in that space — which makes the
-/// whole derivation arithmetic. It lives on [`crate::widgets::hero_scrim`] and is asserted by
-/// that component's anchor table, so brightening a text token and re-deriving this stay one edit.
-/// The binding case is a `TEXT_SECONDARY` BODY line where the hero's bottom-up ramp supplies only
-/// ~0.29: it needs 0.655 total, so the wedge must carry ~0.51 there and rather more at the title.
-///
-/// The wider, two-line fallback can end at x=1039 above the atmospheric ramp. Its corner
-/// treatment peaks at .84 across the full frame width to preserve the bright-art and pure-white
-/// contrast floors. The treatment's geometry and these floors are pinned together by the tests.
+/// whole derivation arithmetic. Home and Detail grade their continuous fields separately in
+/// `widgets_hero_shade_tests` and `widgets_hero_scrim_tests`.
 pub const SCRIM_TEXT_A: f32 = 0.84;
 
 /// **White overlay at alpha `a`** — the ramp every overlay on this palette rides.
@@ -889,6 +970,24 @@ pub const ROW_VALUE_INK_ON_DIM: [f32; 4] = with_a(ACCENT_INK, 0.38);
 /// label; a read-out at the live row's ink made the row look half-available. That same ink
 /// quietened, as [`TEXT_SEPARATOR`] is, rather than a grey of its own.
 pub const ROW_VALUE_INK_DIM: [f32; 4] = with_a(TEXT_TERTIARY, 0.45);
+
+/// **The DISABLED control state, as one value** — what a table row that is present but cannot be
+/// used wears ([`crate::table::Row::disabled`]):
+///
+/// * `label` — the name off the pill: [`TEXT_TERTIARY`], the dim row's label rung.
+/// * `value` — the read-out beside it (a row's value): [`ROW_VALUE_INK_DIM`], the label's ink
+///   quietened one step.
+///
+/// A poster tile is not a control and never wears it (the Under posters picture dims by
+/// [`crate::follow_copy::DIM`] instead).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Disabled {
+    pub label: [f32; 4],
+    pub value: [f32; 4],
+}
+
+/// The one disabled state.
+pub const DISABLED: Disabled = Disabled { label: TEXT_TERTIARY, value: ROW_VALUE_INK_DIM };
 
 // ── The watched TICK on artwork (the tile's one state mark) ──────────────────
 /// The tick's ink: `COOL_0`, the same near-white a title is set in. **No disc, no plate** — the
@@ -1278,6 +1377,26 @@ pub const CARD_RING_RAD: f32 = 14.0;
 /// (1.07): on a 420×236 still that overlaps the neighbouring slot, and 1.04 reads as a lift rather
 /// than a zoom.
 pub const EP_CARD_FOCUS_SCALE: f32 = 1.04;
+
+/// Corner radius of the Continue Watching row's landscape tile (the handoff's `still-radius`); the
+/// tile's size and gap are the episode strip's own ([`crate::card_row::RowStyle::EPISODE`]).
+pub const STILL_RADIUS: f32 = 12.0;
+
+/// The gap between two Continue Watching stills (owner's board CW-13 v2: pitch 460 with the 420 tile).
+/// The Detail episode strip keeps [`crate::card_row::RowStyle::EPISODE`]'s 28.
+pub const STILL_GAP: f32 = 40.0;
+
+/// The Continue Watching footer line's top stands this far under the tile's foot (the board's 244 for
+/// a 236 tile): the line is OFF the art, which carries no scrim and keeps four rounded corners.
+pub const STILL_FOOTER_DROP: f32 = 8.0;
+
+/// Gap from the Continue Watching footer to the next shelf's heading. The two shelves can
+/// share the viewport with the first heading clear of the nav and the second caption in overscan.
+pub const STILL_FOOTER_AIR: f32 = space::LG * 0.5;
+
+/// Baseline rise for the stills heading. Leave room for the shared live focus lift to raise it
+/// farther when a nearby card grows.
+pub const STILL_HEADING_RISE: f32 = space::XS * 0.25;
 
 /// How far the focused episode still rises, in px, at full focus — with [`EP_CARD_FOCUS_SCALE`] it
 /// separates the focused card from the row instead of merely enlarging it in place.

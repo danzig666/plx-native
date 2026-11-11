@@ -4,7 +4,9 @@
 //! minute. Its one caller is the LOOP, which publishes the answer once per iteration
 //! (`run::publish_frame` -> `Bridge::publish_today`); a screen that words a date ("Today",
 //! "Yesterday") RECEIVES it as `AppViews::today` (`LibraryLike::today`) and reads no clock, the way
-//! a frame's time arrives on a `Tick`. `now()` reads `SDL_GetTicks` — the only call site of it in `app/`
+//! a frame's time arrives on a `Tick`. `unix_ms()` is the playback estimate's wall-clock input: it
+//! samples the platform at most every five seconds and advances from monotonic frame ticks. `now()` reads
+//! `SDL_GetTicks` — the only call site of it in `app/`
 //! (the §15.2 gate: `SDL_GetTicks(` only in the clock and the instruments) — unless a replay has
 //! set the frame's recorded tick, in which case every read in the frame answers that tick: the
 //! ingest stamp, each press arm, the HUD linger, a script delay.
@@ -36,28 +38,11 @@ thread_local! {
     static REPLAY: Cell<Option<u32>> = const { Cell::new(None) };
     /// The last read of the platform's calendar date and the minute (of the frame clock) it was read in.
     static TODAY: Cell<Option<(u32, Option<[i32; 3]>)>> = const { Cell::new(None) };
-    /// The last read of the platform's time of day and the second (of the frame clock) it was read in.
-    static TIME: Cell<Option<(u32, Option<plx_base::wallclock::WallTime>)>> = const { Cell::new(None) };
-}
-
-/// The time of day every replay frame answers, for the same reason as [`REPLAY_DATE`].
-pub(crate) const REPLAY_TIME: plx_base::wallclock::WallTime = plx_base::wallclock::WallTime { hour: 12, minute: 0 };
-
-/// **The time of day now** in the OS time zone, for the player's corner clock: read from the platform
-/// at most once a second of the frame clock ([`now`]), so a new minute shows within a second.
-/// [`REPLAY_TIME`] under a replay. Like [`today`], only the loop calls it and publishes the answer
-/// (`Bridge::publish_wall_clock`); a screen reads it from its views.
-pub(crate) fn time_of_day() -> Option<plx_base::wallclock::WallTime> {
-    if REPLAY.with(|c| c.get()).is_some() {
-        return Some(REPLAY_TIME);
-    }
-    let second = now() / 1_000;
-    if let Some((at, time)) = TIME.with(|c| c.get()) {
-        if at == second { return time; }
-    }
-    let time = plx_platform::i18n::local_time_of_day();
-    TIME.with(|c| c.set(Some((second, time))));
-    time
+    /// A wall-clock Unix sample and its monotonic frame tick; advanced between five-second refreshes.
+    static UNIX: Cell<Option<(u32, Option<i64>)>> = const { Cell::new(None) };
+    static LOCAL_END: Cell<Option<(i64, Option<[i32; 2]>)>> = const { Cell::new(None) };
+    /// The wall-clock minute (Unix seconds / 60) the corner clock last converted, and its answer.
+    static TIME: Cell<Option<(i64, Option<plx_base::wallclock::WallTime>)>> = const { Cell::new(None) };
 }
 
 /// The date every replay frame answers: a recording has no calendar of its own, and a fixed one keeps
@@ -78,6 +63,69 @@ pub(crate) fn now() -> u32 {
 /// ([`REPLAY_DATE`]).
 pub(crate) fn set_replay(ms: u32) {
     REPLAY.with(|c| c.set(Some(ms)));
+    UNIX.with(|c| c.set(None));
+}
+
+/// Unix wall-clock milliseconds for live player estimates. Replays deliberately have no wall clock:
+/// inventing today's date for a historical frame would make the HUD nondeterministic. The platform
+/// clock is sampled at most every five seconds and advanced with monotonic frame ticks between samples.
+pub(crate) fn unix_ms() -> Option<i64> {
+    if REPLAY.with(|c| c.get().is_some()) {
+        UNIX.with(|c| c.set(None));
+        return None;
+    }
+    let tick = now();
+    if let Some((at, sampled)) = UNIX.with(|c| c.get()) {
+        if let Some(current) = advance_unix_ms(at, sampled, tick) {
+            return current;
+        }
+    }
+    LOCAL_END.with(|c| c.set(None));
+    let sampled = plx_platform::i18n::unix_timestamp_ms();
+    UNIX.with(|c| c.set(Some((tick, sampled))));
+    sampled
+}
+
+/// Cache timezone conversion until the projected second changes or the wall clock is refreshed.
+pub(crate) fn local_end_time(seconds: i64) -> Option<[i32; 2]> {
+    LOCAL_END.with(|cache| {
+        if let Some((_, local)) = cache.get().filter(|(cached, _)| *cached == seconds) {
+            return local;
+        }
+        let local = plx_platform::i18n::local_clock_time(seconds);
+        cache.set(Some((seconds, local)));
+        local
+    })
+}
+
+/// **The time of day now** in the OS time zone, for the player's corner clock: [`unix_ms`] (so no
+/// wall clock under a replay, for the reason given there) converted by the platform's
+/// `local_clock_time` once per wall-clock minute. Like [`today`], only the loop calls it and
+/// publishes the answer (`Bridge::publish_wall_clock`); a screen reads it from its views.
+pub(crate) fn time_of_day() -> Option<plx_base::wallclock::WallTime> {
+    let minute = unix_ms()?.div_euclid(60_000);
+    if let Some((at, time)) = TIME.with(|c| c.get()) {
+        if at == minute { return time; }
+    }
+    let time = plx_platform::i18n::local_clock_time(minute.checked_mul(60)?).and_then(|[hour, minute]| {
+        let (hour, minute) = (u8::try_from(hour).ok()?, u8::try_from(minute).ok()?);
+        (hour < 24 && minute < 60).then_some(plx_base::wallclock::WallTime { hour, minute })
+    });
+    TIME.with(|c| c.set(Some((minute, time))));
+    time
+}
+
+/// Advance a sampled wall-clock timestamp by monotonic frame time, or ask for a fresh sample once
+/// the cache is five seconds old. Wrapping subtraction keeps SDL's 32-bit tick rollover safe.
+fn advance_unix_ms(sampled_at: u32, sampled: Option<i64>, tick: u32) -> Option<Option<i64>> {
+    let elapsed_ms = tick.wrapping_sub(sampled_at);
+    if elapsed_ms >= 5_000 {
+        return None;
+    }
+    Some(match sampled {
+        Some(sampled) => Some(sampled.checked_add(i64::from(elapsed_ms))?),
+        None => None,
+    })
 }
 
 /// **Today's calendar date** in the OS time zone, `[year, month, day]`: read from the platform at
@@ -106,9 +154,9 @@ pub(crate) fn today() -> Option<[i32; 3]> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_replay_pins_the_time_of_day() {
+    fn a_replay_draws_no_corner_clock() {
         super::set_replay(4242);
-        assert_eq!(super::time_of_day(), Some(super::REPLAY_TIME), "a recording draws the same corner clock every run");
+        assert_eq!(super::time_of_day(), None, "a recording has no wall clock, so every run draws none");
         super::REPLAY.with(|c| c.set(None));
     }
 
@@ -117,6 +165,20 @@ mod tests {
         super::set_replay(4242);
         assert_eq!(super::now(), 4242);
         super::REPLAY.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn unix_wall_time_advances_from_a_monotonic_sample_and_expires() {
+        assert_eq!(super::advance_unix_ms(1_000, Some(10_000), 1_999), Some(Some(10_999)));
+        assert_eq!(super::advance_unix_ms(1_000, Some(10_000), 2_000), Some(Some(11_000)));
+        assert_eq!(super::advance_unix_ms(1_000, Some(10_000), 5_999), Some(Some(14_999)));
+        assert_eq!(super::advance_unix_ms(1_000, Some(10_000), 6_000), None);
+        assert_eq!(super::advance_unix_ms(1_000, None, 1_999), Some(None));
+        assert_eq!(
+            super::advance_unix_ms(u32::MAX - 10, Some(10_000), 5),
+            Some(Some(10_016)),
+            "the monotonic frame clock may wrap"
+        );
     }
 
     #[test]
@@ -162,6 +224,7 @@ mod tests {
         // A replay frame pins the date, whatever the wall clock says.
         super::set_replay(100);
         assert_eq!(super::today(), Some(super::REPLAY_DATE));
+        assert_eq!(super::unix_ms(), None, "a replay has no present-day wall-clock finish");
         super::REPLAY.with(|c| c.set(None));
         super::TODAY.with(|c| c.set(None));
     }

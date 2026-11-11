@@ -70,6 +70,8 @@ pub struct Row {
     /// `On`/`Off` — a row whose value is a word rather than a state ("English", "Title"). Wins over
     /// `toggle` if both are somehow set.
     pub value: Option<String>,
+    /// Sample value that reserves the trailing column even while its read-out is hidden.
+    value_slot: Option<String>,
     pub value_origin: Origin,
     /// Quieten the read-out a further step (the value is context rather than the point).
     pub value_dim: bool,
@@ -125,6 +127,7 @@ impl Row {
             checked: false,
             toggle: None,
             value: None,
+            value_slot: None,
             value_origin: Origin::default(),
             value_dim: false,
             ticon: None,
@@ -189,6 +192,10 @@ impl Row {
     /// Give this row a trailing read-out — see [`Row::value`].
     pub fn value(mut self, v: impl Into<String>) -> Self {
         self.value = Some(v.into());
+        self
+    }
+    pub fn value_slot(mut self, sample: impl Into<String>) -> Self {
+        self.value_slot = Some(sample.into());
         self
     }
     /// Quieten the read-out a step — see [`Row::value_dim`].
@@ -399,6 +406,44 @@ const BOARD_TRAIL_GAP: f32 = theme::space::SM;
 /// A section header's caps tracking in em (`--track-caps`, `.06em`), set on a
 /// [`TableView::board_metrics`] table only.
 const BOARD_CAPS_TRACK_EM: f32 = 0.06;
+/// [`BOARD_CAPS_TRACK_EM`] in px at the header size: the tracking a stand-alone caps label wears
+/// to read as a board section header (the Under posters picture's kind captions).
+pub const BOARD_CAPS_TRACK_PX: f32 = BOARD_CAPS_TRACK_EM * theme::size::CAPTION as f32;
+
+/// **A section header's caps, as one label** (the one draw a [`TableView`] section header and every
+/// stand-alone label that wants the same look share): `text` upper-cased with `to_uppercase` (a
+/// name can be any script), set at `CAPTION` with `tracking` px between characters, its cap top on
+/// `band`'s top, and elided to `budget_w` as it is drawn (tracking is width too).
+/// [`caps_band`] makes the band.
+pub fn draw_caps_label(p: Painter, band: Rect, text: &str, budget_w: f32, ink: [f32; 4], tracking: f32, measure: &dyn plx_machine::machine::Measure) {
+    draw_caps_label_aligned(p, band, text, budget_w, ink, tracking, HAlign::Left, measure);
+}
+
+/// [`draw_caps_label`] set `align`ed in `band` (a label centred over what it names: the Under
+/// posters picture's kind captions over their tiles).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_caps_label_aligned(p: Painter, band: Rect, text: &str, budget_w: f32, ink: [f32; 4], tracking: f32, align: HAlign, measure: &dyn plx_machine::machine::Measure) {
+    let hsz = theme::size::CAPTION;
+    let run = plx_gfx::text::elide_by(&text.to_uppercase(), budget_w, false, |t| {
+        measure.width_str(t, hsz, false) + plx_gfx::text::tracking_extra(t, tracking)
+    });
+    if let Ok(cs) = CString::new(run) {
+        Label::new(cs.as_ptr(), hsz, ink).tracking(tracking).h(align).v(VAlign::CapTop).draw(p, band);
+    }
+}
+
+/// The band [`draw_caps_label`] draws in: `w` wide, its top the caps' top, as tall as the caps
+/// (cap top to baseline).
+pub fn caps_band(x: f32, cap_top: f32, w: f32) -> Rect {
+    Rect::new(x, cap_top, w, caps_band_h())
+}
+
+/// The height of a caps label's ink, cap top to baseline: what a label above something takes.
+pub fn caps_band_h() -> f32 {
+    let (cap_top, baseline) = plx_gfx::text::text_cap_band(theme::size::CAPTION, 0);
+    baseline - cap_top
+}
+
 /// Extra air between a page title band and the hairline under it (owner, 2026-10-01: "a bigger gap
 /// under the title"): the title sits on its own, then the divider, then the rows.
 const TITLE_GAP: f32 = 12.0;
@@ -718,7 +763,7 @@ impl TableView {
     }
     /// A header's letter-spacing in px: none, or the board's `--track-caps`.
     fn header_tracking(&self) -> f32 {
-        if self.board { BOARD_CAPS_TRACK_EM * theme::size::CAPTION as f32 } else { 0.0 }
+        if self.board { BOARD_CAPS_TRACK_PX } else { 0.0 }
     }
     fn tall_row_h(&self) -> f32 {
         if self.tall {
@@ -1254,9 +1299,12 @@ impl TableView {
     /// hugged with [`fit::HUG_MARGIN`] (whole pixels), and the trailing value if it has one.
     fn row_runs(&self, row: &Row, measure: &dyn plx_machine::machine::Measure) -> (f32, Option<f32>) {
         let (size, bold) = self.label_style();
+        let value = row.readout().into_iter().chain(row.value_slot.as_deref())
+            .map(|v| measure.width_str(v, theme::size::LABEL, VALUE_BOLD != 0))
+            .reduce(f32::max);
         (
             (measure.width_str(&row.label, size, bold) * fit::HUG_MARGIN).ceil(),
-            row.readout().map(|v| measure.width_str(v, theme::size::LABEL, VALUE_BOLD != 0)),
+            value,
         )
     }
 
@@ -1701,15 +1749,7 @@ impl TableView {
                         baseline - cap_top,
                     );
                     let (header_w, accessory_w) = Self::header_columns(sec, frame.w, measure, 1.0);
-                    let header_text = plx_gfx::text::elide_by(&sec.header.to_uppercase(), header_w, false, |t| {
-                        measure.width_str(t, hsz, false) + plx_gfx::text::tracking_extra(t, tracking)
-                    });
-                    if let Ok(cs) = CString::new(header_text) {
-                        Label::new(cs.as_ptr(), hsz, self.header_ink)
-                            .tracking(tracking)
-                            .v(VAlign::CapTop)
-                            .draw(p, header_band);
-                    }
+                    draw_caps_label(p, header_band, &sec.header, header_w, self.header_ink, tracking, measure);
                     // trailing accessory, one rung down and on the header's own baseline. Elided,
                     // because it is the run that gives way (see `Section::accessory`).
                     if !sec.accessory.is_empty() {
@@ -1794,7 +1834,7 @@ impl TableView {
             };
             // a disabled row keeps its soft ink under the pill (the ghost): secondary, not near-black
             let base = if row.disabled {
-                on_pill(dimc, theme::TEXT_SECONDARY)
+                on_pill(theme::DISABLED.label, theme::TEXT_SECONDARY)
             } else {
                 on_pill(if row.dim { dimc } else { white }, ink)
             };
@@ -1968,7 +2008,7 @@ impl TableView {
             // while the badges sat on the title's line: right-aligned and row-centred, a chip now
             // occupies the sub-line's band too, and an unbounded sub-line would run under it.
             if !row.detail.is_empty() {
-                let sub = if row.disabled { dimc } else { on_pill(dimc, theme::scrim_black(0.6)) };
+                let sub = if row.disabled { theme::DISABLED.label } else { on_pill(dimc, theme::scrim_black(0.6)) };
                 let detail = plx_gfx::text::elide_by(&row.detail, text_w, false, |t| {
                     measure.width_str(t, theme::size::CAPTION, false)
                 });
@@ -2072,7 +2112,7 @@ fn chip_ground(row: &Row, cover: f32, ink: [f32; 4]) -> ([f32; 4], [f32; 4]) {
 /// [`theme::TEXT_TERTIARY`] under the ghost ([`Row::disabled`]).
 fn row_value_ink(row: &Row, focused: bool) -> [f32; 4] {
     if row.disabled {
-        return if focused { theme::TEXT_TERTIARY } else { theme::ROW_VALUE_INK_DIM };
+        return if focused { theme::DISABLED.label } else { theme::DISABLED.value };
     }
     match (focused, row.dim, row.value_dim) {
         (true, false, false) => theme::ROW_VALUE_INK_ON,
@@ -3115,6 +3155,36 @@ mod tests {
         let inset = board.header_cap_inset(m);
         assert!((10.0..12.0).contains(&inset), "cap top {inset} under the header band");
         assert!((board.header_tracking() - 1.44).abs() < 1e-4);
+    }
+
+    /// **A stand-alone caps label is the section header's own draw**: [`draw_caps_label`] is what the
+    /// table calls for a header, so a label drawn beside it (the Under posters picture's kind
+    /// captions) has the same text, size, weight, ink and measured width, and its band is as tall as
+    /// the caps.
+    #[test]
+    fn a_stand_alone_caps_label_is_the_section_headers_draw() {
+        let _serial = plx_base::testlock::serial();
+        let m = &plx_base::fontcov::advances::ShippedMeasure;
+        let mut t = TableView::new();
+        t.board_metrics(true);
+        t.set_sections(vec![Section::new("Libraries").row(Row::new("a"))], 0, false);
+        let frame = Rect::new(0.0, 0.0, 900.0, 300.0);
+        let header = crate::draw_census::capture_runs(|| t.draw(crate::Painter::recording(), frame, m))
+            .into_iter().find(|r| r.text == "LIBRARIES").expect("the header is painted upper-cased");
+        let band = caps_band(10.0, 20.0, 400.0);
+        let label = crate::draw_census::capture_runs(|| {
+            draw_caps_label(crate::Painter::recording(), band, "Libraries", band.w, t.header_ink, BOARD_CAPS_TRACK_PX, m);
+        }).into_iter().next().expect("the label is painted");
+        assert_eq!((&label.text, label.size, label.ink, label.bold, label.align), (&header.text, header.size, header.ink, header.bold, header.align));
+        assert!((label.at.w - header.at.w).abs() < 0.01, "one width: {} vs {}", label.at.w, header.at.w);
+        assert_eq!(BOARD_CAPS_TRACK_PX, t.header_tracking(), "the label is tracked as a board header is");
+        assert_eq!(band.h, caps_band_h());
+        assert!(band.h > 0.0 && band.h < theme::size::CAPTION as f32, "the caps' ink is shorter than the type size: {}", band.h);
+        // a budget narrower than the word elides it, tracking counted
+        let narrow = crate::draw_census::capture_runs(|| {
+            draw_caps_label(crate::Painter::recording(), band, "Libraries", 60.0, t.header_ink, BOARD_CAPS_TRACK_PX, m);
+        });
+        assert!(narrow[0].text.ends_with('\u{2026}'), "{:?}", narrow[0]);
     }
 
     /// **A board row's trailing run is a flex row of boxes `--space-sm` apart: the chevron's 26px

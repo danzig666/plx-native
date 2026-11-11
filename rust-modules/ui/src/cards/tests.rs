@@ -1748,7 +1748,7 @@ fn a_grid_restore_after_dormant_ticks_arrives_popped_and_a_deliberate_move_still
 fn left_lifted() -> Rig<Grid> {
     let mut r = Rig::<Grid>::new(4 * poster_grid::COLS);
     r.src.captioned = true;
-    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailsKind::YearLength)));
+    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT)));
     r.run(2);
     r.land_focus(100, By::Dir);
     r.run(200);
@@ -1786,7 +1786,7 @@ fn a_grid_that_returns_under_a_held_image_keeps_its_seat_lifted_and_its_caption_
         };
         if !covered {
             r.src.captioned = true;
-            r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailsKind::YearLength)));
+            r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT)));
         }
         r.sect.dormant(true);
         r.feed(ScreenEvent::Enter(Enter::Restored));
@@ -1963,7 +1963,7 @@ fn a_dormant_seats_caption_opens_with_its_lift_and_never_before_it() {
     let full = RowStyle::HOME.focus_scale;
     let mut r = Rig::<Grid>::new(4 * cols);
     r.src.captioned = true;
-    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailsKind::YearLength)));
+    r.sect.set_caption_policy(Some(crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT)));
     r.run(2);
     // the caption of card 0 on the frame the grid last drew
     let caption = |r: &Rig<Grid>| -> f32 {
@@ -2000,7 +2000,7 @@ fn a_dormant_seats_caption_opens_with_its_lift_and_never_before_it() {
 /// frame is painted before any tile.
 #[test]
 fn captions_are_painted_beneath_every_tile() {
-    let policy = crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailsKind::YearLength);
+    let policy = crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT);
     let mut r = Rig::<Grid>::new(4 * poster_grid::COLS);
     r.src.captioned = true;
     r.sect.set_caption_policy(Some(policy));
@@ -4039,6 +4039,27 @@ fn grid_header_press_dips_no_unindexed_member() {
     a_header_press_dips_no_unindexed_member::<Grid>();
 }
 
+/// **A held OK does not close what the pop opened.** `Tile::pop` is the card's pop spring as a
+/// 0..1 progress ([`super::pop_progress`]); the press dip multiplies the painted scale (1.09 x
+/// 0.918 is about 1.0, which `pop_factor` alone reads as "no pop") and must be taken back out for
+/// the pressed card, or the still footer's cue slot shuts at the moment of the press.
+#[test]
+fn a_pressed_cards_pop_progress_ignores_the_press_dip() {
+    let focus_scale = 1.09;
+    let view = FixtureView::default();
+    let src = Cards::new(vec![100, 101], false);
+    let key = FocusKey { entry: ENTRY, elem: 100 };
+    let popped = focus_scale;
+    for dip in [0.9, 0.918, 1.0] {
+        let cx = cx9_pressed(&view, 0, dip, Some(key), Some(key));
+        let s = super::press_scale(popped, 0, Some(0), &cx);
+        let p = super::pop_progress(s, 0, ENTRY, &src, &cx, focus_scale);
+        assert!((p - 1.0).abs() < 1e-4, "pressed at dip {dip}: the pop stays fully open, got {p}");
+        let other = super::pop_progress(1.0, 1, ENTRY, &src, &cx, focus_scale);
+        assert_eq!(other, 0.0, "a card the press does not own is untouched");
+    }
+}
+
 /// The focus read-out of a shelf that holds a slid window names the card by its place in the
 /// whole listing (`cdg`), not by its slot in the window (`cdi`): the two were the same number
 /// on every shelf once, and a reach graded on it could never pass the window length.
@@ -4919,15 +4940,15 @@ struct RowFrame {
 fn shape_captions(src: &mut Cards, policy: Option<crate::caption_policy::CaptionPolicy>) {
     src.captioned = true;
     if let Some(policy) = policy {
-        src.title_only = policy.details == crate::caption_policy::DetailsKind::None;
+        src.title_only = policy.details == crate::caption_policy::DetailParts::NONE;
         src.details_only = !policy.title;
     }
 }
 
 const BOTH_LINES: crate::caption_policy::CaptionPolicy =
-    crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailsKind::YearLength);
+    crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::MOVIE_DEFAULT);
 const TITLE_ONLY: crate::caption_policy::CaptionPolicy =
-    crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailsKind::None);
+    crate::caption_policy::CaptionPolicy::same(true, crate::caption_policy::DetailParts::NONE);
 
 /// A grid of `rows` rows of captioned cards under `policy`, focus seated on card 0 with its band open.
 fn captioned_grid(rows: usize, policy: Option<crate::caption_policy::CaptionPolicy>) -> Rig<Grid> {
@@ -5176,7 +5197,7 @@ fn a_shelf_told_nothing_about_the_heading_below_does_reach_it() {
 /// block: the room never holds a line's box, and a block folded over no lines is not a pass.
 #[test]
 fn a_shelf_with_a_band_of_zero_draws_no_caption_line() {
-    let none = crate::caption_policy::CaptionPolicy::same(false, crate::caption_policy::DetailsKind::None);
+    let none = crate::caption_policy::CaptionPolicy::same(false, crate::caption_policy::DetailParts::NONE);
     let mut a = Rig::<Shelf>::new(6);
     a.sect.set_caption_policy(Some(none));
     a.src.captioned = true;
@@ -5291,7 +5312,7 @@ fn a_down_hands_the_caption_over_from_the_key_frame_and_the_arrival_waits_for_it
 /// or a headshot row (Search's Episode and Person rows, Detail's Extras) reads it.
 #[test]
 fn a_shelf_reserves_and_reveals_the_band_its_caption_policy_asks_for() {
-    use crate::caption_policy::{band_h, CaptionPolicy, DetailsKind};
+    use crate::caption_policy::{band_h, CaptionPolicy, DetailPart, DetailParts};
     let settled_under_band = |policy: Option<CaptionPolicy>| {
         let mut r = Rig::<Shelf>::new(6);
         r.sect.set_caption_policy(policy);
@@ -5302,8 +5323,8 @@ fn a_shelf_reserves_and_reveals_the_band_its_caption_policy_asks_for() {
         let whole = r.src.label(0).revealed(r.sect.band_h(), r.sect.band_expand(), 0.0);
         (r.sect.under_band(), r.sect.band_h(), whole.lines().iter().flatten().map(|l| l.alpha).fold(1.0, f32::min))
     };
-    for (title, details, tall) in [(false, DetailsKind::None, 0.0), (false, DetailsKind::Genre, 80.0),
-        (true, DetailsKind::YearLength, 112.0), (true, DetailsKind::None, 80.0)] {
+    for (title, details, tall) in [(false, DetailParts::NONE, 0.0), (false, DetailParts::of(&[DetailPart::Genre]), 80.0),
+        (true, DetailParts::MOVIE_DEFAULT, 112.0), (true, DetailParts::NONE, 80.0)] {
         let policy = CaptionPolicy::same(title, details);
         let (under, h, reveal) = settled_under_band(Some(policy));
         assert_eq!(h, tall, "title {title}, details {details:?}: the shelf's band is the policy's");
@@ -5324,9 +5345,9 @@ fn a_shelf_reserves_and_reveals_the_band_its_caption_policy_asks_for() {
 /// reserves [`card_row::LEGACY_BAND_H`], not the stored setting's 80 / 40 px.
 #[test]
 fn a_grid_taken_off_the_policy_keeps_the_legacy_band() {
-    use crate::caption_policy::{band_h, CaptionPolicy, DetailsKind};
+    use crate::caption_policy::{band_h, CaptionPolicy, DetailParts};
     let mut r = Rig::<Grid>::new(2 * poster_grid::COLS);
-    let silent = CaptionPolicy::same(false, DetailsKind::None);
+    let silent = CaptionPolicy::same(false, DetailParts::NONE);
     r.sect.set_caption_policy(Some(silent));
     assert_eq!(r.sect.band_h(), band_h(&silent));
     r.sect.set_caption_policy(None);
@@ -5609,7 +5630,7 @@ fn a_shelf_holds_a_style_built_at_runtime() {
 #[test]
 fn default_shelf_composition_keeps_the_label_before_the_source_overlay() {
     let src = Cards::new(vec![1], false);
-    let tile = super::Tile { rect: Rect::new(100.0, 200.0, 200.0, 100.0), scale: 1.0, radius: 10.0, focused: true };
+    let tile = super::Tile { rect: Rect::new(100.0, 200.0, 200.0, 100.0), scale: 1.0, radius: 10.0, focused: true, pop: 0.0 };
     let label = TileLabel::default();
     let draws = crate::draw_census::capture(|| src.compose(Painter::recording(), 0, &tile, &FixtureMeasure,
         Some(&label), |_, given| {
@@ -5617,4 +5638,99 @@ fn default_shelf_composition_keeps_the_label_before_the_source_overlay() {
             crate::draw_census::note(7777, tile.rect);
         }));
     assert_eq!(draws.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), [7777, TILE_PAINTED]);
+}
+
+/// The Continue Watching stills row's heading stands higher over its cards than a poster shelf's:
+/// [`theme::STILL_HEADING_RISE`] belongs to the shared row style. The strip's pitch determines
+/// the card tops.
+#[test]
+fn the_stills_heading_stands_a_fixed_rise_higher_over_its_cards_than_a_posters() {
+    use crate::consts::{CARD_DY, TITLE_DY};
+    // The heading draws at `row_y - TITLE_DY - lift`, the cards at `row_y + CARD_DY`.
+    let over_cards = |style: RowStyle| CARD_DY + TITLE_DY + Shelf::new(ENTRY, style).heading_lift();
+    assert_eq!(over_cards(RowStyle::HOME), CARD_DY + TITLE_DY, "a poster shelf's heading stands at rest where it always did");
+    assert_eq!(
+        over_cards(RowStyle::STILL) - over_cards(RowStyle::HOME),
+        crate::theme::STILL_HEADING_RISE,
+        "the stills row's heading stands one named rise higher, at rest, before any tile has focus"
+    );
+    assert_eq!(
+        RowStyle::STILL.pitch_fixed(),
+        RowStyle::EPISODE.pitch_fixed() + crate::still_footer::FOOTER_UNDER_TILE,
+        "the rise moves the heading, never the cards under it: the row's pitch is the strip's plus the footer line that stands under the tile"
+    );
+}
+
+/// **The Continue Watching row's geometry on the owner's CW-13 v2 board**: the tiles stand 40 px
+/// apart (a 460 px pitch for a 420 px tile) where the detail episode strip keeps its 28. The footer
+/// line stands below the art and the next heading leaves the shared footer gap.
+#[test]
+fn the_stills_row_is_spaced_40_apart_and_its_footer_stands_below_the_art() {
+    use crate::consts::{CARD_DY, PEEK_Y, TITLE_DY};
+    assert_eq!(RowStyle::STILL.gap, 40.0);
+    assert_eq!(RowStyle::EPISODE.gap, 28.0, "the detail episode strip keeps its own gap");
+    assert_eq!(RowStyle::STILL.w + RowStyle::STILL.gap, 460.0);
+    assert_eq!(RowStyle::STILL.w, RowStyle::EPISODE.w, "the same tile, only the air between them differs");
+    assert_eq!(RowStyle::EPISODE.under_tile, 0.0);
+    assert_eq!(RowStyle::HOME.under_tile, 0.0, "a poster shelf spends nothing under its tiles");
+    assert_eq!(RowStyle::STILL.under_tile, crate::still_footer::FOOTER_UNDER_TILE);
+    // the tile top on the board's Home at rest is 768; the footer's foot is the line's top + 24
+    assert_eq!(PEEK_Y + CARD_DY, 768.0);
+    let foot = PEEK_Y + CARD_DY + RowStyle::STILL.h;
+    let footer_foot = foot + crate::theme::STILL_FOOTER_DROP + crate::still_footer::FOOTER_LINE_H;
+    // the heading of the NEXT shelf: one pitch under this row's own, `TITLE_DY` over its tiles
+    let pitch = RowStyle::STILL.pitch_fixed() + crate::card_row::LABEL_BAND_COLLAPSED;
+    let next_heading_y = (PEEK_Y + pitch) - TITLE_DY;
+    assert_eq!(next_heading_y - footer_foot, crate::theme::STILL_FOOTER_AIR, "the next heading clears the footer by the shared gap");
+}
+
+/// The rise and the focus lift do not stack: a focused tile's glow spills up to `heading_lift_max`,
+/// and a heading already standing higher than that has cleared it.
+#[test]
+fn the_stills_heading_never_stands_lower_than_its_rise_whatever_the_focus_lift() {
+    use crate::card_row::{heading_lift_max, heading_lift_of};
+    let sty = RowStyle::STILL;
+    let rise = crate::theme::STILL_HEADING_RISE;
+    let focused = heading_lift_max(&sty);
+    assert!(focused > rise);
+    assert_eq!(heading_lift_of(&sty, 0.0), rise);
+    assert_eq!(heading_lift_of(&sty, focused), focused);
+    assert_eq!(heading_lift_of(&RowStyle::HOME, 4.0), 4.0, "a poster shelf has no rise: its live lift stands");
+}
+
+/// **Focusing a tile never changes the spacing between tiles** (owner, 2026-11, the Continue Watching
+/// stills): with focus on card `i`, every OTHER card stands at its rest rect at every point of the pop,
+/// for the stills style as for a poster shelf; only the focused card grows, and at 1.09 a 420 px tile's
+/// ~19 px a side stays inside the gap (40 px on the stills row, 28 on the strip), so it never overlaps a neighbour.
+#[test]
+fn focusing_a_tile_moves_no_other_tile_at_any_pop_progress() {
+    for style in [RowStyle::STILL, RowStyle::HOME, RowStyle::EPISODE] {
+        let mut r = Rig::<Shelf> {
+            sect: Shelf::new(ENTRY, style),
+            src: Cards::new((0..8u32).map(|i| 100 + i).collect(), false),
+            view: FixtureView::default(),
+            focus: None,
+            press: 1.0,
+            pressed: None,
+            ms: 0,
+        };
+        r.run(2);
+        let rest: Vec<Rect> = (100..108u32).map(|e| Section::place(&r.sect, &r.cx(), &r.src, e, At::Drawn).expect("a card").rect).collect();
+        r.land_focus(102, By::Dir);
+        let (mut mid, mut frames) = (false, 0);
+        while frames < 120 {
+            r.run(1);
+            frames += 1;
+            let pop = r.scale(102).expect("the focused card");
+            mid |= pop > 1.02 && pop < style.focus_scale - 0.02;
+            for (k, e) in (100..108u32).enumerate().filter(|(_, e)| *e != 102) {
+                let now = Section::place(&r.sect, &r.cx(), &r.src, e, At::Drawn).expect("a card").rect;
+                assert_eq!((now.x, now.y, now.w, now.h), (rest[k].x, rest[k].y, rest[k].w, rest[k].h),
+                    "style w={} frame {frames} (pop {pop}): card {e} moved while 102 held focus", style.w);
+            }
+        }
+        assert!(mid, "the premise: the pop was sampled part-way (style w={})", style.w);
+        let popped = Section::place(&r.sect, &r.cx(), &r.src, 102, At::Drawn).expect("the focused card").rect;
+        assert!(popped.w > rest[2].w * 1.05, "the focused card did grow (style w={})", style.w);
+    }
 }

@@ -31,7 +31,7 @@ pub fn media_line(
         item.width,
         item.height,
         item.dovi.present,
-        plx_media::player::video_hdr(),
+        item.hdr,
         &plx_media::route::source_vcodec(ps),
         audio,
     )

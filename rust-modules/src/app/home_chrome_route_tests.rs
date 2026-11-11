@@ -10,7 +10,7 @@
 use super::*;
 use super::test_support::{Drawn, World};
 use super::under_posters_shelf_route_tests::{describe_cards, set, Cell};
-use plx_plex::plex::session::UnderPostersDetails as Details;
+use plx_plex::plex::session::UnderPostersLadder as Details;
 use plx_ui::widgets::{CHIP_FRAME, TAB_TRACK_PAD, TOP_BAR_BOTTOM, TOP_BAR_Y};
 use plx_ui::Rect;
 
@@ -171,6 +171,22 @@ fn present_home_stops(w: &mut World) {
     }).expect("Home is the top page");
     w.d.input.hit.fill(stops);
     w.d.input.hit.swap();
+}
+
+/// **One wheel notch is one directional step**, whatever its size: the notch becomes a single Down
+/// (away from you) or Up key, press and release, and never a run of them or a continuous scroll.
+#[test]
+fn one_wheel_notch_is_one_directional_step() {
+    use plx_machine::machine::{Edge, InputKind, Key};
+    for (dy, key) in [(-1, Key::Down), (-6, Key::Down), (1, Key::Up), (9, Key::Up)] {
+        let events = super::wheel_input(dy, super::test_support::tick(1));
+        let keys: Vec<_> = events.iter().filter_map(|e| match e.kind {
+            InputKind::Key { key, edge, .. } => Some((key, edge)),
+            _ => None,
+        }).collect();
+        assert_eq!(keys, [(key, Edge::Down), (key, Edge::Up)], "wheel {dy}: one press of one key");
+        assert_eq!(events.len(), 2, "wheel {dy}: nothing but that press");
+    }
 }
 
 /// **A Magic Remote user can reach the shelves either side of the one the page rests on.** The page

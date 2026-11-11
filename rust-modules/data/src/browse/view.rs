@@ -2,6 +2,10 @@
 //! a frame can keep this publication across page arrivals, re-queries and account resets.
 //! Source rosters and section hubs are separate publications, not implied by this view.
 
+#[cfg(test)]
+#[path = "view_roster_tests.rs"]
+mod roster_tests;
+
 use std::ops::Range;
 
 use super::{Arc, GenreEntry, SecFetch, SecItems, ServerId, SortEntry};
@@ -461,7 +465,7 @@ struct DirectoryData {
 pub struct DirectorySnapshot {
     preferred: [Option<usize>; 2],
     kind_fetch: [SecFetch; 2],
-    stamp: Option<(u32, u32, usize, usize)>,
+    stamp: Option<(u32, u32, usize, usize, ServerId)>,
     data: Arc<DirectoryData>,
     /// The current library's listing as it stands (an O(1) handle on its immutable pages), for a
     /// page that illustrates the library without being on it ([`DirectoryView::sample`]).
@@ -469,6 +473,9 @@ pub struct DirectorySnapshot {
     /// The first poster of each kind (movie, show) anywhere the Browse store holds rows, for a page
     /// that illustrates a kind without being on a library of it ([`DirectoryView::kind_poster`]).
     kind_posters: [Option<PosterAt>; 2],
+    /// Whether each kind's preferred library has had its shelves read and committed
+    /// ([`DirectoryView::kind_shelves_published`]).
+    kind_shelves: [bool; 2],
     source: Option<usize>,
     source_fetch: SecFetch,
     discovery: SecFetch,
@@ -561,6 +568,7 @@ impl Default for DirectorySnapshot {
             data: Arc::default(),
             items: super::SecItems::default(),
             kind_posters: [None, None],
+            kind_shelves: [false; 2],
             source: None,
             source_fetch: SecFetch::Loading,
             discovery: SecFetch::Loading,
@@ -572,12 +580,13 @@ impl Default for DirectorySnapshot {
 }
 
 impl DirectorySnapshot {
-    pub fn capture_from(&mut self, state: &mut super::BrowseState) {
+    pub fn capture_from(&mut self, state: &mut super::BrowseState, keys: &plx_plex::plex::ClientKeys) {
         let stamp = (
             state.table_epoch(),
             state.source_list_gen(),
             state.cur(),
             state.sources().len(),
+            keys.current(),
         );
         if self.stamp != Some(stamp) {
             self.data = Arc::new(DirectoryData {
@@ -594,8 +603,8 @@ impl DirectorySnapshot {
         }
         self.items = state.states().get(state.cur()).map(|section| section.items.clone()).unwrap_or_default();
         self.kind_posters = scan_kind_posters(state);
-        self.source = state.cur_source_idx();
-        self.source_fetch = state.cur_source_state();
+        self.source = state.cur_source_idx(keys.current());
+        self.source_fetch = state.cur_source_state(keys.current());
         self.discovery = state.discovery_state();
         self.refreshing = state.sources().iter().any(|source| source.reachable() && !source.sections_done);
         self.sections_gen = state.sections_gen();
@@ -603,6 +612,9 @@ impl DirectorySnapshot {
         for (i, kind) in [super::SecKind::Movie, super::SecKind::Show].into_iter().enumerate() {
             self.preferred[i] = state.tab_of_kind(kind).and_then(|tab| state.tab_section(tab));
             self.kind_fetch[i] = state.kind_state(kind);
+            self.kind_shelves[i] = self.preferred[i]
+                .and_then(|section| state.states().get(section))
+                .is_some_and(|st| st.hubs.is_published());
         }
     }
 
@@ -616,7 +628,7 @@ impl DirectorySnapshot {
         Self {
             preferred: [None; 2],
             kind_fetch: [fetch; 2],
-            stamp: Some((epoch, 0, 0, 1)),
+            stamp: Some((epoch, 0, 0, 1, sid)),
             data: Arc::new(DirectoryData {
                 sources: vec![(sid, source)],
                 sections: Vec::new(),
@@ -624,6 +636,7 @@ impl DirectorySnapshot {
             }),
             items: super::SecItems::default(),
             kind_posters: [None, None],
+            kind_shelves: [false; 2],
             source: Some(0),
             source_fetch: fetch,
             discovery: fetch,
@@ -631,6 +644,13 @@ impl DirectorySnapshot {
             sections_gen: 0,
             tabs_gen: 0,
         }
+    }
+
+    /// This directory with `kind`'s library's shelves read and committed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_kind_shelves_published(mut self, kind: super::SecKind) -> Self {
+        self.kind_shelves[if kind == super::SecKind::Show { 1 } else { 0 }] = true;
+        self
     }
 
     /// This directory with `items` as the current library's listing (what [`DirectoryView::sample`] reads).
@@ -689,7 +709,7 @@ impl DirectorySnapshot {
         Self {
             preferred,
             kind_fetch: [SecFetch::Ready; 2],
-            stamp: Some((epoch, 0, current, source_count)),
+            stamp: Some((epoch, 0, current, source_count, ServerId::UNSET)),
             data: Arc::new(DirectoryData {
                 sources,
                 sections,
@@ -697,6 +717,7 @@ impl DirectorySnapshot {
             }),
             items: super::SecItems::default(),
             kind_posters: [None, None],
+            kind_shelves: [false; 2],
             source: None,
             source_fetch: SecFetch::Ready,
             discovery: SecFetch::Ready,
@@ -744,6 +765,17 @@ impl<'a> DirectoryView<'a> {
     /// Reads what the store already holds and starts no fetch.
     pub fn kind_poster(self, kind: std::os::raw::c_int) -> Option<&'a PmsMovie> {
         self.0.kind_posters.get(kind_slot(kind)?)?.as_ref()?.get()
+    }
+    /// **Has the library a page would show for `kind` had its shelves read and committed?** True once
+    /// the store has published that library's hubs, even when they hold no title of the kind, so a
+    /// page that asked for the shelves to find a poster (Settings > Under posters) knows the answer
+    /// is in and stops asking. False while the read is out, staged or has failed, and for a kind with
+    /// no library.
+    pub fn kind_shelves_published(self, kind: super::SecKind) -> bool {
+        self.0.kind_shelves[match kind {
+            super::SecKind::Movie => 0,
+            super::SecKind::Show => 1,
+        }]
     }
     #[allow(dead_code)]
     pub fn source_list_gen(self) -> u32 { self.0.stamp.map_or(0, |stamp| stamp.1) }
@@ -874,17 +906,47 @@ mod tests {
             titled("Alpha", crate::pms::KIND_MOVIE, "/a"),
             titled("Episode", crate::pms::KIND_EPISODE, "/e"),
         ]);
+        // This projection test has a synthetic table and no registry current slot.
+        let mut keys = plx_plex::plex::ClientKeys::default();
+        keys.refill_roster(ServerId::UNSET, 0, 0,
+            state.sources().iter().map(|source| source.sid), |_| None, |_| None, |_| None);
         let mut snapshot = DirectorySnapshot::default();
-        snapshot.capture_from(&mut state);
+        snapshot.capture_from(&mut state, &keys);
         let title = |kind| snapshot.view().kind_poster(kind).map(|m| m.title.clone());
         assert_eq!(title(crate::pms::KIND_MOVIE).as_deref(), Some("Alpha"), "the first movie WITH a poster path");
         assert_eq!(title(crate::pms::KIND_SHOW), None, "nothing cached is a show: no art anywhere");
         assert_eq!(title(crate::pms::KIND_EPISODE), None, "only the two kinds a poster tile names");
         put(&mut state, other, vec![titled("Other film", crate::pms::KIND_MOVIE, "/o"), titled("Sitcom", crate::pms::KIND_SHOW, "/s")]);
-        snapshot.capture_from(&mut state);
+        snapshot.capture_from(&mut state, &keys);
         let title = |kind| snapshot.view().kind_poster(kind).map(|m| m.title.clone());
         assert_eq!(title(crate::pms::KIND_MOVIE).as_deref(), Some("Alpha"), "the current library still wins its kind");
         assert_eq!(title(crate::pms::KIND_SHOW).as_deref(), Some("Sitcom"), "the show comes from the other library's rows");
+    }
+
+    /// **A page waiting for a library's shelves can tell when the answer is in**: false until the
+    /// store has committed that library's hubs (staged is not published), then true, even when the
+    /// hubs hold nothing; and false for a kind with no library.
+    #[test]
+    fn kind_shelves_are_published_only_once_the_libraries_hubs_are_committed() {
+        let _g = plx_base::testlock::serial();
+        let mut state = super::super::BrowseState::default();
+        super::super::seed_two_source_table_for_owner_test(&mut state);
+        // This projection test has a synthetic table and no registry current slot.
+        let mut keys = plx_plex::plex::ClientKeys::default();
+        keys.refill_roster(ServerId::UNSET, 0, 0,
+            state.sources().iter().map(|source| source.sid), |_| None, |_| None, |_| None);
+        let mut snapshot = DirectorySnapshot::default();
+        snapshot.capture_from(&mut state, &keys);
+        let kind = [super::super::SecKind::Movie, super::super::SecKind::Show].into_iter()
+            .find(|kind| snapshot.view().preferred(*kind).is_some()).expect("the seeded table lists a library of some kind");
+        let section = snapshot.view().preferred(kind).unwrap();
+        assert!(!snapshot.view().kind_shelves_published(kind), "nothing read yet");
+        state.state_mut(section).unwrap().hubs.stage_for_test(Vec::new());
+        snapshot.capture_from(&mut state, &keys);
+        assert!(!snapshot.view().kind_shelves_published(kind), "a landed read is only staged");
+        state.state_mut(section).unwrap().hubs.commit_staged(true);
+        snapshot.capture_from(&mut state, &keys);
+        assert!(snapshot.view().kind_shelves_published(kind), "committed, even with no shelf in it");
     }
 
     use super::*;
@@ -933,10 +995,14 @@ mod tests {
         state.source_mut(0).unwrap().sid = ServerId::from_raw(0);
         state.source_mut(1).unwrap().sid = ServerId::from_raw(1);
         state.set_cur(0);
+        // Synthetic registry current is source 0; section selection may move independently.
+        let mut keys = plx_plex::plex::ClientKeys::default();
+        keys.refill_roster(ServerId::from_raw(0), 0, 0,
+            state.sources().iter().map(|source| source.sid), |_| None, |_| None, |_| None);
         let mut directory = DirectorySnapshot::default();
-        directory.capture_from(&mut state);
+        directory.capture_from(&mut state, &keys);
         let old = directory.clone();
-        directory.capture_from(&mut state);
+        directory.capture_from(&mut state, &keys);
         assert!(Arc::ptr_eq(&old.data, &directory.data));
         let view = old.view();
         assert_eq!(view.sections()[0].key, view.sections()[2].key);
@@ -944,7 +1010,7 @@ mod tests {
         assert_eq!(view.sources().len(), 2);
         assert_eq!(view.current(), Some(0));
         assert_eq!(view.source().unwrap().0, view.sections()[0].sid.unwrap());
-        assert_eq!(view.source_fetch(), state.cur_source_state());
+        assert_eq!(view.source_fetch(), state.cur_source_state(keys.current()));
         assert_eq!(view.discovery(), state.discovery_state());
         assert_eq!(
             view.rows_for(0).cloned().collect::<Vec<_>>(),
@@ -970,16 +1036,16 @@ mod tests {
         assert_eq!(view.rows_for(999).count(), 0);
         state.source_mut(0).unwrap().name = "Changed".into();
         state.bump_source_facts_gen();
-        directory.capture_from(&mut state);
+        directory.capture_from(&mut state, &keys);
         assert_eq!(directory.view().sources()[0].1.name, "Changed");
         assert_ne!(old.view().sources()[0].1.name, "Changed");
         state.set_cur(1);
-        directory.capture_from(&mut state);
+        directory.capture_from(&mut state, &keys);
         assert_eq!(directory.view().current(), Some(1));
         assert!(directory.view().sections()[1].row.current);
         assert!(!directory.view().sections()[0].row.current);
         state.reset();
-        directory.capture_from(&mut state);
+        directory.capture_from(&mut state, &keys);
         assert_ne!(directory.view().epoch(), old.view().epoch());
         assert!(directory.view().sections().is_empty());
         assert!(directory.view().current().is_none());

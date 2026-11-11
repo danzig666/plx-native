@@ -627,7 +627,7 @@ fn walk<H: Host>(
                         offer_drawn |= q.opacity() >= 0.5 && hit.w > 0.0 && hit.h > 0.0;
                     }
                 }
-                DrawOp::Playbar { track, fill, track_ink, clock_size, knob, clocks, mark, .. } => {
+                DrawOp::Playbar { track, fill, track_ink, clock_size, knob, clocks, mark, clock_rects, .. } => {
                     let mut live = Playbar::live(f.model, f.busy, f.focus, row.since_play_ms(f.now), f.now);
                     live.clock_grow = row.preview.motion.clock_grow(f.now);
                     // a cancelled scrub's knob returns to the playhead rather than jumping to it
@@ -641,6 +641,7 @@ fn walk<H: Host>(
                         knob: *knob,
                         clocks: *clocks,
                         mark: *mark,
+                        end_time_lane: clock_rects.end_time,
                     };
                     draw_playbar_look(q, live, look, f.measure);
                     bar = Some((live, *track));
@@ -1855,13 +1856,13 @@ mod tests {
             let slot = ControlSlot::Discs(Controls::NONE);
             let mut row = HudMotion::new();
             for _ in 0..20 {
-                row.step(slot, GROUP_SECTION, 1, 0.05, 1_000);
+                row.step(slot, GROUP_SECTION, 1, 0.05, 1_000, Some(true), false);
             }
             assert!(row.section_scale(1) > 1.0, "the focused section button pops: {}", row.section_scale(1));
             assert_eq!(row.section_scale(0), 1.0, "its sibling does not");
             assert_eq!(row.scale(1), 1.0, "and the control row's own springs are not the section's");
             for _ in 0..40 {
-                row.step(slot, GROUP_ROW, 1, 0.05, 1_000);
+                row.step(slot, GROUP_ROW, 1, 0.05, 1_000, Some(true), false);
             }
             assert_eq!(row.section_scale(1), 1.0, "focus moved off the section group: it settles");
         }
@@ -1874,7 +1875,7 @@ mod tests {
             let mut rest = HudMotion::new();
             let mut popped = HudMotion::new();
             for _ in 0..20 {
-                popped.step(slot, GROUP_SECTION, 0, 0.05, 1_000);
+                popped.step(slot, GROUP_SECTION, 0, 0.05, 1_000, Some(true), false);
             }
             let at_rest = info_frame_census(false, 0, GROUP_SECTION, 0, &mut rest);
             let lifted = info_frame_census(false, 0, GROUP_SECTION, 0, &mut popped);

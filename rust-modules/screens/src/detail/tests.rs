@@ -32,6 +32,13 @@ impl ScreenArg for TestArg {
 
 pub(super) struct TestHost;
 
+impl crate::registry::PlayerLike for TestHost {
+    fn session<'a>(_cx: &Cx<'a, Self>) -> &'a plx_media::route::PlaybackSession {
+        plx_media::route::idle_session_for_test()
+    }
+    fn transport_paused(_cx: &Cx<'_, Self>) -> bool { false }
+}
+
 impl Host for TestHost {
     type Arg = TestArg;
     type Fx = AppFx;
@@ -364,9 +371,9 @@ fn a_reconcile_owes_the_re_read_but_moves_neither_focus_nor_scroll() {
         let generation = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), sid, "show");
         {
             let (state, adapter) = test_store().split_for_test();
-            plx_data::metadata::land_detail_for_test(state, adapter, sid, "show", generation, Some(detail(sid, "show")));
+            plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, state, adapter, sid, "show", generation, Some(detail(sid, "show")));
         }
-        test_store().pump_detail();
+        test_store().pump_detail(&plx_plex::plex::ClientKeys::default(), false);
         let _ = step(&mut screen, &ScreenEvent::Tick(plx_machine::machine::Tick { ms: 16, dt_us: 16_667 }), Some(focus));
         assert_eq!(episode_key(&screen, 1, episodes::Row::Still), Some(focus), "the episode keeps its key ({phase:?})");
         assert_eq!(held(&screen), focus, "the landing leaves the focus where it was ({phase:?})");
@@ -396,9 +403,9 @@ fn a_reconcile_landing_holds_the_focus_on_an_episode_past_the_first_page() {
     let generation = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), sid, "show");
     {
         let (state, adapter) = test_store().split_for_test();
-        plx_data::metadata::land_detail_for_test(state, adapter, sid, "show", generation, Some(long_season(total, &[0])));
+        plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, state, adapter, sid, "show", generation, Some(long_season(total, &[0])));
     }
-    test_store().pump_detail();
+    test_store().pump_detail(&plx_plex::plex::ClientKeys::default(), false);
     screen.sync_keys(test_store().view());
     assert_eq!(episode_key(&screen, 70, episodes::Row::Still), Some(focus), "episode 70 keeps the key it had");
     assert_eq!(held(&screen), focus, "the landing left the focus on episode 70, not on the hero");
@@ -418,7 +425,7 @@ fn detail_enter_preserves_the_refresh_truth_table_without_focus_restoration() {
                     let generation = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), sid, "show");
                     if !loading {
                         let (__s, __a) = test_store().split_for_test();
-                        plx_data::metadata::land_detail_for_test(__s, __a, sid, "show", generation, None);
+                        plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, sid, "show", generation, None);
                     }
                     loading.then_some(generation)
                 });
@@ -452,13 +459,13 @@ fn detail_enter_preserves_the_refresh_truth_table_without_focus_restoration() {
                 // otherwise this matrix exhausts the production reservation budget itself.
                 if let Some(generation) = pending {
                     let (__s, __a) = test_store().split_for_test();
-                    plx_data::metadata::land_detail_for_test(__s, __a, sid, "show", generation, None);
+                    plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, sid, "show", generation, None);
                 }
                 if requests > 0 {
                     let (__s, __a) = test_store().split_for_test();
-                    plx_data::metadata::land_detail_for_test(__s, __a, sid, "show", generation + requests, None);
+                    plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, sid, "show", generation + requests, None);
                 }
-                test_store().pump_detail();
+                test_store().pump_detail(&plx_plex::plex::ClientKeys::default(), false);
             }
         }
     }
@@ -490,7 +497,7 @@ fn enter_restored_promotion_survives_a_stale_terminal_before_admission_t2() {
     let generation = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), ServerId::UNSET, "show");
     {
         let (__s, __a) = test_store().split_for_test();
-        plx_data::metadata::land_detail_for_test(__s, __a, ServerId::UNSET, "show", generation, None);
+        plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, ServerId::UNSET, "show", generation, None);
     }
     assert_eq!(test_store().view().detail_request_status(ServerId::UNSET, "show"), Some(false));
 
@@ -573,7 +580,7 @@ fn cancelled_focus_restoration_still_terminates_reconciliation_on_success_or_fai
         assert!(screen.restore_intent.is_none());
         assert_eq!(screen.refresh, DetailRefreshPhase::Requested);
         let (__s, __a) = test_store().split_for_test();
-        assert_eq!(plx_data::metadata::land_detail_for_test(__s, __a, sid, "show", generation,
+        assert_eq!(plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, __s, __a, sid, "show", generation,
             success.then(|| detail(sid, "show"))), success);
         step(&mut screen, &ScreenEvent::StoreChanged(StoreId::Metadata.ord(), generation), None);
         assert_eq!(screen.refresh, DetailRefreshPhase::None);
@@ -1098,7 +1105,7 @@ fn a_return_whose_re_read_fails_puts_the_page_back_at_the_top() {
     let generation = plx_data::metadata::begin_detail_for_test(test_store().adapter_ref(), sid, "show");
     {
         let (state, adapter) = test_store().split_for_test();
-        assert!(!plx_data::metadata::land_detail_for_test(state, adapter, sid, "show", generation, None));
+        assert!(!plx_data::metadata::land_detail_for_test(&plx_plex::plex::ClientKeys::default(), false, state, adapter, sid, "show", generation, None));
     }
     assert!(screen.detail(test_store().view()).is_none());
     pump_restore(&mut screen);
@@ -1332,7 +1339,7 @@ fn hero_focus_follows_its_control_when_the_set_grows_under_it() {
 }
 
 #[test]
-fn hero_focus_survives_a_control_appearing_in_the_middle_of_the_row() {
+fn hero_focus_stays_in_place_when_also_available_lands() {
     let before = hero::HeroSet { more: false,
         watchlist: true,
         go_show: false,
@@ -1353,13 +1360,13 @@ fn hero_focus_survives_a_control_appearing_in_the_middle_of_the_row() {
     let after_index = hero::watch_index(after).unwrap();
     assert_eq!(
         after_index,
-        before_index + 1,
-        "Alt was inserted before the tail"
+        before_index,
+        "the trailing Alt pill leaves the watched control in place"
     );
     assert_eq!(
         hero::ctl_at(before, before_index).unwrap().elem(),
         hero::ctl_at(after, after_index).unwrap().elem(),
-        "the engine key follows the watch control rather than its shifted position"
+        "the engine keeps the same watched control key"
     );
 }
 
@@ -1702,7 +1709,7 @@ fn preview_chrome_drives_the_below_hero_sections_to_zero_in_full_trailer_mode_an
     let mut now = 0u32;
     for _ in 0..300 {
         now += 16;
-        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, &mut sink, test_store().view());
+        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, None, false, &mut sink, test_store().view());
     }
     assert!(
         screen.preview_chrome < 0.01,
@@ -1715,7 +1722,7 @@ fn preview_chrome_drives_the_below_hero_sections_to_zero_in_full_trailer_mode_an
     screen.preview_promoted = false;
     for _ in 0..300 {
         now += 16;
-        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, &mut sink, test_store().view());
+        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, None, false, &mut sink, test_store().view());
     }
     assert!(
         screen.preview_chrome > 0.99,
@@ -1760,7 +1767,7 @@ fn background_autoplay_recedes_identity_and_ratings_but_holds_the_facts_row_and_
     let mut now = 0u32;
     for _ in 0..300 {
         now += 16;
-        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, &mut sink, test_store().view());
+        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, None, false, &mut sink, test_store().view());
     }
     assert!(
         screen.preview_prose < 0.01,
@@ -1782,7 +1789,7 @@ fn background_autoplay_recedes_identity_and_ratings_but_holds_the_facts_row_and_
     assert!(screen.full_trailer());
     for _ in 0..300 {
         now += 16;
-        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, &mut sink, test_store().view());
+        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, None, false, &mut sink, test_store().view());
     }
     assert!(
         screen.preview_chrome < 0.01,
@@ -1842,7 +1849,7 @@ fn preview_tick_does_not_read_the_session_file_every_frame() {
     let mut now = 0u32;
     for _ in 0..30 {
         now += 16;
-        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, &mut sink, test_store().view());
+        screen.preview_tick::<TestHost>(now, 0.016, hero_focus, None, false, &mut sink, test_store().view());
     }
     let reads = plx_plex::plex::session::reads_for_test();
     assert_eq!(
@@ -1888,7 +1895,7 @@ fn an_episode_page_leads_with_the_episodes_own_still() {
         ..Default::default()
     });
     let screen = bare(&_guard, sid, "episode");
-    assert_eq!(screen.art_identity(screen.detail(test_store().view())).2, "episode-still");
+    assert_eq!(screen.art_identity(screen.detail(test_store().view())).1, "episode-still");
     clear();
 }
 
@@ -1905,7 +1912,7 @@ fn a_shows_hero_still_outranks_every_other_art() {
     });
     let _guard = install(d);
     let screen = bare(&_guard, sid, "show");
-    assert_eq!(screen.art_identity(screen.detail(test_store().view())).2, "next-still");
+    assert_eq!(screen.art_identity(screen.detail(test_store().view())).1, "next-still");
     clear();
 }
 
@@ -2129,11 +2136,11 @@ fn back_and_down_both_collapse_full_trailer_mode_and_are_a_no_op_otherwise() {
 }
 
 /// **The input arm's own claim: full-trailer mode answers a key it owns on EVERY edge, before any
-/// other arm, but a `Reveal`-mapped key only ACTS on the DOWN edge.** UP is the probe:
-/// `trailer::trailer_key` maps it to `Reveal`, which has no effect this test can mistake for
+/// other arm, but a `ToggleHud`-mapped key only ACTS on the DOWN edge.** UP is the probe:
+/// `trailer::trailer_key` maps it to `ToggleHud`, which has no effect this test can mistake for
 /// ordinary UP navigation, so a `revealed()` flip after the DOWN edge (and none after the UP edge)
 /// can only have come from this arm running — and running before whatever ordinary UP handling
-/// exists further down. (LEFT/RIGHT now map to `Scrub`, which — unlike `Reveal` — DOES act on
+/// exists further down. (LEFT/RIGHT now map to `Scrub`, which — unlike `ToggleHud` — DOES act on
 /// every edge; that contract is graded separately, by the scrub-specific tests below.)
 #[test]
 fn full_trailer_mode_swallows_every_edge_of_an_owned_key_but_acts_only_on_the_down_edge() {
@@ -2161,7 +2168,7 @@ fn full_trailer_mode_swallows_every_edge_of_an_owned_key_but_acts_only_on_the_do
     assert_eq!(handled, Handled::Yes, "the down edge must be swallowed too");
     assert!(
         screen.trailer_ctl.revealed(),
-        "the down edge must act (Reveal) — proof this ran before ordinary UP handling"
+        "the down edge must act (ToggleHud) — proof this ran before ordinary UP handling"
     );
 
     plx_media::player::preview::reset_for_test();
@@ -2178,7 +2185,7 @@ fn trailer_act(
     screen: &mut DetailScreen,
     act: trailer::TrailerKey,
 ) -> Vec<plx_machine::machine::Stamped<TestHost>> {
-    trailer_act_edge(screen, act, Edge::Down, 0)
+    trailer_act_edge_with_pause(screen, act, Edge::Down, 0, false)
 }
 
 /// The edge-aware twin, for `Scrub`'s own tests below — every other variant here only ever acts
@@ -2189,6 +2196,16 @@ fn trailer_act_edge(
     edge: Edge,
     now: u32,
 ) -> Vec<plx_machine::machine::Stamped<TestHost>> {
+    trailer_act_edge_with_pause(screen, act, edge, now, false)
+}
+
+fn trailer_act_edge_with_pause(
+    screen: &mut DetailScreen,
+    act: trailer::TrailerKey,
+    edge: Edge,
+    now: u32,
+    preview_paused: bool,
+) -> Vec<plx_machine::machine::Stamped<TestHost>> {
     let mut effects = Vec::new();
     let mut present = plx_machine::present::Present::new();
     let mut sink = Effects::new(
@@ -2196,7 +2213,7 @@ fn trailer_act_edge(
         plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(1)),
         &mut present,
     );
-    screen.trailer_act::<TestHost>(act, edge, now, &mut sink);
+    screen.trailer_act::<TestHost>(act, edge, now, Some(0), Some(DurationFixture::DUR), preview_paused, &mut sink);
     drop(sink);
     effects
 }
@@ -2250,35 +2267,10 @@ fn ok_toggles_the_trailers_pause_and_play_pause_pick_a_direction() {
     clear();
 }
 
-/// `trailer_act`'s `Scrub` arm reads `player::duration_ns()`/`playpos_ns()` on `Down`
-/// (`Transport::scrub_fresh`'s own doc: passed in rather than read inside `trailer.rs`, but
-/// `trailer_act` is exactly the one caller that does the reading). Those are the crate-wide
-/// `SHARED` atomics — held together with the `testlock::serial()` guard `install` already hands
-/// back (construct the fixture AFTER it, never beside a second `serial()`: that lock is a plain
-/// mutex and taking it twice on one thread hangs the suite rather than failing it), same as
-/// `screens::player::mod`'s own scrub `Fixture`. `duration_ns` must be positive or
-/// `scrub_fresh` is a deliberate no-op (nothing to scrub within).
-struct DurationFixture(i64, i64);
-impl DurationFixture {
-    const DUR: i64 = 100_000_000_000;
-    fn new() -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-        let was = DurationFixture(
-            plx_media::player::SHARED.duration_ns.load(Relaxed),
-            plx_media::player::SHARED.playpos_ns.load(Relaxed),
-        );
-        plx_media::player::SHARED.duration_ns.store(Self::DUR, Relaxed);
-        plx_media::player::SHARED.playpos_ns.store(0, Relaxed);
-        was
-    }
-}
-impl Drop for DurationFixture {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        plx_media::player::SHARED.duration_ns.store(self.0, Relaxed);
-        plx_media::player::SHARED.playpos_ns.store(self.1, Relaxed);
-    }
-}
+/// Input-time clock facts are supplied directly to the trailer gesture, without writing the
+/// physical feed mailbox. A positive duration admits the gesture.
+struct DurationFixture;
+impl DurationFixture { const DUR: i64 = 100_000_000_000; }
 
 /// **`TrailerKey::Scrub` is dispatched on every edge, not just `Down`** — `Down` hops the fixed
 /// step, `Up` (with no repeat in between, i.e. a tap) arms the debounce rather than committing at
@@ -2291,7 +2283,6 @@ impl Drop for DurationFixture {
 fn left_right_scrub_hops_on_down_and_asks_for_no_transport_request() {
     let sid = ServerId::UNSET;
     let _guard = install(detail(sid, "show"));
-    let _dur = DurationFixture::new();
     let mut screen = bare(&_guard, sid, "show");
     screen.preview_promoted = true;
 
@@ -2315,7 +2306,6 @@ fn left_right_scrub_hops_on_down_and_asks_for_no_transport_request() {
 fn a_held_left_right_scrub_commits_a_preview_seek_on_key_up() {
     let sid = ServerId::UNSET;
     let _guard = install(detail(sid, "show"));
-    let _dur = DurationFixture::new();
     let mut screen = bare(&_guard, sid, "show");
     screen.preview_promoted = true;
 
@@ -2336,17 +2326,55 @@ fn a_held_left_right_scrub_commits_a_preview_seek_on_key_up() {
     clear();
 }
 
-/// A direction key the mode keeps only REVEALS: it asks for no transport at all, which is the
-/// whole of the "no seek on a preview session" rule at this layer.
+/// Revealing the controls requests no playback operation.
 #[test]
 fn a_revealing_key_asks_for_no_transport() {
     let sid = ServerId::UNSET;
     let _guard = install(detail(sid, "show"));
     let mut screen = bare(&_guard, sid, "show");
     screen.preview_promoted = true;
-    let effects = trailer_act(&mut screen, trailer::TrailerKey::Reveal);
+    let effects = trailer_act(&mut screen, trailer::TrailerKey::ToggleHud);
     assert!(transport_reqs(&effects).is_empty());
     assert!(screen.trailer_ctl.revealed());
+    clear();
+}
+
+#[test]
+fn up_toggles_the_full_trailer_hud_without_changing_playback() {
+    let sid = ServerId::UNSET;
+    let _guard = install(detail(sid, "show"));
+    let mut screen = bare(&_guard, sid, "show");
+    screen.preview_promoted = true;
+    let mut now = 0;
+    for paused in [false, true] {
+        screen.trailer_ctl.reveal();
+        for _ in 0..60 {
+            now += 16;
+            screen.trailer_ctl.update(now, 0.016, true, paused, false);
+        }
+        assert!(screen.trailer_ctl.alpha > 0.9);
+        let effects = trailer_act_edge_with_pause(
+            &mut screen, trailer::TrailerKey::ToggleHud, Edge::Down, now, paused,
+        );
+        assert!(transport_reqs(&effects).is_empty());
+        assert!(!screen.trailer_ctl.revealed(), "Up hides a visible HUD, also while paused");
+        let mut motion = false;
+        for _ in 0..100 {
+            now += 16;
+            motion = screen.trailer_ctl.update(now, 0.016, true, paused, false);
+        }
+        assert!(screen.trailer_ctl.alpha < 0.01, "the hidden HUD stays hidden while paused");
+        assert!(!motion, "hidden controls do not keep requesting frames");
+        trailer_act_edge_with_pause(
+            &mut screen, trailer::TrailerKey::ToggleHud, Edge::Up, now, paused,
+        );
+        assert!(!screen.trailer_ctl.revealed(), "release does not reveal it again");
+        trailer_act_edge_with_pause(
+            &mut screen, trailer::TrailerKey::ToggleHud, Edge::Down, now, paused,
+        );
+        assert!(screen.trailer_ctl.revealed(), "the next Up reveals it");
+        assert!(screen.preview_promoted);
+    }
     clear();
 }
 
@@ -2368,12 +2396,9 @@ fn the_collapse_key_leaves_the_mode_and_dismisses_the_transport() {
     clear();
 }
 
-/// The collapse's OTHER branch: `preview::paused()` true means the transport was left paused when
-/// the mode closed, so `collapse_full_trailer` asks for a resume on the way out. The empty case
-/// above (nothing paused, nothing to resume) is the only one the pure `trailer_act` path can reach
-/// on its own; `preview::paused()` reads the live singleton and `player::TX`, so this one drives
-/// both — the same `force_playing_for_test`/`reset_for_test` seam as the input-arm test above, plus
-/// `TX.commit_paused`/`TX.reset`, the same production seam `player::mod`'s own tests use.
+/// The collapse's OTHER branch: the host's addressed transport readout says the trailer was
+/// left paused, so `collapse_full_trailer` asks for a resume on the way out. Supply that fact
+/// directly to the same key effect path rather than sampling a physical Feed transport.
 #[test]
 fn the_collapse_key_resumes_the_transport_when_it_was_left_paused() {
     let sid = ServerId::UNSET;
@@ -2381,11 +2406,7 @@ fn the_collapse_key_resumes_the_transport_when_it_was_left_paused() {
     let mut screen = bare(&_guard, sid, "show");
     screen.preview_promoted = true;
     screen.trailer_ctl.reveal();
-    plx_media::player::preview::force_playing_for_test();
-    plx_media::player::TX.commit_paused(true);
-    assert!(plx_media::player::preview::paused(), "the fixture must actually be paused");
-
-    let effects = trailer_act(&mut screen, trailer::TrailerKey::Collapse);
+    let effects = trailer_act_edge_with_pause(&mut screen, trailer::TrailerKey::Collapse, Edge::Down, 0, true);
 
     assert!(!screen.preview_promoted, "the mode must be over");
     assert!(!screen.trailer_ctl.revealed(), "the controls go with it");
@@ -2395,8 +2416,6 @@ fn the_collapse_key_resumes_the_transport_when_it_was_left_paused() {
         "leaving the mode while paused must ask to resume"
     );
 
-    plx_media::player::TX.reset();
-    plx_media::player::preview::reset_for_test();
     clear();
 }
 
@@ -2746,6 +2765,7 @@ fn a_movie_trailer_disc_plays_the_extra_from_the_start() {
         plx_data::metadata::NowPlaying {
             is_episode: true,
             is_real_episode: true,
+            is_movie: false,
             title: "Show".into(),
             ep_title: "Pilot".into(),
             season: 1,
@@ -2876,6 +2896,7 @@ fn a_trailer_disc_requires_both_rk_and_part() {
         plx_data::metadata::NowPlaying {
             is_episode: true,
             is_real_episode: true,
+            is_movie: false,
             title: "Show".into(),
             ep_title: "Pilot".into(),
             season: 1,
@@ -3552,7 +3573,7 @@ const LEGACY_TEST_MAP: &[(&str, &str)] = &[
         "screens/detail/mod.rs",
     ),
     (
-        "hero_focus_survives_a_control_appearing_in_the_middle_of_the_row",
+        "hero_focus_stays_in_place_when_also_available_lands",
         "screens/detail/mod.rs",
     ),
     (
@@ -5266,7 +5287,7 @@ fn the_identity_line_paints_sm_after_the_run_and_xs_between_chips() {
     let screen = bare_held(ServerId::UNSET, "rk");
     let d = identity_detail(false);
     let m = &plx_base::fontcov::advances::ShippedMeasure;
-    let runs = plx_ui::draw_census::capture_runs(|| screen.draw_identity_line(plx_ui::Painter::recording(), &d, 300.0, m));
+    let runs = plx_ui::draw_census::capture_runs(|| screen.identity_row(plx_ui::Painter::recording(), &d, 300.0, m));
     let kind = plx_platform::i18n::msg::browse_kind_movie();
     let kind_run = runs.iter().find(|r| r.text == kind).expect("the kind label is painted");
     // The recording painter has no loaded font. Geometry comes from the same injected measure
@@ -5289,7 +5310,7 @@ fn an_empty_identity_run_leaves_no_gap_before_the_first_chip() {
     let screen = bare_held(ServerId::UNSET, "rk");
     let d = identity_detail(true);
     let m = &plx_base::fontcov::advances::ShippedMeasure;
-    let runs = plx_ui::draw_census::capture_runs(|| screen.draw_identity_line(plx_ui::Painter::recording(), &d, 300.0, m));
+    let runs = plx_ui::draw_census::capture_runs(|| screen.identity_row(plx_ui::Painter::recording(), &d, 300.0, m));
     let res = keyline_left(painted_x(&runs, "1080p").expect("resolution chip"), "1080p", m);
     assert!((res.0 - plx_ui::consts::MARGIN_X).abs() < 0.5, "no run, no gap: chip at {}", res.0);
 }
@@ -5685,3 +5706,6 @@ fn only_an_episode_page_gets_a_go_to_show_disc() {
         clear();
     }
 }
+
+#[path = "hero_shade_tests.rs"]
+mod hero_shade;

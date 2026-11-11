@@ -468,14 +468,14 @@ impl PreferenceRequest {
         if !current() { return Err(PreferenceError::Stale); }
         let features: Vec<ViewerFeature> = serde_json::from_slice(&read("/api/v2/features")?)
             .map_err(|_| PreferenceError::InvalidResponse)?;
-        // Which feature names plex.tv granted the viewer: the evidence the marker settings' visibility
-        // rests on, and the first thing to read when a viewer cannot find them. Feature ids are Plex's
-        // product names, not personal data.
-        let ids: Vec<&str> = features.iter().map(|f| f.id.as_str()).collect();
-        plx_base::eventlog::log(&format!("marker grants: plex.tv features ({}): {}", ids.len(), ids.join(",")));
         if !current() { return Err(PreferenceError::Stale); }
-        Ok(MarkerAccess { intro: features.iter().any(|f| f.id == "intro-markers"),
-            credits: features.iter().any(|f| f.id == "credits-markers") })
+        // `pass` in this same viewer-credential list (the Pass plex.tv reports for the viewer, never a
+        // shared server owner's) grants both: an
+        // account with an active Pass was measured listing `pass` and neither marker id (a webOS 10
+        // set, 2026-11-05: 109 features), which hid both settings from a Pass holder.
+        let has = |id: &str| features.iter().any(|f| f.id == id);
+        let pass = has("pass");
+        Ok(MarkerAccess { intro: pass || has("intro-markers"), credits: pass || has("credits-markers") })
     }
 }
 
@@ -519,7 +519,10 @@ mod marker_access_tests {
         let (request, _) = PreferenceRequest::fixture_for_test(user, 1, Default::default());
         for (features, expected) in [("[]", MarkerAccess::default()),
             (r#"[{"id":"intro-markers"}]"#, MarkerAccess { intro: true, credits: false }),
-            (r#"[{"id":"credits-markers"}]"#, MarkerAccess { intro: false, credits: true })] {
+            (r#"[{"id":"credits-markers"}]"#, MarkerAccess { intro: false, credits: true }),
+            // the viewer's own Plex Pass, listed without either marker id, grants both
+            (r#"[{"id":"sync"},{"id":"pass"},{"id":"webhooks"}]"#, MarkerAccess { intro: true, credits: true }),
+            (r#"[{"id":"sync"},{"id":"webhooks"}]"#, MarkerAccess::default())] {
             let result = request.load_marker_access_with(|| true, |path| Ok(if path.ends_with("features") {
                 features.as_bytes().to_vec()
             } else { br#"{"id":7,"uuid":"viewer"}"#.to_vec() }));

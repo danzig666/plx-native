@@ -52,6 +52,21 @@
 
 pub(crate) mod scenarios;
 
+/// The URI-mode probe's driver, the application's half of media's probe port (issue #1064).
+#[cfg(all(feature = "devtriggers", feature = "play-uri"))]
+pub(crate) mod uriprobe;
+
+/// The URI dev route (`plxnative-uridev`): the production URI backend, ACB-bound, playing a URL a
+/// developer names. The application's composition reads it once, at `install_uri_product`.
+#[cfg(all(feature = "devtriggers", feature = "play-uri"))]
+pub(crate) mod uri_product;
+
+/// The exported-window override (`plxnative-uriexported`): the production URI backend bound to the
+/// exported window on a webOS 5+ set the evidence table has not admitted. The application's
+/// composition reads it once, at `install_uri_product`.
+#[cfg(all(feature = "devtriggers", feature = "play-uri"))]
+pub(crate) mod uri_exported;
+
 /// The demo video's frame dump (simulator only): see the module doc.
 #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
 pub(crate) mod framedump;
@@ -66,7 +81,7 @@ pub(crate) mod framedump;
 // `test` as well as the feature: `any_trigger_present` is the only caller and it is cfg'd out of a
 // release build, but the test below asserts this list's contents and runs with default features.
 #[cfg(any(feature = "devtriggers", test))]
-const DIAG: [&str; 48] = [
+const DIAG: [&str; 49] = [
     "plxnative-diag.log",
     "plxnative-hud-text-metrics",
     "plxnative-hud-text-metrics.json",
@@ -94,8 +109,8 @@ const DIAG: [&str; 48] = [
     // `fx=` on Home's fingerprint (the focused card's drawn x) and, on every page that draws a
     // card section, the `cd*` fields (`plx_ui::card_probe`): a pure observer of `focus`.
     "plxnative-focusx",
-    // The two OVERDRAW surfaces, the resting-card split's off switch and the hero-ground fold
-    // ([`plx_gfx::overdraw`], `docs/backdrop-blur-profiling.md` Part 5). All four are measurement knobs whose whole
+    // The two OVERDRAW surfaces and the resting-card split's off switch
+    // ([`plx_gfx::overdraw`], `docs/backdrop-blur-profiling.md` Part 5). All three are measurement knobs whose whole
     // method is an A/B against an unmasked control leg — and a non-DIAG trigger suppresses the
     // who's-watching picker, so the control leg and the masked leg would boot to DIFFERENT
     // SCREENS and the difference between them would be the screen, not the class being priced.
@@ -108,7 +123,6 @@ const DIAG: [&str; 48] = [
     // control-leg argument as the card split above: both legs must boot to the SAME screen.
     "plxnative-nopreviewcache",
     "plxnative-previewsnap",
-    "plxnative-heroground",
     // The FRAME BUDGET's A/B control leg (`ui/frame/budget.rs`, spec §8.1): admission as it was
     // before phase 11 — quota only, no time ceiling, no solo rule. DIAG for exactly the argument
     // the three above make: its whole method is an A/B against an unmasked control leg, and a
@@ -178,17 +192,29 @@ const DIAG: [&str; 48] = [
     // variants must not move the boot screen out from under the playback being compared.
     "plxnative-av1obu",
     // Send VP9's sourceInfo envelope as the pipeline made it, without the container-derived HDR10
-    // declaration (`media::player::vp9_hdr`): the A/B for whether the television switches to HDR.
+    // declaration (`plx_play_feed::vp9_hdr`): the A/B for whether the television switches to HDR.
     "plxnative-novp9hdr",
-    // The side subtitle reader (`media::player::subside`): content = the 0-based position of the
+    // The side subtitle reader (`plx_play_feed::side_reader`, `media::player::subside`): content = the 0-based position of the
     // embedded subtitle stream to draw over a plain remux, read at each playback start.
     "plxnative-subside",
-    // The URI-mode probe (`media::player::uriprobe_drive`, issue #1064): content = `load`, `late`
+    // The URI-mode probe (`dev::uriprobe`, the application's half of `media::player::uriprobe_drive`, issue #1064): content = `load`, `late`
     // or `none` (empty = `load`), read at each playback start. It changes how ONE play is carried
     // out and nothing about the boot: the tester signs in and picks a profile as always, then
     // plays a title. A non-DIAG trigger would suppress the who's-watching picker and move that
     // boot away from the one the probe is meant to run on.
     "plxnative-uriprobe",
+    // The URI dev route (`dev::uri_product`): content = `acb part=<N> pms=<dotted-quad:port>
+    // url=<http://dotted-quad:port/path>`, read once at boot. It changes which source one play is
+    // certified for and nothing about the boot, so a test run still signs in and boots as always;
+    // a non-DIAG trigger would suppress the who's-watching picker. It is listed here so that
+    // `ci/check-package.py` greps the shipped bytes for the name.
+    "plxnative-uridev",
+    // The exported-window override (`dev::uri_exported`): presence arms it, read once at boot. It
+    // changes which display path one play's backend is composed with and nothing about the boot, so
+    // the tester signs in and picks a profile as always; a non-DIAG trigger would suppress the
+    // who's-watching picker, and a stale file would keep suppressing it. Listed so that
+    // `ci/check-package.py` greps the shipped bytes for the name.
+    "plxnative-uriexported",
 ];
 
 /// **Turn on the TELEVISION'S OWN GStreamer logging** — `/tmp/plxnative-gstlog`.
@@ -570,7 +596,7 @@ pub(crate) fn quality_switch_script() -> Option<(u32, Vec<plx_plex::plex::sessio
 /// ordinary six-second dev gate and stay paused. A non-empty script may delay that edge and name a
 /// finite accepted hold. `at` also holds the edge until the PUBLISHED playhead has reached that
 /// media position (and, in the simulator, stops the clock sink exactly on it, so the pause freezes
-/// that position: `ffi_host.rs::stop_clock_at`): a wall-clock delay pauses wherever the host's
+/// that position: `HostSink::stop_clock_at`): a wall-clock delay pauses wherever the host's
 /// scheduling has got playback to, which moves from run to run, and the documentation's player
 /// figure wants the same frame and the same clock every time. The simulator's settled capture
 /// (`PLXNATIVE_SHOT_SETTLE`) waits for the Pause to land (`scenarios::screenshot::PauseDebt`): the
@@ -1322,6 +1348,27 @@ mod tests {
     #[test]
     fn uriprobe_trigger_is_diagnostic() {
         assert!(super::DIAG.contains(&"plxnative-uriprobe"));
+    }
+
+    // ---- plxnative-uridev (the URI dev route) ----
+
+    /// The dev route changes which source one play is certified for, never which screen the app
+    /// boots to (a test run signs in with the dev token and plays, as always). It is listed so the
+    /// release check (`ci/check-package.py`) greps the shipped bytes for the name, and so a stale
+    /// file in `/tmp` cannot move a later boot off the screen it was going to.
+    #[test]
+    fn uridev_trigger_is_diagnostic() {
+        assert!(super::DIAG.contains(&"plxnative-uridev"));
+    }
+
+    // ---- plxnative-uriexported (the exported-window override) ----
+
+    /// The override changes the display path one play's backend is composed with, never which screen
+    /// the app boots to: a tester arms it before launch, then signs in and picks a profile as always.
+    /// Out of DIAG, the file would suppress the who's-watching picker on every boot it stays in `/tmp`.
+    #[test]
+    fn uriexported_trigger_is_diagnostic() {
+        assert!(super::DIAG.contains(&"plxnative-uriexported"));
     }
 
     // ---- plxnative-playurl (the pipeline test tier's one trigger) ----

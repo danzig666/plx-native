@@ -178,7 +178,7 @@ fn member_caption(item: &PmsMovie) -> TileLabel {
         address_on_art: item.kind == 3 || (item.kind == 2 && item.season_index > 0),
         ..tile_facts::caption_facts(item)
     };
-    crate::registry::captions::label(&crate::registry::captions::policy(), &facts, None, false)
+    crate::registry::captions::label(&crate::registry::captions::policy(), &facts, None)
 }
 
 /// One run of consecutive slots with a key and a label projected: slot `first + n` is `elems[n]`.
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn season_and_episode_projection_uses_persistent_labels_and_the_policys_caption() {
         use crate::registry::captions::TEST_UNDER_POSTERS;
-        use plx_plex::plex::session::{UnderPosters, UnderPostersDetails as Details};
+        use plx_plex::plex::session::{UnderPosters, UnderPostersLadder as Details};
         let season = PmsMovie { kind: 2, season_index: 3, title: "Season 3".into(), ..Default::default() };
         assert_eq!(member_label(&season), "SEASON 3");
         let episode = PmsMovie { kind: 3, season_index: 3, ep_index: 4, title: "The Answer".into(),
@@ -1166,7 +1166,7 @@ mod tests {
             (false, Details::YearLength, [None, Some("Example Show")]),
             (true, Details::None, [Some("The Answer"), None]),
         ] {
-            TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details, show_details: details.for_shows(), sort_value: false })));
+            TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details: details.movie_parts(), show_details: details.show_parts(), sort_value: false })));
             let caption = member_caption(&episode);
             TEST_UNDER_POSTERS.with(|cell| cell.set(None));
             assert_eq!([text(&caption.title), text(&caption.caption)], want.map(|line| line.map(str::to_owned)), "title {title}, {details:?}");

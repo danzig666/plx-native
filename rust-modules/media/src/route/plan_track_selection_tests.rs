@@ -773,6 +773,29 @@ fn known_audio_channels_cannot_fall_back_to_an_unknown_codec_default() {
     assert_eq!(pick_dp_audio_eligible(&[track], "aac", AudioLangPrefs::default(), 0, StandIn::Any, |c, n, _| caps.audio_supports(c, n)), Some((0, "aac".into(), 1)));
 }
 
+/// An Opus track whose width the Load cannot describe is not direct-playable, in either mode: the Load
+/// needs the channel count (`opusInfo`, 1..=8 channels), and the planner asks it of the track, so
+/// Auto converts the track and Force Direct Play shows its refusal instead of dying at the Load (#1096).
+#[test]
+fn an_opus_track_of_unknown_width_is_not_direct_playable_in_either_mode() {
+    let caps = plx_platform::devcaps::Caps {
+        audio: "aac,ac3,eac3,opus".into(),
+        audio_channels: [("opus".to_string(), 2)].into(),
+        ..plx_platform::devcaps::Caps::assumed()
+    };
+    for mode in [DirectPlayMode::Auto, DirectPlayMode::Forced] {
+        assert!(!audio_direct_plays_with(&caps, mode, "opus", 0, 48_000), "{mode:?}: unknown width");
+        // The Media-level stand-in of an item with no track list (`acodec`, width and rate unstated).
+        assert!(!audio_direct_plays_with(&caps, mode, "opus", 0, 0), "{mode:?}: Media-level Opus, no track list");
+        assert!(audio_direct_plays_with(&caps, mode, "opus", 2, 48_000), "{mode:?}: stereo");
+        assert!(audio_direct_plays_with(&caps, mode, "opus", 1, 48_000), "{mode:?}: mono");
+    }
+    assert!(!audio_direct_plays_with(&caps, DirectPlayMode::Auto, "opus", 6, 48_000), "Auto holds the stereo bound");
+    assert!(audio_direct_plays_with(&caps, DirectPlayMode::Forced, "opus", 6, 48_000), "Force has no table ceiling");
+    assert!(audio_direct_plays_with(&caps, DirectPlayMode::Forced, "opus", 8, 48_000));
+    assert!(!audio_direct_plays_with(&caps, DirectPlayMode::Forced, "opus", 12, 48_000), "wider than any layout");
+}
+
 // ---- StandIn::SameKind: never stand in a different KIND of track ---------------------------
 
 fn titled(mut s: plx_data::metadata::Stream, title: &str) -> plx_data::metadata::Stream {
@@ -1172,4 +1195,20 @@ fn an_attempt_without_dts_picks_the_ac3_sibling_while_the_wider_attempt_keeps_th
     };
     assert_eq!(pick(&a), Some((0, "dca".into(), 11)), "the set with a DTS row direct-plays its default");
     assert_eq!(pick(&b), Some((1, "ac3".into(), 12)), "without the row the same-language AC3 plays instead");
+}
+
+#[test]
+fn the_load_declaration_maps_every_dts_spelling_to_the_payload_name() {
+    // PMS writes the DTS family as `dca` / `dca-ma` / `dca_ma`; the demuxer feeds DTS core
+    // bytes for all of them, and the start guard's payload table knows only `dts`. A
+    // declaration that carries a PMS spelling as-is (the no-pick `src_acodec` of a DTS
+    // title) would be refused at Load — the Akira-class silent error.
+    for codec in ["dts", "dca", "dca-ma", "dca_ma", "dts_ma", "dtshd", "DTS", "DCA"] {
+        assert_eq!(audio_declaration(codec), "dts", "{codec}");
+    }
+    // the payload table's other names and a pass-through survive (case-normalised)
+    assert_eq!(audio_declaration("eac3"), "eac3");
+    assert_eq!(audio_declaration("ac3"), "ac3");
+    assert_eq!(audio_declaration("aac"), "aac");
+    assert_eq!(audio_declaration("TrueHD"), "truehd");
 }

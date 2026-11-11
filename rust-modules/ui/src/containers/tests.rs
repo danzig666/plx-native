@@ -166,6 +166,36 @@ fn a_bar_opener_is_lifted_once_per_frame_by_the_opener_pass_on_the_live_presenta
         "the surface is handed the live drawn rect of the opener");
 }
 
+#[test]
+fn a_bar_opener_does_not_draw_over_an_opaque_surface_that_is_arriving() {
+    use super::modal::{EntryMotion, PopoverMotion};
+    let _guard = plx_base::testlock::serial();
+    let (mut d, mut rig, _) = booted();
+    let account = open_modal(&mut d, &mut rig, Style::Sheet, 16);
+    modal_mut(&mut d, account).bar_opener = Some(7);
+    d.nav.modals.surface_mut(account).unwrap().motion = PopoverMotion::at(1.0);
+    d.request(MachineId::Nav, NavOp::Dismiss(account));
+    let settings = open_modal(&mut d, &mut rig, Style::Opaque { snapshot: true }, 32);
+    assert_eq!(d.nav.modals.surface_mut(account).unwrap().phase, Phase::Closing);
+
+    // The old surface still owns the lift while the new surface is held at zero opacity.
+    rig.bar_lifts.clear();
+    d.draw(&mut rig, true);
+    assert_eq!(rig.bar_lifts.len(), 1);
+    let mut dip = PopoverMotion::at(0.0);
+    dip.choose(EntryMotion::Dip);
+    dip.to(1.0);
+    let mut present = plx_machine::present::Present::new();
+    let mut handle = plx_machine::machine::PresentHandle::of(&mut present);
+    dip.tick_gated(tick(48), &mut handle, false);
+    assert!(dip.floor() > 0.0 && dip.appear == 0.0, "the dip starts by covering the old surface");
+    d.nav.modals.surface_mut(settings).unwrap().motion = dip;
+
+    d.draw(&mut rig, true);
+    assert_eq!(d.host_policy().1, HostRender::Cached, "the host is still cached during the dip");
+    assert_eq!(rig.bar_lifts.len(), 1, "the dip covers the chip with the rest of the account surface");
+}
+
 /// An `Opaque` surface is the mechanism's one documented boundary: it REPLACES its host once the
 /// ground is drawn, so there is no page pass to draw into and no snapshot for a dim to belong to
 /// — its dim is composed with its own ground, in its own `draw`.
@@ -1478,6 +1508,41 @@ fn a_held_surface_warms_its_text_instead_of_rasterising_it() {
     plx_gfx::text::reset_prewarm_for_test();
 }
 
+/// **A VISIBLE surface can hold content back and have its text warmed by the shared pass.** A
+/// Settings push commits at once, so the page it brings in was first rasterised in the push's
+/// first drawn frame (`textx33:18.2` on the television). While a surface answers
+/// `Screen::warms_text` the dispatcher walks `draw_warm` through the recorder, after the surface's
+/// own draw, and drains the queue under the page's prewarm budget in the same frame — and a
+/// surface that holds nothing back is not walked at all.
+#[test]
+fn a_visible_surface_has_the_content_it_holds_back_warmed_by_the_shared_pass() {
+    let _g = plx_base::testlock::serial();
+    let (mut d, mut rig, _) = booted();
+    open_modal(&mut d, &mut rig, Style::Compact, 16);
+    for i in 0..30u32 {
+        d.frame(&mut rig, tick(32 + i * 16), vec![], vec![], &mut NoTap);
+    }
+    assert!(!d.nav.modals.top().unwrap().motion.held(), "premise: the surface is up and visible");
+    let walks = |d: &Dispatcher<FixtureHost>| {
+        d.nav.modals.top().unwrap().entry.inst.as_ref().unwrap().screen.as_any().unwrap()
+            .downcast_ref::<crate::fixture::FixtureModal>().unwrap().warm_walks.clone()
+    };
+    plx_gfx::text::reset_prewarm_for_test();
+    d.frame(&mut rig, tick(700), vec![], vec![], &mut NoTap);
+    assert!(walks(&d).is_empty(), "a surface that holds nothing back is not walked");
+
+    crate::fixture::modal_warms_text(true);
+    d.frame(&mut rig, tick(716), vec![], vec![], &mut NoTap);
+    crate::fixture::modal_warms_text(false);
+    assert_eq!(walks(&d), vec![true], "walked once, through a recording painter");
+    assert!(
+        plx_gfx::text::prewarm_resident_for_test(b"held back text", 24, 0),
+        "…and drained in the same frame, before anything draws it"
+    );
+    assert!(!plx_gfx::text::prewarm_pending());
+    plx_gfx::text::reset_prewarm_for_test();
+}
+
 /// **A held surface's clock does not run, and its opener face is still drawn live.** A surface is
 /// HELD (`PopoverMotion::held`) for its capture frame and while its text warms — up to
 /// `SURFACE_TEXT_HOLD_MAX_MS`, six frames — at appear 0, walked through the text recorder. Two
@@ -2240,6 +2305,38 @@ fn every_dip_frame_gives_the_bar_glass_the_page_it_shows_at_its_alpha() {
     }
     assert!(dip_frames >= 8, "premise: the dip ran ({dip_frames} frames)");
     assert_eq!(d.top_arg(), Some(&FixtureArg::Page(7)));
+}
+
+/// **The replacement capture draws the page's own glass into the image it takes.** At quiescence
+/// the dispatcher captures the page live once more and shows that image for a frame before going
+/// live. Its layer published the image as BLOCKING, as for a held frame, so every glass on the page
+/// (the Library's scroll capsule) was refused inside the very capture that stands for it: the
+/// television showed the capsule's text over bare posters for that frame, a one-frame blink on
+/// every return to a scrolled grid. The capture frame's layer, like the floor's, must not block.
+#[test]
+fn the_replacement_capture_frame_does_not_block_the_page_it_captures() {
+    let _guard = plx_base::testlock::serial();
+    use crate::frame::backdrop::Z;
+    let (mut d, mut rig) = frozen_fixture();
+    let begins = std::rc::Rc::new(std::cell::Cell::new(0));
+    d.page_snapshot = Box::new(CountingSnapshot { begins: begins.clone(), ..Default::default() });
+    d.request(MachineId::Nav, NavOp::Push(FixtureArg::Page(7)));
+    let mut ms = 0;
+    let mut captures_after_dip = 0;
+    for _ in 0..120 {
+        plx_machine::idle::frame_begin(1.0 / 60.0);
+        d.frame_with(&mut rig, tick(ms), vec![], vec![], &mut NoTap, false);
+        let in_flight = d.nav.tabs.stack.transition.in_flight();
+        let blocks = d.backdrop_layers(1.0).into_iter().any(|layer| layer.z < Z::CHROME && layer.blocks);
+        let before = begins.get();
+        d.draw(&mut rig, true);
+        if !in_flight && begins.get() != before {
+            captures_after_dip += 1;
+            assert!(!blocks, "the replacement capture published a blocking image over the page it captures");
+        }
+        ms += 16;
+    }
+    assert!(captures_after_dip >= 1, "premise: a replacement capture ran");
 }
 
 #[test]

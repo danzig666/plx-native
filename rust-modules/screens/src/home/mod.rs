@@ -26,8 +26,7 @@ use plx_ui::hold_hint::{HintInput, HoldHint};
 use plx_ui::icons::Icon;
 use plx_ui::linked_heading::{self, LinkedHeading};
 use plx_ui::landing_hero::{
-    base_scrim_ramp, hero_stack, COL_W as HERO_COL_W,
-    TEXT_BOTTOM as HERO_TEXT_BOTTOM,
+    first_sentence, home_rows, home_shade, home_synopsis, shelf_fade, COL_W as HERO_COL_W, HOME_LABEL_H, SHELF_TOP,
 };
 use plx_machine::machine::{
     Canon, Cx, Delivery, Edge, Effects, EntryId, FocusKey, Fx, GroupId, Handled, InputEvent,
@@ -99,6 +98,8 @@ pub const STRIP_WATCHLIST_ELEM: u32 = plx_ui::dispatch::STRIP_BASE + 5;
 const MAX_ITEMS: usize = plx_data::pms::MAX_SHELF_ITEMS;
 
 const HERO_FLIP_CD: f32 = 0.35;
+/// Seconds the billboard rests before it advances. It counts only while the page stands at the hero
+/// and focus is on the hero or nothing: [`HomeScreen::row_holds_focus`] says when a shelf holds it still.
 const HERO_AUTO_S: f32 = 8.0;
 /// How near its target (px) a shelf's horizontal glide and the page's vertical reveal have to be
 /// before the focused tile counts as RESTED for the hold hint's dwell.
@@ -117,14 +118,14 @@ const HERO_PREFETCH: usize = 1;
 const HERO_ART_CULL: f32 = 0.996;
 const HERO_WASH_W: [f32; 4] = [0.55, 0.55, 0.40, 0.40];
 
-const HERO_ROW_Y: f32 = HERO_TEXT_BOTTOM + theme::space::MD;
+const HERO_ROW_Y: f32 = theme::hero::HOME_ACTIONS_Y;
 const HERO_CTRL_D: f32 = StatusOverlay::CTRL_H;
-const HERO_CTRL_GAP: f32 = plx_ui::widgets::CONTROL_GAP;
 #[cfg(test)]
 const SOURCE_PAD: f32 = theme::space::XS;
 const HERO_PAGER_D: f32 = HERO_CTRL_D * plx_ui::widgets::DISC_ICON_RATIO;
-const HERO_PAGER_BEARING: f32 =
-    HERO_PAGER_D * plx_ui::icons::ink_x(plx_ui::icons::Icon::Chevron).0;
+/// The pager's centre line: the action row's own (y 698), so the dots and the chevron read as one
+/// line with the controls they stand after.
+const HERO_PAGER_CY: f32 = HERO_ROW_Y + HERO_CTRL_D * 0.5;
 
 /// Each row's `motion` bytes are its `Shelf`'s (`Shelf::write`), the L0 row's motion write unchanged
 /// (`base_y` included), so the text, `SCREEN_SHAPES_PIN` and the replay anchors stay what they were;
@@ -160,6 +161,10 @@ struct HubProjection {
     /// same cards (`Arc::ptr_eq`) in the same order. A pointer, not a rating key: a card the
     /// server answered again is a new card even when it reads alike.
     cards: Vec<Arc<PmsMovie>>,
+    /// The Continue Watching deck's artwork keys, one per card of `cards` and built with it (a row
+    /// kept while its cards are the same cards keeps them too): empty for every other row, whose
+    /// cards never opt in to the deck's art walk, so a poster shelf pays for none.
+    deck: Vec<tile_facts::DeckKeys>,
     /// The key table was edited from outside a projection (a restore, an adopted show) since this
     /// row was projected, so its `elems` and the places its keys remember may no longer be the
     /// table's: the row is projected again, whatever the next publication holds. Only
@@ -381,11 +386,17 @@ impl Backdrop {
         self.bind(hero, outgoing, selected, snap);
         // decorative hero-art reveal dissolve (same reason as the wash below)
         plx_machine::idle::decorative(|| {
+            // A layer that has arrived is LANDED on 1.0 (`Spring::land`), as the wash below lands its
+            // own springs: `step` parks one ulp short (0.9999998, a velocity of ~7.7e-7) and walks that
+            // last ulp seconds later on a jittering frame time, and the art's tint alpha is an argument
+            // the chrome glass over the page keys its source on, so each walk re-took it for nothing.
             if self.tex.0 != 0 {
                 self.art.step(1.0, AmbientWash::K, dt);
+                self.art.land(1.0, dt);
             }
             if self.outgoing_tex.0 != 0 {
                 self.outgoing_art.step(1.0, AmbientWash::K, dt);
+                self.outgoing_art.land(1.0, dt);
             }
         });
         // The held art is let go once the picture over it is up — or once it is no longer
@@ -409,16 +420,20 @@ impl Backdrop {
         });
     }
 
-    fn draw(&self, p: Painter, env: &Env, slide: Option<(f32, f32)>) {
+    /// Paint the ground, photograph and the shared side and shelf shade. A slide or opaque art
+    /// draws the shade separately over the art.
+    fn draw(
+        &self,
+        p: Painter,
+        env: &Env,
+        slide: Option<(f32, f32)>,
+        scrim: Option<plx_ui::widgets::WashScrim>,
+    ) {
         if !self.pending_art.is_empty() && env.hero_a > 0.01 && env.sp < HERO_ART_CULL {
             plx_ui::placeholder::note(p, plx_ui::placeholder::Reason::HomeBackdrop, &self.pending_art);
         }
         let incoming_a = reveal(self.tex.0, &self.art);
         let outgoing_a = reveal(self.outgoing_tex.0, &self.outgoing_art);
-        // THE GROUND: the wash, the one art layer dissolving over it (the snap dive, or the art
-        // fading in) and the atmospheric ramp over both, as ONE pass per pixel
-        // (`AmbientWash::draw_ground`). A hero FLIP slides two art layers, which one pass cannot
-        // carry, so there the art and the ramp stay layers of their own.
         // Art held beneath a replaced hero (`held`) is the un-sliding outgoing layer: the new art
         // dissolves in over it, so the two cannot ride the ground's single art layer.
         let held = slide.is_none() && self.outgoing_tex.0 != 0;
@@ -426,17 +441,8 @@ impl Backdrop {
         let wash = !wash_hidden(env.sp, art_a, slide.map(|_| outgoing_a))
             && !self.wash.is_flat(theme::SURFACE_APP, AmbientWash::FLAT_EPS);
         let art_in_ground = wash && slide.is_none() && !held && env.sp < HERO_ART_CULL;
-        let ramp = (env.hero_a > 0.01 && slide.is_none()).then(|| hero_ramp(env.hero_a));
-        // Once the hero is culled NO art is drawn at all, a slide or held layer notwithstanding, and
-        // the shelves and grid stand on the wash alone: ONE colour, which the renderer clears
-        // rather than shades (`AmbientWash::draw_flat_ground`). Every earlier frame — a hero slide,
-        // art held beneath a replacement, a texture still pending, the dive itself — is the
-        // layered gradient exactly as it always was: those frames have a photograph, or are about
-        // to, and flattening them would jump the whole page between gradient and one colour. The
-        // flat ground carries no ramp, and there is none to carry: `hero_a` is 0 from `sp = 0.55`
-        // (`HomeScreen::env`), so `ramp` is `None` at the cull and the layered ramp rects below
-        // are skipped for the same reason.
-        let ramp_in_ground = wash
+        // Once the hero is culled the grid stands on a flat wash alone.
+        let ink_in_ground = wash
             && if env.sp >= HERO_ART_CULL {
                 self.wash.draw_flat_ground(p, Rect::FULL);
                 false
@@ -445,29 +451,15 @@ impl Backdrop {
                     p,
                     Rect::FULL,
                     art_in_ground.then(|| hero_art(self.tex, env.sp, incoming_a)),
-                    ramp,
+                    // the fade and the shade ride the ground only when the ground carries the art
+                    // too: layers painted over it (a slide's two, the held art under a replacement)
+                    // would cover them
+                    None,
+                    scrim.filter(|_| art_in_ground),
                 )
             };
 
-        let folded = !wash
-            && env.hero_a > 0.01
-            && env.sp < 0.001
-            && slide.is_none()
-            && !held
-            && self.tex.0 != 0
-            && incoming_a > 0.01
-            && plx_ui::widgets::hero_ground_armed();
-        if folded {
-            plx_ui::widgets::hero_ground(
-                p,
-                self.tex.0,
-                art_rect(self.tex, env.sp, 0.0),
-                incoming_a * (1.0 - env.sp),
-                base_scrim_ramp(env.hero_a),
-                env.hero_a,
-            );
-        }
-        if !folded && !art_in_ground && env.sp < HERO_ART_CULL {
+        if !art_in_ground && env.sp < HERO_ART_CULL {
             if let Some((out_x, in_x)) = slide {
                 backdrop_art(p, self.outgoing_tex, env.sp, out_x, outgoing_a);
                 backdrop_art(p, self.tex, env.sp, in_x, incoming_a);
@@ -478,25 +470,10 @@ impl Backdrop {
                 backdrop_art(p, self.tex, env.sp, 0.0, incoming_a);
             }
         }
-        if !folded && env.hero_a > 0.01 {
-            if !ramp_in_ground {
-                let [y0, knee, mid, foot] = base_scrim_ramp(env.hero_a);
-                p.rect(
-                    Rect::new(0.0, y0, SCR_W, knee - y0),
-                    0.0,
-                    theme::scrim(0.0),
-                    theme::scrim(mid),
-                    0.0,
-                );
-                p.rect(
-                    Rect::new(0.0, knee, SCR_W, SCR_H - knee),
-                    0.0,
-                    theme::scrim(mid),
-                    theme::scrim(foot),
-                    0.0,
-                );
+        if !ink_in_ground {
+            if let Some(scrim) = scrim {
+                plx_ui::widgets::scrim_layer(p, scrim);
             }
-            plx_ui::widgets::hero_scrim(p, env.hero_a, false);
         }
     }
 }
@@ -575,7 +552,7 @@ pub struct HomeScreen {
     /// The cards the Continue Watching row removed, by [`ui_cards::elem_key`], kept while its
     /// landing is pending (a later publication adds to them and cannot change one) and let go
     /// once nothing fades. Not canon.
-    ghost_cards: HashMap<u64, (u32, Arc<PmsMovie>)>,
+    ghost_cards: HashMap<u64, (u32, Arc<PmsMovie>, tile_facts::DeckKeys)>,
     restored_scroll: Vec<(u32, f32)>,
     restore_reveal: bool,
     /// The rows held in the store (`HubsCmd::Hold`): the command goes out only when the rows in
@@ -603,7 +580,8 @@ pub struct HomeScreen {
     /// operation sequence that measurably diverges the hash. `tick`'s own comment explains why
     /// the timer deliberately reports no `Motion` while it counts.
     hero_auto: f32,
-    /// `HomeCmd::PinHero` holds the billboard: the countdown above stops for the life of the page.
+    /// The countdown above counts only while the page stands at the hero and no shelf holds focus
+    /// ([`HomeScreen::row_holds_focus`]); `HomeCmd::PinHero` holds the billboard: the countdown above stops for the life of the page.
     /// A screenshot pin only, never set by the product, and not logical state (no replay sets it).
     hero_pinned: bool,
     /// The container says this page is covered. For modals, `Navigation` emits `Cover` for the
@@ -937,6 +915,7 @@ impl HomeScreen {
                 continue;
             }
             let identity = Self::hub_identity(view, row, hub);
+            let is_deck = identity == HomeHubIdentity::ContinueWatching;
             let old_index = seats.locate(row, same_place, hub.identity.is_some().then_some(&identity),
                 |old| old.identity.clone());
             let group = self.group_for(&identity);
@@ -979,6 +958,11 @@ impl HomeScreen {
                 link,
                 title: hub.title.to_owned(),
                 cards: if placeholders { Vec::new() } else { hub.items.iter().take(MAX_ITEMS).cloned().collect() },
+                deck: if is_deck && !placeholders {
+                    tile_facts::DeckKeys::of_all(hub.items.iter().take(MAX_ITEMS).map(|item| &**item))
+                } else {
+                    Vec::new()
+                },
                 stale: false,
             });
         }
@@ -992,7 +976,7 @@ impl HomeScreen {
             for (row, projection) in rows.iter().enumerate() {
                 // a shelf stays with its identity, wherever the row went
                 let kept = matched[row].and_then(|old| old_shelves.get_mut(old)?.take());
-                let shelf = kept.unwrap_or_else(|| Shelf::new(self.entry, RowStyle::HOME).cull_margin(GLOW_PAD)
+                let shelf = kept.unwrap_or_else(|| Shelf::new(self.entry, *style_of(&projection.identity)).cull_margin(GLOW_PAD)
                     .animate_landings(projection.identity == HomeHubIdentity::ContinueWatching));
                 self.grid.shelves.push(shelf);
             }
@@ -1008,7 +992,7 @@ impl HomeScreen {
         // A fresh shelf rests at `base_y = 0`, and this runs on events (`Mount`, `StoreChanged`,
         // `Uncover`) as well as on the `Tick` whose `update_grid` lays the grid out. A frame drawn
         // between the two showed the new rows at the top of the screen, over the billboard.
-        self.layout_grid();
+        self.layout_grid_of(&rows);
         let mut removed: HashSet<u32> = HashSet::new();
         // The patch is exact while every row is its own hub. A publication can carry one hub twice
         // (the store does not dedupe `(hubIdentifier, key)`): the two rows share their keys, the map
@@ -1128,7 +1112,7 @@ impl HomeScreen {
     /// another card of the same show on the same server, that tile is where focus goes.
     /// `rebind_shows` covers the other case, where the next episode is new and inherits the element.
     fn next_episode_of(&self, gone: u32) -> Option<u32> {
-        let (_, card) = self.ghost_cards.values().find(|(elem, _)| *elem == gone)?;
+        let (_, card, _) = self.ghost_cards.values().find(|(elem, ..)| *elem == gone)?;
         let show = show_of(card)?;
         let row = self.rows.iter().find(|r| r.identity == HomeHubIdentity::ContinueWatching)?;
         row.elems.iter().copied().find(|elem| self.cw_cards.get(elem)
@@ -1185,7 +1169,10 @@ impl HomeScreen {
             .unwrap_or_default();
         for (elem, movie) in std::mem::take(&mut self.cw_cards) {
             if !now.contains_key(&elem) {
-                self.ghost_cards.insert(ui_cards::elem_key(&elem), (elem, movie));
+                // the deck's art keys are a pure function of the card, so a ghost fades in the
+                // art the live card wore (`HomeCards::facts`)
+                let keys = tile_facts::DeckKeys::of(&movie);
+                self.ghost_cards.insert(ui_cards::elem_key(&elem), (elem, movie, keys));
             }
         }
         self.cw_cards = now;
@@ -1462,15 +1449,66 @@ impl HomeScreen {
         }
     }
 
+    /// The row style row `row`'s shelf is drawn in ([`style_of`]).
+    fn row_style(&self, row: usize) -> &'static RowStyle {
+        self.rows.get(row).map_or(&RowStyle::HOME, |r| style_of(&r.identity))
+    }
+
+    /// **Is `row` the Continue Watching row standing at the head of the page?** Its stills are in
+    /// view on BOTH pages: at the hero's resting place (the row stands at [`PEEK_Y`], whole, under
+    /// the billboard) and at the grid's (the top row, under the top bar). Focus coming onto it
+    /// therefore never moves the page ([`Self::on_grid_page`]).
+    fn holds_page(&self, row: usize) -> bool {
+        row == 0 && self.rows.first().is_some_and(|r| r.identity == HomeHubIdentity::ContinueWatching)
+    }
+
+    /// **Does a shelf (or its heading) hold the focus?** The billboard's auto-advance counts only
+    /// while it does not: a row that holds focus holds the hero still. Before the Continue Watching
+    /// row stopped scrolling the page ([`Self::holds_page`]) this was the page's own position, since
+    /// any focus on a row moved the page off the hero and the countdown only ran at the hero; now the
+    /// row stands in view on the hero's page and the position says nothing, so the rule is stated
+    /// by where focus is. Focus on the hero, or on nothing, counts as it always did, and the
+    /// countdown restarts at its full length when focus returns to the hero.
+    fn row_holds_focus(&self, focus: Option<FocusKey<u32>>) -> bool {
+        matches!(self.focused_loc(focus), Some(Located::Item(..) | Located::Heading(_)))
+    }
+
+    /// **Is `loc` on the grid's page** (the page the shelves rest on) rather than the hero's? A
+    /// shelf is; the hero is not; the Continue Watching row ([`Self::holds_page`]) is on whichever
+    /// page the screen is resting at (`snap_target`), so a key's move between it and the hero, or
+    /// between it and the shelf under it from the grid, crosses no door and leaves the page where it is.
+    fn on_grid_page(&self, loc: Located) -> bool {
+        match loc {
+            Located::Hero(_) => false,
+            Located::Item(row, _) | Located::Heading(row) => !self.holds_page(row) || self.snap_target >= 0.5,
+        }
+    }
+
+    /// The shelf column's geometry over this page's rows ([`ShelfColumn`]).
+    fn column(&self) -> ShelfColumn<impl Fn(usize) -> bool + '_> {
+        ShelfColumn { rows: self.rows.len(), is_deck: move |i| self.rows.get(i).is_some_and(|r| r.identity == HomeHubIdentity::ContinueWatching) }
+    }
+
+    /// **The SETTLED top of shelf `row`** ([`ShelfColumn::top`]). A scroll target and a settled rect
+    /// are computed from this, never from the live band.
+    fn shelf_top(&self, row: usize, band_row: Option<usize>, open: f32) -> f32 {
+        self.column().top(row, band_row, open)
+    }
+
+    /// The scroll a focused shelf RESTS at ([`ShelfColumn::rest`]).
+    fn rest_scroll_of(&self, row: usize) -> f32 {
+        self.column().rest(row)
+    }
+
+    /// The document's end ([`ShelfColumn::max_scroll`]).
+    fn max_scroll(&self) -> f32 {
+        self.column().max_scroll()
+    }
+
     /// The row whose label band is open (or opening) for `focus` — the focused card's row, `None`
     /// on a linked heading, and `fallback` (the row a hero→grid door would open) otherwise.
     /// The band the shelf at `row` opens when focused (`None`, a linked heading focused, opens none):
     /// the Continue Watching deck's is its own ([`shelf_policy`]).
-    /// How far a wheel may scroll the shelves: the last shelf's rest, with its caption band.
-    fn wheel_max_scroll(&self) -> f32 {
-        grid_max_scroll(self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)))
-    }
-
     fn band_open_at(&self, row: Option<usize>) -> f32 {
         row.and_then(|row| self.rows.get(row)).map_or_else(|| band_open_of(false),
             |hub| band_open_of(hub.identity == HomeHubIdentity::ContinueWatching))
@@ -1505,8 +1543,8 @@ impl HomeScreen {
         let focused = self.focused_heading(focus) == Some(row);
         let y = match at {
             At::Drawn => heading_y(self.grid.base_y(row), self.grid.lift(row)),
-            At::SpringTarget => GRID_TOP_Y + shelf_top_banded(row, self.band_row(focus, row), self.band_open_at(self.band_row(focus, row)))
-                - self.grid.scroll_target - TITLE_DY,
+            At::SpringTarget => GRID_TOP_Y + self.shelf_top(row, self.band_row(focus, row), self.band_open_at(self.band_row(focus, row)))
+                - self.grid.scroll_target - TITLE_DY - self.row_style(row).heading_rise,
         };
         Some(heading.face_rect(MARGIN_X, y, f32::from(focused), &m))
     }
@@ -1535,14 +1573,22 @@ impl HomeScreen {
     }
 
     fn layout_grid(&mut self) {
-        for (shelf, hub) in self.grid.shelves.iter_mut().zip(&self.rows) {
+        let rows = std::mem::take(&mut self.rows);
+        self.layout_grid_of(&rows);
+        self.rows = rows;
+    }
+
+    /// [`Self::layout_grid`] for `rows`, the projection the shelves stand for (a publication lays
+    /// them out before it adopts them as `self.rows`).
+    fn layout_grid_of(&mut self, rows: &[HubProjection]) {
+        for (shelf, hub) in self.grid.shelves.iter_mut().zip(rows) {
             shelf.set_caption_policy(Some(shelf_policy(hub.identity == HomeHubIdentity::ContinueWatching)));
         }
         let top = PEEK_Y + (GRID_TOP_Y - PEEK_Y) * self.snap.pos;
         let mut flow = 0.0;
-        for shelf in &mut self.grid.shelves {
+        for (shelf, hub) in self.grid.shelves.iter_mut().zip(rows) {
             shelf.set_base_y(top + flow - self.grid.scroll_y.pos * self.snap.pos);
-            flow += ui_cards::ROW_PITCH_FIXED + shelf.under_band();
+            flow += style_of(&hub.identity).pitch_fixed() + shelf.under_band();
         }
     }
 
@@ -1559,10 +1605,12 @@ impl HomeScreen {
         let mut shelves = std::mem::take(&mut self.grid.shelves);
         let mut on_screen: Option<(usize, usize)> = focused.map(|(row, _)| (row, row));
         for (row, shelf) in shelves.iter_mut().enumerate() {
-            shelf.dormant(dormant);
+            // the Continue Watching row stands in view on the hero's page: it is live there
+            let asleep = dormant && !self.holds_page(row);
+            shelf.dormant(asleep);
             let top = heading_y(shelf.base_y(), shelf.heading_lift());
-            let bottom = shelf.base_y() + CARD_H + shelf.under_band();
-            let visible = !dormant && on_axis(top, bottom - top, SCR_H, 0.0);
+            let bottom = shelf.base_y() + self.row_style(row).h + shelf.under_band();
+            let visible = !asleep && on_axis(top, bottom - top, SCR_H, 0.0);
             if visible {
                 on_screen = Some(on_screen.map_or((row, row), |(lo, hi)| (lo.min(row), hi.max(row))));
             }
@@ -1602,7 +1650,7 @@ impl HomeScreen {
             }
         }
         if let Some(row) = self.rest_row(engine).filter(|row| *row < self.rows.len() && !self.free) {
-            self.grid.scroll_target = rest_scroll(row, self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)));
+            self.grid.scroll_target = self.rest_scroll_of(row);
         }
         self.grid
             .scroll_y
@@ -1633,7 +1681,7 @@ impl HomeScreen {
         // is input, not a clock, so it is not pinned.
         let settled = !snap_moving
             && !plx_machine::motion::phase_clocks_held()
-            && self.snap.pos >= 0.5
+            && (self.snap.pos >= 0.5 || self.holds_page(row))
             && self.visible_activation.is_none()
             && glide.abs() < HINT_REST_PX
             && (self.grid.scroll_y.pos - self.grid.scroll_target).abs() < HINT_REST_PX;
@@ -1697,7 +1745,7 @@ impl HomeScreen {
             // countdown here and restart it exactly once when the last surface is dismissed.
         } else if self.hero_pinned {
             // Held by `HomeCmd::PinHero`: no countdown, no flip.
-        } else if self.snap.pos < 0.05 && view.hero_count() > 1 {
+        } else if self.snap.pos < 0.05 && !self.row_holds_focus(cx.focus.current) && view.hero_count() > 1 {
             // Spelled as an assignment, not `-= dt`: bit-for-bit identical arithmetic to the
             // pre-D4 accumulator, deliberately UNCHANGED — `hero_auto` is HASHED `LogicalState`
             // (`SHAPE`'s `hero_auto:f32`) across three committed replay fixtures, and a
@@ -1731,7 +1779,7 @@ impl HomeScreen {
         // `SNAP_REST_POS`/`SNAP_REST_VEL` for why both terms are needed.
         let snap_moving = (self.snap.pos - self.snap_target).abs() > SNAP_REST_POS
             || self.snap.vel.abs() > SNAP_REST_VEL;
-        let engine_on_grid = self.focused_loc(cx.focus.current).is_some_and(Located::on_grid);
+        let engine_on_grid = self.focused_loc(cx.focus.current).is_some_and(|loc| self.on_grid_page(loc));
         let picture_is_grid = self.snap.pos >= 0.5;
         if engine_on_grid == picture_is_grid {
             self.visible_activation = None;
@@ -1832,7 +1880,7 @@ impl HomeScreen {
             return;
         }
         for hero in neighbours() {
-            if plx_ui::tex::logo_warm(hero.item.sid.raw(), hero_logo_rk(hero.item))
+            if plx_ui::tex::logo_warm(hero.item.sid.raw(), hero_logo_source(hero.item))
                 == Warm::Claimed
             {
                 return;
@@ -1864,12 +1912,12 @@ impl HomeScreen {
     }
 
     fn emit_item_menu<H: HomeLike>(&self, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
-        if self.snap.pos < 0.5 {
-            return Handled::No;
-        }
         let Some((row, col)) = self.focused_grid(cx.focus.current) else {
             return Handled::No;
         };
+        if self.snap.pos < 0.5 && !self.holds_page(row) {
+            return Handled::No;
+        }
         let Some(item) = self.item_at(H::hubs(cx), row, col) else {
             return Handled::No;
         };
@@ -2085,7 +2133,8 @@ impl HomeScreen {
             self.carousel.as_ref(),
             self.snap.pos,
         );
-        plx_ui::profile::phase("hm.backdrop", || self.backdrop.draw(p, &env, slide));
+        let shade = (env.hero_a > 0.01).then(|| home_shade(self.shelf_fade(env.hero_a), env.hero_a));
+        plx_ui::profile::phase("hm.backdrop", || self.backdrop.draw(p, &env, slide, shade));
         if env.hero_a > 0.01 {
             plx_ui::profile::phase("hm.hero", || {
                 self.draw_hero(
@@ -2115,6 +2164,16 @@ impl HomeScreen {
         self.plaintext_alert.draw(f, self.entry);
     }
 
+    /// **The shelf fade of THIS frame** (owner's board CW-13 v2): the hero photograph darkened across
+    /// the whole shelf, full width, to near-black at the Continue Watching row's caption line
+    /// ([`plx_ui::landing_hero::shelf_fade`]), so the captions, which stand on the backdrop with no
+    /// plate, read over any photograph. It starts at the first shelf's live tile top (the page rides
+    /// the dive, and so does the fade) and is the hero's own: `hero_a` fades it out with the hero.
+    fn shelf_fade(&self, hero_a: f32) -> plx_ui::widgets::WashRamp {
+        let tiles_top = self.grid.shelves.first().map_or(SHELF_TOP, |shelf| shelf.base_y() + CARD_DY);
+        shelf_fade(tiles_top, hero_a)
+    }
+
     fn draw_hero(
         &self,
         view: HubsView<'_>,
@@ -2131,30 +2190,41 @@ impl HomeScreen {
         if let Some((out_x, in_x)) = self.slide_offsets() {
             if let Some(old) = self.outgoing_hero(view) {
                 let po = p.translate(out_x, 0.0);
-                hero_content(old.item, display_source(old.source), po, out_x, measure);
+                hero_content(old.item, po, out_x, measure);
                 self.draw_hero_actions(old.item, env, po, out_x, false, page_alpha, focus, measure, press_scale);
             }
             let pi = p.translate(in_x, 0.0);
-            hero_content(hero.item, display_source(hero.source), pi, in_x, measure);
+            hero_content(hero.item, pi, in_x, measure);
             self.draw_hero_actions(hero.item, env, pi, in_x, true, page_alpha, focus, measure, press_scale);
         } else {
-            hero_content(hero.item, display_source(hero.source), p, 0.0, measure);
+            hero_content(hero.item, p, 0.0, measure);
             self.draw_hero_actions(hero.item, env, p, 0.0, true, page_alpha, focus, measure, press_scale);
         }
-        if view.hero_count() > 1 {
-            let resumes = plx_data::metadata::resume_ns(hero.item.resume_ms, hero.item.dur_ns / 1_000_000) > 0;
-            let info = hero_rects(measure, hero.item, plx_appkit::hero_layout::play_label(resumes)).info;
-            let dots = PageDots::new(view.hero_count()).active(self.carousel_index(view));
-            let items = [Item::new(dots.width()), Item::glyph(Icon::Chevron, HERO_PAGER_D)];
-            let row = plx_ui::hstack::HStack::new(&items, HERO_CTRL_GAP,
-                plx_ui::hstack::Align::Leading(info.x + info.w + theme::space::LG));
-            let (x, _) = row.span(0).unwrap();
-            dots.centered_y(x, HERO_ROW_Y + HERO_CTRL_D * 0.5).draw(env, p);
-            let (x, _) = row.span(1).unwrap();
-            plx_ui::icons::draw(p, Icon::Chevron,
-                Rect::new(x - HERO_PAGER_BEARING, HERO_ROW_Y + (HERO_CTRL_D - HERO_PAGER_D) * 0.5,
-                    HERO_PAGER_D, HERO_PAGER_D), theme::TEXT_SECONDARY);
+        if let Some((dots, pager)) = self.pager(view, hero.item, measure) {
+            // Follow the shelf's focus motion so the pager recedes and returns with the card.
+            let p = if self.holds_page(0) {
+                let focus_mix = self.grid.shelves.first().map_or(0.0, |shelf| shelf.band_expand().clamp(0.0, 1.0));
+                p.alpha(1.0 - (1.0 - theme::hero::HOME_PAGER_SHELF_ALPHA) * focus_mix)
+            } else {
+                p
+            };
+            dots.centered_y(pager.dots_x, HERO_PAGER_CY).draw(env, p);
+            plx_ui::icons::draw(p, Icon::Chevron, pager.chevron, theme::TEXT_SECONDARY);
         }
+    }
+
+    /// The billboard's pager for `hero`, the selected one: its page dots (the active one set) and
+    /// where the group stands ([`hero_pager`]), after that hero's Info disc. `None` for a single hero,
+    /// which has nothing to page. It is not a focus stop and records no hit rect.
+    fn pager(&self, view: HubsView<'_>, hero: &PmsMovie, measure: &dyn Measure) -> Option<(PageDots, PagerRects)> {
+        if view.hero_count() <= 1 {
+            return None;
+        }
+        let (label, progress) = hero_action(hero);
+        let info = hero_rects(measure, hero, &label, progress.is_some()).info;
+        let dots = PageDots::new(view.hero_count()).active(self.carousel_index(view));
+        let pager = hero_pager(info.x + info.w, dots.width());
+        Some((dots, pager))
     }
 
     fn draw_hero_actions(
@@ -2169,9 +2239,8 @@ impl HomeScreen {
         measure: &dyn Measure,
         press_scale: f32,
     ) {
-        let resumes = plx_data::metadata::resume_ns(hero.resume_ms, hero.dur_ns / 1_000_000) > 0;
-        let label = plx_appkit::hero_layout::play_label(resumes);
-        let HeroRects { play: pill, disc, info } = hero_rects(measure, hero, label);
+        let (label, progress) = hero_action(hero);
+        let HeroRects { play: pill, disc, info } = hero_rects(measure, hero, &label, progress.is_some());
         if !on_axis(MARGIN_X + dx, info.x + info.w - MARGIN_X, SCR_W, 0.0) { return; }
         let may_read = live && dx.abs() < 0.5 && page_alpha >= 0.999;
         let palette = plx_gfx::gfx::sample_control_ground(
@@ -2184,12 +2253,15 @@ impl HomeScreen {
         // The fill rides the lift spring (`CtlPop::focus`) so the plate cross-fades (and the ink flips) with the pop;
         // a frame drawn off the live row (a transition's snapshot) has no spring and reads the focus.
         let fill = |i| if live { self.hero_pop.focus(i) } else { f32::from(focus == Some(Located::Hero(i))) };
-        Button::new(label.as_ptr(), theme::size::BODY, pill)
+        let mut button = Button::new(label.as_ptr(), theme::size::BODY, pill)
             .icon(Icon::Play)
             .focus_mix(fill(0))
             .palette(palette)
-            .scale(pop(0))
-            .draw(env, p);
+            .scale(pop(0));
+        if let Some(progress) = progress {
+            button = button.inline_progress(progress);
+        }
+        button.draw(env, p);
         if let Some((rect, hex)) = disc.zip(disc_hex(hero)) {
             // At either rest the plain face; only a flip in flight layers the fill.
             let (icon, mid) = plx_appkit::watchlist_disc::paint(self.disc.progress(hex));
@@ -2220,7 +2292,7 @@ impl HomeScreen {
     fn shelf_on_screen(&self, row: usize) -> bool {
         let base_y = self.grid.base_y(row);
         let top = heading_y(base_y, self.grid.lift(row));
-        let bottom = base_y + CARD_H + self.grid.under_band(row);
+        let bottom = base_y + self.row_style(row).h + self.grid.under_band(row);
         on_axis(top, bottom - top, SCR_H, 0.0)
     }
 
@@ -2598,7 +2670,7 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
         });
         let band_row = self.band_row(cx.focus.current, 0);
         for (row, projection) in self.rows.iter().enumerate() {
-            let top = GRID_TOP_Y + shelf_top_banded(row, band_row, self.band_open_at(band_row)) - self.grid.scroll_target;
+            let top = GRID_TOP_Y + self.shelf_top(row, band_row, self.band_open_at(band_row)) - self.grid.scroll_target;
             let linked = self.linked(row).is_some();
             if linked {
                 if let Some(rect) =
@@ -2633,7 +2705,7 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
                     MARGIN_X,
                     top + CARD_DY,
                     SCR_W - 2.0 * MARGIN_X,
-                    CARD_H + band_h_of(projection.identity == HomeHubIdentity::ContinueWatching),
+                    style_of(&projection.identity).h + band_h_of(projection.identity == HomeHubIdentity::ContinueWatching),
                 ),
                 len: projection.elems.len(),
                 elem: ElemKind::Card,
@@ -2750,21 +2822,22 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
                     .focused_grid(cx.focus.current)
                     .map(|(r, _)| r)
                     .unwrap_or(row);
-                let y = GRID_TOP_Y + shelf_top_settled(row, focus_row, self.band_open_at(Some(focus_row))) - self.grid.scroll_target;
+                let y = GRID_TOP_Y + self.shelf_top(row, Some(focus_row), self.band_open_at(Some(focus_row))) - self.grid.scroll_target;
+                let style = self.row_style(row);
                 let base = Rect::new(
-                    card_x(col, self.grid.scroll_x(row)),
+                    card_x(style, col, self.grid.scroll_x(row)),
                     y + CARD_DY,
-                    CARD_W,
-                    CARD_H,
+                    style.w,
+                    style.h,
                 );
                 let scale = if self.focused_grid(cx.focus.current) == Some((row, col)) {
-                    RowStyle::HOME.focus_scale
+                    style.focus_scale
                 } else {
                     1.0
                 };
                 Some(Placed {
                     rect: base.scaled(scale),
-                    rest_rect: base.scaled(RowStyle::HOME.focus_scale),
+                    rest_rect: base.scaled(style.focus_scale),
                     clip: self.section(row).clip,
                     index: Some(col as u32),
                 })
@@ -2847,8 +2920,8 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
         let col = ui_cards::column_near_x(
             from.rect.cx(),
             MARGIN_X,
-            CARD_W + GAP,
-            CARD_W,
+            self.row_style(row_index).w + self.row_style(row_index).gap,
+            self.row_style(row_index).w,
             self.grid.scroll_x(row_index),
             row.elems.len(),
             from.index.unwrap_or(0) as usize,
@@ -2914,7 +2987,7 @@ impl HomeScreen {
     }
 
     fn activation_elem(&self, engine_elem: u32) -> u32 {
-        let engine_grid = self.locate(engine_elem).is_some_and(Located::on_grid);
+        let engine_grid = self.locate(engine_elem).is_some_and(|loc| self.on_grid_page(loc));
         let picture_grid = self.snap.pos >= 0.5;
         if engine_grid != picture_grid {
             self.visible_activation.unwrap_or(engine_elem)
@@ -2972,9 +3045,8 @@ impl HomeScreen {
             return status_overlay(view, &self.plaintext, &self.clock)?.action_frame_measured(measure);
         }
         let hero = self.selected_hero(view)?.item;
-        let resumes = plx_data::metadata::resume_ns(hero.resume_ms, hero.dur_ns / 1_000_000) > 0;
-        let label = plx_appkit::hero_layout::play_label(resumes);
-        let rects = hero_rects(measure, hero, label);
+        let (label, progress) = hero_action(hero);
+        let rects = hero_rects(measure, hero, &label, progress.is_some());
         match index {
             0 => Some(rects.play),
             1 => Some(rects.info),
@@ -3012,7 +3084,7 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 if dx.is_finite() {
                     let under = (0..self.grid.shelves.len()).find(|&row| {
                         let top = self.grid.base_y(row);
-                        self.shelf_on_screen(row) && *y >= top && *y < top + CARD_DY + CARD_H + self.grid.under_band(row)
+                        self.shelf_on_screen(row) && *y >= top && *y < top + CARD_DY + self.row_style(row).h + self.grid.under_band(row)
                     });
                     if let (Some(row), Some(n)) = (under, under.and_then(|row| self.rows.get(row)).map(|hub| hub.elems.len())) {
                         if let Some(shelf) = self.grid.shelves.get_mut(row) {
@@ -3034,7 +3106,7 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 }
                 self.free = true;
                 let (snap, scroll) =
-                    wheel_page(self.snap_target, self.grid.scroll_target, *dy, self.wheel_max_scroll());
+                    wheel_page(self.snap_target, self.grid.scroll_target, *dy, self.max_scroll());
                 self.snap_target = snap;
                 self.grid.scroll_target = scroll;
                 fx.invalidate(Provenance::Input);
@@ -3099,7 +3171,7 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 // it points at, which is on screen (a card peeking under the hero), and a click
                 // there opens that card, never the hero's Play.
                 if let (Some(a), Some(b)) = (from_loc, to_loc) {
-                    if a.on_grid() != b.on_grid() {
+                    if self.on_grid_page(a) != self.on_grid_page(b) {
                         self.visible_activation = (*by != By::Pointer).then(|| from.map(|key| key.elem)).flatten();
                     }
                 }
@@ -3112,6 +3184,8 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                     self.free = false;
                     match to_loc {
                         Some(Located::Hero(_)) => self.snap_target = 0.0,
+                        // the Continue Watching row is in view on either page: it does not move it
+                        Some(Located::Item(row, _) | Located::Heading(row)) if self.holds_page(row) => {}
                         Some(Located::Item(_, _) | Located::Heading(_)) => self.snap_target = 1.0,
                         None => {}
                     }
@@ -3130,10 +3204,10 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                         {
                             let count = hub.elems.len();
                             let scroll = ui_cards::scroll_into_view(shelf.scroll(), col, count,
-                                CARD_W, GAP, SCR_W - 2.0 * MARGIN_X);
+                                style_of(&hub.identity).w, style_of(&hub.identity).gap, SCR_W - 2.0 * MARGIN_X);
                             shelf.restore_scroll(scroll, count);
                         }
-                        self.grid.scroll_target = rest_scroll(row, self.rows.len(), self.band_open_at(self.rows.len().checked_sub(1)));
+                        self.grid.scroll_target = self.rest_scroll_of(row);
                         self.grid.scroll_y.jump(self.grid.scroll_target);
                     }
                     self.layout_grid();
@@ -3556,38 +3630,87 @@ struct HeroRects {
     info: Rect,
 }
 
-fn hero_rects(measure: &dyn Measure, item: &PmsMovie, label: &std::ffi::CStr) -> HeroRects {
-    // One row: Play, the watchlist disc when the title has one (absent: no room, no gap), Info.
-    let has_disc = disc_hex(item).is_some();
-    let widths = [plx_appkit::hero_layout::play_width(measure, label), HERO_CTRL_D, HERO_CTRL_D];
-    let row = &widths[..if has_disc { 3 } else { 2 }];
-    let at = |i| plx_appkit::hero_layout::row_rect(row, i, HERO_ROW_Y);
-    HeroRects {
-        play: at(0),
-        disc: has_disc.then(|| at(1)),
-        info: at(if has_disc { 2 } else { 1 }),
+/// **The billboard's pager: the page dots and the next chevron, in the action row after Info** (owner's
+/// board CW-13). The row is a flex at [`plx_ui::widgets::CONTROL_GAP`] (20); the dots group stands
+/// [`theme::space::LG`] (40: that gap and the group's own 20 px of margin-left) after the Info disc,
+/// and the chevron stands tight after the dots, one `CONTROL_GAP` between their ink (the board's
+/// 60 px chevron box at margin-left -24 is that, [`Item::glyph`] places the glyph by its ink), the
+/// whole group centred on the row's centre line ([`HERO_PAGER_CY`]). It follows the hero's Info disc,
+/// so it stands where that hero's buttons end.
+struct PagerRects {
+    /// The page dots' left edge.
+    dots_x: f32,
+    /// The chevron's box (drawn there so its ink is one gap after the dots').
+    chevron: Rect,
+}
+
+/// The pager after an Info disc whose right edge is `info_right`, for dots `dots_w` wide.
+fn hero_pager(info_right: f32, dots_w: f32) -> PagerRects {
+    let items = [Item::new(dots_w), Item::glyph(Icon::Chevron, HERO_PAGER_D)];
+    let row = plx_ui::hstack::HStack::new(
+        &items,
+        plx_ui::widgets::CONTROL_GAP,
+        plx_ui::hstack::Align::Leading(info_right + theme::space::LG),
+    );
+    let mut spans = row.placed();
+    let dots = spans.next().expect("the dots are present");
+    let chevron = spans.next().expect("the chevron is present");
+    PagerRects {
+        dots_x: dots.x,
+        chevron: Rect::new(chevron.box_x, HERO_PAGER_CY - HERO_PAGER_D * 0.5, HERO_PAGER_D, HERO_PAGER_D),
     }
 }
 
-fn card_x(col: usize, scroll: f32) -> f32 {
-    MARGIN_X + col as f32 * (CARD_W + GAP) - scroll
+fn hero_rects(measure: &dyn Measure, item: &PmsMovie, label: &std::ffi::CStr, inline_progress: bool) -> HeroRects {
+    // One row: Play, the watchlist disc when the title has one (absent: no room, no gap), Info —
+    // each exactly one gap after the one before it, measured between the visible marks
+    // ([`plx_appkit::hero_layout::flat_row`]).
+    let has_disc = disc_hex(item).is_some();
+    let items = [
+        Item::new(if inline_progress {
+            Button::progress_pill_width(measure, label, theme::size::BODY).max(theme::hero::PLAY_MIN_W)
+        } else {
+            plx_appkit::hero_layout::play_width(measure, label)
+        }),
+        if has_disc { Item::new(HERO_CTRL_D) } else { Item::absent() },
+        Item::new(HERO_CTRL_D),
+    ];
+    let row = plx_appkit::hero_layout::flat_row(&items);
+    let at = |i: usize| {
+        let (x, w) = row.span(i).expect("a control of the row is present");
+        Rect::new(x, HERO_ROW_Y, w, HERO_CTRL_D)
+    };
+    HeroRects { play: at(0), disc: has_disc.then(|| at(1)), info: at(2) }
+}
+
+fn card_x(style: &RowStyle, col: usize, scroll: f32) -> f32 {
+    MARGIN_X + col as f32 * (style.w + style.gap) - scroll
 }
 #[cfg(test)]
 fn col_at(x: f32, scroll: f32, count: usize) -> Option<usize> {
     (0..count).find(|&col| {
-        let left = card_x(col, scroll);
+        let left = card_x(&RowStyle::HOME, col, scroll);
         x >= left && x <= left + CARD_W
     })
+}
+/// **The row style a hub's shelf is drawn in**: the Continue Watching row is a row of landscape
+/// stills ([`RowStyle::STILL`], the episode strip's cell), every other hub a poster shelf
+/// ([`RowStyle::HOME`]).
+fn style_of(identity: &HomeHubIdentity) -> &'static RowStyle {
+    deck_style(*identity == HomeHubIdentity::ContinueWatching)
+}
+/// The style of the Continue Watching deck (`deck`) or of a poster shelf.
+fn deck_style(deck: bool) -> &'static RowStyle {
+    if deck { &RowStyle::STILL } else { &RowStyle::HOME }
 }
 fn heading_y(row_y: f32, lift: f32) -> f32 {
     row_y - TITLE_DY - lift
 }
 /// The caption policy a shelf here follows: the stored Under posters setting, and for the Continue
-/// Watching deck (`deck`) its [`captions::deck_policy`](crate::registry::captions::deck_policy)
-/// (the progress line is always shown, so the deck's band keeps a line under Nothing).
+/// Watching deck (`deck`) [`NOTHING_UNDER_STILLS`](crate::registry::captions::NOTHING_UNDER_STILLS) (nothing under the stills: the status and bar are the still's own footer line).
 fn shelf_policy(deck: bool) -> plx_ui::caption_policy::CaptionPolicy {
-    let policy = crate::registry::captions::policy();
-    if deck { crate::registry::captions::deck_policy(&policy) } else { policy }
+    if deck { return crate::registry::captions::NOTHING_UNDER_STILLS }
+    crate::registry::captions::policy()
 }
 /// The focused shelf's caption band (0 / 80 / 112 px) under [`shelf_policy`]: the height the shelf
 /// reserves, opens and reveals by (`Shelf::set_caption_policy`).
@@ -3599,35 +3722,74 @@ fn band_h_of(deck: bool) -> f32 {
 fn band_open_of(deck: bool) -> f32 {
     ui_cards::band_open_for(band_h_of(deck))
 }
-/// **The scroll a focused shelf RESTS at: the Library's rest rule** (`poster_grid::rest_scroll`,
-/// `ui_cards::grid_rest_scroll`): the shelf's top comes to `GRID_TOP_Y`, the first shelf's own
-/// resting line, and the document's end holds the last shelves lower. Every shelf above it has
-/// scrolled off, so no heading but the focused one stands in the top band.
-///
-/// It was the NEAREST scroll that showed the focused shelf with its caption band open
-/// (`ui_cards::reveal` between a `lo` and the shelf's top): Down came to rest at `lo`, which is
-/// the caption's reach short of the bottom margin, so the focused shelf's y followed the Under
-/// posters band (531 / 563 / 603 for 112 / 80 / 0) and the heading of the shelf above rested at
-/// 22 / 54 / 94 with it, under the account chip at the two smaller bands, while Up came to rest at
-/// the shelf's top. A rest that depends on the band and on the direction of the last move is not a
-/// rest a heading can be kept out of the chrome by.
-fn rest_scroll(row: usize, rows: usize, last_open: f32) -> f32 {
-    ui_cards::grid_rest_scroll(row, ui_cards::ROW_PITCH_FIXED + ui_cards::LABEL_BAND_COLLAPSED, 0.0, grid_max_scroll(rows, last_open))
+/// How far the document runs on under the last shelf's band, past the bottom margin
+/// ([`ShelfColumn::max_scroll`]).
+const DOCUMENT_END_PAD: f32 = 60.0;
+
+/// **Home's shelf column: the page's rows stacked, each at its OWN pitch** (the Continue Watching
+/// row of stills is shorter than a poster shelf, [`RowStyle::pitch_fixed`]). `is_deck(i)` says
+/// whether row `i` is that deck. Every number here is the shared rule over those pitches
+/// ([`ui_cards::settled_top_by`], [`ui_cards::grid_rest_scroll_at`]); the page and its tests read
+/// this one type, never a uniform-pitch copy of it.
+struct ShelfColumn<D: Fn(usize) -> bool> {
+    rows: usize,
+    is_deck: D,
 }
-/// The document's end, with `last_open` the band the LAST shelf opens when focused.
-fn grid_max_scroll(rows: usize, last_open: f32) -> f32 {
-    let n = rows.max(1);
-    let h = ui_cards::settled_top_for(n, Some(n - 1), ui_cards::ROW_PITCH_FIXED, last_open);
-    (h - (SCR_H - CONTENT_Y) + 60.0).max(0.0)
-}
-fn shelf_top_settled(row: usize, focus_row: usize, open: f32) -> f32 {
-    shelf_top_banded(row, Some(focus_row), open)
-}
-/// [`shelf_top_settled`] with the open label band named explicitly: `None` while a linked heading
-/// holds focus, which opens no row's band.
-/// `open` is the band the focused shelf opens ([`HomeScreen::band_open_at`]).
-fn shelf_top_banded(row: usize, band_row: Option<usize>, open: f32) -> f32 {
-    ui_cards::settled_top_for(row, band_row, ui_cards::ROW_PITCH_FIXED, open)
+
+impl<D: Fn(usize) -> bool> ShelfColumn<D> {
+    /// The row style row `row`'s shelf is drawn in ([`style_of`]).
+    fn style(&self, row: usize) -> &'static RowStyle {
+        deck_style((self.is_deck)(row))
+    }
+
+    /// **The SETTLED top of shelf `row`**, with `band_row`'s band open by `open` and every other
+    /// shelf collapsed.
+    fn top(&self, row: usize, band_row: Option<usize>, open: f32) -> f32 {
+        ui_cards::settled_top_by(row, band_row, open, |i| self.style(i).pitch_fixed())
+    }
+
+    /// **The scroll a focused shelf RESTS at: the Library's rest rule** (`poster_grid::rest_scroll`,
+    /// `ui_cards::grid_rest_scroll_at`): the shelf's top comes to `GRID_TOP_Y`, the first shelf's
+    /// own resting line, and the document's end holds the last shelves lower. Every shelf above it
+    /// has scrolled off, so no heading but the focused one stands in the top band.
+    ///
+    /// It was the NEAREST scroll that showed the focused shelf with its caption band open
+    /// (`ui_cards::reveal` between a `lo` and the shelf's top): Down came to rest at `lo`, which is
+    /// the caption's reach short of the bottom margin, so the focused shelf's y followed the Under
+    /// posters band (531 / 563 / 603 for 112 / 80 / 0) and the heading of the shelf above rested at
+    /// 22 / 54 / 94 with it, under the account chip at the two smaller bands, while Up came to rest
+    /// at the shelf's top. A rest that depends on the band and on the direction of the last move is
+    /// not a rest a heading can be kept out of the chrome by.
+    ///
+    /// The shelf under the Continue Watching row rests with that row still standing above it (the
+    /// grid's resting place of the handoff's board: the stills on top, the next shelf below), so
+    /// the move down from the stills to it scrolls as little as it can: nothing while the shelf's
+    /// focused two-line label block (the worst the Under posters setting draws) still ends above
+    /// the bottom overscan edge, and otherwise just enough to bring it there
+    /// ([`Self::block_overrun`]). The footer under a still ([`theme::STILL_FOOTER_DROP`]) adds height to the
+    /// row, which carries the shelf below it lower.
+    fn rest(&self, row: usize) -> f32 {
+        let rule = ui_cards::grid_rest_scroll_at(row, self.top(row, None, 0.0), self.max_scroll());
+        if row == 1 && (self.is_deck)(0) {
+            return self.block_overrun(row).min(rule);
+        }
+        rule
+    }
+
+    /// How far below the bottom overscan edge shelf `row`'s focused two-line label block would end
+    /// if the page stood at scroll 0 (never negative): the least scroll that keeps it inside.
+    fn block_overrun(&self, row: usize) -> f32 {
+        let end = GRID_TOP_Y + self.top(row, None, 0.0) + CARD_DY + CARD_H + ui_cards::TileLabel::height(true);
+        (end - (SCR_H - MARGIN_Y)).max(0.0)
+    }
+
+    /// The document's end, with the LAST shelf's band open ([`band_open_of`]).
+    fn max_scroll(&self) -> f32 {
+        let n = self.rows.max(1);
+        let last_open = band_open_of((self.is_deck)(n - 1));
+        let h = self.top(n, Some(n - 1), last_open);
+        (h - (SCR_H - CONTENT_Y) + DOCUMENT_END_PAD).max(0.0)
+    }
 }
 
 fn wash_corners(hero: Option<&PmsMovie>, grid: [[f32; 4]; 4], snap: f32) -> [[f32; 4]; 4] {
@@ -3662,15 +3824,6 @@ fn backdrop_art(p: Painter, tex: (u32, f32, f32), snap: f32, dx: f32, alpha: f32
         theme::with_a(theme::TINT_WHITE, alpha * (1.0 - snap)),
     );
 }
-/// The hero's atmospheric ramp as the ground carries it — the two `rect`s the layered path draws
-/// (`base_scrim_ramp`: nothing above `y0`, `mid` at the knee, `foot` at the panel's foot).
-fn hero_ramp(hero_a: f32) -> plx_ui::widgets::WashRamp {
-    let [y0, knee, mid, foot] = base_scrim_ramp(hero_a);
-    plx_ui::widgets::WashRamp {
-        ink: theme::scrim(1.0),
-        stops: [(y0, 0.0), (knee, mid), (SCR_H, foot)],
-    }
-}
 /// The un-sliding hero art as the layer [`AmbientWash::draw_ground`] carries — exactly what
 /// [`backdrop_art`] would have drawn at `dx = 0`, down to its skip (a texture of 0 draws no art).
 fn hero_art(tex: (u32, f32, f32), snap: f32, alpha: f32) -> plx_ui::widgets::WashArt {
@@ -3686,12 +3839,14 @@ fn hero_art(tex: (u32, f32, f32), snap: f32, alpha: f32) -> plx_ui::widgets::Was
 fn show_of(item: &PmsMovie) -> Option<&str> {
     (item.kind == 3 && !item.show_rk.is_empty()).then_some(item.show_rk.as_str())
 }
-fn hero_logo_rk(item: &PmsMovie) -> &str {
-    if item.kind == 3 && !item.show_rk.is_empty() {
-        &item.show_rk
-    } else {
-        &item.rk
-    }
+fn hero_logo_source(item: &PmsMovie) -> &str {
+    item.logo.as_deref().unwrap_or_else(|| {
+        if item.kind == 3 && !item.show_rk.is_empty() {
+            &item.show_rk
+        } else {
+            &item.rk
+        }
+    })
 }
 fn prefetch_order(cur: i32, n: i32, out: &mut [i32; 2 * HERO_PREFETCH]) -> usize {
     if n <= 1 {
@@ -3719,15 +3874,80 @@ fn prefetch_armed(snap: f32, sliding: bool) -> bool {
     neighbours_armed(snap) && !sliding
 }
 
-fn display_source(real: &str) -> &str {
-    static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    OVERRIDE
-        .get_or_init(|| plx_base::devtrig::read("shared"))
-        .as_deref()
-        .unwrap_or(real)
+/// The copy beneath the title. Playback progress lives in the action row.
+enum HeroLine<'a> {
+    Premise(&'a str),
+    Metadata { identity: String, date: String, length: String, genres: String, quality: Option<String>, rating: &'a str },
 }
 
-fn hero_content(hero: &PmsMovie, source: &str, p: Painter, dx: f32, measure: &dyn Measure) {
+fn hero_resumes(hero: &PmsMovie) -> bool {
+    plx_data::metadata::resume_ns(hero.resume_ms, hero.dur_ns / 1_000_000) > 0
+}
+
+fn hero_action(hero: &PmsMovie) -> (std::borrow::Cow<'static, std::ffi::CStr>, Option<f32>) {
+    use std::borrow::Cow;
+    let resumes = hero_resumes(hero);
+    if resumes {
+        if let Some(progress) = tile_facts::resume_of(hero) {
+            if let Ok(label) = std::ffi::CString::new(plx_ui::fmt::remaining_duration(progress.left_ms)) {
+                return (Cow::Owned(label), Some(progress.frac));
+            }
+        }
+    }
+    (Cow::Borrowed(plx_appkit::hero_layout::play_label(resumes)), None)
+}
+
+fn hero_line(hero: &PmsMovie) -> Option<HeroLine<'_>> {
+    use plx_data::pms::{KIND_EPISODE, KIND_MOVIE, KIND_SHOW};
+    use plx_platform::i18n::msg;
+    use plx_ui::fmt;
+    let is_episode = hero.kind == KIND_EPISODE;
+    let is_show = hero.kind == KIND_SHOW;
+    if (hero.kind == KIND_MOVIE && (!hero.watched || hero_resumes(hero))) || is_episode
+        || (is_show && !hero.watched && !hero_resumes(hero) && hero.viewed_leaf_count.unwrap_or(0) == 0)
+    {
+        let identity = match hero.kind {
+            KIND_EPISODE => {
+                let address = fmt::episode_address(i64::from(hero.season_index), i64::from(hero.ep_index));
+                if address.is_empty() && hero.title.trim() != hero_title(hero).trim() {
+                    hero.title.trim().into()
+                } else {
+                    address
+                }
+            }
+            KIND_SHOW => msg::browse_kind_tv_show().into(),
+            _ => msg::browse_kind_movie().into(),
+        };
+        let year = i64::from(hero.year);
+        let date = fmt::hero_date(if is_episode { &hero.aired } else { "" }, year);
+        let ms = hero.dur_ns / 1_000_000;
+        let length = if ms >= 60_000 {
+            fmt::duration(ms)
+        } else if is_show && hero.child_count > 0 {
+            msg::browse_detail_seasons(hero.child_count)
+        } else {
+            String::new()
+        };
+        let genres = if is_episode {
+            String::new()
+        } else {
+            [hero.genre.as_deref(), hero.secondary_genre.as_deref()].into_iter()
+                .flatten().map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
+        };
+        let quality = if is_show { None } else {
+            hero.video_resolution.as_deref().and_then(|resolution| fmt::resolution(resolution, 0, 0))
+        };
+        let rating = hero.rating.trim();
+        if !(identity.is_empty() && date.is_empty() && length.is_empty() && genres.is_empty() && quality.is_none() && rating.is_empty()) {
+            return Some(HeroLine::Metadata { identity, date, length, genres, quality, rating });
+        }
+    }
+    Some(first_sentence(&hero.summary)).filter(|s| !s.is_empty()).map(HeroLine::Premise)
+}
+
+/// **Home's hero text** (owner's board CW-13 v2): the title (clearLogo, or its typed fallback) and ONE
+/// metadata block beneath it. The identity band is one line in reading ink. A premise can wrap.
+fn hero_content(hero: &PmsMovie, p: Painter, dx: f32, measure: &dyn Measure) {
     if !on_axis(
         MARGIN_X + dx,
         HERO_COL_W,
@@ -3736,35 +3956,44 @@ fn hero_content(hero: &PmsMovie, source: &str, p: Painter, dx: f32, measure: &dy
     ) {
         return;
     }
-    let episode = hero.kind == 3;
-    let title = if episode && !hero.show_title.is_empty() {
-        &hero.show_title
-    } else {
-        &hero.title
-    };
-    let title_h = hero_logo::band_h(LogoRung::Hero);
-    let lead = if episode {
-        plx_appkit::hero_layout::episode_lead(i64::from(hero.season_index), i64::from(hero.ep_index), &hero.title)
-    } else { String::new() };
-    let synopsis = (!hero.summary.is_empty() || !lead.is_empty())
-        .then(|| plx_ui::hero_synopsis(&hero.summary, &lead));
-    let stack = hero_stack(title_h, plx_ui::widgets::BADGE_H, synopsis.as_ref().map(|v| v.measure_h(HERO_COL_W)));
-    HeroLogo::new(hero.sid.raw(), hero_logo_rk(hero), title, LogoRung::Hero)
-        .draw(p, Rect::new(MARGIN_X, stack.title.y, HERO_COL_W, title_h), measure);
-    let kind = if episode || hero.kind == 1 { plx_platform::i18n::msg::browse_kind_tv_show() }
-        else { plx_platform::i18n::msg::browse_kind_movie() };
-    let parts = [hero.edition.as_str(), kind, hero.genre.as_deref().unwrap_or(""), hero.rating.as_str()];
-    let parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
-    let resolution = plx_ui::fmt::resolution(hero.video_resolution.as_deref().unwrap_or(""), 0, 0);
-    plx_ui::widgets::hero_identity(p, Rect::new(MARGIN_X, stack.meta.y, HERO_COL_W, stack.meta.h),
-        &parts, resolution.as_deref(), &[], measure);
-    if let (Some(view), Some(span)) = (synopsis, stack.synopsis) {
-        view.draw(p, Rect::new(MARGIN_X, span.y, HERO_COL_W, 0.0));
+    let (stack, line) = hero_ladder(hero);
+    HeroLogo::new(hero.sid.raw(), hero_logo_source(hero), hero_title(hero), LogoRung::Hero)
+        .draw(p, hero_title_band(&stack), measure);
+    let Some(block) = stack.block else { return };
+    match line {
+        Some(HeroLine::Metadata { identity, date, length, genres, quality, rating }) => {
+            let r = Rect::new(MARGIN_X, block.y, HERO_COL_W, block.h);
+            plx_ui::widgets::hero_metadata(p, r, &[&identity, &date, &length, &genres], quality.as_deref(), rating, measure);
+        }
+        Some(HeroLine::Premise(premise)) => {
+            home_synopsis(premise).draw(p, Rect::new(MARGIN_X, block.y, theme::hero::HOME_SYNOPSIS_W, 0.0));
+        }
+        None => {}
     }
-    let (date, length) = plx_appkit::hero_layout::listing_facts(hero);
-    let credit = plx_ui::fmt::shared_by(source).unwrap_or_default();
-    plx_ui::widgets::hero_facts(p, Rect::new(MARGIN_X, stack.facts.y, HERO_COL_W, stack.facts.h),
-        &date, length.as_deref().unwrap_or(""), plx_data::metadata::resume_ns(hero.resume_ms, hero.dur_ns / 1_000_000) > 0, &credit, measure);
+}
+
+/// The title Home's hero shows: an episode's SHOW (the clearLogo is the show's), else the item's own.
+fn hero_title(hero: &PmsMovie) -> &str {
+    if hero.kind == 3 && !hero.show_title.is_empty() { &hero.show_title } else { &hero.title }
+}
+
+/// **Home's hero ladder for one hero** and the line it stands on ([`hero_line`]): the one place the
+/// block's height is decided, which [`hero_content`] draws on. A label
+/// is one [`HOME_LABEL_H`]; a premise is as tall as its lines (one or two), so a one-line premise
+/// brings the title down a line.
+fn hero_ladder(hero: &PmsMovie) -> (plx_ui::landing_hero::HomeStack, Option<HeroLine<'_>>) {
+    let line = hero_line(hero);
+    let block_h = match &line {
+        Some(HeroLine::Metadata { .. }) => Some(HOME_LABEL_H),
+        Some(HeroLine::Premise(premise)) => Some(home_synopsis(premise).measure_h(theme::hero::HOME_SYNOPSIS_W)),
+        None => None,
+    };
+    (home_rows(hero_logo::band_h(LogoRung::Hero), block_h), line)
+}
+
+/// The column the title (clearLogo or typed) is bottom-anchored in, on [`hero_ladder`]'s rung.
+fn hero_title_band(stack: &plx_ui::landing_hero::HomeStack) -> Rect {
+    Rect::new(MARGIN_X, stack.title.y, HERO_COL_W, stack.title.h)
 }
 
 #[cfg(test)]
@@ -3777,12 +4006,19 @@ pub(crate) mod cards_harness; // Tier 2 card conformance (cards_conformance_test
 /// The cards a landing removed, each under the element it had, in the order the shelf names them
 /// (`Shelf::ghost_keys`); a card the screen did not keep is `None` and is not drawn.
 struct GhostCards<'a> {
-    cards: Vec<Option<&'a (u32, Arc<PmsMovie>)>>,
+    cards: Vec<Option<&'a (u32, Arc<PmsMovie>, tile_facts::DeckKeys)>>,
 }
 
 impl GhostCards<'_> {
     fn item(&self, i: usize) -> Option<&PmsMovie> {
-        self.cards.get(i).copied().flatten().map(|(_, movie)| &**movie)
+        self.cards.get(i).copied().flatten().map(|(_, movie, _)| &**movie)
+    }
+
+    /// **The facts a ghost draws from**: only the Continue Watching row ever leaves ghosts, so each
+    /// is a deck card, opted in to the deck's art walk with the keys it was stashed with, as the
+    /// live row's ([`HomeCards::facts`]) is.
+    fn facts(&self, i: usize) -> Option<plx_ui::tile::TileFacts<'_>> {
+        self.cards.get(i).copied().flatten().map(|(_, movie, keys)| tile_facts::for_deck(movie, keys))
     }
 }
 
@@ -3792,19 +4028,24 @@ impl<H: HomeLike> CardSource<H> for GhostCards<'_> {
     }
     /// The card's own element; a ghost is never focused, pressed or registered, so nothing asks.
     fn elem(&self, i: usize) -> u32 {
-        self.cards.get(i).copied().flatten().map_or(0, |(elem, _)| *elem)
+        self.cards.get(i).copied().flatten().map_or(0, |(elem, ..)| *elem)
     }
     fn index_of(&self, e: &u32) -> Option<usize> {
-        self.cards.iter().position(|c| c.is_some_and(|(elem, _)| elem == e))
+        self.cards.iter().position(|c| c.is_some_and(|(elem, ..)| elem == e))
     }
     fn art(&self, i: usize) -> Art<'_> {
-        Art::Poster(self.item(i).map(tile_facts::of))
+        Art::Still(self.facts(i))
     }
     fn label(&self, _i: usize) -> ui_cards::TileLabel {
         ui_cards::TileLabel::default()
     }
-    fn progress(&self, i: usize) -> Option<f32> {
-        self.item(i).and_then(PmsMovie::resume_frac)
+    /// A still draws its own bar in its footer ([`Self::overlay`]), as the live row's does.
+    fn progress(&self, _i: usize) -> Option<f32> {
+        None
+    }
+    /// The fading still keeps the footer it had ([`tile_facts::deck_overlay`](crate::registry::tile_facts::deck_overlay)).
+    fn overlay(&self, p: Painter, i: usize, tile: &ui_cards::Tile, measure: &dyn plx_machine::machine::Measure) {
+        if let Some(facts) = self.facts(i) { crate::registry::tile_facts::deck_overlay(p, &facts, tile, measure) }
     }
     fn loaded(&self, i: usize) -> bool {
         self.item(i).is_some_and(|item| !item.rk.is_empty())
@@ -3826,6 +4067,30 @@ struct HomeCards<'a> {
 impl<'a> HomeCards<'a> {
     fn item(&self, i: usize) -> Option<&'a PmsMovie> {
         self.home.item_at(self.view, self.row, i)
+    }
+}
+
+impl<'a> HomeCards<'a> {
+    /// Is this row the Continue Watching deck of landscape stills?
+    fn deck(&self) -> bool {
+        self.home.rows.get(self.row).is_some_and(|r| r.identity == HomeHubIdentity::ContinueWatching)
+    }
+
+    /// **The facts card `i` draws from.** A deck card opts in to the deck's art walk (Plex's cover,
+    /// our composite, then its title in type) with the keys the row was projected with; every other
+    /// card, and a deck card whose keys are not the projection's (a frame between a publication and
+    /// its projection, a card past the projected window), is [`tile_facts::of`]: no deck, the old
+    /// chain. The pointer test is what makes the keys safe to read by position.
+    fn facts(&self, i: usize) -> Option<plx_ui::tile::TileFacts<'a>> {
+        let item = self.item(i)?;
+        let home: &'a HomeScreen = self.home;
+        let keys = home.rows.get(self.row).filter(|_| self.deck())
+            .filter(|r| r.cards.get(i).is_some_and(|card| std::ptr::eq(&**card, item)))
+            .and_then(|r| r.deck.get(i));
+        Some(match keys {
+            Some(keys) => tile_facts::for_deck(item, keys),
+            None => tile_facts::of(item),
+        })
     }
 }
 
@@ -3868,24 +4133,40 @@ impl<H: HomeLike> CardSource<H> for HomeCards<'_> {
     /// The card the PICTURE shows focused: none until the dive has made the shelves the picture,
     /// and the card the page came from while the dive back to the billboard still shows them.
     fn focus_index(&self, e: &u32) -> Option<usize> {
-        if self.home.snap.pos <= 0.5 {
+        if self.home.snap.pos <= 0.5 && !self.home.holds_page(self.row) {
             return None;
         }
         self.home.item_col(self.row, self.home.activation_elem(*e))
     }
 
     fn art(&self, i: usize) -> Art<'_> {
-        Art::Poster(self.item(i).map(tile_facts::of))
+        let facts = self.facts(i);
+        if self.deck() { Art::Still(facts) } else { Art::Poster(facts) }
     }
 
+    /// The Continue Watching still carries no label block under it: its footer is drawn ON the
+    /// tile ([`Self::overlay`]).
     fn label(&self, i: usize) -> ui_cards::TileLabel {
         let Some(item) = self.item(i) else { return ui_cards::TileLabel::default() };
-        let deck = self.home.rows[self.row].identity == HomeHubIdentity::ContinueWatching;
-        crate::registry::captions::shelf_label(&crate::registry::captions::policy(), item, deck)
+        if self.deck() { return ui_cards::TileLabel::default() }
+        crate::registry::captions::shelf_label(&crate::registry::captions::policy(), item, false)
     }
 
+    /// A poster wears the resume bar through the shelf; a still draws its own in its footer.
     fn progress(&self, i: usize) -> Option<f32> {
+        if self.deck() { return None }
         self.item(i).and_then(PmsMovie::resume_frac)
+    }
+
+    /// The deck's still carries its one-line footer BELOW the art, with no scrim behind it
+    /// (`tile_facts::deck_overlay`; the backdrop darkens to near-black under it,
+    /// [`HomeScreen::shelf_fade`]): the status text and bar, and on the focused card the cue for what OK does (a play glyph while the
+    /// Playback setting says OK plays, an info glyph while it opens the page), opening with the
+    /// card's own focus pop (`Tile::pop`).
+    fn overlay(&self, p: Painter, i: usize, tile: &ui_cards::Tile, measure: &dyn plx_machine::machine::Measure) {
+        if !self.deck() { return }
+        let Some(facts) = self.facts(i) else { return };
+        crate::registry::tile_facts::deck_overlay(p, &facts, tile, measure);
     }
 
     /// A card has landed once it has a rating key; the ring's placeholder slot is an empty movie.

@@ -7,6 +7,24 @@ player machine: `player/lifecycle.rs` is the machine alone (private state, one w
 `player/foreground.rs` its drivers and `player/transport.rs` the transport-pause contract; its shape
 is gated by `ci/machines.ini` (see "Machine shape" below).
 
+## Notify integration checkpoint (not acceptance)
+
+Notify's typed Direct stream lane and app per-connection cursor are written; the
+frozen API and integration evidence are in `.empryo/reviews/verdict-notify-core.md`
+and `.empryo/reviews/verdict-notify-integration.md`. StoreId Notify is appended at
+12; old ordinals, Home/tape records and NOTIFY_FILLS `[Browse, Hubs]` are unchanged.
+Bridge captures fresh stream eligibility before the one-frame cursor, settles each
+initial admission before that connection's ordinary drain, then maps once and
+drains fan-out jobs. Accepted-held release failures use ordinary terminal timing.
+Production opens off-frame; test boot refuses unless explicitly scripted.
+
+The three Notify allow-area files have been retired. The coordinator reports actual
+ledger totals of 5 workers / 81 globals / 62 forks / 11 fxlanes, down from the
+S4 pre-Notify checkpoint of 6/89/65/11; the pins now match. The source-only stale-key
+check passed in orun-27; runtime tests, capture comparisons and full gates remain
+pending. Per-connection source ordering is preserved; asynchronous worker wall-time
+is not pinned, and disabled-state repair is explicitly intentional.
+
 ## The rule
 
 Logic never performs IO. A machine (a screen, a `data/` store, the session owner, the player's
@@ -30,7 +48,7 @@ and the lines are compared to the tree as an exact multiset.
 | Rule | A site is | Key |
 |---|---|---|
 | `workers` | a production call that starts a worker in a machine: `task::spawn(`, `spawn_small(`, `spawn_small_keeping(`, `spawn_small_or_inline(`, `spawn_off_frame(`, `spawn_off_frame_keeping(`, `storage_worker::submit(`, `submit_retained(`, the command worker's `.submit_ticket(` | `<path>::<enclosing fn>::<spelling>` |
-| `globals` | a production read of a process-global registry in a machine: `client_for`, `current_server`, `current_snapshot`, `keypin::revision`, `keypin::blocked_for`, `session::peek`, `grant::offers`, the session cache's `session::peek_settled` and `session::current_gen`, the server registry's roster readers (`server_ids`, `server_roster_gen`, `server_facts_gen`, `server_probe_result`), the controlled-run switch `tape::active`, the player's transport-pause readers (`transport::paused`, `transport::viewer_paused`, `preview::paused`), the device's capability answer (`devcaps::caps`, and the zero-argument `is_dp_audio` / `is_dp_audio_track` that used to read it), and `player::TX` in the player's lifecycle (at zero) | `<path>::<enclosing fn>::<spelling>` |
+| `globals` | a production read of a process-global registry in a machine: `client_for`, `current_server`, `current_snapshot`, `keypin::revision`, `keypin::blocked_for`, `session::peek`, `grant::offers`, the session cache's `session::peek_settled` and `session::current_gen`, the server registry's roster readers (`server_ids`, `server_roster_gen`, `server_facts_gen`, `server_probe_result`), the controlled-run switch `tape::active`, the player's pause readers (`transport::viewer_paused`, `preview::paused`: each takes the session but also reads process-global state, the claim hold's slot and the preview machine's phase; `transport::paused` reads only the session's readout and is no longer a spelling), the device's capability answer (`devcaps::caps`, and the zero-argument `is_dp_audio` / `is_dp_audio_track` that used to read it), and `player::TX` in the player's lifecycle (at zero) | `<path>::<enclosing fn>::<spelling>` |
 | `forks` | a production test/production fork whose predicate reads `test` or `feature = "test-support"`: a `#[cfg(..)]` attribute that a production build can satisfy (`not(test)`, `not(any(test, feature = "test-support"))`, `all(target_os = .., not(test))`, ...), or an inline `cfg!(..)` of any value | `<path>::<item name>`, or `<path>::<enclosing fn>` for a statement or an inline `cfg!`, or `<path>::<struct>` for a field |
 | `fxlanes` | an `AppFx::<Variant>` arm of `Bridge::app_effect` that does not push `Fx::Deliver(`: one site for each variant on its head, and one for an arm that names no variant (`other => ..`, `_ => ..`) | `<path>::AppFx::<Variant>`, or `<path>::AppFx::_` |
 
@@ -44,10 +62,10 @@ dropped.
 **Scope.** `workers` and `globals` read the machines: everything under `rust-modules/data/src`,
 `session/src`, `screens/src`, `ui/src`, `appkit/src` and `machine/src`, plus
 `plex/src/plex/session.rs` (the session owner's state), the player's `lifecycle.rs`, `recovery.rs`
-(the failed-open ladder machine), `release.rs` (the native object's release machine) and `uriprobe.rs` (the developer URI-mode probe's machine) and the route planners `route/plan.rs` and `route/plan_memory.rs`. The IO layers (the rest of `plex/`, `media/`,
+(the failed-open ladder machine), `release.rs` (the native object's release machine) and the route planners `route/plan.rs` and `route/plan_memory.rs`. The IO layers (the rest of `plex/`, `media/`,
 `net/`, `platform/`) are where those calls belong, so they are not scanned. `forks` reads the whole
-of every crate that holds a machine (`FORK_SCOPE`): `data/`, `plex/`, `media/`, `session/`, `screens/`,
-`ui/`, `appkit/` and `machine/`, because a fork anywhere in them is a test that does not run the
+of every crate that holds a machine (`FORK_SCOPE` in `ci/check-deps.sh` names them: `data/`, `plex/`, `media/`,
+`play-feed/`, `session/`, `screens/`, `ui/`, `appkit/` and `machine/` among them), because a fork anywhere in them is a test that does not run the
 product's code. It read only the first four until the scope was widened to the rest; the
 widening recorded the 17 forks that were already there (three in `screens/`: `legal.rs`
 `build_sha`, `library/lookahead.rs` `rows` and `login.rs` `harness_driven`; thirteen in `ui/`; one in
@@ -88,13 +106,17 @@ widening recorded the 17 forks that were already there (three in `screens/`: `le
 - The command worker's `.submit(` is not covered: it is `#[cfg(any(test, feature = "test-support"))]`
   in `base/src/storage_worker.rs`, so no production line can call it. `.submit_ticket(` is covered
   although no machine calls it today: a machine that did would be starting a worker.
-- The transport-pause atomic (`player::TX`) is reached by a machine through three readers,
-  `transport::paused`, `transport::viewer_paused` and `preview::paused` (each is `TX.paused` behind
-  a function), so those spellings are sites, qualified or bare after an import; a `use ... as`
-  rename of any of them fails outright. The spellings of `TX` itself (`crate::player::TX`,
-  `player::TX`, `super::TX`, a bare `TX`) stay pinned to `lifecycle.rs`, the machine, which now reads
+- The transport Pause is the session's readout (`PlayerReadout::paused`), stepped at every writer, and the Feed keeps its own
+  gate copy (`FEED_TX.paused`, in `plx_play_feed::shared`) written by commands only. A machine reaches it through three readers,
+  `transport::paused`, `transport::viewer_paused` and `preview::paused`, each taking the session. `transport::paused` reads only
+  the readout and is not a spelling any more. The other two stay sites, qualified or bare after an import, because each
+  still reads process-global state behind the session argument: `viewer_paused` the claim hold's slot and serial
+  (`claim_hold::owns_pause`), `preview::paused` the preview machine's phase (`preview::occupies`). A `use ... as`
+  rename of any of the three still fails outright. The spellings of the owners themselves (`crate::player::TX`,
+  `player::TX`, `super::TX`, a bare `TX`, and the Feed owners `shared::FEED_TX`, `shared::FEED_SHARED`
+  and a bare `FEED_TX` / `FEED_SHARED`) stay pinned to `lifecycle.rs`, the machine, which now reads
   none: that pin is a zero-guard (the machine takes the pause as a value on its event). The HUD's
-  direct `TX.paused` reads are not a machine's, and a writer (`set_paused`, `set_transport_paused`) is
+  direct `FEED_TX.paused` reads are not a machine's, and a writer (`set_paused`, `set_transport_paused`) is
   an IO call, not a registry read. Moving the contract out of `lifecycle.rs` deleted its three `TX`
   lines from `ci/allow/globals/media.txt`; the same change widened the rule to the readers above and
   seeded the three `preview::paused` reads the screens already had (`screens/src/detail/mod.rs`) as a
@@ -217,7 +239,7 @@ headed "The listing lanes"): their two worker starts and two registry reads are 
 `data/src/browse/mod.rs`. The Library's source discovery (the section list, the server's name and the
 item counts) is the twelfth (the bullet headed "The discovery lane"): its worker start and its one
 registry read are gone from `data/src/browse/mod.rs`, and its `data-browse` workers ledger file is
-deleted. The Home pins take the session from the Bridge (the bullet headed "The pins' session input"), and so do the Watchlist and catalog stores, for the seated profile and its plex.tv identity (the bullet headed "The Watchlist and catalog session input"), which deletes three `data-watchlist` globals lines; the rest of `browse/` (the roster and the gate reads) is still on its ledger. The Metadata store's
+deleted. The Home pins take the session from the Bridge (the bullet headed "The pins' session input"), and so do the Watchlist and catalog stores, for the seated profile and its plex.tv identity (the bullet headed "The Watchlist and catalog session input"), which deletes three `data-watchlist` globals lines. S4 replaces Browse's roster/gate/current reads with explicit `BrowseRosterInput` and the existing host-filled `ClientKeys`; the obsolete 14-entry Browse globals file was retired. The S4 checkpoint was **6 workers / 89 globals / 65 forks / 11 fxlanes** (recount before deletion: 6/103/65/11); post-Notify retirement the coordinator reports **5/81/62/11**. Runtime and integrated verification remain pending; legacy fixture/caller migration remains tracked in `.empryo/reviews/verdict-s4-integration.md`. Other stores' and Session's global sites remain unchanged. The Metadata store's
 season switch and episode-page window are the tenth (the bullet headed "The Metadata reads"): their
 two worker starts and the `client_for` reads of `fetch_episodes` and `fetch_episode_page` are gone
 from `data/src/metadata.rs`; the Related row's tail window read joins them in the same bullet, and its
@@ -723,6 +745,57 @@ worker start and the `client_for` read inside that worker are gone too. The hous
       rig in the app, screens or hostsim suites waits on a Related landing through a real worker
       (`detail_related_landing_tests` lands the window with `land_related_for_test`), so there is
       no `LiveKind` for it.
+- **Metadata M4: alt sources and dev inputs.** Detail installation emits a Direct, untaped
+  `StoreJob::MetaAltSources(Job<MetaAltSourcesReq>, MetaAltSourcesPort)`. The request captures the
+  item's `(sid,rk)`, GUID, roster generation, ordered whole roster **including origin**, and whole
+  `ClientKeys` snapshot. `finish_alt_sources_job` constructs `KeyedClients` from that snapshot and
+  the runner's lookup; a missing/moved key skips only that server immediately before its GET.
+  Servers registered later never join the read; credential changes after a request is on the wire
+  remain outside this fence. Resolve panic answers one empty list, posted outside `catch_unwind`.
+  Done does not settle before the gated by-value take; refusal settles immediately and monotonically
+  without a mailbox, record or retry, so dump-mode owed cannot starve on a refused launch.
+  - **Publication locking.** Request generation increment/slot clear, roster invalidation, and port
+    publication all acquire `alt_slot` first, then inspect/change `alt_gen`. A stale writer cannot
+    overwrite a newer slot. Consumer generation filtering, landing rank, `(sid,rk)` addressing and
+    captured-roster fencing are retained. Facts changes restamp credit; they do not cancel work.
+  - **One call, three phases.** Bridge refills keys BEFORE begin; `pump_alt_sources_with_library`
+    retains the roster/facts reads and bookkeeping/prune, then consumes an eligible noncontrolled
+    rk-only stand-in chance and returns a private, non-Clone lifetime-bound pass plus owned request.
+    The pass exclusively borrows Metadata and shares the supplied keys through finish: clear,
+    reset, away-and-back, competing steps/publication, reuse, and refill cannot interleave in safe
+    callers. A private per-pass identity binds the owned host answer to its pass. The host handles
+    only a due request using the retained Browse library; finish installs a stand-in first, then
+    gated real data compared with the **PRE-registration roster**, folding one notice. Registration
+    is observed by invalidation on the NEXT pass, never between begin and finish.
+  - **Dev host, not logic IO.** Shared-trigger source latch, per-item stand-in reads and registry
+    registration live in `src/dev/scenarios/metadata.rs`. Source is captured at live Detail launch
+    and held execution, rather than first draw: this is an approved **timing change**, not a pure
+    move. `Detail::source()` uses retained `Option<String>` then real owner facts: `None` is unarmed,
+    `Some(empty)` forces no credit. The field is serde-default AND serialization-skipped, preserving
+    frozen terminal bytes and neutral decoded replay. Controlled capture suppresses before cache/IO;
+    `Bridge::controlled_home` constructs fresh Metadata (only Hubs are restored), so live Details
+    cannot leak retained overrides across that host boundary. Controlled installation is neutral too.
+    Stand-in reads remain once per due noncontrolled rk, even without library/list; source latch is
+    separately once per process. Token is read only on fallback registration. The host preserves
+    current-server identity and uses `register_origin` with origin/pin/connection facts.
+  - **Drains and held policy.** Bridge detail landing and aggregate Metadata pumps refill immediately
+    before pumping and drain Metadata immediately AFTER it, within the same call. Store/raw support
+    pumps take explicit keys/control inputs; Machine Pump without them refuses before taking data.
+    ApplyView-only fan-out lists do not change. Default held/park_page_reads keep alt live off-thread;
+    held_all parks it, and a new Detail does not retire parked alt. Reset rotates adapter identity.
+  - **Ledger and verification scope.** Removed one Metadata worker, eight globals and three forks;
+    five exact globals remain (request roster enumeration/gen, pump roster/facts gen, Detail tape
+    active). Every area header and entry was recounted: actual totals 7/111/68/11 become
+    **6/103/65/11**; the brief's earlier 121/113 globals sums were arithmetic errors, and the old
+    forks pin 71 was a loose ceiling. M4 does not claim all Metadata pure (owner facts and worker
+    timing remain). On prior tree `cfa3cba398266e37b2de759bd6896faa05932fda`, the unchanged Linux
+    replay driver passed 6/6 fixture-mode replays (3,412 graded frames, zero differences); this is
+    historical evidence, not the publication head. M4 landed as PR #1315 (merge
+    `5b4e8db7745167e3211b9842147dfc34423755d3`) after 19/19 checks on exact head `29a`.
+    Exact publication replays were 6 SAME, 2,442 graded frames, with all differences zero. Local
+    full `make check` remained FAILED: two isolated runner-environment issues and a benchmark
+    timestamp defect were independently reproduced on BASE `0aaf`. This does not establish S4
+    testing or ARM, TV or video behavior.
 - **The view-state write lane.** The household's watch-state writes (`data/src/viewstate.rs`: mark
   watched, mark unwatched, remove from Continue Watching, and the fan-out of a watched write, or of
   an end of stream, to the title's other copies) are the eleventh store on the lane. `kick` starts no

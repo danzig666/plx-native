@@ -150,6 +150,7 @@ impl CatalogIo for Discover {
             genres: vec!["Drama".into()],
             content_rating: None,
             duration_ms: None,
+            cover_art: None,
         })
     }
     fn today(&self) -> Option<String> {
@@ -602,7 +603,7 @@ fn the_item_menu_watchlist_arms_queue_the_write_pulse_and_route() {
 fn a_matched_titles_caption_reads_its_copys_facts_under_every_details_pick() {
     use super::test_support::World;
     use super::under_posters_shelf_route_tests::{set, Cell};
-    use plx_plex::plex::session::UnderPostersDetails as Details;
+    use plx_plex::plex::session::UnderPostersLadder as Details;
     let script = Script::new(&[1]);
     *script.roster.lock().unwrap() = vec![ServerId::from_raw(1)];
     script.up.store(true, Ordering::SeqCst);

@@ -1147,6 +1147,52 @@ Verified live:
 | `width=420&height=236&url=/library/metadata/1/art/...` | 200, `image/jpeg`, 420×236, 29 KB |
 | `width=300&height=450&url=/library/metadata/1/thumb/...` | 200, `image/jpeg`, 300×450, 36 KB |
 
+### Hub rows carry `Image[]`, with a stamped clearLogo (measured 2026-11-09, PMS 1.43.5.11079, Guest)
+
+`GET /hubs/continueWatching` and `GET /hubs/sections/{id}` (the `movie.inprogress.N` and
+`tv.inprogress.N` hubs) put the same `Image[]` on every row that `GET /library/metadata/{rk}`
+does (see `docs/plex-api.md`, "Artwork"). Each entry is `{type, url, alt}`; `alt` is the title.
+Every url is a server-relative path with the item's **update stamp** as its last segment:
+
+```
+coverPoster       /library/metadata/<rk>/thumb/<ts>
+background        /library/metadata/<rk>/art/<ts>
+clearLogo         /library/metadata/<rk>/clearLogo/<ts>
+backgroundSquare  /library/metadata/<rk>/squareArt/<ts>
+snapshot          /library/metadata/<episode rk>/thumb/<ts>      (episodes only)
+```
+
+The app uses the stamped clearLogo path for both hero logos and baked cards, so a replacement
+uses a new cache key as soon as updated metadata lands. When the server omits the image list,
+the app can still look up a logo via `/library/metadata/{rk}/clearLogo`. **An episode's `Image[]` names its SHOW's
+rating key** for `coverPoster`, `background`, `clearLogo` and `backgroundSquare` (the row's own
+`ratingKey` 732, the show's 605, in the probe), and only `snapshot` is the episode's own: the
+episode's `thumb` still. A movie row has no `snapshot`. Every row of the probe (4 movies and 1
+episode in Continue Watching) had `clearLogo`, `background` and `coverPoster`; none had a
+`coverArt` (that type exists only on the Discover provider, which PMS does not serve). Whether a
+title without a logo omits the entry or carries an empty url was not observed. A parser must
+treat an absent entry as "none".
+
+The row's `guid` is `plex://movie/<24 hex>` for a movie and `plex://episode/<24 hex>` for an
+episode; the episode's `grandparentGuid` is `plex://show/<24 hex>` (the catalog id of its show).
+
+### An absolute Discover image URL through the transcoder (measured 2026-11-09, PMS 1.43.5.11079, Guest)
+
+A Discover `coverArt` is an absolute URL on `https://metadata-static.plex.tv` (or, for a localized
+cover, `https://image.tmdb.org`; `docs/plex-api.md`). The PMS photo transcoder takes it as `url=` like
+a headshot and fetches it server-side:
+
+| request (`minSize=1`, `url=` the urlencoded absolute coverArt) | result |
+|---|---|
+| `width=420&height=236`, source 1920x1080 | 200, `image/jpeg`, **420x236**, 22 KB (source 263 KB) |
+| `width=420&height=236`, source 3840x2160 (three titles) | 200, `image/jpeg`, **420x236**, 12 to 28 KB (source 0.5 to 1.5 MB) |
+| the same without `minSize` | 200, identical bytes (a 16:9 source at a 16:9 box) |
+
+All four were 16:9 sources, so the box was filled exactly; whether a non-16:9 cover overshoots
+(`minSize=1`, above) was not probed. The request carries the PMS token only, never the Discover
+token. A raw GET of the same absolute URL from the dev Mac also answered 200 with no credential,
+at the full source size.
+
 ### Raw (no transcode wrapper) — verified, do NOT use for grids
 
 ```
@@ -1767,11 +1813,19 @@ array of `{ "id": "…", "uuid": "…" }` records. `uuid` identifies the feature
 A public unauthenticated read with a synthetic client identifier returned a valid list without
 either marker capability. An empty list is a valid denial; a malformed response is unavailable.
 
+**`pass` in this list grants both.** An account with an active Plex Pass, read on a webOS 10 set
+on 2026-11-05, listed 109 features including `pass` and neither `intro-markers` nor
+`credits-markers`, so both settings were hidden from a Pass holder watching on that account. The
+list is read with the viewer's credential, so `pass` there is the Pass plex.tv reports for the
+viewer (their own, or, unmeasured, their Plex Home's), never a shared server owner's. Only the
+Pass holder's own account was measured.
+
 [Plex's intro documentation](https://support.plex.tv/articles/skip-content/) and
 [credits documentation](https://support.plex.tv/articles/credits-detection/) tie skipping to the
 player's viewer or that viewer's eligible Plex Home, rather than an unrelated server owner's Pass.
 Do not infer either grant from PMS `myPlexSubscription`, generic account subscription activity,
-or membership in some server owner's Home.
+or membership in some server owner's Home; `pass` in the viewer-credential `/api/v2/features`
+list above is the one subscription signal accepted.
 
 `PreferenceRequest::load_marker_access` first verifies `/api/v2/user` with the captured viewer
 credential, requiring at least one known ID/UUID to match and neither to conflict, then reads

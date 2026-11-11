@@ -84,7 +84,7 @@ uses `libass-plx-host.so.0`.
 | libass | 0.17.5 | ISC (`licenses/libass-ISC.txt`) |
 | FreeType | 2.15.0 | Elected FreeType License; contributed MIT and Zlib code (`licenses/FreeType.txt`, `licenses/Zlib.txt`) |
 | FriBidi | 1.0.18 | LGPL-2.1-or-later (`licenses/LGPL-2.1.txt`) |
-| HarfBuzz | 15.0.0 | Old MIT (`licenses/HarfBuzz-Old-MIT.txt`) |
+| HarfBuzz | 15.1.0 | Old MIT (`licenses/HarfBuzz-Old-MIT.txt`) |
 | libunibreak | 8.0 | zlib (`licenses/libunibreak-Zlib.txt`) |
 
 Portions of this software are copyright © 2026 The FreeType Project
@@ -362,7 +362,7 @@ stated; election does not alter your rights under the other arms.
 | bitvec | 1.1.1 | Copyright (c) 2018 myrrlyn (Alexander Payne) |
 | bitvec_helpers | 4.0.2 | Copyright (c) 2026 quietvoid |
 | core_maths | 0.1.1 | Copyright (c) 2024 Robert Bastian |
-| dolby_vision | 3.4.0 | Copyright (c) 2026 quietvoid. Parses and rewrites Dolby Vision RPUs for the Profile 7 to 8.1 conversion (`plx_media`'s `ff.rs`); used unmodified, with no optional features |
+| dolby_vision | 3.4.0 | Copyright (c) 2026 quietvoid. Parses and rewrites Dolby Vision RPUs for the Profile 7 to 8.1 conversion (`plx_play_feed`'s `ff.rs`); used unmodified, with no optional features |
 | funty | 2.0.0 | Copyright (c) 2020 myrrlyn (Alexander Payne) |
 | libm | 0.2.16 | Copyright (c) 2018 Jorge Aparicio and the third-party copyright notices preserved verbatim in `licenses/libm.txt` |
 | qrcodegen | 1.8.0 | Copyright (c) Project Nayuki. The complete upstream MIT notice is preserved in `licenses/qrcodegen.txt` |
@@ -505,7 +505,7 @@ enable it) — verified absent from the binary. `rustc-literal-escaper`, `proc_m
 
 ### 2.6 Native crash capture
 
-**Sentry Native 0.17.5** — Copyright (c) 2019 Sentry and individual contributors. Licence:
+**Sentry Native 0.17.6** — Copyright (c) 2019 Sentry and individual contributors. Licence:
 **MIT** (`licenses/MIT.txt`). Its client library is statically linked into `plxnative`; the
 out-of-process `sentry-crash` handler is shipped beside it. The handler is built with its HTTP
 transport disabled: it writes a crash envelope for PlxNative's consent-aware sender to deliver on

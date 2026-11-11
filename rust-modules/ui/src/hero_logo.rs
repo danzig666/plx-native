@@ -37,6 +37,9 @@ pub enum LogoRung {
     Hero,
     /// The detail page's pinned compact title, the strip the hero scrolls up into.
     Compact,
+    /// A Continue Watching deck card's logo (420x236): baked into the card's composite
+    /// (`card_art::compose`) and, when there is no logo, its title in type (`title_text`).
+    Card,
     /// A continuous point between two named rungs, at `t` (0 = the first, 1 = the second) — never
     /// authored as a constant, always the live output of [`LogoRung::lerp`] driven by a spring or
     /// other per-frame progress value (the detail hero's trailer-preview logo, shrinking from
@@ -70,6 +73,13 @@ impl LogoRung {
                 theme::logo::COMPACT_H_MAX,
                 theme::logo::COMPACT_W_MAX,
                 theme::size::TITLE,
+            ),
+            LogoRung::Card => (
+                theme::logo::CARD_AREA,
+                theme::logo::CARD_BAND_H,
+                theme::logo::CARD_H_MAX,
+                theme::logo::CARD_W_MAX,
+                theme::size::HEADLINE,
             ),
             LogoRung::Custom { area, band_h, h_max, w_max, fallback_sz } => (area, band_h, h_max, w_max, fallback_sz),
         }
@@ -134,15 +144,49 @@ pub fn place(band: Rect, w: f32, h: f32, align: HAlign) -> Rect {
     Rect::new(x, band.y + band.h - h, w, h)
 }
 
+/// The title in type at `rung`: the run a band draws when its logo is absent, ink
+/// [`theme::TEXT_PRIMARY`]. THE one place the text fallback's size, weight, leading and line count
+/// are decided, so [`HeroLogo::draw`] and a deck card that never draws a live logo (`Card`'s Type
+/// rung, `card_art::needs_type_title`) cannot set the same title two ways. The caller adds the
+/// alignment and the measure (`.h(..)`, `.with_measure(..)`) and places it, bottom-anchored.
+pub fn title_text(rung: LogoRung, title: &str) -> TextView<'_> {
+    title_text_inked(rung, title, theme::TEXT_PRIMARY)
+}
+
+/// [`title_text`] in another ink — the placeholder accounting's sentinel ink in [`HeroLogo::draw`].
+fn title_text_inked(rung: LogoRung, title: &str, ink: [f32; 4]) -> TextView<'_> {
+    let (_, _, _, _, sz) = rung.bounds();
+    let lines = if sz > theme::size::TITLE { theme::hero::TITLE_LINES } else { 1 };
+    TextView::new(title, sz, ink)
+        .bold().leading(sz as f32 * theme::hero::TITLE_LEAD / theme::size::DISPLAY as f32).max_lines(lines)
+}
+
+/// The height the title run `tv` paints at in a column `band_w` wide: its measured height less the
+/// leading under its last line, plus the cap band, so the run's LAST BASELINE is what a bottom
+/// anchor lands on. Shared by [`HeroLogo::draw`]'s fallback and [`draw_title`].
+fn title_paint_h(tv: &TextView<'_>, rung: LogoRung, band_w: f32, measure: &dyn Measure) -> f32 {
+    let (_, _, _, _, sz) = rung.bounds();
+    tv.measure_h(band_w) - (sz as f32 * theme::hero::TITLE_LEAD / theme::size::DISPLAY as f32) + measure.cap_h(sz)
+}
+
+/// **Draw a title in type in the slot a logo of `rung` would stand in** (`band`: its column, with
+/// `band.y + band.h` the anchor line the run's last baseline lands on), at `align`. It is the
+/// fallback of [`HeroLogo::draw`] and NOTHING else: no logo texture is looked up, so it is what a
+/// Continue Watching card draws when neither Plex's cover nor our composite exists (`Card`'s Type
+/// rung, `card_art::needs_type_title`), where a live logo must never go up.
+pub fn draw_title(p: Painter, rung: LogoRung, title: &str, band: Rect, align: HAlign, measure: &dyn Measure) {
+    let tv = title_text(rung, title).h(align.resolve(title)).with_measure(measure);
+    let h = title_paint_h(&tv, rung, band.w, measure);
+    tv.draw(p, Rect::new(band.x, band.y + band.h - h, band.w, h));
+}
+
 /// The title band itself: the item's clearLogo if it has resolved, else its title as text. Owning
 /// both halves here is what makes the swap consistent across the three sites — and is why the two
 /// fallbacks that used to paint an unbounded run now elide like home's always did.
 pub struct HeroLogo<'a> {
-    rk: &'a str,
-    /// The raw id of the server `rk` is a key on. A clearLogo is fetched through the image
-    /// transcoder of the server that holds the item, and `rk` names an item on that machine alone —
-    /// resolving it against whichever server is current drew no logo at all for a borrowed hero,
-    /// which is how this was reported ("detail page does not show logo image").
+    logo: &'a str,
+    /// The raw id of the server that holds the logo. The same source path can name different
+    /// images on different servers.
     sid: u16,
     title: &'a str,
     rung: LogoRung,
@@ -150,12 +194,11 @@ pub struct HeroLogo<'a> {
 }
 
 impl<'a> HeroLogo<'a> {
-    /// `rk` is the ratingKey whose clearLogo to draw — for an episode hero that is the SHOW's
-    /// (episodes have no clearLogo asset; keying to the episode 404s straight into a text fallback
-    /// of the wrong title). `title` is the run drawn when there is no logo.
-    pub fn new(sid: u16, rk: &'a str, title: &'a str, rung: LogoRung) -> Self {
+    /// `logo` is a stamped clearLogo path or a legacy rating key on `sid`. An empty source
+    /// draws `title` directly. An episode hero can name its show's logo.
+    pub fn new(sid: u16, logo: &'a str, title: &'a str, rung: LogoRung) -> Self {
         Self {
-            rk,
+            logo,
             sid,
             title,
             rung,
@@ -169,6 +212,23 @@ impl<'a> HeroLogo<'a> {
         self
     }
 
+    /// **The rect [`draw`](Self::draw) paints in `band`**: the logo art's own box where it has
+    /// resolved, else the title's text run bottom-anchored on the band and as wide as its widest
+    /// line ([`TextView::ink_span`]), not the column the run was wrapped into. The hero shade stands
+    /// behind exactly this ([`crate::hero_shade`]), so a screen asks the logo what it is painting
+    /// rather than guessing from the band, and it moves with the logo.
+    pub fn painted(&self, band: Rect, measure: &dyn Measure) -> Rect {
+        let align = self.align.resolve(self.title);
+        if let Some((_, sw, sh)) = crate::tex::logo_src(self.sid, self.logo) {
+            let (w, h) = fit(self.rung, sw, sh, band.w);
+            return place(band, w, h, align);
+        }
+        let fallback = title_text(self.rung, self.title).h(align).with_measure(measure);
+        let h = title_paint_h(&fallback, self.rung, band.w, measure);
+        let (left, right) = fallback.ink_span(band);
+        Rect::new(left, band.y + band.h - h, right - left, h)
+    }
+
     /// Draw into `band` — `band.w` is the column the logo is contained to, `band.y + band.h` the
     /// anchor line, and `band.h` should be [`band_h`] of the same rung. Ink is [`theme::TEXT_PRIMARY`]
     /// for both the logo tint and the fallback text (the value all three sites passed already).
@@ -177,24 +237,17 @@ impl<'a> HeroLogo<'a> {
         // Resolve the fallback before consulting the asynchronous texture cache. A recording and
         // its replay need the same measurement census even when the logo happened to be resident
         // in only one run; texture residency is paint state, not logical replay state.
-        let (_, _, _, _, sz) = self.rung.bounds();
         let align = self.align.resolve(self.title);
-        let lines = if sz > theme::size::TITLE { theme::hero::TITLE_LINES } else { 1 };
-        let fallback = TextView::new(self.title, sz, theme::TEXT_PRIMARY)
-            .bold().leading(sz as f32 * theme::hero::TITLE_LEAD / theme::size::DISPLAY as f32).max_lines(lines).h(align).with_measure(measure);
-        let fallback_h = fallback.measure_h(band.w)
-            - (sz as f32 * theme::hero::TITLE_LEAD / theme::size::DISPLAY as f32) + measure.cap_h(sz);
-        // The hero draws the item the shelf under it has focused, and that shelf is the server
-        // being browsed — so its clearLogo is asked of the current server. An item that came from
-        // somewhere else (a merged Continue Watching row) names its own, once items carry one.
-        if let Some((tex, sw, sh)) = crate::tex::logo_src(self.sid, self.rk) {
+        let fallback = title_text(self.rung, self.title).h(align).with_measure(measure);
+        let fallback_h = title_paint_h(&fallback, self.rung, band.w, measure);
+        if let Some((tex, sw, sh)) = crate::tex::logo_src(self.sid, self.logo) {
             let (w, h) = fit(self.rung, sw, sh, band.w);
             // NOT pixel-snapped: a logo is SCALED content, and the crispness contract snaps
             // 1:1-texel content only (see the note above `theme.rs`'s size ladder).
             p.tex(tex, place(band, w, h, align), 0.0, theme::TEXT_PRIMARY);
             return;
         }
-        // An item with a ratingKey whose logo has not resolved draws its title as text, and that is
+        // An item with a logo source that has not resolved draws its title as text, and that is
         // a WAIT only while the logo can still arrive: counted (and sentinel-inked) then. A logo the
         // store has settled as a miss (the 404 of an item with no clearLogo) will never come, so
         // the text is the answer: not counted, but reported as an absence so a driver whose
@@ -205,16 +258,15 @@ impl<'a> HeroLogo<'a> {
         // a real library most items have no clearLogo, so this branch runs every frame. Its answer
         // only picks between the two accounting calls below (and, in the sentinel build, the ink):
         // when nothing can see them, neither call records and both draw TEXT_PRIMARY, so skip it.
-        let (p, ink) = if self.rk.is_empty() || !crate::placeholder::accounting_visible() {
+        let (p, ink) = if self.logo.is_empty() || !crate::placeholder::accounting_visible() {
             (p, theme::TEXT_PRIMARY)
-        } else if crate::tex::logo_failed(self.sid, self.rk) {
-            crate::placeholder::note_absent(p, crate::placeholder::Reason::HeroLogoAbsent, self.rk);
+        } else if crate::tex::logo_failed(self.sid, self.logo) {
+            crate::placeholder::note_absent(p, crate::placeholder::Reason::HeroLogoAbsent, self.logo);
             (p, theme::TEXT_PRIMARY)
         } else {
-            crate::placeholder::ink(p, crate::placeholder::Reason::HeroLogoText, self.rk, theme::TEXT_PRIMARY)
+            crate::placeholder::ink(p, crate::placeholder::Reason::HeroLogoText, self.logo, theme::TEXT_PRIMARY)
         };
-        TextView::new(self.title, sz, ink).bold().leading(sz as f32 * theme::hero::TITLE_LEAD / theme::size::DISPLAY as f32)
-            .max_lines(lines).h(align).with_measure(measure)
+        title_text_inked(self.rung, self.title, ink).h(align).with_measure(measure)
             .draw(p, Rect::new(band.x, band.y + band.h - fallback_h, band.w, fallback_h));
     }
 }
@@ -230,7 +282,7 @@ mod tests {
         assert!(h < band_h(LogoRung::Hero), "paint must be free to be shorter than the title band");
         assert!(w * h <= 60_000.0 + 0.01, "the height floor must not inflate the area");
     }
-    use LogoRung::{Compact, Hero};
+    use LogoRung::{Card, Compact, Hero};
 
     // `fit`/`place`/`band_h` are pure f32 arithmetic over their arguments — no GL, no SDL_ttf, no
     // crate globals — so unlike the catalog-backed Home tests these are ordinary parallel ones, needing
@@ -285,7 +337,7 @@ mod tests {
     /// the mark — which no visual review would reliably catch on an unfamiliar logo.
     #[test]
     fn nothing_overflows_its_column_or_its_ceiling_and_aspect_is_preserved() {
-        for rung in [Hero, Compact] {
+        for rung in [Hero, Compact, Card] {
             let (_, _, h_max, w_max, _) = rung.bounds();
             for a in [
                 0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 20.0,
@@ -465,6 +517,59 @@ mod tests {
         assert_eq!(above, at_1, "t>1 must clamp to t=1");
     }
 
+    /// The card rung's slot is its own height ceiling, and its logo is the constant-area rule's.
+    #[test]
+    fn the_card_rung_is_a_constant_area_inside_its_slot() {
+        assert_eq!(band_h(Card), theme::logo::CARD_H_MAX);
+        let (w, h) = fit(Card, 1500.0, 300.0, 420.0);
+        assert!((w * h - theme::logo::CARD_AREA).abs() < 0.02, "{w}x{h}");
+        assert!(h <= band_h(Card), "an ordinary wordmark sits inside the slot");
+        assert_eq!(fit(Card, 100.0, 100.0, 420.0), (theme::logo::CARD_H_MAX, theme::logo::CARD_H_MAX), "a square clamps at the ceiling");
+    }
+
+    /// The deck card's Type rung sets its title with `title_text`; it must be, run for run, what
+    /// `HeroLogo::draw` falls back to, at every rung that has a fallback.
+    #[test]
+    fn title_text_is_what_the_hero_logo_falls_back_to() {
+        install_store(true);
+        let measure = crate::fixture::FixtureMeasure;
+        for rung in [Hero, Compact, Card] {
+            for title in ["A Title", "The Unbearably Long Name of the Last House at the Edge of the World"] {
+                let band = Rect::new(96.0, 446.0, 400.0, band_h(rung));
+                let drawn = crate::draw_census::capture_runs(|| {
+                    HeroLogo::new(0, "", title, rung).draw(Painter::recording(), band, &measure);
+                });
+                let tv = title_text(rung, title).h(HAlign::Left.resolve(title)).with_measure(&measure);
+                let (_, _, _, _, sz) = rung.bounds();
+                let h = tv.measure_h(band.w) - tv.line_h() + measure.cap_h(sz);
+                let direct = crate::draw_census::capture_runs(|| {
+                    tv.draw(Painter::recording(), Rect::new(band.x, band.y + band.h - h, band.w, h));
+                });
+                assert!(!drawn.is_empty(), "{rung:?}: nothing drawn");
+                assert_eq!(drawn, direct, "{rung:?} {title}");
+            }
+        }
+    }
+
+    /// `draw_title` is the hero logo's text fallback, run for run, and it looks no logo up.
+    #[test]
+    fn draw_title_is_the_fallback_and_never_a_logo() {
+        install_store(false);
+        let measure = crate::fixture::FixtureMeasure;
+        for rung in [Hero, Compact, Card] {
+            let band = Rect::new(96.0, 446.0, 400.0, band_h(rung));
+            let drawn = |f: &dyn Fn()| crate::draw_census::capture_runs(f);
+            let fallback = drawn(&|| HeroLogo::new(0, "", "A Title", rung).draw(Painter::recording(), band, &measure));
+            let title = drawn(&|| draw_title(Painter::recording(), rung, "A Title", band, HAlign::Left, &measure));
+            assert!(!title.is_empty(), "{rung:?}: nothing drawn");
+            assert_eq!(title, fallback, "{rung:?}");
+        }
+        let band = Rect::new(0.0, 0.0, 400.0, band_h(Card));
+        let runs = crate::draw_census::capture_runs(|| draw_title(Painter::recording(), Card, "A Title", band, HAlign::Center, &measure));
+        assert_eq!(runs.len(), 1, "one title");
+        assert_eq!(runs[0].text, "A Title");
+    }
+
     // ---- the placeholder count of the text fallback -------------------------------------------
 
     /// A clearLogo source with one scripted answer: never resident (`logo` is `None`), and
@@ -553,6 +658,29 @@ mod tests {
             assert!(run.at.x + run.at.w <= band.x + band.w + 0.01);
         }
         assert!(runs[1].at.y > runs[0].at.y);
+    }
+
+    /// **A typed title is painted as wide as its widest line**, not as wide as the column it wraps
+    /// into: the shade stands behind this rect, and a column-wide one would be a slab. It starts where
+    /// the title's alignment starts it, and a title that wraps still fits its column.
+    #[test]
+    fn a_typed_title_is_painted_as_wide_as_its_widest_line() {
+        use plx_machine::machine::Measure;
+        install_store(true);
+        let m = crate::fixture::FixtureMeasure;
+        let band = Rect::new(96.0, 446.0, theme::hero::TEXT_W, band_h(Hero));
+        let (_, _, _, _, sz) = Hero.bounds();
+        let width = m.width_str("Hollow Coast", sz, true);
+        assert!(width < band.w * 0.8, "the premise: this title is well inside its column ({width})");
+        let left = HeroLogo::new(0, "", "Hollow Coast", Hero).painted(band, &m);
+        assert_eq!((left.x, left.w), (band.x, width), "left-aligned: from the column edge, its own width");
+        let right = HeroLogo::new(0, "", "Hollow Coast", Hero).align(HAlign::Right).painted(band, &m);
+        assert_eq!((right.w, right.x + right.w), (width, band.x + band.w), "right-aligned: ending at the column's edge");
+        assert_eq!((left.y, left.h), (right.y, right.h), "the alignment moves it sideways only");
+        let long = HeroLogo::new(0, "", "The Unbearably Long Name of the Last House at the Edge of the World", Hero)
+            .painted(band, &m);
+        assert!(long.x >= band.x && long.x + long.w <= band.x + band.w + 0.01, "a wrapped title stays in its column: {long:?}");
+        assert!(long.h > left.h, "…and is taller than the one-line title");
     }
 
     /// The logo is on its way: the hero shows its title as text in the meantime, and that is a wait.

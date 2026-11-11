@@ -131,7 +131,16 @@ fn seconds_scale_durations_keep_the_distinctions_that_matter() {
 /// Time-remaining for a Continue-Watching item — "8m left" / "1h 2m left" (rounded up to
 /// the next whole minute, floored at 1). `remaining_ms` is duration − viewOffset.
 pub fn time_left(remaining_ms: i64) -> String {
-    time_left_minutes_in(plx_platform::i18n::current(), (remaining_ms + 59_999) / 60_000)
+    time_left_minutes_in(plx_platform::i18n::current(), remaining_minutes(remaining_ms))
+}
+
+fn remaining_minutes(remaining_ms: i64) -> i64 {
+    (remaining_ms.saturating_add(59_999) / 60_000).max(1)
+}
+
+/// Time remaining inside a playback control: the compact duration without the word “left”.
+pub fn remaining_duration(remaining_ms: i64) -> String {
+    duration_minutes_in(plx_platform::i18n::current(), remaining_minutes(remaining_ms))
 }
 
 /// [`time_left`] from whole minutes, in a given context; at least a minute (the line promises
@@ -139,6 +148,39 @@ pub fn time_left(remaining_ms: i64) -> String {
 pub fn time_left_minutes_in(cx: &LocaleContext, mins: i64) -> String {
     let (h, m) = split_hours(mins.max(1));
     if h > 0 { msg::core_time_left_hours_in(cx, h, m) } else { msg::core_time_left_minutes_in(cx, m) }
+}
+
+/// **Time left as a still's one-line footer says it** — "38m left", "1h 12m left", the SHORTEST
+/// form each language has (`core.footer_left_*`, not [`time_left`]'s caption wording: a footer line
+/// shares 388 px with an episode tag and a progress bar). Rounded up to the next whole minute and
+/// never zero, as [`time_left`] is. The Home Resume pill uses [`remaining_duration`].
+pub fn footer_left(remaining_ms: i64) -> String {
+    footer_left_minutes_in(plx_platform::i18n::current(), remaining_minutes(remaining_ms))
+}
+
+/// [`footer_left`] from whole minutes, in a given context.
+pub fn footer_left_minutes_in(cx: &LocaleContext, mins: i64) -> String {
+    let (h, m) = split_hours(mins.max(1));
+    if h > 0 { msg::core_footer_left_hours_in(cx, h, m) } else { msg::core_footer_left_minutes_in(cx, m) }
+}
+
+/// **The episode tag that leads a still's footer line**, with its trailing middle dot: `"S2 E4 ·"`
+/// (`core.footer_tag`, so a language spells the letters and the order itself). A number that is not
+/// positive is no number ([`episode_address_in`]'s rule), so an episode with only one of the two
+/// reads `"E4 ·"` or `"S2 ·"`, and with neither the tag is empty and the footer is the time alone
+/// (a film).
+pub fn footer_tag_in(cx: &LocaleContext, season: i64, index: i64) -> String {
+    match (season > 0, index > 0) {
+        (true, true) => msg::core_footer_tag_in(cx, index, season),
+        (true, false) => format!("{} \u{b7}", msg::core_season_in(cx, season)),
+        (false, true) => format!("{} \u{b7}", msg::core_episode_in(cx, index)),
+        (false, false) => String::new(),
+    }
+}
+
+/// [`footer_tag_in`] in the thread's language.
+pub fn footer_tag(season: i64, index: i64) -> String {
+    footer_tag_in(plx_platform::i18n::current(), season, index)
 }
 
 /// **The one release-date phrase** — "Coming 12 Mar" — for an unreleased title: the Watchlist's focus

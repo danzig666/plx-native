@@ -175,6 +175,41 @@ fn switching_profile_leaves_the_container_holding_nothing_of_the_previous_profil
     );
 }
 
+/// **Each `settings-*` fps scene's boot target stands on the page whose heartbeat word the scene selects on.**
+/// `tests/manifest.json` names a `plxnative-settings=<target>` trigger and an `overlay` word; the harness grades
+/// the frames that print the word, so a target that opened another page (or the root, as an unknown one does)
+/// would leave the scene with no samples or, worse, another page's. The pairs are READ from the manifest (every
+/// scene that names a `plxnative-settings` trigger and an `overlay`), not transcribed. About answers the Legal
+/// index's word, which is why it has a boot target and no scene of its own.
+#[test]
+fn each_settings_fps_scene_boot_target_prints_the_overlay_word_the_scene_selects_on() {
+    let _g = plx_base::testlock::serial();
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tests/manifest.json")).expect("manifest.json parses");
+    let mut checked = 0;
+    for scene in manifest["fps_scenes"].as_array().expect("fps_scenes is an array") {
+        let name = scene["name"].as_str().unwrap_or("?");
+        let (Some(target), Some(word)) = (
+            scene["triggers"]["plxnative-settings"].as_str(),
+            scene["overlay"].as_str(),
+        ) else { continue };
+        let page = crate::dev::scenarios::settings_boot_page(target)
+            .unwrap_or_else(|| panic!("scene {name}: no such boot target {target:?}"));
+        let mut d = Dispatcher::<AppHost>::new();
+        let mut rig = Bridge::for_test(|| 0);
+        frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+        open_settings_at(&mut d, page);
+        for ms in 1..=40 {
+            frame(&mut d, &mut rig, AppArg::Home, tick(ms * 16), vec![]);
+        }
+        assert!(settings_up(&d), "scene {name}: the Settings surface is up");
+        assert_eq!(overlay_word(&d), Some(word), "scene {name}: the heartbeat word of the page {target:?} boots");
+        checked += 1;
+    }
+    assert!(checked >= 14, "the manifest's settings scenes were found ({checked})");
+    assert!(crate::dev::scenarios::settings_boot_page("no-such-page").is_none());
+}
+
 /// **A profile switch dismisses an open Settings surface, at once.** The Playback page names the
 /// seated profile and lists that profile's own picks, so it must not survive the switch to the next
 /// one: it would say "for Maya" over Noah's values for as long as it stayed up. The surfaces go
@@ -558,7 +593,7 @@ fn hud_preview_world(name: &str) -> World {
     assert_eq!(overlay_word(&world.d), Some("hud-detail"));
     world.press(Key::Ok);
     assert_eq!(world.bridge.huds_pages.len(), 2);
-    for (page, _) in &world.bridge.huds_pages { page.send(list.clone()).unwrap(); }
+    for (page, ..) in &world.bridge.huds_pages { page.send(list.clone()).unwrap(); }
     // Let the shared route spring settle: during a push both pages register drawn stops.
     world.settle(60);
     assert_eq!(overlay_word(&world.d), Some("hud-preview"));
@@ -1166,6 +1201,7 @@ fn a_seeded_menu_anchor_is_mounted_into_the_next_menu_and_only_that_one() {
 /// opener's rect they ride the mounter (`Bridge::seed_player_more_folds`): a press that seeds nothing mounts the root
 /// More always had, and a Tracks menu opened with a seed pending ignores it (and leaves none for a later More).
 #[test]
+#[cfg(feature = "play-feed")] // forces the speed decoder through `plx_media::ff`
 fn seeded_folded_rows_are_mounted_into_the_next_more_menu_and_only_that_one() {
     use plx_appkit::more_menu::{Action, FoldedRow, MoreRow};
     use plx_appkit::player_hud::command::HudCommand;
@@ -1195,7 +1231,7 @@ fn seeded_folded_rows_are_mounted_into_the_next_more_menu_and_only_that_one() {
             frame(d, rig, AppArg::Player, tick(next()), vec![]);
         }
     };
-    plx_media::ff::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
+    plx_media_codecs::ffi::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
     rig.seed_player_more_folds(seeded());
     open(&mut d, &mut rig, OverlayKind::More { page: None });
     assert!(has_row(&mut d), "More mounts with the rows it was handed");

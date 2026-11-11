@@ -155,22 +155,19 @@ is what keeps stems and bars at their intended weight on a 1080p panel.
 
 ![Home, hero](screenshots/ux-home-hero.jpg)
 
-Home opens on a **hero** — one item, full-bleed backdrop, with its logo or title, a one-line fact
-row (kind · year · rating), a truncated summary and an action row. The hero rotates through a set of
-promoted items; the dots under the action row show the position.
+Home opens on a **hero** — one item, full-bleed backdrop, with its logo or title, an action row and a line for episode, movie or show metadata, or a short premise. The hero rotates through a set of
+promoted items. The dots beside Info show the position.
 
 **Controls on the hero row**, left to right:
 
 | control | what OK does |
 |---|---|
-| **Play** / **Continue** | starts playback — *Continue* when the item has a resume point, *Play* when it does not |
+| **Play** / **Resume** | starts playback. The resume pill shows progress and the time remaining when the runtime is known |
 | **🔖** (bookmark) | adds the title to the Watchlist (an episode's or season's show), or removes it when it is already on it; outline off the list, filled on it. Present only when the hero row names a title with a known catalog id |
 | **ⓘ** (info) | opens that item's detail page |
 
-Those are the only three, in that order (the bookmark disc is absent for a row with no catalog id), and none of the circles carries a name, focused or not. **The `›` beside them is an indicator, not a third button** — it is drawn,
-it never takes focus and it has no hit rect. The hero is paged by **RIGHT past the info disc** or
-**LEFT off the Play pill**, and it also advances itself every **8 s** while the row sits idle. The
-dots under the row show the position.
+Those are the only three, in that order (the bookmark disc is absent for a row with no catalog id), and none of the circles carries a name, focused or not. The hero is paged by **RIGHT past the info disc** or
+**LEFT off the Play pill**, and it also advances itself every **8 s** while the row sits idle.
 
 **Above it**, the top tab strip: **Home**, then **one pill per library section the server reports**
 (here *Movies* and *TV Shows*), then the **Search** pill — drawn as a magnifier mark, not a word.
@@ -191,22 +188,21 @@ just the page.
 
 DOWN from the hero enters the shelves; DOWN again steps between them; LEFT/RIGHT walks the cards.
 The focused card grows, and what Settings → Libraries → Under posters asks for appears
-beneath it (a title line when its Title switch is On; a line the setting turns on is never left empty, so a season, which has no length, says *"Season 6"* under its show's name, and a film the server told us nothing about says *"Movie"*; the setting is the same under every poster in the app: Search results, a person's filmography, a title's Related and collection shelves and a collection's members, though not under a landscape still or a cast headshot) — a Continue Watching card always shows its status line, under every Details setting, Nothing included, here *"S3 · E4 · 8m
-left"* (*"8m left"* for a film), which is the resume state. A watched item carries a check mark in its corner. In a library whose grid is sorted by something that has a value (Settings → Libraries → Under posters → Sort value, on by default), every card of its movies, shows, seasons or episodes shows that value on one line instead, in place of the title and details line: a score beside its provider's mark, a length, a count of plays, a date as *"Today"*, *"Yesterday"*, *"27 Oct"* or *"Oct 2024"*; the Episodes view's wide cards say the same thing under each still (sorted by Audience score, *"TMDB 84%"*). A sort with no value to show, such as the Show order Seasons and Episodes default to, keeps the usual captions.
+beneath it (a title line when its Title switch is On; a line the setting turns on is never left empty, so a season, which has no length, says *"Season 6"* under its show's name, and a film the server told us nothing about says *"Movie"*; the setting is the same under every poster in the app: Search results, a person's filmography, a title's Related and collection shelves and a collection's members, though not under a landscape still or a cast headshot) — a Continue Watching card on Home always shows its status, under every Details setting, Nothing included, as one line below the still, here *"S3 E4 · 8m left"* (*"8m left"* for a film) with a bar on the right, which is the resume state. A watched item carries a check mark in its corner. In a library whose grid is sorted by something that has a value (Settings → Libraries → Under posters → Sort value, on by default), every card of its movies, shows, seasons or episodes shows that value on one line instead, in place of the title and details line: a score beside its provider's mark, a length, a count of plays, a date as *"Today"*, *"Yesterday"*, *"27 Oct"* or *"Oct 2024"*; the Episodes view's wide cards say the same thing under each still (sorted by Audience score, *"TMDB 84%"*). A sort with no value to show, such as the Show order Seasons and Episodes default to, keeps the usual captions.
 
 **OK on a card in *Continue Watching* opens its page by default** (Settings → Playback →
-Continue Watching: *Open details*); set to *Play*, OK plays it directly and the amber ▶ before the first line the card draws is
-what announces that (the title when Under posters → Title is On, otherwise the status line) — the ▶ is drawn only in that mode, and in the default the card's menu leads
-with Play instead; an *episode* card there opens its **show** on that episode's season (the card's menu
+Continue Watching: *Open details*); set to *Play*, OK plays it directly and the white play glyph that opens at the leading edge of the focused card's footer line
+announces that (in the default that glyph is an *info* mark, and the card's menu leads
+with Play instead); an *episode* card there opens its **show** on that episode's season (the card's menu
 offers *Go to Episode*). **Every other card opens a page, an episode included**: an episode tile on a
 discovery shelf ("Recently Released Episodes", "Recently Added…") opens that EPISODE's own page and
-carries no ▶, precisely so nothing on it promises playback. The one-press resume is *Play* mode: there the deck is a list of things already in progress and one
+carries no play glyph, precisely so nothing on it promises playback. The one-press resume is *Play* mode: there the deck is a list of things already in progress and one
 press is the whole point of it. In the default the deck behaves like every other shelf — a press is
 a question rather than a commitment — and the resume is the first row of the card's hold menu (§5.6),
 which opens on it. A card's resume bar is a fact about how far in you
 are and appears on both kinds, so it is never the thing that says a press will play; that is the
-triangle's job alone. (Until 2026-09-05 an episode played from wherever it sat, which put the
-triangle on cards that navigated.)
+footer cue's job alone. (Until 2026-09-05 an episode played from wherever it sat, which put an
+amber triangle on cards that navigated; the triangle is gone everywhere now.)
 
 One refinement inside the deck rule: a **show** or **season** card has no single stream to
 start, so where the deck plays it (OK in *Play* mode, or the menu's Play row in the default) it
@@ -285,6 +281,10 @@ Reached from any library pill in the top strip. A poster grid, four-way navigabl
 - one **sort** control at the right of the header row, reading its current choice (the sort icon, the criterion and a down chevron; its Sort & Filter menu also holds the filters), beside the **Collections** and **Recommended** places;
 - an **A–Z rail** down the right edge, which jumps the grid to a letter, or on a value sort (Score, Duration, Unplayed, Plays, Date added, Date viewed, Release date, and Last episode added when sorted newest first) to a band: a date sort's bands are `Today`, the months of this year, then each earlier year, and Release date's are the year then the decades;
 - watched check marks on the cards.
+
+When you leave a library with Collections or Recommended open, its top-strip pill reopens that
+page next time. The app saves the open page per profile and library. Back from the top of the
+page or OK on its breadcrumb closes it and returns to the grid.
 
 **CH ▲ / CH ▼ page the grid**, which is the fast way through a large library.
 
@@ -805,7 +805,7 @@ data layer are identical to the television's.
 **What the simulator cannot show** is the television's video path. The Starfish/ACB media seam is
 29 symbols that exist only on the television. The player figure (§6.3) is the real HUD over a real
 decoded frame, but the frame is made by a simulator-only facility: a clock sink plays the file the
-mock serves and a system `ffmpeg` decodes it under the UI (`player/sim_video.rs`). It shows what the
+mock serves and a system `ffmpeg` decodes it under the UI (`src/app/adapters/hostsim/sim_video.rs`). It shows what the
 HUD looks like over a picture; it says nothing about LG's decoder or the hardware video plane.
 
 | figure | source | status |

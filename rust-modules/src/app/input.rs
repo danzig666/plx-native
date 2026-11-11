@@ -31,6 +31,7 @@ use super::*;
 pub(crate) struct Pointer {
     pub(crate) dpad_mode: bool,  // D-pad input owns focus; pointer motion below the gate is ignored
     pub(crate) cur_hidden: bool, // the pointer is hidden right now (LG's hide or the transparent cursor)
+    back_cursor: Option<BackCursorOwner>,
     pub(crate) mot_accum: f32,   // motion accumulated since D-pad mode was entered, in logical px
     pub(crate) prev_mx: f32,     // last motion's position, for that accumulation (-1 = none yet)
     pub(crate) prev_my: f32,
@@ -52,11 +53,21 @@ pub(crate) struct Pointer {
     /// The pointer resting in the top or bottom edge band scrolls the page ([`EdgeScroll`]).
     pub(crate) edge: EdgeScroll,
 }
+/// The mounted player and its playback generation.
+pub(crate) type BackCursorTarget = (plx_machine::machine::MachineId, u32);
+
+struct BackCursorOwner {
+    target: BackCursorTarget,
+    // Back may take over a hide already installed by the idle or D-pad path.
+    installed: bool,
+}
+
 impl Pointer {
     /// Pointer mode, cursor shown, nothing held or dragging — where the loop starts.
     pub(crate) const IDLE: Pointer = Pointer {
         dpad_mode: false,
         cur_hidden: false,
+        back_cursor: None,
         mot_accum: 0.0,
         prev_mx: -1.0,
         prev_my: -1.0,
@@ -66,12 +77,63 @@ impl Pointer {
         ok_from_click: false,
         edge: EdgeScroll::IDLE,
     };
+
+    pub(crate) fn back_cursor_active(&self) -> bool {
+        self.back_cursor.is_some()
+    }
+
+    pub(crate) fn note_cursor_motion(&mut self) {
+        if self.cur_hidden && !self.back_cursor_active() {
+            unsafe { super::boot::show_cursor_after_motion(); }
+            self.cur_hidden = false;
+        }
+    }
+
+    pub(crate) fn click_is_ok(&self, on_control: bool, transparent: bool) -> bool {
+        (transparent && self.back_cursor_active())
+            || click_is_ok(self.dpad_mode, self.mot_accum, on_control, transparent)
+    }
+
+    pub(crate) fn sync_back_cursor(
+        &mut self,
+        current: Option<BackCursorTarget>,
+        request: Option<(BackCursorTarget, plx_screens::registry::BackCursorChange)>,
+    ) {
+        use plx_screens::registry::BackCursorChange;
+        if self.back_cursor.as_ref().is_some_and(|owner| Some(owner.target) != current) {
+            self.release_back_cursor(false);
+        }
+        let Some((target, change)) = request.filter(|(target, _)| Some(*target) == current) else {
+            return;
+        };
+        match change {
+            BackCursorChange::Hide => {
+                let installed = !self.cur_hidden || self.back_cursor.as_ref().is_some_and(|owner| owner.installed);
+                unsafe { hide_cursor(); }
+                self.cur_hidden = true;
+                self.back_cursor = Some(BackCursorOwner { target, installed });
+            }
+            BackCursorChange::Wake => self.release_back_cursor(true),
+            BackCursorChange::Release => self.release_back_cursor(false),
+        }
+    }
+
+    fn release_back_cursor(&mut self, motion: bool) {
+        if self.back_cursor.take().is_some_and(|owner| motion || owner.installed) {
+            // On LG's backend this is a no-op. Only a blank cursor installed by
+            // this app can be restored here.
+            unsafe { super::boot::show_cursor_after_motion(); }
+            self.cur_hidden = false;
+        }
+    }
 }
 
 /// How far from the top or bottom of the screen the pointer scrolls the page ([`EdgeScroll`]).
-/// 80 px: at 120 the glide started too readily while the pointer was only on its way to the top
-/// or bottom row (tried on an LG C2 and C3).
-pub(crate) const EDGE_BAND: f32 = 80.0;
+/// 54 px, the safe margin ([`plx_ui::consts::MARGIN_Y`]) and the handoff board's band (top band
+/// 0..54, bottom band 1026..1080): at 120 the glide started too readily while the pointer was only
+/// on its way to the top or bottom row, and 80 still covered a third of a card (tried on an LG C2
+/// and C3).
+pub(crate) const EDGE_BAND: f32 = plx_ui::consts::MARGIN_Y;
 /// How far from the left or right edge the pointer glides the row under it ([`EdgeScroll::pan`]).
 pub(crate) const EDGE_SIDE_BAND: f32 = 120.0;
 /// How long the pointer rests in an edge band before the page starts to move.
@@ -651,7 +713,7 @@ unsafe fn play_loaded_hero(
 ///
 /// Runs in the default feature set too: `menu_play_tick`'s landed arm reaches `start_playback` and
 /// the video sink, but `port.rs` installs `tv::sink::NoSink` under `cfg(test)`, so the sink a bare
-/// `cargo test --lib` meets answers every verb with nothing (`player::ffi` is compiled, and never reached).
+/// `cargo test --lib` meets answers every verb with nothing (the native sink is compiled, and never reached).
 #[cfg(test)]
 mod activate_card_tests {
     use super::*;
@@ -1206,6 +1268,7 @@ pub(crate) unsafe fn begin_fresh_press(
     sym: c_uint,
     wcode: c_uint,
     now: u32,
+    viewer_paused: bool,
     down_sym: &mut u32,
     hud: Option<&mut HudState>,
     ptr: &mut Pointer,
@@ -1213,7 +1276,7 @@ pub(crate) unsafe fn begin_fresh_press(
     press: &mut plx_ui::press::Press,
 ) {
     *down_sym = sym;
-    note_global_press(ps, sym, wcode, now, hud, ok_armed, press);
+    note_global_press(ps, sym, wcode, now, viewer_paused, hud, ok_armed, press);
     if matches!(
         key,
         Key::Up | Key::Down | Key::Left { alt: false } | Key::Right { alt: false }
@@ -1223,6 +1286,7 @@ pub(crate) unsafe fn begin_fresh_press(
         }
         ptr.dpad_mode = true;
         ptr.cur_hidden = true;
+        ptr.back_cursor = None;
         ptr.mot_accum = 0.0;
         ptr.edge.stop();
     }
@@ -1240,6 +1304,7 @@ pub(crate) fn note_global_press(
     sym: c_uint,
     wcode: c_uint,
     now: u32,
+    viewer_paused: bool,
     hud: Option<&mut HudState>,
     ok_armed: &mut bool,
     press: &mut plx_ui::press::Press,
@@ -1248,11 +1313,10 @@ pub(crate) fn note_global_press(
         return; // an unsupported key is not input the app acted on — see `begin_fresh_press`
     }
     // What the user could SEE, and only then the un-dismiss — one operation, because the order is
-    // load-bearing (`HudState::note_fresh_press`). Taken for every BOUND key on every screen: it is
-    // one cheap predicate, and the alternative is each player arm remembering to ask first, which
-    // is exactly the ordering the pointer path had to be fixed for once already.
+    // load-bearing (`HudState::note_fresh_press`). The bare player takes its own sample in
+    // delivery order and passes no HUD here.
     if let Some(hud) = hud {
-        hud.note_fresh_press(ps, now, paused());
+        hud.note_fresh_press(ps, now, viewer_paused);
     }
     // a fresh non-OK key (navigation / BACK) while a click is armed aborts the press — spring the
     // card back to rest WITHOUT activating (you "slid off" the control). A key the app does not
@@ -1272,15 +1336,16 @@ mod unsupported_key_tests {
 
     /// Drive one fresh press through [`note_global_press`] and report what it left behind:
     /// `(a click is still armed, the HUD is still dismissed)`. `press::*`, `hud_until()` and
-    /// `hud_until()` and `paused()` are crate globals, so every caller holds `testlock::serial()`;
-    /// the press is the test's own `Press`.
+    /// The caller supplies the viewer's pause goal at the input boundary; the press is this
+    /// test's own `Press`.
     fn press(ps: &plx_media::route::PlaybackSession, sym: c_uint, wcode: c_uint) -> (bool, bool) {
         let mut hud = HudState::IDLE;
         let mut ok_armed = true; // a click is in flight, as if OK were still down on a card
         hud.dismissed = true; // …and the transport was hidden by hand (UP from the control row)
         let mut p = plx_ui::press::Press::new();
         p.begin(1_000);
-        note_global_press(ps, sym, wcode, 1_000, Some(&mut hud), &mut ok_armed, &mut p);
+        note_global_press(ps, sym, wcode, 1_000, false,
+            Some(&mut hud), &mut ok_armed, &mut p);
         let out = (p.is_active() && ok_armed, hud.dismissed);
         p.cancel();
         out
@@ -1867,6 +1932,21 @@ mod edge_scroll_tests {
         (0..=ms / 16).filter_map(|i| e.step(on_control, t0 + i * 16).map(|d| (t0 + i * 16, d))).collect()
     }
 
+    /// **The edge glide bands are 54 px tall** (the handoff board's: 0..54 at the top, 1026..1080 at
+    /// the bottom of the 1080 screen), not the 80 px that covered a third of a card.
+    #[test]
+    fn the_edge_bands_are_54_px_tall_at_the_top_and_the_bottom_of_the_screen() {
+        assert_eq!(EDGE_BAND, 54.0);
+        assert_eq!((EdgeScroll::band(0.0), EdgeScroll::band(53.9)), (Some(1), Some(1)));
+        assert_eq!((EdgeScroll::band(54.0), EdgeScroll::band(SCR_H - 54.1)), (None, None), "the band ends at 54 px");
+        assert_eq!((EdgeScroll::band(SCR_H - 54.0), EdgeScroll::band(SCR_H - 0.1)), (Some(-1), Some(-1)));
+        assert_eq!(SCR_H - EDGE_BAND, 1026.0, "the bottom band's top on the 1080 board");
+        // a pointer 70 px from the top (inside the old band) no longer glides
+        let mut e = EdgeScroll::IDLE;
+        e.moved(960.0, 70.0, false);
+        assert!(run(&mut e, false, 1000, 2000).is_empty());
+    }
+
     /// The pointer near the TOP of a scrolled page moved nothing (a page rests its focused row at
     /// the top, so nothing hoverable is left above it). Resting in the
     /// top band over no control glides the page up after the dwell, on EVERY frame (continuous,
@@ -1937,11 +2017,11 @@ mod edge_scroll_tests {
         let mut e = EdgeScroll::IDLE;
         e.moved(960.0, 40.0, false);
         assert!(!run(&mut e, false, 0, 600).is_empty());
-        assert!(e.moved(900.0, 60.0, false), "a move inside the band while gliding is not hover");
+        assert!(e.moved(900.0, 50.0, false), "a move inside the band while gliding is not hover");
         assert!(e.step(false, 616).is_some(), "a card sliding under the pointer does not stop it");
         assert!(!e.moved(900.0, 400.0, false), "leaving the band ends the glide");
         assert!(e.step(false, 632).is_none());
-        e.moved(900.0, 60.0, false);
+        e.moved(900.0, 50.0, false);
         assert!(run(&mut e, false, 648, EDGE_DWELL_MS - 20).is_empty(), "coming back starts the dwell again");
     }
 

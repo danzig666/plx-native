@@ -6,7 +6,7 @@
 //! row (the partition by `SCOPE`): a live setting that stayed `Install` would be restored from
 //! nobody's seat.
 use super::*;
-use plx_plex::plex::session::{self as session, prefs::DESCRIPTORS, stored_effective, UnderPostersDetails};
+use plx_plex::plex::session::{self as session, prefs::DESCRIPTORS, stored_effective, UnderPostersLadder};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn declared_by_plex() -> BTreeMap<&'static str, bool> {
@@ -633,7 +633,7 @@ fn under_posters_is_picked_into_the_seated_profiles_record_and_follows_the_seat(
     restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
     assert_eq!(under_posters(), UnderPosters::DEFAULT, "nothing picked: the default");
 
-    let pick = UnderPosters { title: true, details: UnderPostersDetails::AgeRatingScore, show_details: UnderPostersDetails::AgeRatingScore.for_shows(), sort_value: false };
+    let pick = UnderPosters { title: true, details: UnderPostersLadder::AgeRatingScore.movie_parts(), show_details: UnderPostersLadder::AgeRatingScore.show_parts(), sort_value: false };
     assert!(confirm::<UnderPostersPref>(pick));
     assert_eq!(under_posters(), pick, "the cell holds the pick");
     let after = session::load();
@@ -687,4 +687,101 @@ fn dolby_vision_mode_is_picked_into_the_seated_profiles_record_and_follows_the_s
     session.seated("u1", TOKEN);
     restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
     assert_eq!(dolby_vision_mode(), DolbyVisionMode::Off, "u1 seated again restores Off");
+}
+
+/// Puts the playback engine's cell and the mirrors back on drop; declared AFTER `serial()`.
+struct EngineBack(plx_plex::plex::session::UriEngine);
+impl Drop for EngineBack {
+    fn drop(&mut self) {
+        unseed_profile_prefs_for_test();
+        restore_uri_engine(self.0);
+    }
+}
+
+/// **The opt-in to the URI engine is the seated profile's own pick and nobody else's.** A profile
+/// that chose `On` reads it; a second profile, an unseated process and a record that chose nothing
+/// read the default `Off`, so the production qualifier answers Unknown for them.
+#[test]
+fn the_uri_engine_opt_in_follows_the_seated_profile_only() {
+    use plx_plex::plex::session::UriEngine;
+    let _g = plx_base::testlock::serial();
+    let _session = session::TempSession::new("restore-uri-engine");
+    let _back = EngineBack(uri_engine());
+    let own = vec![picked("u1", &stamp(), serde_json::json!({"uri_engine": "on"}))];
+    let rec = record(Preferences::default(), own);
+
+    restore(&rec, &seat("u1"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::On, "the profile that chose it");
+    restore(&rec, &seat("u2"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "another profile on the same account");
+    restore_uri_engine(UriEngine::On);
+    restore(&rec, &Seat::Unseated, Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "an unseated process reads the install key, which is the default");
+    restore_uri_engine(UriEngine::On);
+    restore(&record(Preferences::default(), vec![]), &seat("u1"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "a record that chose nothing");
+}
+
+/// **A Settings pick of the playback engine is durable first, then live, and the profile's own.**
+/// It is a Confirm row like its neighbours (`How::settings`), lands in the picking
+/// profile's record only, and a profile seated afterwards still reads the default.
+#[test]
+fn a_confirmed_opt_in_is_stored_as_the_picking_profiles_own_and_no_ones_else() {
+    use plx_plex::plex::session::UriEngine;
+    let _g = plx_base::testlock::serial();
+    let session = session::TempSession::new("pick-uri-engine");
+    let _back = EngineBack(uri_engine());
+    let mut legacy = record(Preferences::default(), vec![]);
+    legacy.client_id = "cid-test".into();
+    session.seated("u1", TOKEN);
+    session::save(&legacy);
+    seed_profile_prefs_for_test(&session::peek());
+    restore_profile_rows(&session::peek(), &seat("u1"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "setup: nobody has opted in");
+    assert!(matches!(How::settings::<UriEnginePref>(std::sync::mpsc::channel().0), How::Confirm(_)));
+
+    assert!(confirm::<UriEnginePref>(UriEngine::On), "the write was durable");
+    assert_eq!(uri_engine(), UriEngine::On, "and only then live");
+    let records = session::load().prefs.profile_prefs;
+    assert_eq!(own_of::<UriEnginePref>(&records, "u1"), Some(UriEngine::On));
+    assert_eq!(own_of::<UriEnginePref>(&records, "u2"), None);
+
+    session.seated("u2", TOKEN);
+    restore_profile_rows(&session::peek(), &seat("u2"), Overrides::default());
+    assert_eq!(uri_engine(), UriEngine::Off, "u2 is not opted in by u1's pick");
+}
+
+
+/// The estimated-end-time cell follows the seated profile, falls back to the legacy key,
+/// and defaults ON when neither source has a value.
+#[test]
+fn restore_end_time_preference_is_profile_scoped_and_defaults_on() {
+    let _g = plx_base::testlock::serial();
+    let _session = session::TempSession::new("restore-end-time-preference");
+    struct RestoreEndTime(bool);
+    impl Drop for RestoreEndTime {
+        fn drop(&mut self) {
+            unseed_profile_prefs_for_test();
+            restore_hud_end_time(self.0);
+        }
+    }
+    let _restore = RestoreEndTime(hud_end_time());
+
+    let rec = record(
+        Preferences { hud_end_time: Some(false), ..Default::default() },
+        vec![
+            picked("u1", &stamp(), serde_json::json!({ "hud_end_time": true })),
+            picked("u2", &stamp(), serde_json::json!({ "hud_end_time": false })),
+        ],
+    );
+    restore(&rec, &seat("u1"), Overrides::default());
+    assert!(hud_end_time(), "u1's own ON overrides the legacy OFF");
+    restore(&rec, &seat("u2"), Overrides::default());
+    assert!(!hud_end_time(), "u2's own OFF is independent");
+    restore(&rec, &seat("u3"), Overrides::default());
+    assert!(!hud_end_time(), "a profile without a pick reads the legacy OFF");
+
+    let fresh = record(Preferences::default(), vec![]);
+    restore(&fresh, &seat("u1"), Overrides::default());
+    assert!(hud_end_time(), "a fresh profile defaults to ON");
 }

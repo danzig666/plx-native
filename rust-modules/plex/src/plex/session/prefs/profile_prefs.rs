@@ -34,11 +34,11 @@
 //! * **No `extensions`**: a field a later build adds is not carried by this one.
 use super::{
     Fallback, Parse, ProfileKeyed, ProfileRecords, Preferences, Row, Scope, Setting, SettingsWrite,
-    IntroSkipPref, CreditsSkipPref, DolbyVisionModePref, InstantDpadSeekingPref, AudioEnhancementsPref, DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, QualityPref, SkipIntervalPref,
-    HudSelectionPref, SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref, UnderPostersPref,
+    IntroSkipPref, CreditsSkipPref, DolbyVisionModePref, InstantDpadSeekingPref, UriEnginePref, AudioEnhancementsPref, DeckPressPref, DirectPlayModePref, HdrOverlayBrightnessPref, NextEpisodeModePref, QualityPref, SkipIntervalPref,
+    HudSelectionPref, SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref, HudEndTimePref, UnderPostersPref,
 };
 use crate::plex::session::{
-    MarkerSkipMode, DolbyVisionMode, InstantDpadSeeking, DeckPress, DirectPlayMode, HdrOverlayBrightness, NextEpisodeMode, PlaybackQuality, Seat, Session, SkipInterval, SubtitlePosition,
+    MarkerSkipMode, DolbyVisionMode, InstantDpadSeeking, UriEngine, DeckPress, DirectPlayMode, HdrOverlayBrightness, NextEpisodeMode, PlaybackQuality, Seat, Session, SkipInterval, SubtitlePosition,
     SubtitleSize, SubtitleTone, UnderPosters,
 };
 use crate::plex::AudioEnhancements;
@@ -67,6 +67,8 @@ pub struct ProfilePrefs {
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub instant_dpad_seeking: Option<InstantDpadSeeking>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
+    pub uri_engine: Option<UriEngine>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub dolby_vision_mode: Option<DolbyVisionMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub intro_skip: Option<MarkerSkipMode>,
@@ -82,6 +84,9 @@ pub struct ProfilePrefs {
     /// absent.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub trailer_autoplay: Option<bool>,
+    /// The profile's own estimated playback end-time HUD switch; absent reads the default ON.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
+    pub hud_end_time: Option<bool>,
     /// The chosen player HUD's package id ([`HudSelectionPref`]); `None` reads the legacy install-wide key.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::de_soft_opt")]
     pub hud_selection: Option<String>,
@@ -166,6 +171,7 @@ profile_setting!(
     NextEpisodeModePref = next_episode_mode,
     SkipIntervalPref = skip_interval,
     InstantDpadSeekingPref = instant_dpad_seeking,
+    UriEnginePref = uri_engine,
     DolbyVisionModePref = dolby_vision_mode,
     IntroSkipPref = intro_skip,
     CreditsSkipPref = credits_skip,
@@ -173,6 +179,7 @@ profile_setting!(
     UnderPostersPref = under_posters,
     AudioEnhancementsPref = audio_enhancements,
     TrailerAutoplayPref = trailer_autoplay,
+    HudEndTimePref = hud_end_time,
 );
 
 const _: () = assert!(matches!(<HudSelectionPref as Row>::FALLBACK, Fallback::LegacyInstallKey));

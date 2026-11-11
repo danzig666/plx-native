@@ -33,7 +33,7 @@ use std::sync::Arc;
 use crate::settings::{Family, RouteSurface};
 use plx_data::stores::{StoreCmd, StoreId, StoreWork};
 use plx_machine::machine::{
-    Canon, Chrome, Cx, Effects, EntryId, Host, InstanceId, LogicalState, ScreenId,
+    Canon, Chrome, Cx, Effects, EntryId, Host, InstanceId, LogicalState, MachineId, ScreenId,
 };
 use plx_ui::screen::{Mounter, ReturnState, Screen};
 
@@ -196,6 +196,14 @@ pub struct ItemMenuReq {
     pub from_home: bool,
 }
 
+/// A change to the cursor hold started when Back dismisses the player transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackCursorChange {
+    Hide,
+    Wake,
+    Release,
+}
+
 /// **What a player overlay asks for**, once its own `step` has decided.
 ///
 /// A panel on the player's page-owned `ModalStack` owns its own state and its own input, but not
@@ -205,6 +213,11 @@ pub struct ItemMenuReq {
 /// So the panel decides and the loop performs, exactly as `LibraryReq` does for the Library.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerReq {
+    BackCursor {
+        owner: MachineId,
+        playback: u32,
+        change: BackCursorChange,
+    },
     AutoSkip { id: plx_appkit::skip_policy::OfferId, reply: plx_machine::machine::MachineId },
     CancelAutoSkip(plx_appkit::skip_policy::OfferId),
     /// Accepted only after the owned player confirmation. Never emitted by boot or Play.
@@ -817,7 +830,7 @@ const KEY_SLACK: usize = 256;
 pub(crate) fn key_cap(live: usize) -> usize { 2 * live + KEY_SLACK }
 
 /// How many keys may leave the page before a table that drops its keys sweeps them: Home's
-/// placeholder slots, and the Recommended page's item and slot keys (`RecommendedScreen::rebuild`,
+/// placeholder slots, and the Recommended page's card and control keys (`RecommendedScreen::rebuild`,
 /// off `KeyRegistry::count`). Closing the gap a key at a time moves every key behind it in the
 /// table and in the indexes that name positions, so a page that changes a few keys per publication
 /// paid for the whole table on each one; the sweep is batched instead. What waits on Home is a key
@@ -1343,6 +1356,8 @@ pub trait PlayerLike: AppLike<Memory = PageMemory> + Sized {
     fn wall(_cx: &Cx<'_, Self>) -> Option<plx_base::wallclock::WallTime> {
         None
     }
+    /// Viewer pause intent sampled by the host at this frame's Tick boundary.
+    fn transport_paused(cx: &Cx<'_, Self>) -> bool;
 }
 
 pub trait SearchLike: AppLike<Memory = PageMemory> + Sized {
@@ -1437,6 +1452,11 @@ pub enum AppMsg {
     Library(LibraryCmd),
     LibraryEdit { target: plx_data::stores::browse::SectionAddress, edit: plx_data::stores::browse::QueryEdit },
     LibrarySelect(plx_data::stores::browse::SectionAddress),
+    /// A Sources menu pick delivered after the close animation, still tied to its opening page.
+    LibraryMenuSelect {
+        origin: plx_data::stores::browse::SectionAddress,
+        target: plx_data::stores::browse::SectionAddress,
+    },
     DetailRestore {
         spot: plx_data::metadata::Spot,
         episode: Option<String>,
@@ -1449,7 +1469,7 @@ pub enum AppMsg {
     /// `Deferred` for a covered one; `None` is ignored.
     DetailReconcile { refresh: DetailRefreshPhase },
     /// The *Also available* surface committed a row: open that copy's own page. The SURFACE names
-    /// the destination and the PAGE navigates, which is `LibraryMenu`'s shape (`LibrarySelect`) and
+    /// the destination and the PAGE navigates, which is `LibraryMenu`'s shape (`LibraryMenuSelect`) and
     /// what keeps "what a press means on the Detail page" in one place instead of two.
     AltSourceOpen(ContentArg),
     /// The *Play Version* surface committed a row: play that version of the page's item, as its
@@ -1562,6 +1582,16 @@ pub mod word {
     pub const PICKER: &str = "picker";
     /// The Player HUD page (`screens::hud_settings`), a page of the Settings family's inner stack.
     pub const PLAYER_HUD: &str = "player-hud";
+    /// The Language page, the Diagnostics page and the Under posters pages (`screens::settings`,
+    /// `settings_diagnostics`, `settings_under_posters`): pages of the Settings family's inner stack, each its own
+    /// `overlay=` word. The two details pickers answer one word PER KIND (`DetailsPage::name`) so a scene
+    /// that boots the Show picker cannot be satisfied by the Movie one. Several are hyphenated, which is why
+    /// `tests/run.py` captures an overlay word as `[\w-]+`.
+    pub const LANGUAGE: &str = "language";
+    pub const DIAGNOSTICS: &str = "diagnostics";
+    pub const UNDER_POSTERS: &str = "under-posters";
+    pub const UNDER_POSTERS_MOVIE: &str = "under-posters-movie";
+    pub const UNDER_POSTERS_SHOW: &str = "under-posters-show";
     pub const HUD_GALLERY: &str = "hud-gallery";
     pub const HUD_DETAIL: &str = "hud-detail";
     pub const HUD_ABOUT: &str = "hud-about";
@@ -2741,7 +2771,11 @@ pub const SCREEN_SHAPES: &[&str] = &[
 // Incompatible replay anchors are re-recorded through tools/plxnative-rec rerecord.
 // The restored Up Next pair retains a scoped declined segment across timer/grant changes.
 // Previous screen pin: 0x1802_f17e_e583_f977; re-record incompatible replay anchors.
-const SCREEN_SHAPES_PIN: u64 = 0xf852_85cc_f116_356b;
+// The player's Back motion gate keeps its last position and fixed anchor in the canon.
+// Previous pin: 0xf852_85cc_f116_356b. Re-record incompatible replay anchors.
+// The Library menu retains its parent scroll across a Genre drill-in and the selected library
+// through its closing morph. Previous pin: 0x7e36_4373_746a_c3dc.
+const SCREEN_SHAPES_PIN: u64 = 0x1427_1d82_bf6b_e04c;
 
 #[cfg(test)]
 mod arg_tests {

@@ -50,7 +50,7 @@ arguments, and its time is the `dt` it is handed.
    matter more than couch-copy scale, and it must never migrate into chrome or prose. The hero
    SYNOPSIS is the case that proves
    the rule and it is no longer here: a blurb is the longest run of prose on its page, so it is
-   reading copy, and both heroes now draw it at `LABEL` 26 through `ui::hero_synopsis`. (The hero
+   reading copy, and Detail draws it at `LABEL` 26 through `ui::hero_synopsis`. Home has a separate line for episode, movie or show metadata, or a short premise. Remaining time lives in the Resume button. (The hero
    identity line uses `theme::hero::IDENTITY_SIZE`, regular `CAPTION` 24, matching the latest PDF.) Pass a rung to `Painter::text`/`Label`/`TextView`/`text::elide` instead of a bare
    `24`/`28`/… — a size is a role, not a magic number; pick the nearest rung, and if no rung fits a
    genuinely new role, **add a documented rung to `pub mod size` in `gfx/tokens.rs`** (`theme::size`
@@ -87,6 +87,14 @@ arguments, and its time is the `dt` it is handed.
      the owner's `Focusable` contract (`screen.rs`: `neighbour`, `Link`, `EdgeRule`, `Seat`). A
      screen declares its groups and edges; it never matches a direction key to move focus between
      regions.
+   - **Cold text before it is shown** (a destination's strings meeting the glyph cache in the first
+     visible frame): the shared prewarm — a recording walk (`record_walk`, `Painter::recording`)
+     drained by `plx_gfx::text::drain_prewarm` under the frame's budget. A route dip does it for its
+     staged page (`Transition::prewarms_text`), a held surface for itself (`PopoverMotion::held`), a
+     panel for the page it drills into (`PanelMotion::prewarm_text`), and a surface that holds
+     content back for a visible frame — the Settings push — answers `Screen::warms_text` /
+     `draw_warm` and waits at its start (`RoutePush::begin_warm`). Never rasterise a page's strings
+     in its first drawn frame, and never write a screen-local warm loop.
    - **A row of pills** (selection and focus capsules that travel): `widgets::TabStrip` and
      `SelMark` (`widgets.rs`), the nav bar's own motion.
    - **Menus**: `Popover` (`popover.rs`) around a `TableView` (`table.rs`). A menu placed beside the
@@ -173,7 +181,7 @@ default a spec is built with and no screen runs it, so a scroll fault on a stack
 snapping grid (`GridSpec::new`; a grid built with `GridSpec::resting` is read through
 `rest_target(end)` instead, because `reveal_target()` has no document end in it and `Stack::wanted`
 passes its own; the Library applies the same rule through `Layout::row_reveal` ->
-`poster_grid::rest_scroll`, and Home's shelf grid through `home::rest_scroll` -> `cards::grid_rest_scroll`,
+`poster_grid::rest_scroll`, and Home's shelf grid through `home::ShelfColumn::rest` -> `cards::grid_rest_scroll_at` over `cards::settled_top_by` (one rule over the rows' OWN pitches: the stills deck is shorter than a poster shelf; `rest_scroll` is the uniform-pitch case),
 so the focused shelf rests with its heading at `GRID_TOP_Y - TITLE_DY` whatever the Under posters band
 and whichever way focus arrived) and applies the document
 shift a content landing needs, `landed_shift()`, to its scroll and scroll target; the grid does
@@ -749,38 +757,39 @@ of stacked shelves hands each one the lift of the next shelf's heading (`Section
 `Stack`, Home, Recommended and Detail do; a `Stack` page keeps its shelves adjacent, the air under one its
 `StackPage::shelf_foot`, never a `Custom` gap section between two); `GridBands::closing` names the card a closing band's caption belongs to.
 Live and target geometry include these bands, so painting, paging, scrolling and restored
-viewports agree. Episode rows use landscape stills. `Art::Still` supplies the label ground;
-`widgets::still_overlay` draws its labels and resume bar afterward. Both the artwork and
+viewports agree. Episode rows use landscape stills; the Continue Watching row's is `RowStyle::STILL`
+(the episode cell at `theme::STILL_RADIUS`; the focused still only pops, and every other tile stands at its
+rest x at any pop progress: the 1.09 pop grows a tile ~19 px a side inside the 40 px gap, `theme::STILL_GAP`, pitch 460; the Detail strip's `EPISODE` style keeps 28), with no caption band under it (`captions::NOTHING_UNDER_STILLS`, Home's and Recommended's landscape deck alike). A tile's focus pop
+reaches a mark that must ride it as `cards::Tile::pop` (0..1, the pop spring read as progress), never
+as a timer of the mark's own. The deck card's artwork (Plex's cover, then the baked composite, then the
+title in type) is `card_art::pick` over `tile_facts::for_deck`; the composite is a bitmap baked once by
+the poster worker (`card_art::compose`), never a live logo. The footer's one-line fit rule is
+`still_footer::footer_geometry`, the one place its widths are decided (a started episode: `S2 E4 · 38m left` and a bar; an unstarted one: `S2 E1 · New episode` and no bar, the tag kept while the whole text fits). The stills row's heading stands `RowStyle::heading_rise` (`theme::STILL_HEADING_RISE`) above a poster shelf's, joined with the focus lift by `card_row::heading_lift_of`, which `Shelf::heading_lift()` reports to Home and Recommended alike. `Art::Still` supplies the label ground;
+`widgets::still_overlay` draws its labels afterward (a `StillFooter::Shelf` still also its full-bleed resume bar; a
+`StillFooter::Continue` still its one footer line, bar included: on the deck that line stands BELOW the art with no scrim,
+`still_footer::Place::Below`, 8 px under the tile; the Detail strip's stays in the art, `Place::InArt`). Both the artwork and
 its ground participate in backdrop discovery, including texture changes and UV cropping.
 
-- An **amber ▶** means **this press starts the video**. It is drawn where that is true and nowhere
-  else: the detail page's episode filmstrip always, and a Continue Watching deck only while
-  Settings > Playback > Continue Watching is "Play" (`DeckPress::Play`; the default opens the page
-  and draws none). On a poster deck (Home's, Recommended's) the mark leads the FIRST line the Under
-  posters setting draws (`registry::captions::label`): the title when Title is On, else the details
-  line ("8m left"), hanging to the left of a line that is centred as if it were not there; with the
-  title and the details both off (Nothing) no line is drawn and so no mark, EXCEPT on the deck: its
-  progress line ("S3 · E4 · 18m left") is the tile's state and is always shown, Nothing included (the
-  owner's 2026-10-22 call; `captions::deck_policy`), so the deck's band keeps one line (two with the
-  Title On) and the mark leads that line. The band is per shelf, so it never changes as focus walks
-  the row. Watch state does not
-  withdraw it — `widgets::still_glyph` is the whole rule, graded by an exhaustive table, because
-  the clause that failed first was the absent one: the glyph used to be decided by `PosterMark`
-  FIRST, so an in-progress tile drew nothing and a Continue Watching deck — almost entirely
-  in-progress tiles — announced nothing and then played.
+- **No card draws an amber ▶.** Nobody read it as "playback starts", and what OK does is now said by the
+  focused Continue Watching still's footer cue (`ui::still_footer`): a white play glyph when the
+  Playback setting makes OK play (`DeckPress::Play`), an info glyph when it opens the page (the
+  default). The cue sits in a 28 px slot that is collapsed at rest and opens with the card's own
+  focus-pop (`cards::Tile::pop`), so the footer text moves by exactly the slot and the bar shrinks
+  toward it, never below 64 px. The detail page's episode strip has no cue (OK there always opens or
+  plays the episode, and the strip is not a deck). The caption mark is gone from the code too
+  (`TileLabel::glyph`, its draw path and the census that read it were removed), so no caption can bring it back.
 - An **amber resume BAR** means **how far in you already are**. It is a fact about the item, not a
   promise about the press, so it is drawn wherever there is progress to report, including on a
-  shelf that navigates. Hiding it there would hide something true; the triangle beside it was
-  always the mark that read as "this will play".
+  shelf that navigates. Hiding it there would hide something true. On a Continue Watching still
+  it is the footer's own 6 px bar (radius 3) on the right, under the art, and on a strip card a 4 px bar inside it (each
+  100 px, shrinking to 64);
+  `resume_bar` (the full-bleed band) is for posters and `StillFooter::Shelf` stills.
 - A **`✓`** means **finished** — likewise a state, not a promise.
 
-**A card with no play indicator NAVIGATES** (a poster deck set to Play with the title and details both Off draws no
-line to carry the mark, the one exception), and an episode navigates to its own detail page —
+**What a press does is a fact of the route, not of a mark**: an episode navigates to its own detail page,
 except on Continue Watching, where it opens the SHOW on the card's season
-(`app::input::activate_deck_card`; the card menu's Go to Episode is the way to the episode).
-Until 2026-09-05 `want_play` was `from_deck || kind == 3` on both Home and the Library, so an
-episode played immediately from ANY shelf and every landscape tile drew the triangle whatever its
-press did. Behaviour and mark both read `is_continue && route::deck_press().press_plays()`
+(`app::input::activate_deck_card`; the card menu's Go to Episode is the way to the episode), or resumes
+when `route::deck_press().press_plays()`. The footer cue reads the same `press_plays()`
 (`Shelf::is_continue` / `pms::hub_is_continue` alone is no longer the answer to either), so they
 cannot disagree. A poster wears nothing at all when it has never
 been started — most of a server is unstarted, so a clean shelf is the common case and a mark is

@@ -27,6 +27,12 @@
 //! at commit: `leaving` holds that body for the spring's length and draws it in the child role,
 //! exactly as `legal.rs`'s index/document pair never swapped roles when BACK ran the same spring
 //! backward.
+//!
+//! A push commits at once, but its spring waits at 0 while the destination's strings are made
+//! resident ([`RoutePush::begin_warm`]): the surface answers `Screen::warms_text`, walks the
+//! incoming page through the text recorder (`Screen::draw_warm`) and the dispatcher drains it under
+//! the shared prewarm budget, so a page's first open rasterises nothing in a visible frame. A warm
+//! page waits no longer than the one frame it takes to find that out, and the spring is repaid it.
 
 use std::borrow::Cow;
 
@@ -405,7 +411,8 @@ impl RouteSurface {
         //
         // **…AND IT QUEUES IT BEFORE THE DESTINATION'S MOUNT RUNS.** The engine takes the Enters in
         // the order they are queued and the last one wins, and a page that wants another seat (the
-        // Details picker on its checked line, the Language page on the chosen language) asks for it
+        // Language page on the chosen language; a details picker opens on its first part, a set of
+        // switches has no checked line) asks for it
         // from its `Mount`, which `run_inner` below delivers. Queued after that, this default put
         // every such page back on its first row.
         if !popping {
@@ -435,6 +442,11 @@ impl RouteSurface {
             self.push.leaving_page = None;
             self.push.route.jump(false);
             self.push.open = true;
+            // The destination is mounted and owns input already, but its strings have never met the
+            // glyph cache: the spring waits at 0 while `draw_warm` walks them off-screen and the
+            // dispatcher rasterises them under its prewarm budget, instead of the push's first
+            // drawn frame paying for all of them at once.
+            self.push.route.begin_warm();
         }
         // A pop returns to a page that has been entered: the row it left from, else its first.
         if popping {
@@ -892,6 +904,22 @@ impl<H: DirectoryLike> Screen<H> for RouteSurface {
         };
         self.draw_pages(f, entrance);
     }
+    /// A push is waiting for its destination's text ([`RoutePush::begin_warm`]): the incoming page
+    /// is not drawn yet, and `draw_warm` walks it through the recorder.
+    fn warms_text(&self) -> bool {
+        self.push.route.warming()
+    }
+    fn draw_warm(&mut self, f: &mut DrawFrame<'_, '_, H>) {
+        // The page the push will show, at rest: the strings are the same whatever the spring's
+        // position (`the_narrative_frame_is_constant_and_the_list_travels_on_every_held_page`).
+        let navigation = f.navigation();
+        let icx = inner_cx(f.cx);
+        if let Some(inst) = self.top_mut() {
+            let mut inner = DrawFrame::with_navigation(&icx, f.painter, navigation);
+            inst.screen.draw(&mut inner);
+        }
+        self.push.route.walked();
+    }
     fn render(&self) -> RenderStrategy {
         RenderStrategy::Page
     }
@@ -1108,6 +1136,8 @@ pub struct RootPage {
     alert: PlaintextAlert,
     /// `plex::grant::revision` as last read — an offer or an answer landing rebuilds the rows.
     grant_seen: u64,
+    /// The libraries whose shelves the Under posters picture is owed, asked once the row has focus.
+    under_ask: under_posters::PosterAsk,
     /// The sentence beside the table: the focused row's own, else the page's (Settings v2). A pure
     /// function of the focused row ([`sentence_for`]); this only fades between its answers.
     follow: plx_ui::follow_copy::FollowCopy,
@@ -1132,7 +1162,7 @@ impl LogicalState for RootState {
     fn write(&self, w: &mut Canon) {
         w.u32(self.sel.0).bool(self.auto_sign_in).bool(self.trailer_autoplay).str(self.language.tag());
         if self.under_posters != plx_plex::plex::session::UnderPosters::DEFAULT {
-            w.u8(self.under_posters.pack());
+            w.u32(u32::from(self.under_posters.pack()));
         }
         if self.trace != plx_platform::playback_trace::Status::Off { w.u8(0xd1).u8(self.trace as u8); }
         if !self.plaintext.is_empty() {
@@ -1377,6 +1407,7 @@ impl RootPage {
             session_watch: Default::default(),
             session_snapshot: Default::default(),
             pending_auto: None, pending_trailer: None,
+            under_ask: Default::default(),
             plaintext_rows: Vec::new(),
             pending_plaintext: None,
             alert: PlaintextAlert::new(ALERT_GROUP, super::registry::ALERT, super::registry::ALERT + 1),
@@ -1614,6 +1645,12 @@ impl Machine<InnerHost> for RootPage {
                 Handled::Yes
             }
             ScreenEvent::Tick(t) => {
+                // Only while this page is the one on top: every page of the stack ticks, and the
+                // Under posters page asks for the same posters itself once it is pushed.
+                if self.form.selected_id() == Some(&RootId::UnderPosters)
+                    && cx.focus.current.is_some_and(|key| key.entry == self.entry) {
+                    self.under_ask.step(cx, fx);
+                }
                 let mut landed = self.session_watch.changed();
                 if self.pending_auto.as_ref().is_some_and(|(_, ticket)| !matches!(ticket.try_recv(),
                     Err(std::sync::mpsc::TryRecvError::Empty))) {
@@ -1748,7 +1785,7 @@ impl Screen<InnerHost> for RootPage {
         let posters: Vec<&plx_data::pms::PmsMovie> = f.cx.views.directory.sample(PICTURE_POSTERS).collect();
         let fan = plx_ui::follow_copy::PosterFan { arts: posters.iter().map(|m| plx_ui::widgets::Art::Poster(Some(super::registry::tile_facts::of(m)))).collect() };
         let kind_posters = under_posters::preview_posters(f.cx);
-        let under = under_posters::RootPicture { value: self.state.under_posters, posters: &kind_posters, kinds: &[PosterKind::Movie, PosterKind::Show], sorted: false };
+        let under = under_posters::RootPicture { value: self.state.under_posters, posters: &kind_posters, sorted: false, opacity: [1.0, 1.0] };
         let picture: Option<&dyn plx_ui::follow_copy::PictureSlot> = match self.form.selected_id() {
             Some(RootId::Favourites) => Some(&fan),
             Some(RootId::UnderPosters) => Some(&under),
@@ -1791,6 +1828,10 @@ mod test_support;
 #[cfg(test)]
 #[path = "settings_push_tests.rs"]
 mod push_tests;
+
+#[cfg(test)]
+#[path = "settings_warm_tests.rs"]
+mod warm_tests;
 
 #[cfg(test)]
 #[path = "settings_draw_and_lifecycle_tests.rs"]
@@ -2032,7 +2073,7 @@ impl Machine<InnerHost> for LanguagePage {
 plx_ui::focusable_via_view!(LanguagePage, InnerHost, view);
 
 impl Screen<InnerHost> for LanguagePage {
-    fn name(&self) -> &'static str { "language" }
+    fn name(&self) -> &'static str { word::LANGUAGE }
     fn state(&self) -> &dyn LogicalState { &self.state }
     fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_platform::i18n::msg::settings_title())) }
     fn prepare(&mut self, _b: &mut Budget, _cx: &Cx<'_, InnerHost>) {}
