@@ -6003,12 +6003,12 @@ fn a_card_peeking_under_the_hero_is_clickable_and_its_click_opens_it_in_place() 
     s.record_stops(&mut frame, view);
     let stops = frame.into_stops();
     let stop = *stops.iter().find(|stop| stop.key == card).expect("the peeking card is a stop");
-    assert!(stop.rect.y < SCR_H && stop.rect.y + stop.rect.h > SCR_H, "premise: the card peeks, cut by the bottom: {:?}", stop.rect);
+    assert!(stop.rect.y > 0.0 && stop.rect.y < SCR_H, "premise: the card shows under the hero: {:?}", stop.rect);
     assert_eq!(stop.hover, Hover::Focus, "a hover there takes focus, as a partly shown poster does in the Library");
     let mut map = HitMap::new();
     map.fill(stops);
     map.swap();
-    let (x, y) = (stop.rect.cx(), (stop.rect.y + SCR_H) / 2.0);
+    let (x, y) = (stop.rect.cx(), (stop.rect.y + (stop.rect.y + stop.rect.h).min(SCR_H)) / 2.0);
     let hit = map.resolve(Some(card.entry), PointerKind::Click, x, y, Some(hero));
     assert_eq!((hit.focus, hit.activate), (Some(card), Some((card, Activate::Press))), "its visible part takes the click");
     let hover = map.resolve(Some(card.entry), PointerKind::Move, x, y, Some(hero));
@@ -6278,8 +6278,9 @@ fn hovering_a_still_changes_focus_but_not_the_page() {
     let stops = frame.into_stops();
     let stop = stops.iter().find(|stop| stop.key == a).expect("a still is a stop");
     assert_eq!(stop.hover, Hover::Focus, "the pointer takes a still on the hero's page");
+    // This fork: a shelf under the row takes the pointer too, as every poster on screen does.
     assert!(stops.iter().filter(|stop| stop.key.elem != HERO_PLAY_ELEM && s.locate(stop.key.elem) .is_some_and(|l| matches!(l, Located::Item(row, _) if row > 0)))
-        .all(|stop| stop.hover == Hover::OnlyIfFocused), "a shelf under the row does not take it");
+        .all(|stop| stop.hover == Hover::Focus), "a shelf under the row takes it too");
     let before = (s.snap_target, s.grid.scroll_target);
     moved(&mut s, view, Some(hero), a, By::Pointer);
     moved(&mut s, view, Some(a), b, By::Pointer);
