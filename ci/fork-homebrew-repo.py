@@ -48,8 +48,8 @@ def repo(tag: str, ipk: str, slug: str, icon_uri: str) -> dict:
             {
                 "id": app_id,
                 "title": "PlxNative (danzig666 fork)",
-                "shortDescription": "Native Plex client with this fork's extras: automatic intro and "
-                "credits skipping and a media line in the player. Replaces PlxNative.",
+                "shortDescription": "Native Plex client with this fork's extras: a player clock, a media "
+                "line and Magic Remote scrolling. Replaces PlxNative.",
                 "iconUri": icon_uri,
                 "manifest": {
                     "id": app_id,
