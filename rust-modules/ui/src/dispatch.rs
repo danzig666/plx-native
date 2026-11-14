@@ -15,6 +15,8 @@
 //! receives no `Tick`, a Cached or Replaced host does not prepare, a Replaced host does not draw.
 #![allow(dead_code)] // since 5b screens run through most of this; suspend/resume/set_focus_source_override/viewport/frame_index still have no caller anywhere (grep-checked, not 3b's stale "screens from 5b")
 
+pub mod press;
+
 use std::collections::VecDeque;
 
 use super::containers::modal::{HostRender, HostUpdate};
@@ -230,6 +232,11 @@ pub trait Rig<H: Host> {
         parts: &CxParts<H::Elem>,
         fx: &mut Effects<'_, H>,
     ) -> Handled;
+    /// Deliver with the original envelope sender; legacy rigs retain their delivery behavior.
+    fn deliver_from(&mut self, _from: MachineId, to: MachineId, msg: &H::Msg,
+        parts: &CxParts<H::Elem>, fx: &mut Effects<'_, H>) -> Handled {
+        self.deliver(to, msg, parts, fx)
+    }
     /// A timer for a non-instance machine.
     fn timer(&mut self, owner: MachineId, id: TimerId, parts: &CxParts<H::Elem>, fx: &mut Effects<'_, H>);
     /// Execute an application effect against the adapters; may emit more (an adapter result
@@ -242,9 +249,13 @@ pub trait Rig<H: Host> {
     fn system_keyboard(&mut self, _up: bool) {}
     /// A native text commit proves the panel is already active; do not start it again.
     fn adopt_system_keyboard(&mut self) {}
-    fn page_alpha(&self) -> f32 { 1.0 }
-    fn navigation_presentation(&self) -> super::screen::NavPresentation {
-        super::screen::NavPresentation { page_alpha: self.page_alpha(), ..Default::default() }
+    /// Derive this draw's presentation from the navigation owner, never a published global.
+    fn navigation_presentation(&self, nav: &Navigation<H>) -> super::screen::NavPresentation {
+        super::screen::NavPresentation {
+            page_alpha: nav.tabs.stack.page_alpha(),
+            chrome_alpha: nav.tabs.stack.chrome_alpha(),
+            ..Default::default()
+        }
     }
     /// Shared chrome draws after its page and before surfaces, using a captured vocabulary.
     fn draw_chrome(&mut self, _arg: &H::Arg, _parts: &CxParts<H::Elem>,
@@ -554,6 +565,18 @@ where
         }
     }
 
+    /// Capture presentation attribution from the actual navigation input owner.
+    /// Closing surfaces hand input back to the page even while their images remain.
+    /// A system keyboard edits the underlying entry, so it uses that entry's scope too.
+    pub fn input_scope(&self) -> plx_machine::present::Scope {
+        if self.owner_entry().is_some_and(|entry|
+            self.nav.modals.surfaces.iter().any(|surface| surface.entry.id == entry)) {
+            plx_machine::present::Scope::Surface
+        } else {
+            plx_machine::present::Scope::Page
+        }
+    }
+
     /// Does the owner's page resolve through the engine and the map (§7.6 `FocusSource`)?
     fn engine_page(&self) -> bool {
         if self.focus_override == Some(FocusSource::Legacy) {
@@ -775,7 +798,7 @@ where
     /// Only the scale is the lift's business; a hold in flight or the hint's elapsed time is not
     /// (the lift draws one card, not the page's hold hint).
     pub fn opener_press(&self) -> PressRead<H::Elem> {
-        PressRead { scale: self.input.press.scale(), is_long: false, held_ms: None, owner: self.input.dip_owner }
+        PressRead { is_long: false, held_ms: None, ..self.input.press_read(0) }
     }
 
     /// **The context the opener lift draws with**: the page's own pieces for `entry`'s focused
@@ -854,12 +877,7 @@ where
         let owner = self.owner();
         CxParts {
             tick,
-            press: PressRead {
-                scale: self.input.press.scale(),
-                is_long: self.input.press.was_long(),
-                held_ms: self.input.press.held_ms(tick.ms),
-                owner: self.input.dip_owner,
-            },
+            press: self.input.press_read(tick.ms),
             focus: self.input.engine.read(owner),
             owner,
         }
@@ -1185,6 +1203,11 @@ where
             let (delivery, owner) = match pe {
                 PressEvent::Hold(id, owner, key) => (Delivery::Press { id, key, held: true }, owner),
                 PressEvent::Commit(id, owner, key) => (Delivery::Press { id, key, held: false }, owner),
+                PressEvent::PageDamage => {
+                    self.present.note_in_scope(plx_machine::present::Scope::Page,
+                        plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
+                    continue;
+                }
             };
             head.push(Stamped {
                 from: MachineId::Input,
@@ -1309,34 +1332,40 @@ where
             ));
         }
 
-        // 8. the present decision, once (its WHY is read before the take clears it)
+        // 8. Observational demand only. Product admission/ack belong to prepare/swap;
+        // lifecycle and backbuffer refusal must not consume this runtime's pending work.
         let why = self.present.why();
         report.underlay_moving = self.present.page_moving();
         self.page_quiescent = !report.underlay_moving
-            && !plx_machine::idle::page_layout_moving()
+            && !plx_machine::motion::report::page_layout_moving()
             && !self.budget.has_queued_work();
         report.video_only = self.present.video_plane()
             && !self.present.changed()
             && !self.budget.has_queued_work();
-        let will_present = self.present.take(tick.ms) || self.budget.has_queued_work();
+        let will_present = self.present.peek(tick.ms) || self.budget.has_queued_work();
         tap.present(f, will_present, why);
         // `prepare_does_not_change_the_logical_state_hash` (§5.4): a prepare pass touches render
         // resources only — graded on every presenting frame of a debug build
+        // Hashed only when the prepare pass runs: otherwise nothing between the two hashes can
+        // reach the hashed state (`rig.opaque_route` is handed one bool), and a debug frame paid
+        // two full-state hashes to compare a state with itself.
         #[cfg(debug_assertions)]
-        let hash_before_prepare = self.state_hash();
+        let hash_before_prepare = (will_present && draw).then(|| self.state_hash());
 
         // 9. prepare (only if presenting), then opaque_route on EVERY frame. The activity table:
         //    the top page prepares unless its host fold is Cached or Replaced; every surface does.
-        if will_present {
+        if will_present && draw {
             plx_base::diag::spans::span("dprep", || self.prepare_pass(rig, tick));
         }
         rig.opaque_route(self.present.video_plane());
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.state_hash(),
-            hash_before_prepare,
-            "a prepare pass changed the logical state"
-        );
+        if let Some(before) = hash_before_prepare {
+            debug_assert_eq!(
+                self.state_hash(),
+                before,
+                "a prepare pass changed the logical state"
+            );
+        }
 
         // 10. draw, then the tail
         if will_present && draw {
@@ -1349,6 +1378,11 @@ where
 
     /// Step 9's prepare pass: the top page unless its host fold is Cached or Replaced, then
     /// every surface, then the rig's own render cache — inside the budget's frame.
+    /// Product prepare entry: called only after lifecycle/backbuffer admission.
+    pub fn prepare(&mut self, rig: &mut dyn Rig<H>) {
+        if !self.prepared { self.prepare_pass(rig, self.last_tick); }
+    }
+
     fn prepare_pass(&mut self, rig: &mut dyn Rig<H>, tick: Tick) {
         self.prepared = true;
         let (_, host_render) = self.nav.modals.host_policy();
@@ -1410,6 +1444,7 @@ where
         }
         let mut report = FrameReport::default();
         self.draw_with(rig, tick, &mut report, pages, None, super::frame::backdrop::Z::ALL);
+        plx_machine::motion::report::collect_into(&mut self.present, tick.ms);
         report
     }
 
@@ -1473,6 +1508,9 @@ where
         }
         let mut report = FrameReport::default();
         self.draw_with(rig, tick, &mut report, pages, Some(glass), ceiling);
+        if ceiling == super::frame::backdrop::Z::ALL {
+            plx_machine::motion::report::collect_into(&mut self.present, tick.ms);
+        }
         report
     }
 
@@ -1503,20 +1541,21 @@ where
     /// the same [`Self::bar_stops`] `draw` calls.
     #[cfg(any(test, feature = "test-support"))]
     pub fn present_bar_stops(&mut self, rig: &dyn Rig<H>) {
-        let stops = Self::bar_stops(&self.nav, self.owner_entry(), rig.navigation_presentation());
+        let stops = Self::bar_stops(&self.nav, self.owner_entry(), rig.navigation_presentation(&self.nav));
         self.input.hit.fill(stops);
         self.input.hit.swap();
     }
 
     fn draw_pass(&mut self, rig: &mut dyn Rig<H>, tick: Tick, report: &mut FrameReport) {
         self.draw_with(rig, tick, report, true, None, super::frame::backdrop::Z::ALL);
+        plx_machine::motion::report::collect_into(&mut self.present, tick.ms);
     }
 
     fn draw_with(&mut self, rig: &mut dyn Rig<H>, tick: Tick, report: &mut FrameReport, pages: bool,
         mut glass: Option<&mut super::frame::glass::GlassPlan>, ceiling: super::frame::backdrop::Z) {
         use super::frame::backdrop::{self, Z};
         let strip_owner = self.owner_entry();
-        let navigation = rig.navigation_presentation();
+        let navigation = rig.navigation_presentation(&self.nav);
         // The element the opener lift draws live above the host snapshot is NOT part of the page
         // pass (`DrawFrame::lifted`). When it changes (the menu mounts, or the lift stands down
         // because focus moved off the opener while the menu fades) the snapshot no longer matches
@@ -1561,7 +1600,7 @@ where
         let page_quiescent = self.page_quiescent
             && !plx_gfx::text::prewarm_pending()
             && !self.present.page_moving()
-            && !plx_machine::idle::page_layout_moving()
+            && !plx_machine::motion::report::page_layout_moving()
             && !self.budget.has_queued_work();
         let mut image = self.page_image;
         let paint = if eligible {
@@ -1586,10 +1625,10 @@ where
                 self.present.set_scope(plx_machine::present::Scope::Surface);
                 PresentHandle::of(&mut self.present).note(plx_machine::present::PresentEvent::Motion);
                 self.present.set_scope(plx_machine::present::Scope::Page);
-                plx_machine::idle::invalidate();
+                // This owned surface Motion already requests the next compositor frame.
             }
         }
-        let Dispatcher { nav, input, page_snapshot, page_image, page_stops, page_debt, page_image_alpha, .. } = self;
+        let Dispatcher { nav, input, present, page_snapshot, page_image, page_stops, page_debt, page_image_alpha, .. } = self;
         if !source_pass { *page_image_alpha = None; }
         let mut stops = Vec::new();
         let mut set = RenderSet {
@@ -1695,9 +1734,10 @@ where
                         if full_alpha { page_navigation.page_alpha = 1.0; }
                         let mut f = DrawFrame::with_navigation(&page_cx, Painter::root(), page_navigation);
                         f.lifted = lifted;
-                        if !full_alpha { f.page_alpha *= nav.tabs.stack.transition.page_alpha(); }
+                        // The stack's page alpha is already in `navigation`; apply it once.
                         let drawn_from = super::placeholder::mark();
                         backdrop::draw_span("page", || inst.screen.draw(&mut f));
+                        f.apply_frame_requests(present);
                         if capture { *page_debt = Some((e.id, super::placeholder::since(drawn_from))); }
                         report.drawn.push(inst.id);
                         let drawn_stops = f.into_stops();
@@ -1765,7 +1805,7 @@ where
             if Z::DIM < ceiling {
                 let _dim_layer = backdrop::layer(Z::DIM, false);
                 let _scope = rig.surface_scope();
-                backdrop::draw_span("scrims", || nav.modals.draw_scrims(navigation.page_alpha));
+                backdrop::draw_span("scrims", || nav.modals.draw_scrims(navigation.page_alpha, present));
             }
         }
         // One prewarm budget per frame, shared by the page (here) and a held surface (below).
@@ -1829,6 +1869,7 @@ where
                     face.entry_floor = s.motion.floor();
                     face.underlay = Some(field);
                     backdrop::draw_span("surf", || inst.screen.draw_held(&mut face));
+                    face.apply_frame_requests(present);
                 } else {
                     backdrop::draw_span("surf", || {
                         crate::popover_glass::drawing_surface(index, || inst.screen.draw(&mut f));
@@ -1845,6 +1886,7 @@ where
                     }
                 }
                 report.drawn.push(inst.id);
+                f.apply_frame_requests(present);
                 stops.extend(f.into_stops());
                 // (b) is a count of THIS SURFACE's own backing renders, asked of the surface —
                 // not a literal `1`, which is what made "more than one render per surface"
@@ -1882,7 +1924,9 @@ where
                         // page pass, so a redraw reads the same views the page drew with
                         let lift_cx = lift_parts.page_cx::<H>(
                             views, measure, entry, lift_parts.focus.clone(), nav.tabs.stack.beneath_id(entry));
-                        screen.redraw_focused(&mut DrawFrame::with_navigation(&lift_cx, Painter::root(), navigation), focus);
+                        let mut frame = DrawFrame::with_navigation(&lift_cx, Painter::root(), navigation);
+                        screen.redraw_focused(&mut frame, focus);
+                        frame.apply_frame_requests(present);
                     }
                 }
                 if let Some((elem, presented, _)) = bar_lift.filter(|_| pages) {
@@ -1982,7 +2026,7 @@ where
                 Fx::Deliver(to, delivery) => {
                     steps += 1;
                     let mut out: Vec<Stamped<H>> = Vec::new();
-                    self.execute_deliver(rig, parts, to, delivery, &mut out, report, tap);
+                    self.execute_deliver(rig, parts, item.from, to, delivery, &mut out, report, tap);
                     self.absorb(out);
                 }
                 Fx::Timer { id, after_ms } => {
@@ -2081,6 +2125,7 @@ where
         &mut self,
         rig: &mut dyn Rig<H>,
         parts: &CxParts<H::Elem>,
+        from: MachineId,
         to: MachineId,
         delivery: Delivery<H>,
         out: &mut Vec<Stamped<H>>,
@@ -2120,7 +2165,7 @@ where
                     return;
                 }
                 let event = if held { ScreenEvent::PressHold(id) } else { ScreenEvent::PressCommit(id) };
-                self.execute_deliver(rig, parts, to, Delivery::Screen(event), out, report, tap);
+                self.execute_deliver(rig, parts, from, to, Delivery::Screen(event), out, report, tap);
             }
             (MachineId::Instance(id), Delivery::Screen(ev)) => {
                 // An OS ownership edge takes effect at its position in the delivery stream.
@@ -2234,7 +2279,10 @@ where
                 let Split { views, measure, .. } = rig.split();
                 let cx = addressed.cx::<H>(views, measure);
                 let mut fx = Effects::new(out, to, present);
-                let handled = plx_base::diag::spans::span("dstep", || inst.screen.step(&ev, &cx, &mut fx));
+                let handled = plx_base::diag::spans::span("dstep", || {
+                    let _step = plx_base::step::StepScope::enter();
+                    inst.screen.step(&ev, &cx, &mut fx)
+                });
                 drop(fx);
                 drop(cx);
                 present.set_scope(plx_machine::present::Scope::Page);
@@ -2273,7 +2321,7 @@ where
             (other, Delivery::Machine(msg)) => {
                 let Dispatcher { present, .. } = self;
                 let mut fx = Effects::new(out, other, present);
-                let _ = rig.deliver(other, &msg, parts, &mut fx);
+                let _ = rig.deliver_from(from, other, &msg, parts, &mut fx);
             }
             (_, Delivery::Screen(_) | Delivery::Press { .. } | Delivery::Keyboard { .. }) => {
                 report.dropped_deliveries += 1;
@@ -2574,7 +2622,7 @@ where
             self.input.abandon_if_off(entry, to);
             if let Some(id) = self.nav.instance_of(entry) {
                 let mut out = Vec::new();
-                self.execute_deliver(rig, parts, MachineId::Instance(id), Delivery::Screen(ScreenEvent::FocusMoved { from, to, by }), &mut out, report, tap);
+                self.execute_deliver(rig, parts, MachineId::Input, MachineId::Instance(id), Delivery::Screen(ScreenEvent::FocusMoved { from, to, by }), &mut out, report, tap);
                 self.absorb(out);
             }
         }
@@ -2968,6 +3016,10 @@ mod product_resolution_contract_tests {
 }
 
 #[cfg(test)]
+#[path = "step_scope_tests.rs"]
+mod step_scope_tests;
+
+#[cfg(test)]
 mod cold_open_tests {
     use super::*;
     use crate::fixture::{tick, FixtureArg, FixtureHost, FixtureRig};
@@ -2981,7 +3033,7 @@ mod cold_open_tests {
 
         // boot: Home is requested, mounts at nav commit and draws in the same frame
         d.request(MachineId::Nav, NavOp::Root(FixtureArg::Home));
-        let r = d.frame(&mut rig, tick(0), vec![], vec![], &mut NoTap);
+        let r = crate::fixture::frame_and_swap(&mut d, &mut rig, tick(0), vec![], vec![], &mut NoTap);
         assert_eq!(r.mounted.len(), 1);
         assert_eq!(r.mounted[0].1, "home", "the report carries the screen's own name");
         assert!(r.drawn.contains(&r.mounted[0].0), "it drew in the frame it mounted in");
@@ -2991,8 +3043,8 @@ mod cold_open_tests {
         );
 
         // …and never again for that instance, however many frames it goes on drawing for
-        d.frame(&mut rig, tick(16), vec![], vec![], &mut NoTap);
-        d.frame(&mut rig, tick(32), vec![], vec![], &mut NoTap);
+        crate::fixture::frame_and_swap(&mut d, &mut rig, tick(16), vec![], vec![], &mut NoTap);
+        crate::fixture::frame_and_swap(&mut d, &mut rig, tick(32), vec![], vec![], &mut NoTap);
         assert!(d.take_cold_open_lines().is_empty(), "one line per MOUNT, not per frame");
 
         // A second screen mounted later reports its own word — and its own CLOCK, which is the
@@ -3000,14 +3052,14 @@ mod cold_open_tests {
         // (a structural op that damaged nothing), so the body has not drawn yet and owes no line;
         // the next frame that presents is the one it opens on, 16 ms later.
         d.request(MachineId::Nav, NavOp::Push(FixtureArg::Page(1)));
-        let r2 = d.frame(&mut rig, tick(48), vec![], vec![], &mut NoTap);
+        let r2 = crate::fixture::frame_and_swap(&mut d, &mut rig, tick(48), vec![], vec![], &mut NoTap);
         assert_eq!(r2.mounted.len(), 1);
         assert!(!r2.presented && r2.drawn.is_empty(), "the mount frame drew nothing");
         assert!(d.take_cold_open_lines().is_empty(), "a mount that has not drawn owes no line");
         d.present.note(plx_machine::present::PresentEvent::Damage(
             plx_machine::present::Provenance::Input,
         ));
-        let r3 = d.frame(&mut rig, tick(64), vec![], vec![], &mut NoTap);
+        let r3 = crate::fixture::frame_and_swap(&mut d, &mut rig, tick(64), vec![], vec![], &mut NoTap);
         assert!(r3.presented, "damage opened the gate");
         assert_eq!(
             d.take_cold_open_lines(),

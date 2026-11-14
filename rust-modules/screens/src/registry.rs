@@ -25,6 +25,10 @@
 //! on the dispatcher yet. The bridge drains them after every dispatcher frame.
 
 pub use crate::family::SettingsPage;
+pub use crate::family::InnerViews;
+pub use crate::inputs::{GrantInputs, ScreenInputs};
+#[cfg(test)]
+pub(crate) use crate::inputs::{capture_fixture, empty_fixture, publication_fixture};
 /// The stored Under posters setting as the ui caption policy: the shared door a screen outside
 /// Settings (the Library's Collections page) reads it through, so none names `crate::settings`.
 pub use crate::settings::caption_policy_of;
@@ -120,6 +124,7 @@ pub struct AccountPreferenceReply {
 }
 
 pub enum PreferenceCmd {
+    AutoSignIn { on: bool, reply: std::sync::mpsc::Sender<bool> },
     /// Demand viewer features; the app coalesces this profile-scoped read.
     EnsureMarkerAccess,
     ChooseMarker { kind: plx_data::metadata::MarkerKind, mode: plx_plex::plex::session::MarkerSkipMode,
@@ -265,18 +270,11 @@ pub enum PlayerReq {
     /// `super::bridge::open_player_overlay` straight from the loop's key ladder; `PlayerScreen`
     /// may not name that function itself (§2.2), so it asks instead.
     OpenOverlay(crate::player::overlay::OverlayKind),
-    /// **A pointer click landed on the transport's own control row** — whichever disc, the Skip
-    /// pill or the Up Next tile currently occupies it. Arms a tvOS press dip;
-    /// the loop's commit-frame dispatch
-    /// (`app/run.rs`'s `Route::Player => activate_player_row(...)`) performs whatever the row
-    /// decides once the spring-back has played, through the same performer OK reaches by
-    /// [`Command`](PlayerReq::Command) and [`StandIn`](PlayerReq::StandIn). OK on the row does not
-    /// ask this: the focus engine presses the control itself.
-    ArmControlRow,
+
     /// **A press on a control of the discs committed**, after the engine's tvOS dip has played
     /// (`PressCommit`, [`PlayerScreen`](crate::player::PlayerScreen)): perform this command. The screen resolves the command of the control the
     /// engine holds, so the app's performer (`app::playback::perform_hud_command`) never reads a
-    /// cursor. OK on the row is this; a pointer click on the row is still [`ArmControlRow`](PlayerReq::ArmControlRow).
+    /// cursor. Keyboard and pointer presses use this same commit path.
     Command(plx_appkit::player_hud::command::HudCommand),
     /// **A press on a stand-in committed** — the Skip pill, or one of the Up Next pair — after the
     /// same dip. A stand-in's meaning depends on the segment it offers, which the app resolves on
@@ -1294,6 +1292,10 @@ pub enum PlayIntent {
         context: String,
         /// The version picked on the Play Version panel, `None` for the default (`Media[0]`).
         version: Option<plx_plex::plex::MediaId>,
+        /// The show the item's episode belongs to, `""` for anything that is not an episode (a
+        /// trailer, a movie, an extra). The queue builder keys the PlayQueue off the show so the
+        /// episodes before this one are in it, which is what the HUD's Previous needs.
+        show_rk: String,
     },
     /// The alternative source the page had selected (`route::request_play_movie`). Owned rather
     /// than a `&'static` catalog borrow: it is held inside `PageAction`/`AppFx` across a frame
@@ -1341,7 +1343,8 @@ pub trait MetadataLike: AppLike + Sized {
 
 /// A host that publishes Home's retained catalog view. The view is borrowed from the rig-owned
 /// snapshot and is therefore valid for the complete step/draw query without per-frame cloning.
-pub trait HomeLike: AppLike<Memory = PageMemory> + Sized {
+pub trait HomeLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
+    fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts>;
     fn hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::pms::HubsView<'a>;
 }
 
@@ -1365,7 +1368,8 @@ pub trait SearchLike: AppLike<Memory = PageMemory> + Sized {
 }
 
 /// A host that publishes all three retained Library views captured at the frame split.
-pub trait LibraryLike: AppLike<Memory = PageMemory> + Sized {
+pub trait LibraryLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
+    fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts>;
     fn marker_prefs(_cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { Default::default() }
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a>;
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
@@ -1408,7 +1412,7 @@ pub struct Forbidden;
 /// A host carrying the retained Browse directory needed by Chrome and the Settings family.
 /// Full Library hosts implement this automatically; the nested Settings host carries only this
 /// one publication so its Onboard child never falls back to the compatibility selector.
-pub trait DirectoryLike: AppLike + Sized {
+pub trait DirectoryLike: AppLike + ScreenInputsLike + Sized {
     fn marker_prefs(_cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { Default::default() }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
 }
@@ -1421,7 +1425,12 @@ impl<H: LibraryLike> DirectoryLike for H {
 }
 
 /// Session's immutable frame publication; playback retains its separate `session` view.
-pub trait AuthLike: AppLike + Sized {
+/// A host must explicitly supply the retained inputs; no ambient or neutral fallback.
+pub trait ScreenInputsLike: AppLike + Sized {
+    fn screen_inputs<'a>(cx: &Cx<'a, Self>) -> &'a crate::inputs::ScreenInputs;
+}
+
+pub trait AuthLike: AppLike + ScreenInputsLike + Sized {
     fn auth<'a>(cx: &Cx<'a, Self>) -> plx_session::auth::SessionRead<'a>;
 }
 
@@ -1432,6 +1441,21 @@ pub enum DetailRefreshPhase {
     None,
     Deferred,
     Requested,
+}
+
+/// Explicit offline screen-host capture; the production machine has no registry fallback.
+#[cfg(test)]
+pub(crate) fn run_person_fixture(store: &mut plx_data::stores::person::PersonStore,
+    cmd: plx_data::stores::person::PersonCmd) -> bool {
+    let mut keys = plx_plex::plex::ClientKeys::default();
+    keys.refill_roster(plx_plex::plex::current_server(), plx_plex::plex::server_roster_gen(),
+        plx_plex::plex::server_facts_gen(), plx_plex::plex::server_ids(),
+        plx_plex::plex::client_for, plx_plex::plex::server_facts, plx_plex::plex::server_probe_result);
+    let bio = plx_base::devtrig::read("personbio");
+    let input = plx_data::person::PersonInput { keys: &keys, session: None, visible_generation: 0,
+                profile_scope: 0, owner_epoch: 0, profile_generation: 0, tenure: 0, profile_key: "",
+        controlled: false, profile_refused: false, credits_refused: false, dev_bio: bio.as_deref(), dev_credits: None };
+    store.run_with_input(cmd, &input)
 }
 
 /// The application's messages (spec §3.1).
@@ -1446,6 +1470,8 @@ pub enum AppMsg {
     SelectionReply { correlation: u32, accepted: bool, flow_epoch: u64 },
     BackReply { correlation: u32, resumed: bool },
     Store(StoreCmd),
+    /// Person commands retain their originating body through deferred delivery and teardown.
+    PersonCommand { from: MachineId, command: plx_data::stores::person::PersonCmd },
     StoreWork(StoreWork),
     HubsResult(plx_data::stores::hubs::HubsResult),
     Home(HomeCmd),

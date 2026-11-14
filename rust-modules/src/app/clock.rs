@@ -51,6 +51,7 @@ pub(crate) const REPLAY_DATE: [i32; 3] = [2026, 1, 1];
 
 /// Milliseconds since SDL init — or, under a replay, the recorded tick of the frame in flight.
 pub(crate) fn now() -> u32 {
+    plx_base::step::assert_io_allowed("app::clock::now");
     if let Some(ms) = REPLAY.with(|c| c.get()) {
         return ms;
     }
@@ -70,6 +71,7 @@ pub(crate) fn set_replay(ms: u32) {
 /// inventing today's date for a historical frame would make the HUD nondeterministic. The platform
 /// clock is sampled at most every five seconds and advanced with monotonic frame ticks between samples.
 pub(crate) fn unix_ms() -> Option<i64> {
+    plx_base::step::assert_io_allowed("app::clock::unix_ms");
     if REPLAY.with(|c| c.get().is_some()) {
         UNIX.with(|c| c.set(None));
         return None;
@@ -103,6 +105,7 @@ pub(crate) fn local_end_time(seconds: i64) -> Option<[i32; 2]> {
 /// `local_clock_time` once per wall-clock minute. Like [`today`], only the loop calls it and
 /// publishes the answer (`Bridge::publish_wall_clock`); a screen reads it from its views.
 pub(crate) fn time_of_day() -> Option<plx_base::wallclock::WallTime> {
+    plx_base::step::assert_io_allowed("app::clock::time_of_day");
     let minute = unix_ms()?.div_euclid(60_000);
     if let Some((at, time)) = TIME.with(|c| c.get()) {
         if at == minute { return time; }
@@ -138,6 +141,7 @@ fn advance_unix_ms(sampled_at: u32, sampled: Option<i64>, tick: u32) -> Option<O
 /// into the Bridge's views. A screen or a host impl never calls it: `AppHost::today` returns the
 /// frame's publication.
 pub(crate) fn today() -> Option<[i32; 3]> {
+    plx_base::step::assert_io_allowed("app::clock::today");
     // A recorded Library grid sorted by a date must word the same on every run and on every day.
     if REPLAY.with(|c| c.get()).is_some() {
         return Some(REPLAY_DATE);
@@ -157,6 +161,20 @@ mod tests {
     fn a_replay_draws_no_corner_clock() {
         super::set_replay(4242);
         assert_eq!(super::time_of_day(), None, "a recording has no wall clock, so every run draws none");
+        super::REPLAY.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn a_machine_cannot_sample_even_the_replay_clock_or_cached_calendar() {
+        super::set_replay(4242);
+        let _allowed = plx_base::task::allow_blocking(const { &plx_base::task::BlockingLabel::new("fixture") });
+        let step = plx_base::step::StepScope::enter();
+        for read in [|| { super::now(); }, || { super::unix_ms(); }, || { super::today(); }] {
+            assert!(std::panic::catch_unwind(read).is_err());
+        }
+        drop(step);
+        assert_eq!(super::now(), 4242);
+        assert_eq!(super::today(), Some(super::REPLAY_DATE));
         super::REPLAY.with(|c| c.set(None));
     }
 

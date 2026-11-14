@@ -22,7 +22,14 @@ impl Host for TestHost {
     type Init = FixtureArg;
     type Memory = PageMemory;
 }
+impl crate::registry::ScreenInputsLike for TestHost {
+    fn screen_inputs<'a>(_cx: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs {
+        crate::registry::empty_fixture()
+    }
+}
+
 impl LibraryLike for TestHost {
+    fn clock_facts<'a>(_cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts> { None }
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a> {
         cx.views.listing
     }
@@ -81,6 +88,7 @@ fn shelf_activate_and_hold_keep_the_deck_promise_and_engine_item_identity() {
             is_long: true,
             held_ms: None,
             owner: None,
+            ..Default::default()
         },
         owner,
     };

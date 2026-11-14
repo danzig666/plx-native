@@ -227,11 +227,11 @@ fn clear() {
     // The *Also available* store outlives a page, so a test that seeded it hands the next one an
     // empty one — the addressed store cannot MIS-answer, but it can answer for an item a later
     // test happens to reuse the pair of.
-    test_store().run(plx_data::stores::metadata::MetadataCmd::AltInstall {
+    test_store().run_with_keys(plx_data::stores::metadata::MetadataCmd::AltInstall {
         sid: plx_plex::plex::ServerId::UNSET,
         rk: String::new(),
         copies: Vec::new(),
-    });
+    }, &plx_data::pms::registry_keys_for_test());
 }
 
 fn step(
@@ -1570,7 +1570,7 @@ fn hero_action_row_hit_matches_the_drawn_controls_at_every_set_size() {
                     // The *Also available* control's gate is the STORE, addressed by the page's own
                     // pair — seeded here the way a landed cross-source resolve seeds it, never by
                     // opening the panel.
-                    test_store().run(plx_data::stores::metadata::MetadataCmd::AltInstall {
+                    test_store().run_with_keys(plx_data::stores::metadata::MetadataCmd::AltInstall {
                         sid,
                         rk: "hero-hit".into(),
                         copies: if alt {
@@ -1581,7 +1581,7 @@ fn hero_action_row_hit_matches_the_drawn_controls_at_every_set_size() {
                         } else {
                             Vec::new()
                         },
-                    });
+                    }, &plx_data::pms::registry_keys_for_test());
                     let mut screen = bare(&_guard, sid, "hero-hit");
                     let set = screen.hero_set(test_store().view());
                     assert_eq!(
@@ -5335,7 +5335,7 @@ fn the_held_episode_still_is_left_out_of_the_page_pass_and_drawn_once_by_the_lif
     }
     const DIP: f32 = 0.918;
     let mut context = cx(&measure, Some(key.elem));
-    context.press = PressRead { scale: DIP, is_long: true, held_ms: Some(400), owner: Some(key) };
+    context.press = PressRead { scale: DIP, is_long: true, held_ms: Some(400), owner: Some(key), ..Default::default() };
 
     let mut census = |lifted: Option<FocusKey<u32>>, lift: bool| {
         plx_ui::popover::set_lift_owns(false);
@@ -5402,7 +5402,7 @@ fn the_hold_hint_over_an_episode_still_waits_while_the_season_loads() {
     let measure = plx_ui::fixture::FixtureMeasure;
     let elem = episode_key(&screen, 0, episodes::Row::Still).unwrap();
     let mut context = cx(&measure, Some(elem));
-    context.press = PressRead { scale: 1.0, is_long: false, held_ms: Some(200), owner: None };
+    context.press = PressRead { scale: 1.0, is_long: false, held_ms: Some(200), owner: None, ..Default::default() };
     let located = Some(Located::Episode(0, episodes::Row::Still));
     let hinted = |screen: &DetailScreen| screen.hint_input(&context, located).focus.is_some();
 

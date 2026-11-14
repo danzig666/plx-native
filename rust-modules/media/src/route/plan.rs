@@ -2,7 +2,11 @@
 //! the plain data types they need. Nothing here reads a `static mut`, touches [`super::decision`]'s
 //! `SESSION`/`PLAYER_CONTROL`/`PLAY_SLOT`/`ENCODER_CLEANUP`/`SCROBBLE_JOIN`/`TIMELINE_STOP_FENCE`/
 //! `QUALITY`, or calls `task::spawn*` — that is what makes [`build_stream`] safe to run on the
-//! resolve worker. Everything else in the former `route.rs` (session state, the synchronized
+//! resolve worker. (One bounded wait is the exception that is not named here: a handoff's queue
+//! re-read, [`build_stream`]'s `queue.refreshed` on its `beside` leg, waits up to 1.5 s through
+//! `queue_navigation` for the outgoing episode's `stopped` report, the shared stop fence, before
+//! it reads the rows; it never runs on the main thread.) Everything else in the former
+//! `route.rs` (session state, the synchronized
 //! `PlayerControl`, PMS/native I/O, the encoder/scrobble/timeline machinery) lives in
 //! [`super::decision`]. `ci/check-deps.sh`'s `wall` gate holds this file, and its child
 //! module `plan_memory.rs` (the track memory's pure helpers), to zero
@@ -477,7 +481,7 @@ pub(super) fn transcode_spec_carrying_burn<'a>(
 }
 
 
-pub use plx_plex::plex::session::{PlaybackQuality as Quality, DeckPress, DirectPlayMode, HdrOverlayBrightness, NextEpisodeMode, SkipInterval, SubtitleSize, SubtitlePosition};
+pub use plx_plex::plex::session::{PlaybackQuality as Quality, DeckPress, DirectPlayMode, HdrOverlayBrightness, NextEpisodeMode, SkipInterval, SubtitleSize, SubtitlePosition, SubtitleTone};
 
 
 /// The ladder IN ORDER, best first. The ONE place row order lives, so the picker's index mapping
@@ -1206,8 +1210,10 @@ pub enum PlayVerdict {
     /// Force Direct Play is on, and this is why the original cannot play.
     Forced(ForcedFailure),
     /// A hero/trailer preview resolved to a route that is not a direct play. A muted preview takes
-    /// only the original, so the plan is refused here, with no URL.
-    PreviewNeedsDirectPlay,
+    /// only the original, so the plan is refused here, with no URL. `reason` is the first failing
+    /// condition in [`crate::player::preview::refusal`]'s fixed order; it is typed data for the
+    /// failure report (`playback.preview_refusal`) and changes nothing about how the refusal reads.
+    PreviewNeedsDirectPlay { reason: plx_telemetry::telemetry::classes::PreviewRefusal },
     /// This build has no Feed executor and no source-specific URI qualification was granted.
     NoQualifiedBackend,
 }
@@ -1240,7 +1246,7 @@ impl PlayVerdict {
         match self {
             Self::Server(sentence, _) => Borrowed(sentence),
             Self::DirectPlayDisabled => Borrowed(msg::widgets_verdict_direct_play_disabled()),
-            Self::PreviewNeedsDirectPlay => Borrowed(msg::widgets_reason_open()),
+            Self::PreviewNeedsDirectPlay { .. } => Borrowed(msg::widgets_reason_open()),
             Self::NoQualifiedBackend => Borrowed(msg::widgets_reason_open()),
             Self::Forced(why) => match why {
                 ForcedFailure::NoOriginal => Borrowed(msg::widgets_verdict_forced_no_original()),
@@ -1452,6 +1458,11 @@ pub struct ResolveEnv {
     pub src_kbps: i64,
     /// Trailer sessions omit `continuous=1` so EOS cannot Up-Next into a sibling extra.
     pub omit_queue_continuous: bool,
+    /// The show the played EPISODE belongs to, empty for anything else (and for a caller that did not
+    /// know it). The queue is built from the show with the episode as its start, so the episodes
+    /// BEFORE it are in the queue and Previous has somewhere to go
+    /// ([`plx_plex::plex::Client::create_play_queue`]).
+    pub queue_show_rk: String,
     /// An explicit queue-item handoff reuses the existing queue instead of POSTing a new tail.
     pub queue_continuation: Option<super::queue_navigation::QueueContinuation>,
     /// Hero preview. Skip the PlayQueue entirely, and refuse anything that is not a direct play.
@@ -1819,7 +1830,7 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
             Some(plx_base::task::beside(s, "route-queue", move || {
                 env.queue_continuation.as_ref().filter(|queue| queue.matches(env.sid, rk))
                     .map(|queue| queue.refreshed(client).resolve()).unwrap_or_else(|| resolve_playqueue(
-                        client, rk, &session, &env.machine_id, !env.omit_queue_continuous,
+                        client, rk, &env.queue_show_rk, &session, &env.machine_id, !env.omit_queue_continuous,
                     ))
             }))
         } else {
@@ -1882,8 +1893,8 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
             plan.src_fps = plan.playing.as_ref().map_or(0.0, |p| p.video_fps);
             plan.playing_fresh = env.cached_item.is_none() && plan.playing.is_some();
             let src_kbps = match (env.version, played.as_ref()) {
-                (None, Some(_)) => plan.playing.as_ref().map_or(0, |p| p.bitrate),
-                _ => env.src_kbps,
+                (None, None) => env.src_kbps,
+                _ => plan.playing.as_ref().map_or(0, |p| p.bitrate),
             };
             let reselected = env.with_selection_for_part(plan.part_id);
             let env = reselected.as_ref().unwrap_or(env);
@@ -2720,6 +2731,11 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
             }
             let auto_original = decision.as_ref().is_some_and(|d| d.original);
             let adaptive = auto_uses_hls(playback_quality, auto_original);
+            // Whether a direct play was on offer BEFORE the override just below sets `directplay` false
+            // for HLS. The preview gate's reason needs it: after the override `directplay` is false for
+            // every Auto-quality HLS pick, so the gate's own inputs cannot tell a preview Auto sent to
+            // HLS from one the server would have transcoded anyway.
+            let direct_play_offered = directplay;
             if adaptive {
                 allowed = flavors_allowed(
                     link,
@@ -2877,11 +2893,13 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
                 plan.memory_note = true;
             }
             log_memory(memory_unshown.is_some());
-            if env.preview && !crate::player::preview::accepts_direct_play(directplay, !part.is_empty(), adaptive) {
-                crate::player::log("preview: refused — not a direct play");
-                plan.url.clear();
-                plan.verdict = Some(PlayVerdict::PreviewNeedsDirectPlay);
-                return plan;
+            if env.preview {
+                if let Some(reason) = crate::player::preview::refusal(directplay, direct_play_offered, !part.is_empty(), adaptive) {
+                    crate::player::log(&format!("preview: refused — not a direct play ({})", reason.code()));
+                    plan.url.clear();
+                    plan.verdict = Some(PlayVerdict::PreviewNeedsDirectPlay { reason });
+                    return plan;
+                }
             }
             if (directplay || rk.is_empty()) && !part.is_empty()
                 && (rk.is_empty() || !pms_uri_possible || env.feed_original_eligible) {

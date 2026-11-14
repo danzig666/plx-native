@@ -21,7 +21,7 @@ pub use crate::browse::{
 pub use crate::browse::section_hubs::{HubsId, HubsSnapshot, HubsView, Publication};
 #[allow(unused_imports)] // Shared owner vocabulary; some members are feature/test specific.
 pub use crate::browse::view::{
-    DirectorySnapshot, DirectoryView, ListingId, ListingSnapshot, ListingView, SectionView,
+    DirectorySnapshot, DirectoryView, ListingId, ListingSnapshot, ListingView, SectionView, SAMPLE_POSTERS,
 };
 
 /// Owner-aware first-run gate shared by boot and login. The retained directory is the granted
@@ -154,12 +154,13 @@ impl BrowseStore {
     /// controlled Home arm admits the discovery through the run's ledger).
     #[must_use]
     pub fn take_jobs(&mut self) -> Vec<super::StoreJob> {
+        self.jobs.extend(self.state.take_preference_jobs());
         std::mem::take(&mut self.jobs)
     }
 
     /// Does the outbox hold a job nobody has taken yet?
     pub fn has_jobs(&self) -> bool {
-        !self.jobs.is_empty()
+        !self.jobs.is_empty() || self.state.has_preference_jobs()
     }
 
     /// Run one command for a caller that holds no session: the Stores fan-outs, which send only
@@ -174,7 +175,7 @@ impl BrowseStore {
             return false;
         }
         let session = plx_plex::plex::session::Session::default();
-        self.run_with_input(cmd, &BrowseRosterInput {
+        self.run_with_input(cmd, &BrowseRosterInput { tenure: 0,
             keys, session: &session, visible_generation: 0, settled: false, profile_key: "",
         })
     }
@@ -221,7 +222,7 @@ impl BrowseStore {
     pub fn run_for_test(&mut self, cmd: BrowseCmd) -> bool {
         self.observe_pin_write();
         let session = plx_plex::plex::session::peek();
-        self.run_with_input(cmd, &BrowseRosterInput {
+        self.run_with_input(cmd, &BrowseRosterInput { tenure: plx_plex::plex::session::tenure(),
             keys: &ClientKeys::default(), session: &session,
             visible_generation: plx_plex::plex::session::visible_generation(),
             settled: plx_plex::plex::session::peek_settled().is_some(),
@@ -266,7 +267,7 @@ impl BrowseStore {
         keys.refill_roster(plx_plex::plex::current_server(), plx_plex::plex::server_roster_gen(),
             plx_plex::plex::server_facts_gen(), plx_plex::plex::server_ids(),
             plx_plex::plex::client_for, plx_plex::plex::server_facts, plx_plex::plex::server_probe_result);
-        self.pump_with_gate(plx_machine::landgate::fixture_gate(), &BrowseRosterInput {
+        self.pump_with_gate(plx_machine::landgate::fixture_gate(), &BrowseRosterInput { tenure: plx_plex::plex::session::tenure(),
             keys: &keys, session: &session,
             visible_generation: plx_plex::plex::session::visible_generation(),
             settled: plx_plex::plex::session::peek_settled().is_some(),
@@ -303,7 +304,7 @@ impl BrowseStore {
         keys.refill_roster(plx_plex::plex::current_server(), plx_plex::plex::server_roster_gen(),
             plx_plex::plex::server_facts_gen(), plx_plex::plex::server_ids(),
             plx_plex::plex::client_for, plx_plex::plex::server_facts, plx_plex::plex::server_probe_result);
-        self.discover_pump_with_gate(plx_machine::landgate::fixture_gate(), &BrowseRosterInput {
+        self.discover_pump_with_gate(plx_machine::landgate::fixture_gate(), &BrowseRosterInput { tenure: plx_plex::plex::session::tenure(),
             keys: &keys, session: &session,
             visible_generation: plx_plex::plex::session::visible_generation(),
             settled: plx_plex::plex::session::peek_settled().is_some(),
@@ -921,7 +922,7 @@ mod contract_tests {
         );
         let session = plx_plex::plex::session::peek();
         let profile_key = plx_plex::plex::session::current_profile_key();
-        let input = BrowseRosterInput {
+        let input = BrowseRosterInput { tenure: 0,
             keys: &keys, session: &session,
             visible_generation: plx_plex::plex::session::visible_generation(),
             settled: plx_plex::plex::session::peek_settled().is_some(), profile_key: &profile_key,
@@ -1173,7 +1174,7 @@ mod contract_tests {
             plx_plex::plex::client_for, plx_plex::plex::server_facts,
             plx_plex::plex::server_probe_result,
         );
-        let input = BrowseRosterInput {
+        let input = BrowseRosterInput { tenure: 0,
             keys: &keys, session: &plx_plex::plex::session::peek(),
             visible_generation: plx_plex::plex::session::visible_generation(),
             settled: plx_plex::plex::session::peek_settled().is_some(),
@@ -1201,6 +1202,12 @@ mod contract_tests {
         let _ = stores.take_notices();
         let before_notice = stores.browse.borrow().gen();
         let before_sources = stores.browse.borrow().source_list_gen_for_test();
+        // Data publication cannot dirty or wake an independent presentation owner.
+        let mut present = plx_machine::present::Present::global();
+        assert!(present.take(0));
+        present.acknowledge(0);
+        assert!(!present.changed());
+        let damage = (present.damage_epoch(), present.page_damage_epoch());
         plx_plex::plex::register_for_test(
             "", "127.0.0.1", 9, "synthetic", "fixture");
         let launches = refused_discovery_step(&stores);
@@ -1210,7 +1217,8 @@ mod contract_tests {
         assert_eq!(stores.browse.borrow().gen(), before_notice + 1);
         assert_eq!(stores.take_notices(), [(StoreId::Browse, before_notice + 1)]);
         assert!(stores.take_notices().is_empty());
-        let _ = plx_machine::idle::take_local_damage();
+        assert_eq!((present.damage_epoch(), present.page_damage_epoch()), damage);
+        assert!(!present.changed(), "a data publication must not wake an unrelated owner");
 
         let settled_notice = stores.browse.borrow().gen();
         let settled_sources = stores.browse.borrow().source_list_gen_for_test();
@@ -1219,8 +1227,9 @@ mod contract_tests {
         assert_eq!(stores.browse.borrow().gen(), settled_notice);
         assert_eq!(stores.browse.borrow().source_list_gen_for_test(), settled_sources);
         assert!(stores.take_notices().is_empty());
-        assert_eq!(plx_machine::idle::take_local_damage(), 0,
-            "an empty-to-empty machine identity must not invalidate the settled frame");
+        assert_eq!((present.damage_epoch(), present.page_damage_epoch()), damage);
+        assert!(!present.changed(),
+            "an empty-to-empty machine identity must not dirty or wake an unrelated owner");
 
         plx_plex::plex::reset_servers_for_test();
     }

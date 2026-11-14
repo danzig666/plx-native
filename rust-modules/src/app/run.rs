@@ -38,12 +38,13 @@
 //! the same way; see `dev::scenarios`'s own module doc for the full inventory.
 use super::*;
 use plx_appkit::player_hud::geometry::{GROUP_ROW, GROUP_TABS};
+use plx_ui::dispatch::Rig as _;
 
 /// One lazy product frame-tail hash path for recording and replay grading alike.
 pub(super) fn recorder_end_frame(
     rec: &mut super::recorder::Recplay,
     bridge: &super::bridge::Bridge,
-    press: &plx_ui::press::Press,
+
     route: &str,
     overlay: &str,
     focus: &str,
@@ -51,8 +52,9 @@ pub(super) fn recorder_end_frame(
 ) -> bool {
     rec.measurements(bridge);
     rec.content_end();
-    rec.end_frame_with_gate(&|| super::recorder::state_hash(
-        press, route, overlay, focus, tree, bridge.session_subhash(), bridge.consent_subhash(),
+    let profile = rec.frame_hash_profile();
+    rec.end_frame_with_gate(&|| super::recorder::state_hash_profile(profile,
+        route, overlay, focus, tree, bridge.session_subhash(), bridge.consent_subhash(),
         bridge.initial_subhash(),
     ), &|id| bridge.store_gen(id), bridge.landgate())
 }
@@ -303,7 +305,7 @@ pub(crate) unsafe fn run(app: &mut App) {
 /// Settle repair and exact native release before publishing this frame's playback facts.
 fn poll_player_release(app: &mut App) {
     if app.adapters.player.poll_repair(&mut app.player.repair) {
-        plx_machine::idle::invalidate();
+        app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
     }
     // A timed-out Feed Load and an off-frame Unload get their main-thread tails here.
     #[cfg(feature = "play-feed")]
@@ -367,7 +369,7 @@ fn clock_and_press(app: &mut App, fr: &mut Frame) {
     let rest_dt = if crate::dev::framedump::active() { crate::dev::framedump::idle_dt(fr.dt) } else { fr.dt };
     #[cfg(not(all(feature = "hostsim", feature = "devtriggers")))]
     let rest_dt = fr.dt;
-    plx_machine::idle::frame_begin_judging_rest_with(fr.dt, rest_dt);
+    plx_machine::motion::report::frame_begin_judging_rest_with(fr.dt, rest_dt);
     // Is a page capture still in flight on the GPU, and is recorded text still warming? Latched
     // once, before the springs step, so the held appear spring and the present gate below read
     // the same answer — and, being the machine's speed rather than the inputs, recorded or
@@ -378,17 +380,8 @@ fn clock_and_press(app: &mut App, fr: &mut Frame) {
         plx_gfx::text::latch_surface_text_pending(seen.text);
         seen.snapshot
     });
-    // ui::press (tvOS click) — advance the dip/spring every frame; when a deferred activation
-    // commits (the spring-back bounce has played), run it for whichever CARD view armed the
-    // press. A long-press does NOT commit (`press::tick` clears `want_commit` at `LONG_MS`):
-    // on Home it opens the item menu below, and anywhere else it just springs back.
-    let (_, press_moving) = plx_machine::idle::scoped_motion(|| {
-        app.input.press.tick(fr.now, fr.dt);
-    });
-    // The motion of whatever page is UNDER a popover — Home, the Library or Search, since
-    // the profile chip is a stop on all three. It was `home_underlay_moving` while only Home
-    // could be underneath. The account popover's glass re-snapshots off this.
-    fr.underlay_moving = press_moving;
+    // Dispatcher::frame alone ticks the owned press and delivers its hold/commit events.
+    fr.underlay_moving = false;
 }
 
 /// **Make sure the player has a compiled HUD**, on each player frame in `prepare_window` (inside the frame
@@ -478,11 +471,20 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
     // tick drain, so on a cold-open frame (~62 ms) every upload was over the ceiling and
     // only the forward-progress escape let ONE through. A quota of three that was really a
     // quota of one, on exactly the frames with the most textures waiting.
-    app.pages.budget.begin_frame(plx_base::diag::heartbeat::now_us());
+    // The budget opens with Dispatcher::prepare only after actual admission.
     // The poster adapter's frame (spec §3.3 step 3's tail): a new frame for the slot LRU and
     // every decoded image handed to the render cache as owned pixels. No GL here — the
     // upload is below, on the presenting side of the decision.
-    super::adapters::poster::begin_frame();
+    for outcome in super::adapters::poster::begin_frame() {
+        match outcome {
+            super::adapters::poster::ResourceOutcome::RetryDue | super::adapters::poster::ResourceOutcome::EvictionDue =>
+                app.pages.present.note(plx_machine::present::PresentEvent::Wake),
+            super::adapters::poster::ResourceOutcome::AdmissionRefused
+                | super::adapters::poster::ResourceOutcome::RetryParked
+                | super::adapters::poster::ResourceOutcome::LoadFailed =>
+                app.note_presentation_damage(plx_machine::present::Provenance::Resource(plx_machine::present::ResourceKind::Texture)),
+        }
+    }
     super::adapters::poster::drain_decoded();
 
     fr.player = matches!(app.route(), AppArg::Player);
@@ -529,7 +531,7 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
             .map(|p| p.clock_fingerprint(&app.player.session, fr.now));
         if let Some(fp) = fp {
             if app.player.note_clock(fp) {
-                plx_machine::idle::invalidate();
+                app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
             }
         }
     }
@@ -577,13 +579,19 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
     // The simulator's settled capture (`PLXNATIVE_SHOT_SETTLE`): once nothing has changed for the
     // asked-for quiet, invalidate so the NEXT present is the settled frame and `maybe_capture`
     // takes it. Before the decision below, so that invalidate selects this very frame.
+    app.bridge.observe_plex_visual_inputs(&mut app.pages.present);
+    // Settle decisions must include this frame's input, motion and landed content.
+    plx_machine::motion::report::collect_into(&mut app.pages.present, fr.now);
     #[cfg(feature = "hostsim")]
-    crate::shot::tick(fr.now, app.pages.budget.has_queued_work() || plx_gfx::gfx::snapshot_pending()
-        || app.scenarios.shots.pending());
+    if crate::shot::tick(fr.now, app.pages.budget.has_queued_work() || plx_gfx::gfx::snapshot_pending()
+        || app.scenarios.shots.pending(), app.pages.present.last_change_ms()) {
+        app.pages.present.note(plx_machine::present::PresentEvent::Wake);
+    }
+    // Admission snapshots pending generations but consumes nothing. A lifecycle or
+    // backbuffer refusal leaves the same work pending, including worker-only wakes.
+    let demand = app.pages.present.take(fr.now) || app.pages.budget.has_queued_work();
     fr.present = !plx_gfx::gfx::snapshot_pending()
-        && app.window_activity.allow_present(
-            plx_machine::idle::should_present(fr.now) || app.pages.budget.has_queued_work(),
-        );
+        && app.window_activity.allow_present(demand);
     // Read-only: was the fence the only thing standing between this iteration and a present? An
     // inactive window would not have presented either way. (`should_present` is deliberately not
     // asked: it takes-and-clears the damage the deferred frame still needs.)
@@ -596,6 +604,7 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
     app.rec.present(fr.present);
     if fr.present {
         app.window_activity.begin_present(fr.player);
+        app.pages.prepare(&mut app.bridge);
     }
     // ---- step 9's UPLOAD, on the presenting side of the decision ---------------------
     //
@@ -615,7 +624,7 @@ unsafe fn prepare_window(app: &mut App, fr: &mut Frame) {
         // `prepare` (`PanelMotion::prewarm_text`), and uploaded here: `fr.present` already carries the window-activity gate, so a frame that
         // does not present, or one while the window is backgrounded, uploads nothing.
         plx_ui::panel_motion::PanelMotion::drain_queued_text(plx_base::diag::heartbeat::now_us);
-        let mut ph = plx_machine::machine::PresentHandle::of(&mut app.present);
+        let mut ph = plx_machine::machine::PresentHandle::of(&mut app.pages.present);
         super::adapters::poster::prepare(
             &mut app.pages.budget,
             &mut ph,
@@ -653,7 +662,7 @@ fn hud_model(
     ps: &plx_media::route::PlaybackSession,
     meta: plx_data::metadata::MetadataView<'_>,
     viewer_paused: bool,
-    live_clock: bool,
+    live_clock_and_lane: bool,
 ) -> plx_appkit::player_hud::model::HudModel {
     let position_ns = plx_media::player::playpos_ns(ps);
     let playpos_ns = position_ns.unwrap_or(0);
@@ -666,7 +675,7 @@ fn hud_model(
     let (is_episode, is_movie) = meta.now_playing().map_or((false, false), |n| (n.is_real_episode, n.is_movie));
     let projected_end_time = if plx_appkit::player_hud::model::end_time_is_eligible(
         plx_appkit::player_hud::model::EndTimeEligibility {
-            enabled: live_clock && plx_media::route::hud_end_time(),
+            enabled: live_clock_and_lane && plx_media::route::hud_end_time(),
             is_movie_or_episode: is_episode || is_movie,
             is_preview: plx_media::route::is_preview(ps),
             advancing,
@@ -724,7 +733,9 @@ fn publish_product_frame(app: &mut App, was_player: bool) {
 
 /// Frame-boundary runner inputs, captured before the event pump.
 fn begin_product_frame(app: &mut App) -> Frame {
-    app.bridge.publish_marker_preferences(clock::now());
+    if app.bridge.publish_marker_preferences(clock::now()) {
+        app.note_presentation_damage(plx_machine::present::Provenance::Landing(plx_machine::machine::MachineId::Session));
+    }
     let mut frame = Frame::begin(&app.player.session, app.bridge.metadata_view());
     frame.ctrl = plx_appkit::player_hud::slot_with_preferences(&app.player.session,
         app.bridge.metadata_view(), app.bridge.marker_preferences());
@@ -735,7 +746,9 @@ fn begin_product_frame(app: &mut App) -> Frame {
 fn publish_player_model(app: &mut App) {
     let mut model = hud_model(&app.player.session, app.bridge.metadata_view(),
         app.adapters.player.backend_viewer_paused().unwrap_or(false),
-        matches!(app.rec, super::recorder::Recplay::Off) && !app.bridge.is_controlled_replay());
+        matches!(app.rec, super::recorder::Recplay::Off) && !app.bridge.is_controlled_replay()
+            // a HUD with no finish-time lane draws no estimate, so none is projected for it
+            && app.hud.as_ref().is_some_and(|hud| hud.compiled.declares_end_time()));
     model.marker_prefs = app.bridge.marker_preferences();
     model.covered = app.pages.surface_up();
     if let Some(screen) = super::bridge::player_mut(&mut app.pages) { screen.set_model(model); }
@@ -763,6 +776,20 @@ pub(crate) fn rig_clear_opaque_region() {
     plx_platform::tv::window::clear_opaque_region();
 }
 
+/// **Simulator only: the television's compositor, over the frame the straighten pass just made.** The
+/// decoded picture under the UI when `plxnative-simvideo` holds one, black otherwise
+/// ([`plx_gfx::gfx::draw_under`]'s straight-alpha mix either way). The pass has no simulator switch, so
+/// this is not optional on a bound frame: a shot of the straight buffer would be the pass's own
+/// intermediate picture.
+#[cfg(feature = "hostsim")]
+fn composite_plane_under() {
+    #[cfg(feature = "play-feed")]
+    if crate::app::adapters::hostsim::composite_under() {
+        return;
+    }
+    plx_gfx::gfx::draw_under_black();
+}
+
 /// One idle iteration's font-warming slice: a key pressed during it waits at most this long more
 /// than the idle poll already makes it wait.
 const FONT_WARM_SLICE_US: u64 = 2_000;
@@ -783,10 +810,16 @@ unsafe fn present_and_swap(
         }
         // the glyph cache's frame serial (phase 11, text.rs's hot window): a drawn frame
         plx_gfx::text::begin_frame();
+        // …and the straighten pass's ledger: nothing drawn yet, the surface not yet straight.
+        plx_gfx::gfx::straighten::frame_begin();
         // A finished underlay-field reduction is read HERE, before framebuffer 0 holds anything
         // of this frame — a read between the page and the surfaces splits its render pass.
         plx_gfx::gfx::field_frame_begin();
+        #[cfg(feature = "hostsim")]
+        let shot_last_change = app.pages.present.last_change_ms();
         let (_vx, _vy, _vw, _vh) = draw(app, fr);
+        app.bridge.observe_plex_visual_inputs(&mut app.pages.present);
+        plx_machine::motion::report::collect_into(&mut app.pages.present, fr.now);
         app.instr.mark(plx_base::diag::heartbeat::Phase::Draw); // draw
         // dev capture stream: grab this finished frame before the swap (after the last draw,
         // so the copy's pass-flush is work the swap would submit anyway). One atomic when idle.
@@ -799,11 +832,24 @@ unsafe fn present_and_swap(
             crate::capture::tick(fr.now);
         }
         app.instr.mark(plx_base::diag::heartbeat::Phase::Capture); // capture
-        // `plxnative-simvideo`: the decoded picture goes UNDER the finished UI, as the television's
-        // compositor puts its video plane under ours — before the capture, so shots include it.
-        #[cfg(all(feature = "hostsim", feature = "play-feed"))]
-        if fr.player {
-            crate::app::adapters::hostsim::composite_under();
+        // **THE FRAME'S LAST DRAW over the bound video plane: premultiplied -> straight.** The
+        // television's compositor multiplies our surface by its alpha (`panel = ui.rgb * ui.a + video
+        // * (1 - ui.a)`) and the framebuffer holds premultiplied colour, so every translucent pixel
+        // would be darkened by its own alpha a second time; this divides it back out, in place, on a
+        // frame that drew anything (`gfx/straighten.rs` has the measurement, the buffer-age argument
+        // and the cost). Keyed on the plane's BIT, like the capture above and the opaque region: the
+        // bound trailer preview is as translucent as the player. It is after every read of the
+        // framebuffer the frame makes (the capture tick above, which skips this very frame) and before
+        // the swap and everything that follows it; nothing the loop does after it samples
+        // framebuffer 0 on the television (`video_plane_refuses` shuts every door past it).
+        plx_gfx::gfx::straighten::straighten_surface(app.player.video_plane_bound);
+        // `plxnative-simvideo`, and the simulator's stand-in for the compositor the pass feeds: a
+        // bound frame goes through the television's straight-alpha mix over the decoded picture, or
+        // over black with none, so a shot is the panel and not the straight buffer. Before the
+        // screenshot seam below, so shots include it.
+        #[cfg(feature = "hostsim")]
+        if app.player.video_plane_bound {
+            composite_plane_under();
         }
         // Before the swap, never after: the back buffer is undefined once presented.
         // A dump decides here whether this frame is written (`dev::framedump`); otherwise the
@@ -819,7 +865,9 @@ unsafe fn present_and_swap(
         #[cfg(all(feature = "hostsim", not(feature = "devtriggers")))]
         let screenshot_seam = true;
         #[cfg(feature = "hostsim")]
-        if screenshot_seam && crate::shot::maybe_capture(_vx, _vy, _vw, _vh) {
+        if screenshot_seam && crate::shot::maybe_capture(fr.now, app.pages.present.changed_after_admission()
+            || app.pages.budget.has_queued_work() || plx_gfx::gfx::snapshot_pending()
+            || app.scenarios.shots.pending(), shot_last_change, _vx, _vy, _vw, _vh) {
             // The headless one-shot is done: finish this frame, then leave through the ordinary
             // shutdown rather than exiting from inside the frame (see `shot::maybe_capture`).
             app.running = false;
@@ -870,7 +918,8 @@ unsafe fn present_and_swap(
         plx_gfx::gfx::snapshot_frame_end();
         // …and a ground probe's queued copy is read back here, between frames, if it is done.
         plx_gfx::gfx::ground_probes_frame_end();
-        plx_machine::idle::note_present(fr.now);
+        plx_machine::motion::report::collect_into(&mut app.pages.present, fr.now);
+        app.pages.present.acknowledge(fr.now);
         // The swap has returned: this frame's interval, for the visit's slow and frozen counts.
         app.instr.frame_presented();
         // The poster-gate scenes' frame counter, at the same post-swap seam as the present count
@@ -898,7 +947,7 @@ unsafe fn present_and_swap(
         // Device and macOS presented frames block in swap; WSLg/X11 presented frames use the
         // software budget above. A skipped frame reaches neither path, so sleep here to keep a
         // settled screen from becoming a CPU spinner.
-        SDL_Delay(plx_machine::idle::IDLE_POLL_MS);
+        SDL_Delay(plx_machine::motion::report::IDLE_POLL_MS);
     }
 }
 
@@ -952,7 +1001,8 @@ unsafe fn ingress_token(app: &mut App, fr: &mut Frame, token: &str) -> bool {
             return true;
         }
     }
-    let accepted = dispatch_remote_token(token, &app.player.session, &app.adapters.player);
+    let scope = app.pages.input_scope();
+    let accepted = dispatch_remote_token(token, &app.player.session, &app.adapters.player, &mut app.pages.present, scope);
     if accepted && token_is_direct(token) { app.rec.input(super::recorder::enc_token(token)); }
     accepted
 }
@@ -986,7 +1036,7 @@ fn ingest_text(app: &mut App, text: &str, panel: bool, source: plx_machine::mach
     app.rec.input(super::recorder::enc_text(text, panel, at, source));
     app.inputs.extend(text_inputs(text, panel, at, source));
     app.last_input = at.ms;
-    plx_machine::idle::invalidate();
+    app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
 }
 
 /// Revoke the borrowed SDL window handles on background. `release` answers whether a surface was
@@ -1035,22 +1085,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         }
         return;
     }
-    // INPUT while a popover holds the page frozen is the POPOVER's: every invalidate
-    // such an event raises — the one below, and whatever its handler adds — is
-    // attributed to it, so the frozen host is not re-rendered on every key-up
-    // (`popover::host::input_scope`). Only input: a lifecycle or window event is the
-    // APP's and may change the page under the panel (backgrounding drops Search's
-    // editing layout), so its damage stays the page's and the snapshot is retaken.
-    let _own_input = if is_input_event(et) {
-        plx_ui::popover::host::input_scope()
-    } else {
-        None
-    };
-    // ANY event is a reason to repaint (`plx_machine::idle`): a key changes focus or a label,
-    // a lifecycle event changes the whole screen. Marked here — once, for every event
-    // kind — rather than in each of the ~30 arms below, where the next one added would
-    // silently draw nothing.
-    plx_machine::idle::invalidate();
+    // Attribute only the input repaint to its owner; lifecycle changes remain page damage.
+    if is_input_event(et) { app.note_input_damage(); }
+    else { app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle); }
     if et == SDL_KEYDOWN
         || et == SDL_KEYUP
         || et == SDL_TEXTINPUT
@@ -1159,7 +1196,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             &mut app.player.session,
             &mut app.adapters.player,
         ) {
-            plx_machine::idle::invalidate();
+            app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
         }
         // Playback owns its resolve and Engine before the queued Player page mounts. Page
         // presence only governs the screen-local cleanup below, never resource suspension.
@@ -1220,7 +1257,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             app.reread.resume();
             // Reacquire only on DID foreground, before playback restoration and rendering.
             restore_window(app.win);
-            plx_machine::idle::invalidate();
+            app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
             // A decoder-release park is claimed by this edge like any other park.
             app.decoder_parked = false;
             let activation = did_foreground_with_link(app);
@@ -1291,7 +1328,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             // own `TAP_COMMIT_MS` debounce on the very same `Edge::Up` — so one tap of RIGHT
             // issued two seeks. The publish that followed went with it: nothing here moves a
             // published field any more.
-            on_key_up(sym, app.ok_armed, &mut app.down_sym, &mut app.input.press);
+            on_key_up(sym, &mut app.down_sym);
             return;
         }
         // A repeat is only a repeat if we watched the key go down. See `App::down_sym`:
@@ -1315,7 +1352,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             // All that is left of the legacy repeat path is the deferred press's liveness
             // beat: the player's continuous scrub, its last direct consumer, engages from
             // `PlayerScreen`'s own `Edge::Repeat` (phase 12, PX-PLAYER).
-            on_auto_repeat(sym, app.ok_armed, &mut app.input.press);
+
             return;
         }
         // From here down this IS a fresh press, whatever the driver stamped on it.
@@ -1352,8 +1389,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
                 super::bridge::player_mut(&mut app.pages).map(|player| &mut player.hud)
             },
             &mut app.ptr,
-            &mut app.ok_armed,
-            &mut app.input.press,
+
         );
         // `note_fresh_press` may have extended the auto-hide deadline; publish it once, here.
         if let Some(player) = super::bridge::player_mut(&mut app.pages) {
@@ -1635,23 +1671,8 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         // machine now records about it: motion in that window is a DRAG (§7.5) rather than a
         // move, and the idle-cursor hide below leaves a held pointer alone.
         app.ptr.button_down = true;
-        // A FRESH click supersedes a press still in flight from the previous one — the
-        // pointer's twin of `begin_fresh_press`'s nav-key abort. Without it, clicking a
-        // control and then something else inside the ~210 ms commit window let the first
-        // click's deferred activation fire AFTER the second had already acted (two
-        // `on_ok`s: the watched toggle flipped twice, each with its own blocking
-        // refetch). Every arm below re-arms from scratch.
-        //
-        // It sits at the TOP of the pointer handler rather than inside one route's arm,
-        // where it lived while only detail cards armed a press from a click. Every
-        // control face defers now, so the interleaving it guards is reachable on every
-        // screen — including across arms, e.g. Home's hero pill pressed and then a tab
-        // pill clicked, which navigates at once and would otherwise have played the
-        // hero a moment later on the page it had just left.
-        if app.ok_armed {
-            app.input.press.cancel();
-            app.ok_armed = false;
-        }
+        // The dispatcher owns supersession/cancellation of any previous pointer press.
+
         // A click on NO control is the player's play/pause toggle, so it wakes a paused park
         // Playing (`wake_input`); a click on a control (the scrub bar, a disc, a tab) is that
         // control's, which a paused park keeps drawn, so it is only a wake. The OK key a set
@@ -1708,17 +1729,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
                 app.rec.input(super::recorder::enc_pointer("release", cx as i32, cy as i32));
             }
         }
-        // a click that armed the tvOS press (a detail card) releases on the button-up,
-        // the pointer's twin of the OK key-up: without it the dip would sit there until
-        // press.rs's dropped-key-up ceiling fired. A no-op when no press is in flight.
-        app.input.press.release(app.last_input);
-        // …and the same release for the TREE's press machine, which has no pointer-up of
-        // its own: `dispatch`'s ingest reaches `InputMachine::release` from exactly one
-        // place, an `Ok` key on the `Up` edge, so that is what a button-up becomes here
-        // (`bridge::release_input` carries the reasoning and why it is inert everywhere
-        // else). Unconditional on ownership for `press.release`'s reason above — a
-        // release with nothing armed is a no-op, and asking `owns_input` would drop the
-        // release of a press armed on the frame a surface began to close.
+        // Forward button-up as the dispatcher's OK-up release. Unconditional on ownership:
+        // querying owns_input here could drop an up while a surface begins closing.
+        // With nothing armed, InputMachine::release is inert.
         app.inputs.push(super::bridge::release_input(plx_machine::machine::Tick {
             ms: app.last_input,
             dt_us: 0,
@@ -1865,7 +1878,7 @@ fn park_on_decoder_release(app: &mut App) {
     log("player: decoder released by the pipeline — parked until the next press");
     park_playback(app);
     app.decoder_parked = true;
-    plx_machine::idle::invalidate();
+    app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
 }
 
 /// What the press that wakes a decoder-release park asks of the transport, as far as the restore
@@ -1950,7 +1963,7 @@ fn claim_parked_foreground(app: &mut App, input: ForegroundInput) -> bool {
     if launched {
         finish_foreground_launch(app);
     }
-    plx_machine::idle::invalidate();
+    app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
     launched
 }
 
@@ -2060,6 +2073,9 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         #[cfg(feature = "play-feed")]
         park_on_decoder_release(app);
         app.adapters.player.sync_request_metrics(&mut app.player.session);
+        // The subtitle registries' colour fact, delivered to the session's readout for the Subtitles
+        // menu to read (a field, not a registry): whichever backend plays.
+        plx_media::player::deliver_subtitle_ink(&mut app.player.session);
         let foreground = playback_may_run(app);
         let backend_at = app.adapters.player.backend_tick();
         let _ = app.adapters.player.backend_set_foreground_at(&mut app.player.session, foreground, backend_at);
@@ -2117,11 +2133,8 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         // Everything downstream READS `app.player.video_plane_bound`; nothing recomputes it, and
         // nothing keys the plane's consequences on the route any more.
         if let Some(bound) = plx_media::player::observe_video_plane(&mut app.player, &mut app.adapters.player) {
-            // One edge, three gates. `set_video_plane_bound` has already told the LIVE one
-            // (`plx_machine::idle`); these are the two §4.4 machines — the one `App` owns and the
-            // dispatcher's, which is what answers `Rig::opaque_route` at step 9 — plus the rig's
-            // own copy for the draw-entry call. `PresentEvent::VideoPlane` has no other source.
-            app.present.note(plx_machine::present::PresentEvent::VideoPlane(bound));
+            // One observed edge, one gate recipient. Rendering reads the player's sampled
+            // plane state; neither the bridge nor a second app gate mirrors this input.
             app.pages.present.note(plx_machine::present::PresentEvent::VideoPlane(bound));
             app.bridge.publish_video_plane(bound);
         }
@@ -2141,7 +2154,7 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
                     repause_at: &mut app.repause_at,
                 },
             );
-            plx_machine::idle::invalidate();
+            app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
             if matches!(activation, ForegroundActivation::Launched) {
                 finish_foreground_launch(app);
             }
@@ -2402,102 +2415,11 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         }
 }
 
-/// Results and requests that land BEFORE nav commit: the OK arm and the press machine, the
-/// person / detail open requests, the login and profiles landings (`install_pms`), the glass
-/// load, and the nav oscillator.
+/// Results and requests that land BEFORE nav commit: person/detail open requests, login and
+/// profiles landings (`install_pms`), glass load and the nav oscillator. Press commits are
+/// delivered by the dispatcher, never polled here.
 pub(crate) unsafe fn land_results(app: &mut App, fr: &mut Frame) {
-        if app.ok_armed {
-            // PRESS-AND-HOLD → the item context menu, on the latch `press::tick` has always set
-            // and nothing ever read (`LONG_MS`, `is_long`). It fires while the key is still DOWN,
-            // which is what makes the menu feel like a hold rather than a delayed tap; the press
-            // is cancelled so the card springs back, and `ok_armed` is dropped so the eventual
-            // key-up commits nothing. A SHORT press is untouched on BOTH screens — what it does
-            // on a Continue Watching tile is `route::deck_press()`'s answer (resume, or open the
-            // page), and OK on an episode still still plays it, by design; the hold is the other
-            // half of those interactions either way. Ordered ahead of the commit
-            // arm (and exclusive with it) so the two can never both run.
-            //
-            // `is_long` leads and short-circuits, deliberately: everything after it OPENS a
-            // menu, so evaluating the arms first would put the popover up on the key-DOWN of
-            // every tap.
-            let held_menu = app.input.press.is_long(fr.now)
-                && match app.route() {
-                    // The detail page has THREE hold surfaces and tries them in turn. Each
-                    // declines by section (`focused_season` answers only on the tab strip,
-                    // `focused_episode` only on the filmstrip, `focused_related` only on the
-                    // Related shelf), so at most one can open and the order between them is not
-                    // a precedence — it is just an order.
-                    //
-                    // The season strip is the newest and the reason is worth keeping: the page
-                    // can mark at three grains and only two of them had a door. An episode has
-                    // its still's hold and the show has the hero's toggle, so "I have seen
-                    // season 3" meant opening eleven menus — a missing control, not a workflow.
-                    //
-                    // The CAST shelf arms the same press and still falls through to the
-                    // ordinary spring-back, deliberately: a headshot is a person, with no
-                    // ratingKey and no watch state, so every row this menu builds would be
-                    // absent and the panel would open empty.
-                    //
-                    // `Route::Search` is deliberately absent (phase 7 Search cutover): its own
-                    // press-and-hold item menu opener is `SearchReq::ItemMenu`, drained by
-                    // `content::search_requests` — an owned screen's press arms and commits
-                    // through the tree's own press machine end to end, so it cannot arrive here
-                    // at all (`app.ok_armed` is armed only by the player's pointer-click
-                    // requests below, neither of which reaches Route::Search any more).
-                    _ => false,
-                };
-            if held_menu {
-                app.ok_armed = false;
-                app.input.press.cancel();
-            } else if app.input.press.take_commit(fr.now) {
-                app.ok_armed = false;
-                // The deferred activation, dispatched by asking the SAME questions the key
-                // ladder asked when it armed the press, in the SAME order.
-                //
-                // **The two family arms that stood at the top of this dispatch are gone** — the
-                // consent question's answer pill and the first-run editor's action. Both were
-                // here for one reason: the press was the LOOP's, so the loop had to remember, a
-                // frame or two later and from nothing but the route, which screen had armed it.
-                // The tree owns its own press end to end (`InputMachine::arm` records the owner,
-                // and `PressEvent::Commit` is delivered back to exactly that machine), so an
-                // owned screen's press cannot arrive here at all — which also retires the
-                // ordering hazard the old comment recorded, that consent stood OVER a route with
-                // its own arm below and a match on `route` alone would have committed a consent
-                // press as a Home activation.
-                match app.route() {
-                    // `Account { over: Home }` and not every `Account`: the popover can stand on
-                    // three pages now, and a press armed on a Library card must not commit as a
-                    // HOME activation because a panel happened to open over it. (Reaching either
-                    // is near-impossible — a nav key cancels the press — but the arm has to say
-                    // which page it means.)
-                    // Re-ASKED, not remembered, exactly as the Detail arm below does —
-                    // and it has to be asked now that the shelves arm this press too. The
-                    // grid's answer is `Card` (open the page); a SHELF tile's is
-                    // `ShelfCard`, which a section deck turns into a RESUME. Dispatching
-                    // both here rather than calling `open_library_card` unconditionally is
-                    // what stops a held-then-released press on a Continue Watching tile
-                    // opening the detail page the immediate path would have resumed past.
-                    // `Route::Profiles | Route::Search` is deliberately absent (phase 6/7): both
-                    // are owned screens now, so their own press machine arms and commits this
-                    // activation — nothing here ever arms `app.input.press` for either any more
-                    // (see the removed key/pointer arms above), so this deferred commit can never
-                    // see either route.
-                    // the transport's control row (discs or a stand-in)
-                    AppArg::Player => activate_player_row(&mut app.player,
-                        &mut app.adapters.player,
-                        &mut app.repause_at,
-                        fr.ctrl,
-                        fr.now,
-                        &mut app.refresh_hubs,
-                        &mut app.pages,
-                        &mut app.bridge,
-                    ),
-                    _ => {}
-                }
-            } else if !app.input.press.is_active() {
-                app.ok_armed = false; // long-press / cancelled — disarm without activating
-            }
-        }
+
 
         // The ONE consumer of a cast-row person request, drained every frame whatever the
         // route. `detail::on_ok`'s cast arm raises it, and it is reached from three places
@@ -2743,7 +2665,7 @@ fn follow_control_row(app: &mut App, ctrl: plx_appkit::player_hud::ControlSlot, 
             player.hud.nav = HudNav::HOME;
             // The ring goes back to the SCRUBBER for the engine as much as for `nav`: `PlayerScreen::key_ok`
             // acts on the element the engine holds, so a stale seat on the stand-in's item (an enabled
-            // Previous / Restart on an episode, which reconcile leaves alone) made the next OK
+            // Previous on an episode, which reconcile leaves alone) made the next OK
             // press a disc where `main`'s `nav`-driven OK toggled pause. On a movie `main` did not
             // honour this contract either: reconcile moved the stale item to Subtitles and mirrored
             // it into `nav`, so OK opened that menu. Following the contract is the one deliberate
@@ -2804,7 +2726,7 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
             // Player/Detail frames was pure waste on the A53. Scoped, because the page can be the
             // one UNDER the account popover and its glass backdrop is refreshed off the
             // underlay's motion.
-            let (_, moving) = plx_machine::idle::scoped_motion(|| {
+            let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
                 app.bridge.update_home_chrome(&mut app.pages, &mut app.glass, fr.dt);
             });
             fr.underlay_moving |= moving;
@@ -2855,12 +2777,21 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
         // panel is a surface now and the dispatcher ticks it, containers before pages, once per
         // frame: `PlayerOverlayScreen::step`'s `Tick` arm.)
         // Re-samples on its own 2 Hz hold; a no-op when the panel is off.
-        app.diagnostics.update(&app.player.session, &app.adapters.player,
-            app.adapters.player.backend_viewer_paused(), fr.now);
+        if app.diagnostics.update(&app.player.session, &app.adapters.player,
+            app.adapters.player.backend_viewer_paused(), fr.now) {
+            app.pages.present.note_in_scope(plx_machine::present::Scope::Surface,
+                plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Lifecycle));
+        }
         // …and the lab upload's toast, which expires on a clock rather than a spring.
-        crate::lab::update(fr.now);
+        if crate::lab::update(&mut app.lab_toast, fr.now) {
+            app.pages.present.note_in_scope(plx_machine::present::Scope::Surface,
+                plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Lifecycle));
+        }
         #[cfg(feature = "threadcheck")]
-        plx_ui::runtime_warning::update(app.boot_initial.is_some());
+        if plx_ui::runtime_warning::update(app.boot_initial.is_some()) {
+            app.pages.present.note_in_scope(plx_machine::present::Scope::Surface,
+                plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Lifecycle));
+        }
         // The Up Next countdown and the control row's focus pop are the PLAYER INSTANCE's and
         // are stepped from its own `Tick` for the reason `HudMotion::step` gives — the row is
         // not drawn on every frame of the route, so a spring advanced in the draw would run at a
@@ -2898,11 +2829,12 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
                 // A cold resume's rebuild landed (`player::land_resume`): the Load the pending play
                 // was holding for starts now.
                 if let Some(outcome) = plx_media::player::land_resume(&mut app.player.session, &mut app.adapters.player) {
-                    plx_machine::idle::invalidate();
+                    app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
                     finish_landed_play(app, matches!(outcome, plx_media::player::ResumeOutcome::Prepared));
                 }
                 if let Some(r) = plx_media::route::pump_play(&mut app.player.session, app.bridge.metadata_mut()) {
-                    plx_machine::idle::invalidate();
+            app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
+                    app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
                     // The resolved URI locator is an owned IO result. Install it against the
                     // route ticket before the common start door chooses a physical backend.
                     #[cfg(feature = "play-uri")]
@@ -2923,6 +2855,9 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
                     // A preview landing nobody is waiting for any more (the page halted it while
                     // the resolve was in flight) must not start an engine: nothing would track
                     // it, so nothing would stop it at its end or hand the engine to a later Play.
+                    // The viewer moved focus; no route failed, so the metric request finishes
+                    // `Cancelled`, never as a handled `PreviewNotDirect` (that kind is only a
+                    // landing the resolve itself refused, which never reaches this branch).
                     #[cfg(feature = "play-feed")]
                     if plx_media::route::is_preview(&app.player.session)
                         && !plx_media::player::preview::expects_landing()
@@ -2931,9 +2866,7 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
                             let _ = plx_media::route::reject_route_start_preparation(transaction);
                         }
                         app.player.session.finish_metric_request(
-                            plx_media::player::attempt_metrics::RequestOutcome::Failed(
-                                plx_media::player::backend::handled_failure(
-                                    plx_media::player::FailureKind::PreviewNotDirect)));
+                            plx_media::player::attempt_metrics::RequestOutcome::Cancelled);
                         app.adapters.player.sync_request_metrics(&mut app.player.session);
                         plx_media::player::stop_playback(&mut app.player.session, &mut app.adapters.player);
                         plx_media::route::clear_preview(&mut app.player.session);
@@ -2967,7 +2900,7 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
         // the same reason as pump_play — play_item_now requests a detail from Home and flips
         // straight to the player, so a Detail-gated pump would never land it.
         if app.bridge.metadata_pump_detail() {
-            plx_machine::idle::invalidate(); // a detail landing rewrites the page under us
+            app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle); // a detail landing rewrites the page under us
         }
         // Async season load: install the worker's episode list into CURRENT. Route-unconditional
         // for the same reason as pump_detail above; see `stores/metadata.rs`'s module doc for why
@@ -2977,7 +2910,7 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
         // Pumping season first could apply a stale season landing to CURRENT in the one frame
         // before pump_detail() replaces it.
         if app.bridge.metadata_pump_season() {
-            plx_machine::idle::invalidate(); // a season landing rewrites the episode row under us
+            app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle); // a season landing rewrites the episode row under us
         }
         // D7: the continuation half of `activate_card`'s show/season Play — see
         // `App::menu_play_await`/`input::menu_play_tick`'s own doc. Right beside the pump above
@@ -3008,7 +2941,11 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
         super::bridge::execute_endpoint_outcomes(&mut app.pages, endpoints);
         // …and the read-back it owes: what the server now says about the item(s) just written, on
         // every route for the same reason (a refused write is put right here, not by a refetch).
-        let endpoints = app.bridge.reconcile_pump();
+        let outcome = app.bridge.reconcile_pump();
+        if outcome.changed {
+            app.note_presentation_damage(plx_machine::present::Provenance::Landing(plx_machine::machine::MachineId::Store(plx_data::stores::StoreId::ViewReconcile.ord())));
+        }
+        let endpoints = outcome.endpoints;
         super::bridge::execute_endpoint_outcomes(&mut app.pages, endpoints);
         // The PMS notification feed (on, for owned servers only: opens nothing until one is described) and
         // the reads its hints owe the pages on the stack, visible and covered. Route-unconditional
@@ -3133,7 +3070,7 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
             // is counted in PRESENTS — a loop iteration the gate skipped drew no glass — and
             // because a step rollover invalidates the snapshot, which must precede every glass
             // surface drawn by the synthetic dial.
-            app.glass.prepare_dial(fr.now);
+            app.glass.prepare_dial(fr.now, &mut app.pages.present);
             // The authored canvas, scaled UNIFORMLY into the drawable and centred. The shaders
             // divide every coordinate by `u_screen` (which stays 1920x1080), so this one call
             // is the entire logical->physical mapping — nothing else in the renderer knows the
@@ -3230,10 +3167,11 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                         // debug assertion. A popover from this page halts the preview first, so
                         // this frame only skips while the picture is the intended ground.
                         if !(app.player.video_plane_bound && plx_media::route::is_preview(&app.player.session)) {
-                            plx_base::diag::spans::span("host", || plx_ui::popover::host::begin_frame(fr.underlay_moving));
+                            plx_base::diag::spans::span("host", || plx_ui::popover::host::begin_frame(
+                                fr.underlay_moving, app.pages.present.page_damaged()));
                         }
                         use plx_ui::frame::backdrop::Z;
-                        let layers = app.pages.backdrop_layers(plx_ui::nav::page_alpha());
+                        let layers = app.pages.backdrop_layers(app.bridge.navigation_presentation(&app.pages.nav).page_alpha);
                         app.glass.sources.borrow_mut().begin(layers);
                         let sources = app.glass.sources.clone();
                         let _visible_walk = app.glass.walk(Z::ALL);
@@ -3306,7 +3244,7 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                         // top of everything, and the one thing the tab track (drawn inside the
                         // page) cannot have.
                         drop(_visible_walk);
-                        app.glass.draw_nav_blur();
+                        app.glass.draw_nav_blur(app.bridge.navigation_presentation(&app.pages.nav));
                         app.glass.draw_dial();
                         // The on-screen counter, off the player route (chrome over video). It draws
                         // the last completed `fps=` window — frames actually swapped, not loop
@@ -3339,7 +3277,7 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                     plx_ui::anim::draw_overlay(); // dev diagnostic overlay (all routes)
                                                      // The lab upload read-out, over everything, on every route — including the
                                                      // player, where the two branches above diverge and this one must not.
-                    crate::lab::draw(app.diagnostics.frame_if_shown());
+                    crate::lab::draw(&app.lab_toast, app.diagnostics.frame_if_shown());
                     #[cfg(feature = "threadcheck")]
                     plx_ui::runtime_warning::draw(app.boot_initial.is_some());
                 });
@@ -3515,7 +3453,7 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
         };
         if crate::focusprobe::armed() {
             let content = super::bridge::content_probe(&app.pages, &app.bridge);
-            crate::focusprobe::sample(&app.player.session, fr.rn, probe_screen(app), probe_hud(app), fr.ctrl, &content, app.bridge.metadata_view());
+            crate::focusprobe::sample(&app.player.session, fr.rn, probe_screen(app), probe_hud(app), fr.ctrl, &content, app.bridge.metadata_view(), app.pages.input.press.is_active());
         }
         // The recorder's frame tail (spec §5.3): on an event frame the logical-state hash —
         // the press machine, the route and overlay words, the focus fingerprint and, since phase
@@ -3530,13 +3468,12 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
         // read lazily by recorder_end_frame for both recording and replay; no raw state is logged.
         if !matches!(app.rec, super::recorder::Recplay::Off) {
             let content = super::bridge::content_probe(&app.pages, &app.bridge);
-            let focus = crate::focusprobe::line(&app.player.session, fr.rn, probe_screen(app), probe_hud(app), fr.ctrl, &content, app.bridge.metadata_view());
+            let focus = crate::focusprobe::line(&app.player.session, fr.rn, probe_screen(app), probe_hud(app), fr.ctrl, &content, app.bridge.metadata_view(), app.pages.input.press.is_active());
             // The bare WORD, not the heartbeat's ` overlay=<word>` spelling: the prefix is that
             // line's grammar and has no business in a state hash (phase 10 item 4).
             let ov = super::words::overlay_word(&app.pages, &app.route()).unwrap_or("");
             let tree = app.pages.state_hash();
-            let press = &app.input.press;
-            let done = recorder_end_frame(&mut app.rec, &app.bridge, press, rn, ov, &focus, tree);
+            let done = recorder_end_frame(&mut app.rec, &app.bridge, rn, ov, &focus, tree);
             if done {
                 app.running = false;
             }
@@ -3694,7 +3631,7 @@ pub(crate) unsafe fn heartbeat(app: &mut App, fr: &mut Frame) {
             // a settled screen doing its job, `loop=0` is an app in trouble, and `fps=0` on its
             // own is not a fault at all. The dev on-screen counter draws this same drained
             // value, cached below; it never reads a second presentation counter.
-            let pres = plx_machine::idle::take_presents();
+            let pres = app.pages.present.take_presents();
             #[cfg(feature = "devtools")]
             {
                 app.fps_shown = pres.min(i32::MAX as u32) as i32;
@@ -3809,7 +3746,7 @@ unsafe fn replay_inject(app: &mut App, fr: &mut Frame, v: &serde_json::Value) {
                 // Same navigation owner as ordinary foreground, with platform and
                 // player restoration kept behind actual SDL lifecycle ingress.
                 super::bridge::foreground(&mut app.pages);
-                plx_machine::idle::invalidate();
+                app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
                 return;
             }
             Err(reason) => { app.rec.refuse(reason); return; }
@@ -3835,7 +3772,7 @@ unsafe fn replay_inject(app: &mut App, fr: &mut Frame, v: &serde_json::Value) {
                 log("replay: text has no owned Search recipient");
             } else if let Some(events) = super::recorder::dec_text(v) {
                 app.inputs.extend(events);
-                plx_machine::idle::invalidate();
+                app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
             } else { log("replay: malformed text input"); }
         }
         "key" => {
@@ -3870,14 +3807,14 @@ unsafe fn controlled_key_input(app: &mut App, event: plx_machine::machine::Input
         app.ptr.last_motion=event.at.ms;
         app.ptr.note_cursor_motion();
         if matches!(event.kind,InputKind::Click{..}) { app.ptr.button_down=true; }
-        plx_machine::idle::invalidate();
+        app.note_presentation_damage(plx_machine::present::Provenance::Lifecycle);
         app.inputs.push(event);
         return;
     }
     if matches!(event.kind,InputKind::Key { key:Key::Ok,sym:0,wcode:0,edge:Edge::Up,at_edge:false })
         && event.source==plx_machine::machine::Source::Sdl {
         app.last_input=event.at.ms;
-        app.input.press.release(event.at.ms);
+
         app.ptr.button_down=false;
         app.inputs.push(event);
         return;
@@ -3890,7 +3827,7 @@ unsafe fn controlled_key_input(app: &mut App, event: plx_machine::machine::Input
         app.rec.refuse("unsupported controlled key destination"); return;
     }
     match edge {
-        Edge::Up => on_key_up(sym, app.ok_armed, &mut app.down_sym, &mut app.input.press),
+        Edge::Up => on_key_up(sym, &mut app.down_sym),
         Edge::Repeat if sym == app.down_sym => {
             if !app.modal_repeat.ready(event.at.ms) { return; }
         }
@@ -3899,7 +3836,7 @@ unsafe fn controlled_key_input(app: &mut App, event: plx_machine::machine::Input
             let viewer_paused = viewer_paused_for(&app.player.session, &app.adapters.player);
             begin_fresh_press(&mut app.player.session, classify(sym, wcode), sym, wcode,
                 event.at.ms, viewer_paused, &mut app.down_sym,
-                None, &mut app.ptr, &mut app.ok_armed, &mut app.input.press);
+                None, &mut app.ptr);
         }
     }
     app.inputs.push(event);
@@ -3982,6 +3919,7 @@ mod lifecycle_regression_tests {
             down_sym: Default::default(),
             modal_repeat: RepeatGate::IDLE,
             diagnostics: Default::default(),
+        lab_toast: Default::default(),
             player: plx_media::player::machine::Player::new(),
             adapters: Adapters {
                 player: crate::app::adapters::backends::test_adapter(),
@@ -3989,7 +3927,7 @@ mod lifecycle_regression_tests {
             repause_at: -1,
             decoder_parked: false,
             foreground_retry: None,
-            ok_armed: Default::default(),
+
             last_route_reported: Default::default(),
             ptr: Pointer::IDLE,
             menu_play_await: Default::default(),
@@ -4093,12 +4031,12 @@ mod lifecycle_regression_tests {
                     nobudget: Default::default(),
                 },
             },
-            input: plx_ui::input::Input::new(),
+
             measure_fault_logged: Default::default(),
             rec: super::super::recorder::Recplay::Off,
             boot_initial: Default::default(),
             telemetry_guard: Default::default(),
-            present: plx_machine::present::Present::new(),
+
             glass: Default::default(),
             pages: plx_ui::dispatch::Dispatcher::new(),
             inputs: Default::default(),
@@ -4860,7 +4798,7 @@ mod lifecycle_regression_tests {
         assert_eq!(reqs, vec![plx_screens::registry::PlayerReq::Transport(None)], "OK toggles play");
     }
 
-    /// The same on an EPISODE, where the first disc (Previous / Restart) IS enabled, so the engine's
+    /// The same on an EPISODE, where the first disc (Previous) IS enabled, so the engine's
     /// reconcile has nothing to move: before the departure re-seated the engine, the ring said
     /// "scrubber" while the engine held that disc, and OK restarted the episode.
     #[test]
@@ -4869,7 +4807,7 @@ mod lifecycle_regression_tests {
         use plx_data::metadata::{Marker, MarkerKind};
         let _serial = plx_base::testlock::serial();
         let credits = Marker { kind: MarkerKind::Credits, start_ms: 0, end_ms: 60_000, final_seg: true };
-        let discs = ControlSlot::Discs(Controls::for_item(true, true, true, true));
+        let discs = ControlSlot::Discs(Controls::for_item(true, true, true));
         assert!(discs.enabled(plx_appkit::player_hud::BTN_PREVIOUS), "the fixture: the first disc is live");
         let (focus, engine, reqs) = depart_and_press_ok(ControlSlot::UpNext(credits), discs);
         assert_eq!(focus, GROUP_SCRUB, "nav");
@@ -5008,8 +4946,6 @@ mod lifecycle_regression_tests {
             &mut app.refresh_hubs,
             &mut app.pages,
             &mut app.bridge,
-            &mut app.ok_armed,
-            &mut app.input.press,
         );
         for later in [232, 248, 264, 280, 296] {
             frame(&mut app, later);
@@ -5096,11 +5032,12 @@ mod lifecycle_regression_tests {
         );
     }
 
-    /// **Previous and Next are not interchangeable in the performer.** With the playhead past the
-    /// restart threshold, Previous restarts the item (`queue_transport::step(Previous)` seeks to 0);
-    /// Next, with no queue behind it, asks for no seek at all. A swap of the two steps fails both ways.
+    /// **Previous and Next are queue steps and never seeks.** With the playhead well into the item
+    /// (it used to be past Previous's five-second restart threshold, where `queue_transport::step`
+    /// seeked to 0 and rewrote the episode's resume point), neither step, with no queue behind or
+    /// after the item, asks for a seek: an item with no neighbour has nothing to step to.
     #[test]
-    fn previous_steps_the_queue_back_and_next_steps_it_forward() {
+    fn previous_and_next_with_no_neighbour_seek_nowhere() {
         use plx_appkit::player_hud::command::HudCommand;
         let _serial = plx_base::testlock::serial();
         let mut app = app();
@@ -5110,7 +5047,7 @@ mod lifecycle_regression_tests {
         perform_on_a_mounted_player(&mut app, HudCommand::Next, 100);
         assert_eq!(globals.seek_to(), -1, "Next, with nothing queued after it, seeks nowhere");
         perform_on_a_mounted_player(&mut app, HudCommand::Previous, 200);
-        assert_eq!(globals.seek_to(), 0, "Previous past the threshold restarts the item");
+        assert_eq!(globals.seek_to(), -1, "Previous, with nothing queued before it, seeks nowhere: it is not a restart");
     }
 
     /// **A section no control opens is reached through More, and focus ends on a drawn control.** The package places
@@ -5186,8 +5123,6 @@ mod lifecycle_regression_tests {
                 &mut app.refresh_hubs,
                 &mut app.pages,
                 &mut app.bridge,
-                &mut app.ok_armed,
-                &mut app.input.press,
             );
             for later in [232, 248, 264, 280, 296, 312, 328, 344] {
                 frame(&mut app, later);
@@ -5926,6 +5861,7 @@ mod lifecycle_regression_tests {
                 "First",
                 "",
                 None,
+                "",
             ));
             self.entered.recv_timeout(Duration::from_secs(3)).unwrap();
         }
@@ -6177,6 +6113,7 @@ mod lifecycle_regression_tests {
                 "Episode 1",
                 "",
                 None,
+                "",
             ));
             self.entered.recv_timeout(Duration::from_secs(3)).unwrap();
             self.resolve();
@@ -7565,16 +7502,9 @@ mod lifecycle_regression_tests {
         let fr = refuse_restore(&mut rig);
 
         player_requests(
-            &mut rig.app.player,
-            &mut rig.app.adapters.player,
-            &mut rig.app.repause_at,
-            vec![plx_screens::registry::PlayerReq::Exit],
-            fr.now,
-            &mut rig.app.refresh_hubs,
-            &mut rig.app.pages,
-            &mut rig.app.bridge,
-            &mut rig.app.ok_armed,
-            &mut rig.app.input.press,
+            &mut rig.app.player, &mut rig.app.adapters.player, &mut rig.app.repause_at,
+            vec![plx_screens::registry::PlayerReq::Exit], fr.now, &mut rig.app.refresh_hubs,
+            &mut rig.app.pages, &mut rig.app.bridge,
         );
         frame(&mut rig.app, 48);
         assert!(super::super::bridge::player(&rig.app.pages).is_none());
@@ -7606,8 +7536,6 @@ mod lifecycle_regression_tests {
             &mut rig.app.refresh_hubs,
             &mut rig.app.pages,
             &mut rig.app.bridge,
-            &mut rig.app.ok_armed,
-            &mut rig.app.input.press,
         );
         assert!(plx_media::route::play_pending());
         rig.accept_start();
@@ -7686,8 +7614,6 @@ mod lifecycle_regression_tests {
             &mut rig.app.refresh_hubs,
             &mut rig.app.pages,
             &mut rig.app.bridge,
-            &mut rig.app.ok_armed,
-            &mut rig.app.input.press,
         );
         frame(&mut rig.app, 48);
         assert!(super::super::bridge::player(&rig.app.pages).is_none());
@@ -7705,6 +7631,7 @@ mod lifecycle_regression_tests {
             "Replacement",
             "",
             None,
+            "",
         ));
         rig.accept_start();
         assert!(plx_media::route::play_pending());
@@ -9050,6 +8977,69 @@ mod lifecycle_regression_tests {
         assert!(super::super::bridge::player(&rig.app.pages).is_some(), "premise: the player is on top");
     }
 
+    /// **A preview the page halted while its resolve was in flight is a cancellation, not a
+    /// failure.** The viewer moved focus off the hero before the plan landed, so the landing is
+    /// discarded unstarted ([`plx_media::player::preview::halt`] left the machine Idle). Nothing
+    /// failed: the request must finish `Cancelled`. It used to finish
+    /// `Failed(handled_failure(PreviewNotDirect))`, a terminal handled-error effect naming a route
+    /// problem the preview never had, for a plain focus move. (That effect is a local attempt
+    /// measurement; the Sentry `PlaybackError` of a preview is `report::tick_preview`'s, keyed on
+    /// the resolve's own refusal verdict, which a discarded landing never carries.)
+    #[test]
+    fn a_preview_halted_before_its_landing_finishes_its_request_cancelled() {
+        use plx_media::player::attempt_metrics::{Fx, RequestOutcome};
+        let _serial = plx_base::testlock::serial();
+        // The preview machine is process-wide: put it back to Idle when this test ends, however it
+        // ends, so a panic between `request_start` and `halt` cannot leave every later test in the
+        // binary seeing `preview::occupies()`.
+        let _preview = super::super::bridge::test_support::PreviewReset;
+        let Some(mut rig) = Rig::new() else { return };
+        let mut t = product_transition(&mut rig.app);
+        settle(&mut rig.app, &mut t);
+        // The machine and the autoplay switch are process-wide: stand them where a fresh install
+        // has them, whatever an earlier test in this binary left behind.
+        plx_media::player::preview::reset_for_test();
+        plx_media::player::preview::restore_trailer_autoplay(true);
+        assert_eq!(plx_media::player::preview::request_start(rig.sid, "1", 0),
+            plx_media::player::preview::Start::Accepted);
+        assert!(plx_media::route::request_preview(
+            &mut rig.app.player.session,
+            rig.app.bridge.metadata_mut(),
+            plx_platform::devcaps::caps(),
+            rig.sid,
+            "1",
+            "/library/parts/1/file.mkv",
+            "h264",
+            "aac",
+            "First",
+        ));
+        rig.entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let request = rig.app.player.session.metric_request().expect("a preview mints a metric request");
+        // The page's focus leaves the hero while the resolve is still parked on the server: with
+        // no preview session installed yet, `halt` releases the machine so the landing is unwanted.
+        plx_media::player::preview::halt(&mut rig.app.player.session, &mut rig.app.adapters.player);
+        assert!(!plx_media::player::preview::occupies(), "premise: nothing waits for the landing any more");
+        rig.release.send(()).unwrap();
+        poll_until("the halted preview's request never settled", || {
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            fr.now = t;
+            unsafe { update(&mut rig.app, &mut fr); }
+            rig.app.adapters.player.backend_metrics_snapshot()
+                .is_some_and(|summary| summary.id == request && summary.outcome.is_some())
+        });
+        let summary = rig.app.adapters.player.backend_metrics_snapshot().unwrap();
+        assert_eq!(summary.outcome, Some(RequestOutcome::Cancelled),
+            "the viewer left; no route failed, so the request is cancelled, not a handled error");
+        assert!(!rig.app.adapters.player.backend_metric_notices().any(|notice| matches!(notice,
+            plx_media::player::backend::MetricNotice::Measured(Fx::HandledError { .. }))),
+            "a halted preview raises no handled-error effect");
+        assert!(!plx_media::route::is_preview(&rig.app.player.session),
+            "the discarded landing retired the preview mark");
+        assert_ne!(plx_media::player::state(&rig.app.player.session),
+            plx_media::player::PlaybackState::Error,
+            "the failure observer reports on the Error transition, which a focus move must never cause");
+    }
+
     /// The real app request and landing must reach the backend reducer, including the source
     /// failure's automatic retry. The fixture serves JSON at the media URL, so both physical
     /// opens fail and the common owner eventually makes a terminal error decision.
@@ -9781,6 +9771,191 @@ mod lifecycle_regression_tests {
             rig.requests.lock().unwrap(),
         );
     }
+
+    // ---- Previous and Next walk the queue, and never rewrite the episode they leave -------------
+    //
+    // The Previous disc used to be a RESTART from five seconds in (a seek to 0 that rewrote the
+    // playhead and the viewOffset of the episode the viewer meant to leave), and was disabled again
+    // before it: a play started fresh had a queue that began at the playing episode, so there was
+    // no episode before it to go to. These play an episode of a three-episode season fresh, the way
+    // a Continue Watching tile or the detail page's Play does, and press the controls.
+
+    /// One episode `n` of the season fixture as a PlayQueue row (ratingKey `n`, queue item `10 + n`).
+    fn season_row(n: usize) -> String {
+        format!(
+            r#"{{"ratingKey":"{n}","playQueueItemID":{},"type":"episode","title":"Episode {n}",
+            "grandparentRatingKey":"50","grandparentTitle":"Show","parentIndex":1,"index":{n},
+            "duration":60000,
+            "Media":[{{"videoCodec":"h264","audioCodec":"aac","width":1280,"height":720,
+            "Part":[{{"id":{n},"key":"/library/parts/{n}/file.mkv","Stream":[
+            {{"id":1,"streamType":1,"codec":"h264"}},
+            {{"id":2,"streamType":2,"codec":"aac","selected":true}}]}}]}}]}}"#,
+            10 + n
+        )
+    }
+
+    /// The fixture's answer to `POST /playQueues` for a show-keyed request (`key=` names the episode
+    /// to start on: the WHOLE season, that episode selected, the episodes before it included) or an
+    /// episode-only one (that episode and the ones after it), and to `GET /playQueues/1` (the whole
+    /// season). `/decision` direct-plays; the timeline and the scrobble answer empty.
+    fn season_body(request: &str) -> String {
+        if request.contains("/decision?") {
+            return queue_body(request, true).to_owned();
+        }
+        if request.contains("/:/") {
+            return r#"{"MediaContainer":{}}"#.into();
+        }
+        let after = |marker: &str| {
+            request.split_once(marker).and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse::<usize>().ok())
+        };
+        let (first, selected) = if request.starts_with("POST") {
+            match (after("key=%2Flibrary%2Fmetadata%2F"), after("metadata%2F")) {
+                (Some(keyed), _) => (1, keyed),
+                (None, Some(episode)) => (episode, episode),
+                _ => (1, 1),
+            }
+        } else {
+            (1, 1)
+        };
+        let rows: Vec<String> = (first..=3).map(season_row).collect();
+        format!(
+            r#"{{"MediaContainer":{{"machineIdentifier":"lifecycle-fixture","size":{},
+            "playQueueID":1,"playQueueSelectedItemID":{},"playQueueSelectedItemOffset":{},
+            "playQueueTotalCount":{},"Metadata":[{}]}}}}"#,
+            rows.len(),
+            10 + selected,
+            selected - first,
+            rows.len(),
+            rows.join(",")
+        )
+    }
+
+    /// Episode `rk` of the season fixture played FRESH (a show-keyed request, no queue handed over),
+    /// its plan landed and a real Engine over it with the playhead at `pos_ms` of 60 s.
+    fn playing_season_episode_at(rig: &mut Rig, rk: &str, pos_ms: i64) {
+        assert!(plx_media::route::request_play(
+            &mut rig.app.player.session,
+            rig.app.bridge.metadata_mut(),
+            plx_platform::devcaps::caps(),
+            rig.sid,
+            rk,
+            &format!("/library/parts/{rk}/file.mkv"),
+            "h264",
+            "aac",
+            "Episode",
+            "",
+            None,
+            "50",
+        ));
+        rig.entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        rig.release.send(()).unwrap();
+        poll_until("the season fixture's plan did not land", || {
+            plx_media::route::pump_play(&mut rig.app.player.session, rig.app.bridge.metadata_mut()).is_some()
+        });
+        rig.accept_start();
+        frame(&mut rig.app, 16);
+        let _ = plx_platform::tv::launch::take_all();
+        assert!(rig.app.adapters.player.is_live(), "the fixture must create the actual Engine");
+        plx_play_feed::shared::FEED_SHARED.duration_ns.store(60_000_000_000, Ordering::Relaxed);
+        plx_play_feed::shared::FEED_SHARED.playpos_ns.store(pos_ms * 1_000_000, Ordering::Relaxed);
+        publish_feed_fixture_facts(&mut rig.app.player.session, |facts| {
+            facts.duration_ns = Some(60_000_000_000);
+            facts.position_ns = Some(pos_ms * 1_000_000);
+            facts.started = Some(true);
+        });
+    }
+
+    /// The `state=stopped` timeline reports episode `rk` sent, once the stop's worker has finished.
+    fn stop_reports(rig: &Rig, rk: &str) -> Vec<String> {
+        plx_media::route::drain_scrobble();
+        let needle = format!("ratingKey={rk}&");
+        rig.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("/:/timeline") && l.contains(&needle) && l.contains("state=stopped"))
+            .cloned()
+            .collect()
+    }
+
+    /// **Previous goes to the episode before, and the episode it leaves reports where it was.** E2
+    /// of the season is played fresh and the viewer is 30 s into it. The queue the fresh play built
+    /// holds E1, so the Previous disc is enabled (the old disc was a Restart that seeked to 0); a
+    /// press stops E2 at the playhead it really reached (`time=30000`, never a rewound 0 and no
+    /// seek at all) and asks for E1.
+    #[test]
+    fn previous_plays_the_episode_before_and_the_one_it_leaves_reports_its_real_position() {
+        use plx_appkit::player_hud::command::HudCommand;
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving_with(|request: &str| season_body(request)) else {
+            eprintln!("SKIPPED previous_plays_the_episode_before_and_the_one_it_leaves_reports_its_real_position: \
+                lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        playing_season_episode_at(&mut rig, "2", 30_000);
+        let controls = plx_appkit::player_hud::Controls::now(&rig.app.player.session);
+        assert!(controls.previous, "a FRESH play of E2 has E1 before it: {:?}", rig.requests.lock().unwrap());
+        assert!(controls.next, "and E3 after it");
+        let globals = SeekGlobals::set(&mut rig.app, 30_000_000_000, 60_000_000_000);
+
+        perform_on_a_mounted_player(&mut rig.app, HudCommand::Previous, 100);
+
+        assert!(plx_media::route::play_pending(), "Previous asked for the episode before");
+        assert_eq!(globals.seek_to(), -1, "Previous is a queue step: it seeks nowhere");
+        let stops = stop_reports(&rig, "2");
+        assert_eq!(stops.len(), 1, "the outgoing episode was stopped once: {:?}", rig.requests.lock().unwrap());
+        assert!(stops[0].contains("time=30000&"), "it reports the playhead it reached, not 0: {}", stops[0]);
+    }
+
+    /// **The first episode of the queue has no Previous.** E1 of the season, played fresh, is the
+    /// first row: the disc is disabled, and a Previous press (the Previous key reaches the same
+    /// performer) changes nothing: no stop report, no request, no seek.
+    #[test]
+    fn previous_on_the_first_episode_of_the_queue_is_disabled_and_does_nothing() {
+        use plx_appkit::player_hud::command::HudCommand;
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving_with(|request: &str| season_body(request)) else {
+            eprintln!("SKIPPED previous_on_the_first_episode_of_the_queue_is_disabled_and_does_nothing: \
+                lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        playing_season_episode_at(&mut rig, "1", 30_000);
+        let controls = plx_appkit::player_hud::Controls::now(&rig.app.player.session);
+        assert!(!controls.previous, "nothing before the first episode: {:?}", rig.requests.lock().unwrap());
+        assert!(controls.next, "E2 follows");
+        assert!(!controls.enabled(plx_appkit::player_hud::BTN_PREVIOUS), "the disc has no focus stop");
+        assert_eq!(controls.command(plx_appkit::player_hud::BTN_PREVIOUS), None, "and nothing to press");
+        let globals = SeekGlobals::set(&mut rig.app, 30_000_000_000, 60_000_000_000);
+
+        perform_on_a_mounted_player(&mut rig.app, HudCommand::Previous, 100);
+
+        assert!(!plx_media::route::play_pending(), "no episode before E1 to request");
+        assert_eq!(globals.seek_to(), -1, "and it is not a restart either");
+        assert!(stop_reports(&rig, "1").is_empty(), "E1 plays on: {:?}", rig.requests.lock().unwrap());
+    }
+
+    /// **Next still steps forward, and the episode it leaves reports where it was.** The same E2 at
+    /// 30 s: Next stops it at `time=30000` and requests E3.
+    #[test]
+    fn next_plays_the_episode_after_and_the_one_it_leaves_reports_its_real_position() {
+        use plx_appkit::player_hud::command::HudCommand;
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving_with(|request: &str| season_body(request)) else {
+            eprintln!("SKIPPED next_plays_the_episode_after_and_the_one_it_leaves_reports_its_real_position: \
+                lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        playing_season_episode_at(&mut rig, "2", 30_000);
+        let globals = SeekGlobals::set(&mut rig.app, 30_000_000_000, 60_000_000_000);
+
+        perform_on_a_mounted_player(&mut rig.app, HudCommand::Next, 100);
+
+        assert!(plx_media::route::play_pending(), "Next asked for E3");
+        assert_eq!(globals.seek_to(), -1);
+        let stops = stop_reports(&rig, "2");
+        assert_eq!(stops.len(), 1, "{:?}", rig.requests.lock().unwrap());
+        assert!(stops[0].contains("time=30000&"), "{}", stops[0]);
+    }
 }
 
 #[cfg(test)]
@@ -9790,9 +9965,13 @@ mod video_plane_gate_tests {
     //! writer), the gate (`plx_machine::idle`, the machine layer) and this file's own source (the loop is
     //! the one consumer a unit test cannot drive). The gate-only half stayed beside the gate:
     //! `plx_machine::idle`'s `the_present_gate_answers_true_only_while_the_plane_bit_is_set`.
-    use plx_machine::idle::{
-        invalidate, reset_for_test, should_present, take_local_damage, video_plane_bound,
-    };
+    use plx_machine::present::{Present, PresentEvent};
+
+    fn swap(present: &mut Present, now: u32) -> bool {
+        let admitted = present.take(now);
+        if admitted { present.acknowledge(now); }
+        admitted
+    }
 
     /// **Spec §9, §4.4, §16 risk 10 — the whole-frame gate is turned off by the PLANE'S BIT, not
     /// by the player route, and both of its edges are carried.**
@@ -9818,46 +9997,42 @@ mod video_plane_gate_tests {
     #[test]
     fn the_present_gate_answers_true_only_while_the_plane_is_bound() {
         let _g = plx_base::testlock::serial();
-        reset_for_test();
+        let mut present = Present::new();
         let mut player = plx_media::player::machine::Player::new();
-        assert!(!video_plane_bound(), "a fresh machine has no plane");
+        assert!(!present.video_plane(), "a fresh machine has no plane");
 
-        invalidate();
-        assert!(should_present(0), "the damage just raised selects this frame");
-        assert!(!should_present(16), "settled, inside the keepalive: nothing to send");
+        assert!(swap(&mut present, 0), "initial damage selects this frame");
+        assert!(!swap(&mut present, 16), "settled, inside the keepalive: nothing to send");
 
         // ---- the TRUE edge, and what it buys ----
-        player.set_video_plane_bound(true);
-        assert!(video_plane_bound(), "the machine's edge is the gate's only input");
+        assert_eq!(player.set_video_plane_bound(true), Some(true));
+        present.note(PresentEvent::VideoPlane(true));
+        assert!(present.video_plane(), "the machine's edge is the gate's only input");
         for t in [32u32, 48, 64, 80] {
             assert!(
-                should_present(t),
+                swap(&mut present, t),
                 "while the plane is bound every frame presents, unconditionally — nothing about                  this frame moved",
             );
         }
 
         // A LEVEL is not an edge. Writing the same value again must publish nothing: a second
         // formula term feeding the gate is exactly what risk 10 names.
-        let _ = take_local_damage();
-        player.set_video_plane_bound(true);
-        assert_eq!(
-            take_local_damage(),
-            0,
-            "re-asserting the same bit raised damage — the bit is published on EDGES only",
-        );
+        assert_eq!(player.set_video_plane_bound(true), None,
+            "re-asserting the same bit must publish no edge");
 
         // ---- the FALSE edge, on a frame that would otherwise not present ----
         // Nothing else has happened: no input, no landing, no spring, and the keepalive is not due
         // (LAST_PRESENT is 0 and KEEPALIVE_MS is 2000). Without the edge's own report this frame
         // is skipped, and the last video frame stays on the panel behind a stale opaque region.
-        player.set_video_plane_bound(false);
-        assert!(!video_plane_bound());
+        assert_eq!(player.set_video_plane_bound(false), Some(false));
+        present.note(PresentEvent::VideoPlane(false));
+        assert!(!present.video_plane());
         assert!(
-            should_present(96),
+            swap(&mut present, 96),
             "the unbind frame presents even though nothing else about it moved",
         );
         assert!(
-            !should_present(112),
+            !swap(&mut present, 112),
             "…and the frame after it is an ordinary idle frame again, which is the whole point",
         );
 
@@ -10109,5 +10284,57 @@ mod wake_input_tests {
         ] {
             assert_eq!(wake_input(press, saved), want, "{press:?} over {saved:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod straighten_wiring_tests {
+    //! `present_and_swap` needs a real SDL/GL context, so the straighten pass's place in the frame is
+    //! pinned from the source text, the idiom `video_plane_gate_tests` and `pump_wiring_tests` use.
+
+    /// **The pass is the frame's last draw before the swap, and every readback is before it.** The
+    /// order in `present_and_swap`: the ledger opens (`frame_begin`), the frame draws, the dev capture
+    /// stream reads the framebuffer (and skips a bound frame, which is the only one the pass runs
+    /// on), THEN the pass, THEN the simulator's compositor stand-in, the simulator's two readers
+    /// (frame dump, screenshot) and the swap. A read between the pass and the compositor would see
+    /// the straight buffer; a pass after the swap would straighten an undefined back buffer.
+    ///
+    /// The pass takes the plane's BIT, unnested (it does its own gating on the bit and on whether the
+    /// frame drew), and the simulator's compositor runs on that same bit, so the two run together or
+    /// not at all: a straightened frame no reader may see uncomposited.
+    #[test]
+    fn the_straighten_pass_is_last_before_the_swap_and_after_every_readback() {
+        let whole = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/run.rs"),
+        )
+        .expect("read run.rs");
+        let src = whole.split("\n#[cfg(test)]\nmod ").next().expect("the loop's source");
+        const PASS: &str = "        plx_gfx::gfx::straighten::straighten_surface(app.player.video_plane_bound);";
+        assert_eq!(
+            src.lines().filter(|l| *l == PASS).count(),
+            1,
+            "the pass is called exactly once, at `present_and_swap`'s `if fr.present` depth, handed the plane's bit",
+        );
+        assert!(
+            !src.contains("straighten_surface(fr.player)"),
+            "keyed on the plane's bit, not the route: the bound trailer preview is not the player route",
+        );
+        let at = |needle: &str| src.find(needle).unwrap_or_else(|| panic!("`{needle}` is gone from run.rs"));
+        let begin = at("plx_gfx::gfx::straighten::frame_begin();");
+        let draw = at("let (_vx, _vy, _vw, _vh) = draw(app, fr);");
+        let capture = at("crate::capture::tick(fr.now);");
+        let pass = at(PASS.trim_start());
+        let compositor = at("composite_plane_under();\n        }");
+        let dump = at("crate::dev::framedump::after_draw(");
+        let shot = at("crate::shot::maybe_capture(");
+        let swap = at("SDL_GL_SwapWindow(app.win);");
+        assert!(begin < draw, "the ledger opens before the frame draws");
+        assert!(draw < capture && capture < pass, "the capture stream reads before the pass");
+        assert!(pass < compositor, "the simulator's compositor runs after the pass it models");
+        assert!(compositor < dump && compositor < shot, "no reader sees a straight, uncomposited frame");
+        assert!(shot < swap && dump < swap, "…and the pass is done before the swap");
+        // The compositor stand-in sits behind the same bit the pass is handed.
+        let guard = "        #[cfg(feature = \"hostsim\")]\n        if app.player.video_plane_bound {\n            composite_plane_under();";
+        assert!(src.contains(guard), "the simulator composites on exactly the frames the pass straightened");
     }
 }

@@ -525,11 +525,10 @@ impl DetailScreen {
 
     /// The membership the bookmark disc wears: On draws the filled face, Off and Unknown the outline
     /// (the PUT is idempotent, so an unknown membership offers Add). A change flips the disc.
-    pub fn set_watchlist(&mut self, membership: plx_data::catalog::Membership) {
-        // When the disc snaps and when it animates is its own rule (`watchlist_disc::Disc::set`).
-        if self.watchlist.set(membership) {
-            plx_machine::idle::invalidate();
-        }
+    pub fn set_watchlist(&mut self, membership: plx_data::catalog::Membership) -> bool {
+        // The runner applies this changed-input effect to its owned Present. When
+        // the disc snaps or animates is still the disc's own motion rule.
+        self.watchlist.set(membership)
     }
 
     /// The membership the disc currently wears.
@@ -924,7 +923,7 @@ impl DetailScreen {
                 d.cur_season,
                 Some(i),
                 self.tab_scroll.pos,
-                self.season_pop.scale(0),
+                self.season_pop.scale(0, f.press),
             ),
             Some(Located::Episode(i, row)) => episodes::draw_focused(
                 f.painter,
@@ -1715,7 +1714,7 @@ impl<H: ContentLike + crate::registry::MetadataLike + PlayerLike> Focusable<H> f
                 let base =
                     hero::hero_btn_rect_at(set, i, self.hero_chain(measure, meta).btn_y - vertical, widths);
                 (
-                    base.scaled(self.ctl_pop.scale(i)),
+                    base.scaled(self.ctl_pop.scale(i, cx.press)),
                     base.scaled(plx_ui::widgets::CTRL_FOCUS_SCALE),
                     Some(i as u32),
                 )
@@ -1727,7 +1726,7 @@ impl<H: ContentLike + crate::registry::MetadataLike + PlayerLike> Focusable<H> f
                     self.tab_scroll.pos,
                 )?;
                 (
-                    base.scaled(self.season_pop.scale(0)),
+                    base.scaled(self.season_pop.scale(0, cx.press)),
                     base.scaled(plx_ui::widgets::CTRL_FOCUS_SCALE),
                     Some(i as u32),
                 )
@@ -2570,7 +2569,7 @@ impl<H: ContentLike + crate::registry::MetadataLike + PlayerLike> Screen<H> for 
                             _ => None,
                         },
                         self.tab_scroll.pos,
-                        self.season_pop.scale(0),
+                        self.season_pop.scale(0, f.press),
                     ),
                     2 => {
                         episodes::draw(
@@ -3065,7 +3064,7 @@ impl DetailScreen {
         for (i, ctl) in controls[..n].iter().copied().enumerate() {
             let rect = hero::hero_btn_rect_at(set, i, y, widths);
             let fill = self.ctl_pop.focus(i);
-            let scale = self.ctl_pop.scale(i);
+            let scale = self.ctl_pop.scale(i, cx.press);
             match ctl {
                 hero::HeroCtl::Play => Button::new(
                     hero::hero_pill_label(set.restart).as_ptr(),
@@ -4484,6 +4483,7 @@ impl DetailScreen {
                     title: title.to_string(),
                     context: plx_data::metadata::TRAILER_CONTEXT.into(),
                     version: None,
+                    show_rk: String::new(),
                 };
                 self.content(fx, ContentReq::Play { play, resume_ns: 0 });
             }
@@ -4598,6 +4598,9 @@ impl DetailScreen {
                     title: d.title.clone(),
                     context: String::new(),
                     version,
+                    // An episode page plays its own episode: its show keys the queue. A movie
+                    // page has none.
+                    show_rk: d.episodes_show_rk().to_owned(),
                 },
                 |m| PlayIntent::Movie { item: m.clone(), version },
             );
@@ -4678,6 +4681,7 @@ impl DetailScreen {
             title,
             context,
             version,
+            show_rk: d.episodes_show_rk().to_owned(),
         };
         self.content(fx, ContentReq::Play { play, resume_ns });
         true
