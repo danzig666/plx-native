@@ -3483,8 +3483,13 @@ impl Bridge<'_> {
                 let status = self.playback_trace_command(from, command);
                 out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::PlaybackTrace(status)))));
             }
-            // The state reaches the pages with the next frame's views (`AppViews::update`).
-            InlineAppFx::Update(command) => self.retained.updater.command(command),
+            // Answered on the ordered lane; the state also reaches every page with the next frame's
+            // views (`AppViews::update`).
+            InlineAppFx::Update(command) => {
+                self.retained.updater.command(command);
+                let status = self.retained.updater.view().clone();
+                out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::Update(status)))));
+            }
             InlineAppFx::Huds(command) => out.push(Fx::Deliver(MachineId::Huds, Delivery::Machine(AppMsg::Huds(command)))),
             InlineAppFx::Store(StoreId::Person, StoreCmd::Person(command)) => out.push(Fx::Deliver(
                 MachineId::Store(StoreId::Person.ord()), Delivery::Machine(AppMsg::PersonCommand { from, command }))),

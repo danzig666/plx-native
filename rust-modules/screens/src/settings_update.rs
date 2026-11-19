@@ -182,6 +182,16 @@ impl Machine<InnerHost> for UpdatePage {
                 ));
                 Handled::Yes
             }
+            // The answer to this page's own press: the state it left, a frame before the views
+            // publish it.
+            ScreenEvent::App(super::super::registry::AppMsg::Update(status)) => {
+                if self.state.status != *status {
+                    self.state.status = status.clone();
+                    self.rebuild();
+                    fx.invalidate(Provenance::Landing(MachineId::Session));
+                }
+                Handled::Yes
+            }
             ScreenEvent::Tick(t) => {
                 self.form.table.update(t.dt(), RouteLayout::screen().sectioned_table().h);
                 Handled::Yes

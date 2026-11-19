@@ -135,8 +135,9 @@ pub enum AppFx {
     Preferences(PreferenceCmd),
     /// Local firmware logging; the runner answers this surface through an addressed event.
     PlaybackTrace(plx_platform::playback_trace::Command),
-    /// The fork's self-updater's command; its state reaches pages as each frame's publication
-    /// ([`LibraryLike::update_status`]), so nothing is answered.
+    /// The fork's self-updater's command, answered on the ordered lane with an addressed
+    /// `AppMsg::Update`; its state also reaches pages as each frame's publication
+    /// ([`LibraryLike::update_status`]), which is what a page reads when nothing was pressed.
     Update(UpdateCmd),
     /// A store command, executed as a `Deliver` to the store machine in the same drain.
     Store(StoreId, StoreCmd),
@@ -1669,6 +1670,8 @@ pub enum AppMsg {
     PlayerPresented { watch: Option<plx_appkit::skip_policy::OfferId>, paired: bool },
     AutoSkipResolved { id: plx_appkit::skip_policy::OfferId, outcome: plx_appkit::skip_policy::OfferOutcome },
     PlaybackTrace(plx_platform::playback_trace::Status),
+    /// The self-updater's state after a page's [`UpdateCmd`], addressed to that page.
+    Update(UpdateStatus),
     Session(plx_session::auth::owner::SessionEvent),
     Consent(ConsentCmd),
     /// A command of the player-HUD package store, delivered to [`MachineId::Huds`].
