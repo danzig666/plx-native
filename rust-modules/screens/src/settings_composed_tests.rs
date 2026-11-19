@@ -518,14 +518,15 @@ fn a_real_push_seats_the_new_page_fresh_and_a_pop_restores_the_row_that_opened_i
         path(&d, id)
     );
 
-    // Mounting the surface already seats row 0 (its own `Enter::Fresh`); four real DOWNs
-    // move focus — and the engine's remembered cursor for `(id, GroupId(0))` — to row 4,
-    // Legal notices (Settings v2: Diagnostics is the root's own row, between Privacy & data and it).
-    for i in 1..=4u32 {
+    // Mounting the surface already seats row 0 (its own `Enter::Fresh`); five real DOWNs
+    // move focus — and the engine's remembered cursor for `(id, GroupId(0))` — to row 5,
+    // Legal notices (Settings v2: Diagnostics is the root's own row, between Privacy & data and it,
+    // and this fork's Software update follows Diagnostics).
+    for i in 1..=5u32 {
         frame(&mut d, &mut rig, 16 * i, vec![key(Key::Down, tick(16 * i))]);
     }
     let legal_row = d.focus().expect("a row is focused after a real DOWN");
-    assert_eq!(legal_row.elem, root_key(RootId::Legal), "the fourth DOWN is Legal notices in the signed-out fixture");
+    assert_eq!(legal_row.elem, root_key(RootId::Legal), "the fifth DOWN is Legal notices in the signed-out fixture");
 
     frame(&mut d, &mut rig, 96, vec![key(Key::Ok, tick(96))]);
     assert!(

@@ -48,6 +48,75 @@ pub mod tile_facts;
 /// The Under posters setting read once, and the one builder of a focused poster's caption.
 pub mod captions;
 
+/// **This fork's self-updater**, as Settings › Software update asks it (the application's
+/// `app::update` owns the check and the install; a page states no IO and reads the answer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpdateCmd {
+    /// Answer with the state as it stands.
+    Status,
+    /// Read the fork's release feed now.
+    Check,
+    /// Hand the newer release the last check found to Homebrew Channel.
+    Install,
+}
+
+/// The updater's state, the answer to every [`UpdateCmd`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UpdateStatus {
+    pub phase: UpdatePhase,
+    /// This build's version.
+    pub current: String,
+    /// The newer release the last check found, if any.
+    pub latest: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpdatePhase {
+    /// No updater here: a development install, or not a television.
+    Unavailable,
+    /// Nothing asked yet in this run.
+    Idle,
+    Checking,
+    UpToDate,
+    CheckFailed,
+    /// A newer release is known ([`UpdateStatus::latest`]).
+    Available,
+    /// Homebrew Channel is downloading it; the percentage when it knows the size.
+    Downloading(Option<u8>),
+    Verifying,
+    /// The system installer has it; this app is normally stopped during this step.
+    Installing,
+    /// The install completed and this process is still running.
+    Installed,
+    NoHomebrewChannel,
+    InstallFailed,
+}
+
+impl UpdatePhase {
+    /// A check or an install is under way: a second one is not started, and the page polls.
+    pub fn busy(self) -> bool {
+        matches!(self, UpdatePhase::Checking | UpdatePhase::Downloading(_) | UpdatePhase::Verifying | UpdatePhase::Installing)
+    }
+
+    /// The phase's canonical number, for a page's logical state.
+    pub fn code(self) -> u8 {
+        match self {
+            UpdatePhase::Unavailable => 0,
+            UpdatePhase::Idle => 1,
+            UpdatePhase::Checking => 2,
+            UpdatePhase::UpToDate => 3,
+            UpdatePhase::CheckFailed => 4,
+            UpdatePhase::Available => 5,
+            UpdatePhase::Downloading(_) => 6,
+            UpdatePhase::Verifying => 7,
+            UpdatePhase::Installing => 8,
+            UpdatePhase::Installed => 9,
+            UpdatePhase::NoHomebrewChannel => 10,
+            UpdatePhase::InstallFailed => 11,
+        }
+    }
+}
+
 /// The application's effects (spec §3.1). `Store` since phase 4; `Consent` and `Loop` since 5b.
 pub enum AppFx {
     Session(plx_session::auth::SessionCmd),
@@ -56,6 +125,8 @@ pub enum AppFx {
     Preferences(PreferenceCmd),
     /// Local firmware logging; the runner answers this surface through an addressed event.
     PlaybackTrace(plx_platform::playback_trace::Command),
+    /// The fork's self-updater; the runner answers through an addressed `AppMsg::Update`.
+    Update(UpdateCmd),
     /// A store command, executed as a `Deliver` to the store machine in the same drain.
     Store(StoreId, StoreCmd),
     /// Poll only the store work this visible route owns, after its read-only step returns.
@@ -88,6 +159,7 @@ pub enum AppFx {
 pub enum InlineAppFx {
     Session(plx_session::auth::SessionCmd),
     PlaybackTrace(plx_platform::playback_trace::Command),
+    Update(UpdateCmd),
     Store(StoreId, StoreCmd),
     StoreWork(StoreWork),
     Consent(ConsentCmd),
@@ -137,6 +209,7 @@ impl plx_machine::machine::AppEffect for AppFx {
         match self {
             Self::Session(v) => Inline(InlineAppFx::Session(v)),
             Self::PlaybackTrace(v) => Inline(InlineAppFx::PlaybackTrace(v)),
+            Self::Update(v) => Inline(InlineAppFx::Update(v)),
             Self::Store(id, v) => Inline(InlineAppFx::Store(id, v)),
             Self::StoreWork(v) => Inline(InlineAppFx::StoreWork(v)),
             Self::Consent(v) => Inline(InlineAppFx::Consent(v)),
@@ -1581,6 +1654,8 @@ pub enum AppMsg {
     PlayerPresented { watch: Option<plx_appkit::skip_policy::OfferId>, paired: bool },
     AutoSkipResolved { id: plx_appkit::skip_policy::OfferId, outcome: plx_appkit::skip_policy::OfferOutcome },
     PlaybackTrace(plx_platform::playback_trace::Status),
+    /// The fork's self-updater's state, the answer to an `AppFx::Update`.
+    Update(UpdateStatus),
     Session(plx_session::auth::owner::SessionEvent),
     Consent(ConsentCmd),
     /// A command of the player-HUD package store, delivered to [`MachineId::Huds`].
@@ -1751,6 +1826,7 @@ pub mod word {
     /// `tests/run.py` captures an overlay word as `[\w-]+`.
     pub const LANGUAGE: &str = "language";
     pub const DIAGNOSTICS: &str = "diagnostics";
+    pub const SOFTWARE_UPDATE: &str = "software-update";
     pub const UNDER_POSTERS: &str = "under-posters";
     pub const UNDER_POSTERS_MOVIE: &str = "under-posters-movie";
     pub const UNDER_POSTERS_SHOW: &str = "under-posters-show";
@@ -3390,6 +3466,7 @@ mod a11y_coverage_tests {
                 SettingsPage::ConsentStage(_) => Covered("Settings::ConsentStage", || surface(SettingsPage::ConsentStage(0))),
                 SettingsPage::Picker(_) => Covered("Settings::Picker", || surface(SettingsPage::Picker(PickerKind::Quality))),
                 SettingsPage::Diagnostics => Covered("Settings::Diagnostics", || surface(SettingsPage::Diagnostics)),
+                SettingsPage::SoftwareUpdate => Covered("Settings::SoftwareUpdate", || surface(SettingsPage::SoftwareUpdate)),
                 SettingsPage::PlayerHud => Covered("Settings::PlayerHud", || surface(SettingsPage::PlayerHud)),
                 SettingsPage::HudGallery => Covered("Settings::HudGallery", || surface(SettingsPage::HudGallery)),
                 SettingsPage::HudDetail(_) => Covered("Settings::HudDetail", crate::hud_settings::tests::hud_detail_conforms),
@@ -3403,7 +3480,7 @@ mod a11y_coverage_tests {
     /// How many leaf arms the table has: 21 flat `AppArg` arms, 5 `ContentArg`, 22 `SettingsPage` and
     /// `FirstRunConsent`. A new arm fails [`coverage`] to compile, and then this to pass until the census
     /// below holds it too.
-    const ARMS: usize = 49;
+    const ARMS: usize = 50;
 
     /// **A value of every leaf arm** the table names: the registry's own page and surface censuses, plus
     /// the arms those leave out (Filmography and every Settings page).
@@ -3434,6 +3511,7 @@ mod a11y_coverage_tests {
                 SettingsPage::ConsentStage(0),
                 SettingsPage::Picker(PickerKind::Quality),
                 SettingsPage::Diagnostics,
+                SettingsPage::SoftwareUpdate,
                 SettingsPage::PlayerHud,
                 SettingsPage::HudGallery,
                 SettingsPage::HudDetail(sha),

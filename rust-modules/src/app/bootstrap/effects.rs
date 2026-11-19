@@ -274,7 +274,7 @@ pub(crate) fn inline(effect: &plx_screens::registry::InlineAppFx) -> Result<Valu
         InlineAppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status) => Ok(json!({"playback_trace":"status"})),
         InlineAppFx::Store(id, command) => Ok(json!({"store":id.ord().0,"command":store(command)?})),
         InlineAppFx::StoreWork(work) => Ok(json!({"work":work_value(work)?})),
-        InlineAppFx::PlaybackTrace(_) | InlineAppFx::Consent(_) | InlineAppFx::Huds(_) => Err("unsupported Home application effect"),
+        InlineAppFx::PlaybackTrace(_) | InlineAppFx::Consent(_) | InlineAppFx::Huds(_) | InlineAppFx::Update(_) => Err("unsupported Home application effect"),
     }
 }
 

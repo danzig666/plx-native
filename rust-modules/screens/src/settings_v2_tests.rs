@@ -11,6 +11,7 @@ use plx_platform::playback_trace::{Command, Status};
 fn inputs(signed_in: bool) -> RootInputs {
     RootInputs {
         trace: Status::Off,
+        update_value: String::new(),
         signed_in, multi_user: false, library_count: 3, auto_sign_in: false, trailer_autoplay: true,
         resolution: UiResolution::Auto, resolution_offered: false,
         language: plx_platform::i18n::Preference::System,
@@ -33,7 +34,7 @@ fn the_root_is_four_groups_of_rows_without_sub_lines() {
         RootId::Favourites, RootId::UnderPosters,
         RootId::Playback, RootId::AudioSubtitles,
         RootId::Language, RootId::AutoSignIn, RootId::TrailerAutoplay,
-        RootId::Privacy, RootId::Diagnostics, RootId::Legal, RootId::About,
+        RootId::Privacy, RootId::Diagnostics, RootId::SoftwareUpdate, RootId::Legal, RootId::About,
     ]);
     let mut form = FormTable::<RootId, Action, SettingsPage>::new(super::super::registry::BAND);
     form.set(root_form(&inputs), None);
@@ -51,7 +52,7 @@ fn the_root_is_four_groups_of_rows_without_sub_lines() {
 fn the_signed_out_root_drops_every_signed_in_row() {
     assert_eq!(ids(&inputs(false)), vec![
         RootId::Playback, RootId::Language,
-        RootId::Privacy, RootId::Diagnostics, RootId::Legal, RootId::About,
+        RootId::Privacy, RootId::Diagnostics, RootId::SoftwareUpdate, RootId::Legal, RootId::About,
     ]);
     assert!(!ids(&inputs(true)).contains(&RootId::AutoSignIn), "one profile skips the picker already");
 }
@@ -60,7 +61,8 @@ fn the_signed_out_root_drops_every_signed_in_row() {
 /// metrics, in the Settings layout's own table frame), and how far it may drift before this test
 /// says the row heights or the section break moved. It is a pin of our geometry, not a number
 /// read off the board.
-const ALL_ROWS_SCROLL: f32 = 244.0;
+// 244 on the board; this fork's Software update row adds one 60 px row.
+const ALL_ROWS_SCROLL: f32 = 304.0;
 const ALL_ROWS_SCROLL_TOLERANCE: f32 = 6.0;
 
 /// Sv2s-R2: every conditional row at once is the board's longest root, and it scrolls.
@@ -139,7 +141,7 @@ fn every_followed_sentence_fits_five_lines_in_every_language() {
         let drop = layout.copy_cap_drop(&ShippedMeasure);
         let mut all: Vec<RootId> = vec![RootId::Favourites, RootId::UnderPosters, RootId::Playback, RootId::AudioSubtitles,
             RootId::Language, RootId::AutoSignIn, RootId::TrailerAutoplay, RootId::Resolution, RootId::Privacy,
-            RootId::Diagnostics, RootId::Legal, RootId::About];
+            RootId::Diagnostics, RootId::SoftwareUpdate, RootId::Legal, RootId::About];
         all.push(RootId::Plaintext(ServerMachineId("m".into())));
         for id in all {
             let text = sentence_for(Some(&id));
@@ -273,7 +275,7 @@ fn the_root_and_diagnostics_rows_name_themselves_with_distinct_ids() {
     let root = [
         RootId::Favourites, RootId::UnderPosters, RootId::Playback, RootId::AudioSubtitles, RootId::Language,
         RootId::AutoSignIn, RootId::TrailerAutoplay, RootId::Resolution, RootId::Privacy, RootId::Diagnostics,
-        RootId::Legal, RootId::About,
+        RootId::SoftwareUpdate, RootId::Legal, RootId::About,
     ];
     let mut names: Vec<&str> = root.iter().map(|id| id.a11y().expect("a root row names itself")).collect();
     let diag = [diagnostics::DiagId::Trace, diagnostics::DiagId::Export, diagnostics::DiagId::Delete];

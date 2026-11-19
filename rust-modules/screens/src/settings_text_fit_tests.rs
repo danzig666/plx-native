@@ -32,6 +32,7 @@ const ALL_TRACE_STATUSES: [plx_platform::playback_trace::Status; 7] = {
 fn base_root_inputs() -> RootInputs {
     RootInputs {
         trace: plx_platform::playback_trace::Status::Off,
+        update_value: String::new(),
         signed_in: true, multi_user: false, library_count: 0,
         auto_sign_in: false, trailer_autoplay: true, resolution: UiResolution::Auto, resolution_offered: true,
         language: plx_platform::i18n::Preference::System,
@@ -62,6 +63,21 @@ fn every_settings_row_fits_its_column_in_every_language() {
             overflowing(&format!("{tag} diagnostics page {status:?}"), &page.form.table, &mut out);
         }
 
+        // This fork's Software update page in every phase, with the longest version a fork release
+        // names, and the root row's value once a newer version is known.
+        {
+            use crate::registry::{UpdatePhase, UpdateStatus};
+            for phase in [UpdatePhase::Unavailable, UpdatePhase::Idle, UpdatePhase::Checking, UpdatePhase::UpToDate,
+                UpdatePhase::CheckFailed, UpdatePhase::Available, UpdatePhase::Downloading(None),
+                UpdatePhase::Downloading(Some(100)), UpdatePhase::Verifying, UpdatePhase::Installing,
+                UpdatePhase::Installed, UpdatePhase::NoHomebrewChannel, UpdatePhase::InstallFailed] {
+                let status = UpdateStatus { phase, current: "0.10.124".into(), latest: Some("0.10.125".into()) };
+                let page = update::UpdatePage::at(EntryId(0), status);
+                overflowing(&format!("{tag} software update page {phase:?}"), &page.form.table, &mut out);
+            }
+            overflowing_root(&format!("{tag} root (update available)"), &RootInputs {
+                update_value: plx_platform::i18n::msg::settings_update_available("0.10.125"), ..base_root_inputs() }, &mut out);
+        }
         overflowing_root(&format!("{tag} root (signed in)"), &base_root_inputs(), &mut out);
         for trace in [plx_platform::playback_trace::Status::Off, plx_platform::playback_trace::Status::Recording,
             plx_platform::playback_trace::Status::Saved, plx_platform::playback_trace::Status::Saving,

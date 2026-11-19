@@ -8,6 +8,7 @@ pub mod secure;
 pub mod sink;
 pub mod sound;
 pub mod toast;
+pub mod update;
 pub mod uri;
 pub mod window;
 
@@ -30,6 +31,9 @@ pub struct Port {
     pub go_home: fn(),
     pub poll_home: fn(),
     pub deliver_toast: fn(&str, toast::Identity) -> toast::Sent,
+    /// Homebrew Channel's `install`, streamed: the payload, and a sink handed every reply in order
+    /// that returns `false` once it has its answer ([`update`]).
+    pub install_package: fn(&str, &mut dyn FnMut(&str) -> bool) -> Result<(), update::PortFail>,
     pub bind_window: fn(*mut c_void),
     pub grab_surface: fn(*mut c_void),
     /// Answers whether a surface was held (and so actually let go of).
@@ -71,6 +75,7 @@ static ABSENT: Port = Port {
     go_home: nothing,
     poll_home: nothing,
     deliver_toast: toast::deliver_without_port,
+    install_package: |_, _| Err(update::PortFail::Unsupported),
     bind_window: |_| {},
     grab_surface: |_| {},
     release_surface: || false,

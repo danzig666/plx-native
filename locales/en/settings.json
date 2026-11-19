@@ -1661,5 +1661,82 @@
   "settings.audio.page_copy": {
     "value": "Audio and subtitle language preferences sync with your Plex account. Playback settings belong to each profile.",
     "description": "Sentence beside the Audio & subtitles page when no row has a sentence of its own: the account preferences sync with Plex, the Look group belongs to each profile. Two sentences."
+  },
+  "settings.update.title": {
+    "value": "Software update",
+    "description": "Settings › Software update (this fork's self-updater): the root row's label and the page's title."
+  },
+  "settings.update.root_detail": {
+    "value": "Check for a newer PlxNative from this fork's releases and install it through Homebrew Channel.",
+    "description": "Settings root, the sentence beside the table while the Software update row has focus."
+  },
+  "settings.update.detail": {
+    "value": "This is PlxNative {version}. Updates come from this fork's releases and install through Homebrew Channel. PlxNative closes while an update installs.",
+    "args": {"version": "str"},
+    "description": "Settings › Software update: the sentence under the page title. {version} is this build's version number, such as 0.10.24."
+  },
+  "settings.update.check": {
+    "value": "Check for updates",
+    "description": "Settings › Software update: the button that reads the fork's release list now."
+  },
+  "settings.update.install": {
+    "value": "Install {version}",
+    "args": {"version": "str"},
+    "description": "Settings › Software update: the button that hands the newer release to Homebrew Channel. {version} is its version number, such as 0.10.25. Keep it short: a table row label."
+  },
+  "settings.update.checking": {
+    "value": "Checking…",
+    "description": "Settings › Software update: a row value while the release list is being read."
+  },
+  "settings.update.up_to_date": {
+    "value": "Up to date",
+    "description": "Settings › Software update: a row value when no newer release exists."
+  },
+  "settings.update.check_failed": {
+    "value": "Couldn't check",
+    "description": "Settings › Software update: a row value when the release list could not be read (no network, a server error)."
+  },
+  "settings.update.available": {
+    "value": "{version} available",
+    "args": {"version": "str"},
+    "description": "Settings › Software update and the Settings root row: a newer release exists. {version} is its version number, such as 0.10.25. Keep it short: a row value."
+  },
+  "settings.update.downloading": {
+    "value": "Downloading…",
+    "description": "Settings › Software update: a row value while Homebrew Channel downloads the update and has not said how far it is."
+  },
+  "settings.update.downloading_percent": {
+    "value": "Downloading {percent}%",
+    "args": {"percent": "str"},
+    "description": "Settings › Software update: a row value while Homebrew Channel downloads the update. {percent} is a whole number from 0 to 100."
+  },
+  "settings.update.verifying": {
+    "value": "Verifying…",
+    "description": "Settings › Software update: a row value while Homebrew Channel checks the downloaded package's checksum."
+  },
+  "settings.update.installing": {
+    "value": "Installing…",
+    "description": "Settings › Software update: a row value while the TV's installer replaces the app; the app is normally closed during this step."
+  },
+  "settings.update.installed": {
+    "value": "Installed",
+    "description": "Settings › Software update: a row value when the install finished while the app kept running (the new version runs from the next start)."
+  },
+  "settings.update.needs_hbc": {
+    "value": "Needs Homebrew Channel",
+    "description": "Settings › Software update: a row value when this TV has no Homebrew Channel, which installs the update. Homebrew Channel is a product name: do not translate it."
+  },
+  "settings.update.install_failed": {
+    "value": "Couldn't install",
+    "description": "Settings › Software update: a row value when Homebrew Channel or the TV's installer refused the update."
+  },
+  "settings.update.unavailable": {
+    "value": "Not in this build",
+    "description": "Settings › Software update: the Check row's value in a development build, which does not update itself."
+  },
+  "settings.update.toast": {
+    "value": "PlxNative {version} is available. Install it in Settings › Software update.",
+    "args": {"version": "str"},
+    "description": "The TV's own notification, raised once when the start-up check finds a newer release. {version} is its version number, such as 0.10.25. 'Settings' and 'Software update' are the names of those pages."
   }
 }

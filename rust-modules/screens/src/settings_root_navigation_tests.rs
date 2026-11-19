@@ -703,6 +703,7 @@ fn turning_an_unencrypted_connection_on_asks_the_shared_question_first() {
 fn inputs_for(signed_in: bool) -> RootInputs {
     RootInputs {
         trace: plx_platform::playback_trace::Status::Off,
+        update_value: String::new(),
         signed_in, multi_user: true, library_count: 3, auto_sign_in: false, trailer_autoplay: true, resolution: UiResolution::Auto, resolution_offered: true,
         language: plx_platform::i18n::Preference::System,
         under_posters: plx_plex::plex::session::UnderPosters::DEFAULT, plaintext: Vec::new(),

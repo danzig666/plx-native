@@ -43,6 +43,7 @@
 use crate::tv::device::{Hardware, Info, NyxFile};
 
 pub mod jail_repair;
+pub mod hbc_install;
 pub mod caps;
 pub mod toast;
 #[cfg(all(not(feature = "hostsim"), not(test)))]
@@ -739,8 +740,8 @@ pub mod ls2 {
             error: *mut LSError,
         ) -> bool;
         /// `LSCall`: the call that keeps its token and delivers EVERY message the callee sends on
-        /// it. The URI transport's subscription needs that; every other caller wants one reply.
-        #[cfg(feature = "uri-transport")]
+        /// it. The URI transport's subscription and [`Registration::stream`] need that; every
+        /// other caller wants one reply.
         fn LSCall(
             handle: *mut c_void,
             uri: *const c_char,
@@ -789,6 +790,22 @@ pub mod ls2 {
             unsafe {
                 *(context as *mut Option<String>) =
                     Some(CStr::from_ptr(payload).to_string_lossy().into_owned());
+            }
+        }
+        true
+    }
+
+    /// [`Registration::stream`]'s reply sink: every message is appended to the heap queue the call
+    /// was given, in the order the bus dispatches them on this registration's own context.
+    extern "C" fn on_stream(_h: *mut c_void, message: *mut c_void, context: *mut c_void) -> bool {
+        if context.is_null() || message.is_null() {
+            return true;
+        }
+        let payload = unsafe { LSMessageGetPayload(message) };
+        if !payload.is_null() {
+            unsafe {
+                (*(context as *mut Vec<String>))
+                    .push(CStr::from_ptr(payload).to_string_lossy().into_owned());
             }
         }
         true
@@ -1078,6 +1095,77 @@ pub mod ls2 {
             }
             let reply = unsafe { Box::from_raw(slot) };
             reply.ok_or(Fail::Timeout)
+        }
+    }
+
+    impl Registration {
+        /// One call that keeps its token (`LSCall`) and hands EVERY reply to `on_reply`, in order,
+        /// on this thread, until `on_reply` returns `false` (it has its answer), `idle` passes
+        /// with no reply, or `total` passes; the call is then cancelled. Blocks for all of that:
+        /// a worker's call, never the frame thread's. `Ok` only when `on_reply` ended it.
+        ///
+        /// Cancelling stops the delivery; whether it stops the callee's work is the callee's
+        /// business. The reply queue is on the heap and is leaked if the cancel is refused, for
+        /// the reason [`Self::call`]'s slot is (a late dispatch into freed memory).
+        pub fn stream(
+            &self,
+            uri: &str,
+            payload: &str,
+            idle: Duration,
+            total: Duration,
+            on_reply: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<(), Fail> {
+            let _block = plx_base::task::assert_may_block(const { &plx_base::task::BlockingLabel::new("LS2 stream") });
+            let setup = |stage| Fail::Setup { stage, detail: String::new(), code: None };
+            let uri = CString::new(uri).map_err(|_| setup("uri"))?;
+            let payload = CString::new(payload).map_err(|_| setup("payload"))?;
+            let mut error: LSError = unsafe { std::mem::zeroed() };
+            unsafe { LSErrorInit(&mut error) };
+            let queue: *mut Vec<String> = Box::into_raw(Box::new(Vec::new()));
+            let mut token = 0;
+            let called = unsafe {
+                LSCall(self.handle, uri.as_ptr(), payload.as_ptr(), on_stream, queue as *mut c_void,
+                    &mut token, &mut error)
+            };
+            if !called {
+                let code = Some(error.error_code);
+                let detail = error_text(&error);
+                unsafe {
+                    LSErrorFree(&mut error);
+                    drop(Box::from_raw(queue));
+                }
+                return Err(Fail::Setup { stage: "call", detail, code });
+            }
+            let started = Instant::now();
+            let mut last = started;
+            let mut answered = false;
+            while !answered {
+                unsafe { g_main_context_iteration(self.context, 0) };
+                let replies = unsafe { std::mem::take(&mut *queue) };
+                if !replies.is_empty() {
+                    last = Instant::now();
+                }
+                answered = replies.iter().any(|reply| !on_reply(reply));
+                let now = Instant::now();
+                if answered || now.duration_since(last) >= idle || now.duration_since(started) >= total {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let mut owned = true;
+            if token != 0 {
+                reset(&mut error);
+                if !unsafe { LSCallCancel(self.handle, token, &mut error) } {
+                    plx_base::eventlog::log(&format!(
+                        "ls2: stream cancel refused — leaking its reply queue ({})", error_text(&error)));
+                    owned = false;
+                }
+            }
+            unsafe { LSErrorFree(&mut error) };
+            if owned {
+                unsafe { drop(Box::from_raw(queue)) };
+            }
+            if answered { Ok(()) } else { Err(Fail::Timeout) }
         }
     }
 

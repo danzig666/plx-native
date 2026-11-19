@@ -1347,6 +1347,7 @@ pub(crate) fn settings_boot_page(target: &str) -> Option<plx_screens::family::Se
         "player-hud" => SettingsPage::PlayerHud,
         "audio" => SettingsPage::AudioSubtitles,
         "diagnostics" => SettingsPage::Diagnostics,
+        "software-update" => SettingsPage::SoftwareUpdate,
         // Prints `overlay=legal`, the Legal index's word (a `DocumentPage` answers `word::LEGAL`), so no fps scene
         // selects on it.
         "about" => SettingsPage::About,

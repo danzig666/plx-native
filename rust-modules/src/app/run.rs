@@ -404,6 +404,7 @@ fn publish_frame(bridge: &mut super::bridge::Bridge, session: &plx_media::route:
 /// a bare units-per-second.
 fn clock_and_press(app: &mut App, fr: &mut Frame) {
     plx_platform::playback_trace::tick();
+    app.runtime.bridge(&mut app.bridge).update_tick();
     if let Some((to, status)) = app.runtime.bridge(&mut app.bridge).playback_trace_poll() {
         app.pages.emit(to, plx_machine::machine::Fx::Deliver(to,
             plx_machine::machine::Delivery::Screen(plx_ui::screen::ScreenEvent::App(

@@ -667,6 +667,8 @@ pub(crate) struct BridgeRetained {
     today: Option<[i32; 3]>,
     /// This frame's publication of the time of day — see `AppViews::wall`.
     wall: Option<plx_base::wallclock::WallTime>,
+    /// The fork's self-updater (`app::update`): Settings › Software update reads and drives it.
+    updater: super::update::Updater,
     /// **Is the hardware video plane bound?** `Player::video_plane_bound`, published here by the
     /// loop on its edges — the rig's own copy of the one bit, for the privileged call at draw
     /// entry (`clear_opaque_region`), which the `Rig` trait gives no argument.
@@ -995,6 +997,7 @@ impl BridgeRetained {
             playback_live: false,
             today: None,
             wall: None,
+            updater: super::update::Updater::live(),
             video_plane: false,
             measure: plx_ui::rec::Measurements::Live(measure),
             hubs: reads.hubs,
@@ -1376,6 +1379,16 @@ impl Bridge<'_> {
 
     /// Begin the player-HUD store with the compiled classic as what draws until a package lands, and read
     /// what is installed. Boot calls it once, outside any frame; a controlled run never does.
+    /// The self-updater's start-up check (a worker decides whether it is due).
+    pub(crate) fn update_start(&mut self) {
+        self.retained.updater.start();
+    }
+
+    /// One frame's look at the self-updater's workers. A page polls the state itself.
+    pub(crate) fn update_tick(&mut self) {
+        self.retained.updater.tick();
+    }
+
     pub(crate) fn huds_start(&mut self, classic: plx_appkit::player_hud::loaded::LoadedHud) {
         self.huds.start(classic, plx_plex::plex::identity::version());
         self.huds_refresh();
@@ -3464,6 +3477,10 @@ impl Bridge<'_> {
             InlineAppFx::PlaybackTrace(command) => {
                 let status = self.playback_trace_command(from, command);
                 out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::PlaybackTrace(status)))));
+            }
+            InlineAppFx::Update(command) => {
+                let status = self.retained.updater.command(command);
+                out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::Update(status)))));
             }
             InlineAppFx::Huds(command) => out.push(Fx::Deliver(MachineId::Huds, Delivery::Machine(AppMsg::Huds(command)))),
             InlineAppFx::Store(StoreId::Person, StoreCmd::Person(command)) => out.push(Fx::Deliver(

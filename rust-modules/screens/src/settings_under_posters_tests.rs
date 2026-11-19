@@ -715,6 +715,7 @@ fn the_root_row_opens_the_page() {
 fn text_fit_inputs() -> RootInputs {
     RootInputs {
         trace: plx_platform::playback_trace::Status::Off,
+        update_value: String::new(),
         signed_in: true, multi_user: false, library_count: 0,
         auto_sign_in: false, trailer_autoplay: true, resolution: UiResolution::Auto, resolution_offered: false,
         language: plx_platform::i18n::Preference::System,

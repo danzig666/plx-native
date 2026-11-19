@@ -2469,6 +2469,8 @@ pub(crate) unsafe fn construct(
     // **The HUD compiles here, at boot, outside any frame**, and the mounter is seeded with it (`run::boot_hud`;
     // a controlled run defers it to the first player frame).
     let hud = super::run::boot_hud(&mut bridge, controlled);
+    // The fork's self-updater: its start-up check, never in a controlled run (`app::update`).
+    if !controlled { bridge.update_start(); }
     // End the bootstrap capability before moving its physical owners into App.
     drop(bridge);
     let mut app = App {

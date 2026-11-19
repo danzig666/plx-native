@@ -508,6 +508,7 @@ fn mount_page(
         SettingsPage::Picker(kind) => Box::new(super::preferences::PickerPage::new(entry, kind, &cx.views.inputs)),
         SettingsPage::PlayerHud => Box::new(super::hud_settings::HudPage::new(entry)),
         SettingsPage::Diagnostics => Box::new(diagnostics::DiagnosticsPage::new(entry)),
+        SettingsPage::SoftwareUpdate => Box::new(update::UpdatePage::new(entry)),
         page @ (SettingsPage::HudGallery | SettingsPage::HudDetail(..) | SettingsPage::HudAbout(..) | SettingsPage::HudPreview(..)) =>
             Box::new(super::hud_settings::HudPage::at(entry, page)),
     }
@@ -733,6 +734,8 @@ impl<H: DirectoryLike> Machine<H> for RouteSurface {
             ScreenEvent::Timer(id) => self.step_top(ScreenEvent::Timer(*id), cx, fx),
             ScreenEvent::App(super::registry::AppMsg::PlaybackTrace(status)) => self.step_top(
                 ScreenEvent::App(super::registry::AppMsg::PlaybackTrace(*status)), cx, fx),
+            ScreenEvent::App(super::registry::AppMsg::Update(status)) => self.step_top(
+                ScreenEvent::App(super::registry::AppMsg::Update(status.clone())), cx, fx),
             ScreenEvent::StoreChanged(o, g) => {
                 for eid in self.inner.entries.iter().map(|e| e.id).collect::<Vec<_>>() {
                     self.deliver(eid, ScreenEvent::StoreChanged(*o, *g), cx, fx);
@@ -1096,6 +1099,8 @@ enum RootId {
     /// The single Diagnostics row (Settings v2): its value reads Off or On and it opens the page
     /// that holds the trace rows.
     Diagnostics,
+    /// This fork's Software update row: its value names a newer version when one is known.
+    SoftwareUpdate,
     Legal,
     About,
 }
@@ -1118,6 +1123,7 @@ impl FormId for RootId {
             RootId::Resolution => 10,
             RootId::UnderPosters => 11,
             RootId::Diagnostics => 12,
+            RootId::SoftwareUpdate => 13,
             // the base; `root_form` adds the position (`item_keyed`)
             RootId::Plaintext(_) => PLAINTEXT_KEY_BASE,
         })
@@ -1136,6 +1142,7 @@ impl FormId for RootId {
             RootId::Plaintext(_) => return None,
             RootId::Privacy => "privacy",
             RootId::Diagnostics => "diagnostics",
+            RootId::SoftwareUpdate => "software_update",
             RootId::Legal => "legal",
             RootId::About => "about",
         })
@@ -1202,6 +1209,8 @@ struct RootState {
     /// one, so every other root's digest is unchanged.
     plaintext: Vec<bool>,
     trace: plx_platform::playback_trace::Status,
+    /// The self-updater's state, as the runner last answered it.
+    update: crate::registry::UpdateStatus,
 }
 
 impl LogicalState for RootState {
@@ -1211,6 +1220,9 @@ impl LogicalState for RootState {
             w.u32(u32::from(self.under_posters.pack()));
         }
         if self.trace != plx_platform::playback_trace::Status::Off { w.u8(0xd1).u8(self.trace as u8); }
+        // Only while the row shows something, so every other root's digest is unchanged.
+        let update = update::root_value(&self.update);
+        if !update.is_empty() { w.u8(0xd2).str(&update); }
         if !self.plaintext.is_empty() {
             w.u32(self.plaintext.len() as u32);
             for &on in &self.plaintext {
@@ -1250,6 +1262,8 @@ struct PlaintextRowInput {
 /// can drive it directly with a synthesized combination no real session may currently be in.
 struct RootInputs {
     trace: plx_platform::playback_trace::Status,
+    /// The Software update row's value ([`update::root_value`]): empty unless a newer version is known.
+    update_value: String,
     signed_in: bool,
     /// A one-person account already skips the profile picker; only a multi-user account is ever
     /// shown the Automatically Sign In switch.
@@ -1306,6 +1320,7 @@ fn sentence_for(id: Option<&RootId>) -> Cow<'static, str> {
         Some(RootId::Resolution) => Cow::Borrowed(msg::settings_resolution_detail()),
         Some(RootId::Privacy) => Cow::Borrowed(msg::settings_privacy_detail()),
         Some(RootId::Diagnostics) => Cow::Borrowed(msg::settings_diagnostics_detail()),
+        Some(RootId::SoftwareUpdate) => Cow::Borrowed(msg::settings_update_root_detail()),
         Some(RootId::Legal) => Cow::Borrowed(msg::settings_legal_detail()),
         Some(RootId::About) => Cow::Borrowed(msg::settings_about_detail()),
         Some(RootId::Plaintext(_)) | None => Cow::Borrowed(msg::settings_root_copy()),
@@ -1317,7 +1332,7 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
     // Order (Settings v2): Libraries (Favorite libraries, Under posters), Playback (Video &
     // playback, Audio & subtitles), System (Language, Automatically Sign In, Play trailers
     // automatically, Interface resolution on webOS 1-3), Unencrypted connections, then Support
-    // (Privacy & data, Diagnostics, Legal notices, About PlxNative). A row is its label and a value,
+    // (Privacy & data, Diagnostics, this fork's Software update, Legal notices, About PlxNative). A row is its label and a value,
     // a switch or a chevron: its sentence is [`sentence_for`]'s.
     //
     // The Libraries section is Libraries and the row is Favorite libraries: the switch governs
@@ -1426,6 +1441,14 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
                 .chevron(true),
         )
         .item(
+            RootId::SoftwareUpdate,
+            RowKind::Nav(SettingsPage::SoftwareUpdate),
+            Action::Door,
+            Row::new(plx_platform::i18n::msg::settings_update_title())
+                .value(inputs.update_value.clone())
+                .chevron(true),
+        )
+        .item(
             RootId::Legal,
             RowKind::Nav(SettingsPage::Legal),
             Action::Door,
@@ -1471,6 +1494,7 @@ impl RootPage {
                 under_posters: plx_plex::plex::session::UnderPosters::DEFAULT,
                 plaintext: Vec::new(),
                 trace: plx_platform::playback_trace::Status::Off,
+                update: update::unknown(),
             },
         };
         s.rebuild(directory);
@@ -1505,6 +1529,7 @@ impl RootPage {
         let plaintext = if signed_in { self.plaintext_inputs() } else { Vec::new() };
         let form = root_form(&RootInputs {
             trace: self.state.trace,
+            update_value: update::root_value(&self.state.update),
             signed_in, multi_user, library_count: directory.pinned_count() as i64,
             auto_sign_in, trailer_autoplay, resolution, resolution_offered, language: self.state.language,
             under_posters: self.state.under_posters, plaintext,
@@ -1681,8 +1706,17 @@ impl Machine<InnerHost> for RootPage {
             ScreenEvent::Enter(_) => {
                 // Read diagnostic status through the runner, never through a global in the screen.
                 fx.push(Fx::App(AppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status)));
+                fx.push(Fx::App(AppFx::Update(crate::registry::UpdateCmd::Status)));
                 // a return from a child: the favourite count may have changed
                 self.rebuild(cx.views.directory);
+                Handled::Yes
+            }
+            ScreenEvent::App(super::registry::AppMsg::Update(status)) => {
+                if self.state.update != *status {
+                    self.state.update = status.clone();
+                    self.rebuild(cx.views.directory);
+                    fx.invalidate(Provenance::Landing(MachineId::Session));
+                }
                 Handled::Yes
             }
             ScreenEvent::App(super::registry::AppMsg::PlaybackTrace(status)) => {
@@ -1908,6 +1942,8 @@ impl Screen<InnerHost> for RootPage {
 mod under_posters;
 #[path = "settings_diagnostics.rs"]
 mod diagnostics;
+#[path = "settings_update.rs"]
+mod update;
 #[cfg(test)]
 #[path = "settings_v2_tests.rs"]
 mod v2_tests;
