@@ -796,7 +796,7 @@ impl BridgeRetained {
             section_hubs: self.section_hubs.view(), search: self.search.view(),
             metadata: stores.metadata_view(), person: stores.person_view(), collection: stores.collection_view(),
             subtitle_search: stores.subtitle_search_view(), session: &self.playback,
-            transport_paused: self.transport_paused, today: self.today, beneath: None }
+            transport_paused: self.transport_paused, today: self.today, wall: self.wall, beneath: None }
     }
 
     /// A Bridge booted from a controlled Home. It always runs the `Live` store runner, whatever
