@@ -3,11 +3,11 @@
 //!
 //! Two rows: *Check for updates*, whose value says what the last check found, and *Install
 //! {version}*, present once a check has found a newer release, whose value follows the install.
-//! While either runs the section is disabled, and the page asks for the state every tick.
+//! While either runs, and once an install has gone quiet, the section is disabled.
 //!
-//! Like every page of the family it states no IO: a press leaves as an [`AppFx::Update`] and the
-//! state returns as an addressed `AppMsg::Update` (the application's `app::update` owns the check,
-//! the install and the version).
+//! Like every page of the family it states no IO: a press leaves as an [`AppFx::Update`], and the
+//! state is each frame's publication (`InnerViews::update`, from the application's `app::update`,
+//! which owns the check, the install and the version), compared at the head of every step.
 
 use super::*;
 use crate::registry::{UpdateCmd, UpdatePhase, UpdateStatus};
@@ -63,6 +63,7 @@ fn install_value(phase: UpdatePhase) -> String {
         UpdatePhase::Installed => msg::settings_update_installed().to_owned(),
         UpdatePhase::NoHomebrewChannel => msg::settings_update_needs_hbc().to_owned(),
         UpdatePhase::InstallFailed => msg::settings_update_install_failed().to_owned(),
+        UpdatePhase::Unconfirmed => msg::settings_update_unconfirmed().to_owned(),
         UpdatePhase::Unavailable | UpdatePhase::Idle | UpdatePhase::Checking | UpdatePhase::UpToDate
         | UpdatePhase::CheckFailed | UpdatePhase::Available => String::new(),
     }
@@ -72,10 +73,11 @@ fn install_value(phase: UpdatePhase) -> String {
 pub(super) fn update_form(status: &UpdateStatus) -> Form<UpdateId, UpdateAction, SettingsPage> {
     use plx_platform::i18n::msg;
     let installing = matches!(status.phase, UpdatePhase::Downloading(_) | UpdatePhase::Verifying
-        | UpdatePhase::Installing | UpdatePhase::Installed | UpdatePhase::NoHomebrewChannel | UpdatePhase::InstallFailed);
+        | UpdatePhase::Installing | UpdatePhase::Installed | UpdatePhase::NoHomebrewChannel | UpdatePhase::InstallFailed
+        | UpdatePhase::Unconfirmed);
     let latest = status.latest.as_deref().filter(|_| status.phase != UpdatePhase::Unavailable);
     let section = FormSection::new("")
-        .disabled(status.phase.busy() || status.phase == UpdatePhase::Unavailable)
+        .disabled(status.phase.busy() || matches!(status.phase, UpdatePhase::Unavailable | UpdatePhase::Unconfirmed))
         .item(UpdateId::Check, RowKind::Button, UpdateAction::Check,
             Row::new(msg::settings_update_check()).value(if installing { String::new() } else { check_value(status) }))
         .item_if(latest.is_some(), UpdateId::Install, RowKind::Button, UpdateAction::Install,
@@ -91,9 +93,9 @@ pub(super) fn root_value(status: &UpdateStatus) -> String {
     }
 }
 
-/// The updater's state before the first answer: nothing known.
+/// The updater's state before the first publication: nothing known.
 pub(super) fn unknown() -> UpdateStatus {
-    UpdateStatus { phase: UpdatePhase::Idle, current: String::new(), latest: None }
+    UpdateStatus::UNKNOWN
 }
 
 pub(super) struct UpdatePage {
@@ -124,10 +126,6 @@ impl LogicalState for UpdateState {
 }
 
 impl UpdatePage {
-    pub(super) fn new(entry: EntryId) -> Self {
-        Self::at(entry, unknown())
-    }
-
     /// The page as it stands once the runner has answered `status`: the table the fit tests grade
     /// in every state, the one a viewer sees.
     pub(super) fn at(entry: EntryId, status: UpdateStatus) -> Self {
@@ -169,6 +167,11 @@ impl UpdatePage {
 impl Machine<InnerHost> for UpdatePage {
     type Ev = ScreenEvent<InnerHost>;
     fn step(&mut self, ev: &Self::Ev, cx: &Cx<'_, InnerHost>, fx: &mut Effects<'_, InnerHost>) -> Handled {
+        if self.state.status != *cx.views.update {
+            self.state.status = cx.views.update.clone();
+            self.rebuild();
+            fx.invalidate(Provenance::Landing(MachineId::Session));
+        }
         match ev {
             ScreenEvent::Mount => {
                 fx.push(Fx::Deliver(
@@ -177,22 +180,9 @@ impl Machine<InnerHost> for UpdatePage {
                         focus: FocusTarget::Elem(FocusKey { entry: self.entry, elem: self.state.sel.0 }),
                     })),
                 ));
-                // Read the state through the runner, never through a global in the screen.
-                fx.push(Fx::App(AppFx::Update(UpdateCmd::Status)));
-                Handled::Yes
-            }
-            ScreenEvent::App(super::super::registry::AppMsg::Update(status)) => {
-                if self.state.status != *status {
-                    self.state.status = status.clone();
-                    self.rebuild();
-                    fx.invalidate(Provenance::Landing(MachineId::Session));
-                }
                 Handled::Yes
             }
             ScreenEvent::Tick(t) => {
-                if self.state.status.phase.busy() {
-                    fx.push(Fx::App(AppFx::Update(UpdateCmd::Status)));
-                }
                 self.form.table.update(t.dt(), RouteLayout::screen().sectioned_table().h);
                 Handled::Yes
             }

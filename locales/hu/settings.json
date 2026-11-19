@@ -420,5 +420,6 @@
   "settings.update.needs_hbc": "Homebrew Channel szükséges",
   "settings.update.install_failed": "Nem sikerült telepíteni",
   "settings.update.unavailable": "Ebben a buildben nincs",
-  "settings.update.toast": "Elérhető a PlxNative {version}. Telepítse a Beállítások › Szoftverfrissítés oldalon."
+  "settings.update.toast": "Elérhető a PlxNative {version}. Telepítse a Beállítások › Szoftverfrissítés oldalon.",
+  "settings.update.unconfirmed": "Lehet, hogy még települ"
 }

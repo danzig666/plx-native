@@ -508,7 +508,7 @@ fn mount_page(
         SettingsPage::Picker(kind) => Box::new(super::preferences::PickerPage::new(entry, kind, &cx.views.inputs)),
         SettingsPage::PlayerHud => Box::new(super::hud_settings::HudPage::new(entry)),
         SettingsPage::Diagnostics => Box::new(diagnostics::DiagnosticsPage::new(entry)),
-        SettingsPage::SoftwareUpdate => Box::new(update::UpdatePage::new(entry)),
+        SettingsPage::SoftwareUpdate => Box::new(update::UpdatePage::at(entry, cx.views.update.clone())),
         page @ (SettingsPage::HudGallery | SettingsPage::HudDetail(..) | SettingsPage::HudAbout(..) | SettingsPage::HudPreview(..)) =>
             Box::new(super::hud_settings::HudPage::at(entry, page)),
     }
@@ -734,8 +734,6 @@ impl<H: DirectoryLike> Machine<H> for RouteSurface {
             ScreenEvent::Timer(id) => self.step_top(ScreenEvent::Timer(*id), cx, fx),
             ScreenEvent::App(super::registry::AppMsg::PlaybackTrace(status)) => self.step_top(
                 ScreenEvent::App(super::registry::AppMsg::PlaybackTrace(*status)), cx, fx),
-            ScreenEvent::App(super::registry::AppMsg::Update(status)) => self.step_top(
-                ScreenEvent::App(super::registry::AppMsg::Update(status.clone())), cx, fx),
             ScreenEvent::StoreChanged(o, g) => {
                 for eid in self.inner.entries.iter().map(|e| e.id).collect::<Vec<_>>() {
                     self.deliver(eid, ScreenEvent::StoreChanged(*o, *g), cx, fx);
@@ -1694,6 +1692,13 @@ impl Machine<InnerHost> for RootPage {
         fx: &mut Effects<'_, InnerHost>,
     ) -> Handled {
         self.inputs = cx.views.inputs.clone();
+        // The self-updater's publication, compared at the head of every step (the root reads it and
+        // asks nothing): a version found while Settings is open shows at once.
+        if self.state.update != *cx.views.update {
+            self.state.update = cx.views.update.clone();
+            self.rebuild(cx.views.directory);
+            fx.invalidate(Provenance::Landing(MachineId::Session));
+        }
         match self.alert.step(ev, cx) {
             AlertStep::Pass => {}
             AlertStep::Done(handled) => return handled,
@@ -1706,17 +1711,8 @@ impl Machine<InnerHost> for RootPage {
             ScreenEvent::Enter(_) => {
                 // Read diagnostic status through the runner, never through a global in the screen.
                 fx.push(Fx::App(AppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status)));
-                fx.push(Fx::App(AppFx::Update(crate::registry::UpdateCmd::Status)));
                 // a return from a child: the favourite count may have changed
                 self.rebuild(cx.views.directory);
-                Handled::Yes
-            }
-            ScreenEvent::App(super::registry::AppMsg::Update(status)) => {
-                if self.state.update != *status {
-                    self.state.update = status.clone();
-                    self.rebuild(cx.views.directory);
-                    fx.invalidate(Provenance::Landing(MachineId::Session));
-                }
                 Handled::Yes
             }
             ScreenEvent::App(super::registry::AppMsg::PlaybackTrace(status)) => {

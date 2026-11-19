@@ -16,7 +16,8 @@
 //! available.
 //!
 //! Every request runs on a worker; the frame loop only drains their answers ([`Updater::tick`]),
-//! and a page reads the state through an addressed answer, never this module.
+//! and the Bridge publishes the state with each frame's views (`AppViews::update`), which the pages
+//! read; they ask nothing, so a recording of Settings holds no effect of this module's.
 
 use plx_screens::registry::{UpdateCmd, UpdatePhase, UpdateStatus};
 use std::sync::mpsc;
@@ -27,7 +28,7 @@ pub(crate) const FEED: &str = "https://raw.githubusercontent.com/danzig666/plx-n
 const MAX_FEED_BYTES: usize = 64 * 1024;
 /// A start-up check runs when the last one is at least this old.
 const AUTO_EVERY_SECS: u64 = 20 * 3600;
-/// The stamp of the last completed check, in Unix seconds.
+/// The stamp of the last check that read the feed, in Unix seconds.
 const STAMP: &str = "plxnative-update-checked";
 
 /// A release the feed names.
@@ -58,44 +59,59 @@ pub(crate) struct Updater {
     rx: mpsc::Receiver<Msg>,
     /// A start-up check found a newer version: the toast is owed once.
     tell: Option<String>,
+    /// The state as the frames publish it, rebuilt after every change ([`Self::view`]).
+    view: UpdateStatus,
 }
 
 impl Updater {
     pub(crate) fn new(enabled: bool, current: &'static str) -> Self {
         let (tx, rx) = mpsc::channel();
         let phase = if enabled { UpdatePhase::Idle } else { UpdatePhase::Unavailable };
-        Self { enabled, current, phase, found: None, tx, rx, tell: None }
+        let mut updater = Self { enabled, current, phase, found: None, tx, rx, tell: None,
+            view: UpdateStatus::UNKNOWN };
+        updater.publish();
+        updater
     }
 
-    /// The updater of this process: the stable package, on a television build.
-    pub(crate) fn live() -> Self {
-        let on_tv = !cfg!(any(feature = "hostsim", test));
-        Self::new(on_tv && plx_base::paths::app_id() == plx_base::paths::STABLE_APP_ID,
+    /// The updater of a live run (`live` is the Bridge's own live-or-controlled answer): the stable
+    /// package updates itself; a development flavour, a controlled run and a test host do not.
+    pub(crate) fn for_run(live: bool) -> Self {
+        Self::new(live && plx_base::paths::app_id() == plx_base::paths::STABLE_APP_ID,
             plx_plex::plex::identity::version())
     }
 
-    pub(crate) fn status(&self) -> UpdateStatus {
-        UpdateStatus {
+    /// The state this frame publishes.
+    pub(crate) fn view(&self) -> &UpdateStatus {
+        &self.view
+    }
+
+    fn publish(&mut self) {
+        self.view = UpdateStatus {
             phase: self.phase,
             current: self.current.to_owned(),
             latest: self.found.as_ref().map(|r| r.version.clone()),
-        }
+        };
     }
 
-    /// A page's command, answered with the state it leaves.
-    pub(crate) fn command(&mut self, cmd: UpdateCmd) -> UpdateStatus {
+    #[cfg(test)]
+    fn status(&self) -> UpdateStatus {
+        self.view.clone()
+    }
+
+    /// A page's command. The state it leaves is published at once ([`Self::view`]).
+    pub(crate) fn command(&mut self, cmd: UpdateCmd) {
         match cmd {
-            UpdateCmd::Status => {}
             UpdateCmd::Check => self.check(false),
             UpdateCmd::Install => self.install(),
         }
-        self.status()
+        self.publish();
     }
 
     /// The start-up check, when the last one is old enough (decided on the worker, which reads the
     /// stamp).
     pub(crate) fn start(&mut self) {
         self.check(true);
+        self.publish();
     }
 
     fn check(&mut self, auto: bool) {
@@ -113,7 +129,11 @@ impl Updater {
                 Msg::NotDue
             } else {
                 let found = fetch();
-                let _ = std::fs::write(&stamp, now.to_string());
+                // Only a check that read the feed holds the next start-up check off: one made
+                // before the network was up is tried again at the next start.
+                if found.is_ok() {
+                    let _ = std::fs::write(&stamp, now.to_string());
+                }
                 match &found {
                     Ok(release) => plx_base::eventlog::log(&format!(
                         "update: the feed names {} (this build {current})", release.version)),
@@ -131,7 +151,7 @@ impl Updater {
 
     fn install(&mut self) {
         let Some(release) = self.found.clone() else { return };
-        if !self.enabled || self.phase.busy() || self.phase == UpdatePhase::Installed {
+        if !self.enabled || self.phase.busy() || matches!(self.phase, UpdatePhase::Installed | UpdatePhase::Unconfirmed) {
             return;
         }
         self.phase = UpdatePhase::Downloading(None);
@@ -155,6 +175,9 @@ impl Updater {
         while let Ok(msg) = self.rx.try_recv() {
             moved = true;
             self.land(msg);
+        }
+        if moved {
+            self.publish();
         }
         if let Some(version) = self.tell.take() {
             let message = plx_platform::i18n::msg::settings_update_toast(&version);
@@ -188,7 +211,8 @@ impl Updater {
             }
             Msg::Install(step) => {
                 // A late answer never turns an ended install back into progress.
-                if matches!(self.phase, UpdatePhase::Installed | UpdatePhase::InstallFailed | UpdatePhase::NoHomebrewChannel) {
+                if matches!(self.phase, UpdatePhase::Installed | UpdatePhase::InstallFailed
+                    | UpdatePhase::NoHomebrewChannel | UpdatePhase::Unconfirmed) {
                     return;
                 }
                 self.phase = match step {
@@ -200,7 +224,8 @@ impl Updater {
                         plx_base::eventlog::log(&format!("update: install failed: {failure:?}"));
                         match failure {
                             Failure::NoHomebrewChannel => UpdatePhase::NoHomebrewChannel,
-                            Failure::Refused(_) | Failure::NoAnswer | Failure::Unsupported => UpdatePhase::InstallFailed,
+                            Failure::NoAnswer => UpdatePhase::Unconfirmed,
+                            Failure::Refused(_) | Failure::NotSent | Failure::Unsupported => UpdatePhase::InstallFailed,
                         }
                     }
                 };
@@ -298,6 +323,12 @@ mod tests {
         assert!(due(Some(5_000), 1_000), "a stamp from the future holds nothing off");
     }
 
+    /// Land one answer as `tick` does, and publish.
+    fn landed(u: &mut Updater, msg: Msg) {
+        u.land(msg);
+        u.publish();
+    }
+
     fn rig() -> Updater {
         Updater::new(true, "0.10.24")
     }
@@ -310,26 +341,26 @@ mod tests {
     fn a_newer_release_is_offered_and_a_start_up_find_is_told_once() {
         let mut u = rig();
         u.phase = UpdatePhase::Checking;
-        u.land(Msg::Checked { found: Ok(release("0.10.25")), auto: true });
+        landed(&mut u, Msg::Checked { found: Ok(release("0.10.25")), auto: true });
         let s = u.status();
         assert_eq!((s.phase, s.latest.as_deref(), s.current.as_str()), (UpdatePhase::Available, Some("0.10.25"), "0.10.24"));
         assert_eq!(u.tell.as_deref(), Some("0.10.25"), "the toast is owed");
         let mut v = rig();
-        v.land(Msg::Checked { found: Ok(release("0.10.25")), auto: false });
+        landed(&mut v, Msg::Checked { found: Ok(release("0.10.25")), auto: false });
         assert!(v.tell.is_none(), "a check the viewer asked for is answered on the page, not by a toast");
     }
 
     #[test]
     fn the_same_or_an_older_release_is_up_to_date_and_a_failed_check_keeps_a_known_find() {
         let mut u = rig();
-        u.land(Msg::Checked { found: Ok(release("0.10.24")), auto: false });
+        landed(&mut u, Msg::Checked { found: Ok(release("0.10.24")), auto: false });
         assert_eq!(u.status().phase, UpdatePhase::UpToDate);
-        u.land(Msg::Checked { found: Err("offline".into()), auto: false });
+        landed(&mut u, Msg::Checked { found: Err("offline".into()), auto: false });
         assert_eq!(u.status().phase, UpdatePhase::CheckFailed);
-        u.land(Msg::Checked { found: Ok(release("0.10.26")), auto: false });
-        u.land(Msg::Checked { found: Err("offline".into()), auto: false });
+        landed(&mut u, Msg::Checked { found: Ok(release("0.10.26")), auto: false });
+        landed(&mut u, Msg::Checked { found: Err("offline".into()), auto: false });
         assert_eq!((u.status().phase, u.status().latest.as_deref()), (UpdatePhase::Available, Some("0.10.26")));
-        u.land(Msg::NotDue);
+        landed(&mut u, Msg::NotDue);
         assert_eq!(u.status().phase, UpdatePhase::Idle);
     }
 
@@ -339,32 +370,53 @@ mod tests {
         let mut u = rig();
         u.found = Some(release("0.10.25"));
         u.phase = UpdatePhase::Downloading(None);
-        u.land(Msg::Install(Progress::Downloading(Some(41))));
+        landed(&mut u, Msg::Install(Progress::Downloading(Some(41))));
         assert_eq!(u.status().phase, UpdatePhase::Downloading(Some(41)));
-        u.land(Msg::Install(Progress::Verifying));
-        u.land(Msg::Install(Progress::Installing));
+        landed(&mut u, Msg::Install(Progress::Verifying));
+        landed(&mut u, Msg::Install(Progress::Installing));
         assert_eq!(u.status().phase, UpdatePhase::Installing);
-        u.land(Msg::Install(Progress::Failed(Failure::Refused("Invalid file checksum".into()))));
+        landed(&mut u, Msg::Install(Progress::Failed(Failure::Refused("Invalid file checksum".into()))));
         assert_eq!(u.status().phase, UpdatePhase::InstallFailed);
-        u.land(Msg::Install(Progress::Downloading(Some(90))));
+        landed(&mut u, Msg::Install(Progress::Downloading(Some(90))));
         assert_eq!(u.status().phase, UpdatePhase::InstallFailed, "a late answer stays out");
         let mut v = rig();
         v.found = Some(release("0.10.25"));
-        v.land(Msg::Install(Progress::Failed(Failure::NoHomebrewChannel)));
+        landed(&mut v, Msg::Install(Progress::Failed(Failure::NoHomebrewChannel)));
         assert_eq!(v.status().phase, UpdatePhase::NoHomebrewChannel);
+    }
+
+    /// Homebrew Channel's cancel does nothing, so an install that went quiet may still be running:
+    /// it is not offered again in this run. One that was never sent can be tried again.
+    #[test]
+    fn a_silent_install_is_never_started_twice_and_an_unsent_one_can_be_retried() {
+        use plx_platform::tv::update::{Failure, Progress};
+        let mut u = rig();
+        u.found = Some(release("0.10.25"));
+        landed(&mut u, Msg::Install(Progress::Downloading(Some(10))));
+        landed(&mut u, Msg::Install(Progress::Failed(Failure::NoAnswer)));
+        assert_eq!(u.view().phase, UpdatePhase::Unconfirmed);
+        u.command(UpdateCmd::Install);
+        assert_eq!(u.view().phase, UpdatePhase::Unconfirmed, "no second install");
+        let mut v = rig();
+        v.found = Some(release("0.10.25"));
+        landed(&mut v, Msg::Install(Progress::Failed(Failure::NotSent)));
+        assert_eq!(v.view().phase, UpdatePhase::InstallFailed, "nothing was handed over: Install is offered again");
     }
 
     #[test]
     fn a_development_install_has_no_updater_and_asks_nothing() {
         let mut u = Updater::new(false, "0.11.0-dev");
-        assert_eq!(u.command(UpdateCmd::Check).phase, UpdatePhase::Unavailable);
-        assert_eq!(u.command(UpdateCmd::Install).phase, UpdatePhase::Unavailable);
+        u.command(UpdateCmd::Check);
+        assert_eq!(u.view().phase, UpdatePhase::Unavailable);
+        u.command(UpdateCmd::Install);
+        assert_eq!(u.view().phase, UpdatePhase::Unavailable);
         assert!(!u.tick());
     }
 
     #[test]
     fn install_without_a_find_does_nothing() {
         let mut u = rig();
-        assert_eq!(u.command(UpdateCmd::Install).phase, UpdatePhase::Idle);
+        u.command(UpdateCmd::Install);
+        assert_eq!(u.view().phase, UpdatePhase::Idle);
     }
 }

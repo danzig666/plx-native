@@ -70,7 +70,8 @@ fn every_settings_row_fits_its_column_in_every_language() {
             for phase in [UpdatePhase::Unavailable, UpdatePhase::Idle, UpdatePhase::Checking, UpdatePhase::UpToDate,
                 UpdatePhase::CheckFailed, UpdatePhase::Available, UpdatePhase::Downloading(None),
                 UpdatePhase::Downloading(Some(100)), UpdatePhase::Verifying, UpdatePhase::Installing,
-                UpdatePhase::Installed, UpdatePhase::NoHomebrewChannel, UpdatePhase::InstallFailed] {
+                UpdatePhase::Installed, UpdatePhase::NoHomebrewChannel, UpdatePhase::InstallFailed,
+                UpdatePhase::Unconfirmed] {
                 let status = UpdateStatus { phase, current: "0.10.124".into(), latest: Some("0.10.125".into()) };
                 let page = update::UpdatePage::at(EntryId(0), status);
                 overflowing(&format!("{tag} software update page {phase:?}"), &page.form.table, &mut out);

@@ -426,5 +426,6 @@
   "settings.update.needs_hbc": "Wymaga Homebrew Channel",
   "settings.update.install_failed": "Nie udało się zainstalować",
   "settings.update.unavailable": "Brak w tej wersji",
-  "settings.update.toast": "Dostępna jest wersja PlxNative {version}. Zainstaluj ją w Ustawieniach › Aktualizacja oprogramowania."
+  "settings.update.toast": "Dostępna jest wersja PlxNative {version}. Zainstaluj ją w Ustawieniach › Aktualizacja oprogramowania.",
+  "settings.update.unconfirmed": "Może się jeszcze instalować"
 }

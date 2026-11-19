@@ -52,15 +52,13 @@ pub mod captions;
 /// `app::update` owns the check and the install; a page states no IO and reads the answer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UpdateCmd {
-    /// Answer with the state as it stands.
-    Status,
     /// Read the fork's release feed now.
     Check,
     /// Hand the newer release the last check found to Homebrew Channel.
     Install,
 }
 
-/// The updater's state, the answer to every [`UpdateCmd`].
+/// The updater's state as each frame publishes it ([`LibraryLike::update_status`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct UpdateStatus {
     pub phase: UpdatePhase,
@@ -90,7 +88,18 @@ pub enum UpdatePhase {
     Installed,
     NoHomebrewChannel,
     InstallFailed,
+    /// Homebrew Channel went quiet mid-install. Its install may still be finishing (its cancel does
+    /// nothing), so a second one is not offered in this run.
+    Unconfirmed,
 }
+
+impl UpdateStatus {
+    /// Nothing known: what a host with no updater publishes.
+    pub const UNKNOWN: UpdateStatus = UpdateStatus { phase: UpdatePhase::Idle, current: String::new(), latest: None };
+}
+
+/// [`UpdateStatus::UNKNOWN`] as a place a view can borrow for the whole program.
+pub static UPDATE_UNKNOWN: UpdateStatus = UpdateStatus::UNKNOWN;
 
 impl UpdatePhase {
     /// A check or an install is under way: a second one is not started, and the page polls.
@@ -113,6 +122,7 @@ impl UpdatePhase {
             UpdatePhase::Installed => 9,
             UpdatePhase::NoHomebrewChannel => 10,
             UpdatePhase::InstallFailed => 11,
+            UpdatePhase::Unconfirmed => 12,
         }
     }
 }
@@ -125,7 +135,8 @@ pub enum AppFx {
     Preferences(PreferenceCmd),
     /// Local firmware logging; the runner answers this surface through an addressed event.
     PlaybackTrace(plx_platform::playback_trace::Command),
-    /// The fork's self-updater; the runner answers through an addressed `AppMsg::Update`.
+    /// The fork's self-updater's command; its state reaches pages as each frame's publication
+    /// ([`LibraryLike::update_status`]), so nothing is answered.
     Update(UpdateCmd),
     /// A store command, executed as a `Deliver` to the store machine in the same drain.
     Store(StoreId, StoreCmd),
@@ -1557,6 +1568,8 @@ pub trait SearchLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
 pub trait LibraryLike: AppLike<Memory = PageMemory> + ScreenInputsLike + Sized {
     fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts>;
     fn marker_prefs(_cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { Default::default() }
+    /// This frame's publication of the fork's self-updater (Settings › Software update reads it).
+    fn update_status<'a>(_cx: &Cx<'a, Self>) -> &'a UpdateStatus { &UPDATE_UNKNOWN }
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a>;
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
     fn section_hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::HubsView<'a>;
@@ -1600,11 +1613,13 @@ pub struct Forbidden;
 /// one publication so its Onboard child never falls back to the compatibility selector.
 pub trait DirectoryLike: AppLike + ScreenInputsLike + Sized {
     fn marker_prefs(_cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { Default::default() }
+    fn update_status<'a>(_cx: &Cx<'a, Self>) -> &'a UpdateStatus { &UPDATE_UNKNOWN }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
 }
 
 impl<H: LibraryLike> DirectoryLike for H {
     fn marker_prefs(cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { LibraryLike::marker_prefs(cx) }
+    fn update_status<'a>(cx: &Cx<'a, Self>) -> &'a UpdateStatus { LibraryLike::update_status(cx) }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a> {
         LibraryLike::directory(cx)
     }
@@ -1654,8 +1669,6 @@ pub enum AppMsg {
     PlayerPresented { watch: Option<plx_appkit::skip_policy::OfferId>, paired: bool },
     AutoSkipResolved { id: plx_appkit::skip_policy::OfferId, outcome: plx_appkit::skip_policy::OfferOutcome },
     PlaybackTrace(plx_platform::playback_trace::Status),
-    /// The fork's self-updater's state, the answer to an `AppFx::Update`.
-    Update(UpdateStatus),
     Session(plx_session::auth::owner::SessionEvent),
     Consent(ConsentCmd),
     /// A command of the player-HUD package store, delivered to [`MachineId::Huds`].

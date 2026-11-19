@@ -57,7 +57,10 @@ pub enum Failure {
     /// The service refused, in its own words (a download error, `Invalid file checksum (…)`, an
     /// installer error).
     Refused(String),
-    /// The call could not be made, or the service went quiet before it finished.
+    /// The call was never sent (no bus): nothing was handed over, so it can be tried again.
+    NotSent,
+    /// The service went quiet before it finished. Its install may still be running (its cancel
+    /// does nothing), so it is not offered again in this run.
     NoAnswer,
     /// Not on a TV.
     Unsupported,
@@ -124,7 +127,8 @@ pub fn install(ipk_url: &str, sha256: &str, app_id: &str, report: &mut dyn FnMut
     }
     report(Progress::Failed(match result {
         Err(PortFail::Unsupported) => Failure::Unsupported,
-        Err(PortFail::NoBus | PortFail::Silent) | Ok(()) => Failure::NoAnswer,
+        Err(PortFail::NoBus) => Failure::NotSent,
+        Err(PortFail::Silent) | Ok(()) => Failure::NoAnswer,
     }));
 }
 

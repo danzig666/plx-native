@@ -1738,5 +1738,9 @@
     "value": "PlxNative {version} is available. Install it in Settings › Software update.",
     "args": {"version": "str"},
     "description": "The TV's own notification, raised once when the start-up check finds a newer release. {version} is its version number, such as 0.10.25. 'Settings' and 'Software update' are the names of those pages."
+  },
+  "settings.update.unconfirmed": {
+    "value": "May still be installing",
+    "description": "Settings › Software update: a row value when Homebrew Channel stopped reporting mid-install; its install may still be finishing, so Install is not offered again until PlxNative restarts."
   }
 }

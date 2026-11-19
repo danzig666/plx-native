@@ -423,5 +423,6 @@
   "settings.update.needs_hbc": "Cal Homebrew Channel",
   "settings.update.install_failed": "No s’ha pogut instal·lar",
   "settings.update.unavailable": "No en aquesta versió",
-  "settings.update.toast": "PlxNative {version} està disponible. Instal·la-la a Configuració › Actualització de programari."
+  "settings.update.toast": "PlxNative {version} està disponible. Instal·la-la a Configuració › Actualització de programari.",
+  "settings.update.unconfirmed": "Potser encara s’està instal·lant"
 }

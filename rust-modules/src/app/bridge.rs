@@ -204,6 +204,9 @@ pub(crate) struct AppViews<'a> {
     /// **The time of day as this frame's publication**, for the player HUD's corner clock: published
     /// by the loop once per iteration ([`Bridge::publish_wall_clock`]), like [`Self::today`].
     pub(crate) wall: Option<plx_base::wallclock::WallTime>,
+    /// **The fork's self-updater as this frame's publication** (`app::update`): Settings › Software
+    /// update and the root's row read it, and ask nothing.
+    pub(crate) update: &'a plx_screens::registry::UpdateStatus,
     /// **The kind of page beneath the page these views are read for** on the navigation stack,
     /// folded in by the dispatcher per page ([`Host::views_over`]); `None` for a root, and for
     /// every context that is not a page's own. What a page that names where BACK goes reads
@@ -226,7 +229,7 @@ impl Bridge<'_> {
             search: self.retained.search.view(), metadata: self.stores.metadata_view(),
             person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session,
             transport_paused: self.retained.transport_paused,
-            today: self.retained.today, wall: self.retained.wall, beneath: None }
+            today: self.retained.today, wall: self.retained.wall, update: self.retained.updater.view(), beneath: None }
     }
 }
 
@@ -343,6 +346,7 @@ impl plx_screens::registry::SearchLike for AppHost {
 impl plx_screens::registry::LibraryLike for AppHost {
     fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts> { Some(cx.views.clock) }
     fn marker_prefs(cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { cx.views.marker_prefs }
+    fn update_status<'a>(cx: &Cx<'a, Self>) -> &'a plx_screens::registry::UpdateStatus { cx.views.update }
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a> { cx.views.listing }
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a> { cx.views.directory }
     fn section_hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::HubsView<'a> { cx.views.section_hubs }
@@ -798,7 +802,7 @@ impl BridgeRetained {
             section_hubs: self.section_hubs.view(), search: self.search.view(),
             metadata: stores.metadata_view(), person: stores.person_view(), collection: stores.collection_view(),
             subtitle_search: stores.subtitle_search_view(), session: &self.playback,
-            transport_paused: self.transport_paused, today: self.today, wall: self.wall, beneath: None }
+            transport_paused: self.transport_paused, today: self.today, wall: self.wall, update: self.updater.view(), beneath: None }
     }
 
     /// A Bridge booted from a controlled Home. It always runs the `Live` store runner, whatever
@@ -997,7 +1001,7 @@ impl BridgeRetained {
             playback_live: false,
             today: None,
             wall: None,
-            updater: super::update::Updater::live(),
+            updater: super::update::Updater::for_run(live_screen_inputs),
             video_plane: false,
             measure: plx_ui::rec::Measurements::Live(measure),
             hubs: reads.hubs,
@@ -1377,18 +1381,19 @@ impl Bridge<'_> {
         self.huds_publish();
     }
 
-    /// Begin the player-HUD store with the compiled classic as what draws until a package lands, and read
-    /// what is installed. Boot calls it once, outside any frame; a controlled run never does.
     /// The self-updater's start-up check (a worker decides whether it is due).
     pub(crate) fn update_start(&mut self) {
         self.retained.updater.start();
     }
 
-    /// One frame's look at the self-updater's workers. A page polls the state itself.
+    /// One frame's look at the self-updater's workers; what moved is published with the next
+    /// frame's views (`AppViews::update`).
     pub(crate) fn update_tick(&mut self) {
         self.retained.updater.tick();
     }
 
+    /// Begin the player-HUD store with the compiled classic as what draws until a package lands, and read
+    /// what is installed. Boot calls it once, outside any frame; a controlled run never does.
     pub(crate) fn huds_start(&mut self, classic: plx_appkit::player_hud::loaded::LoadedHud) {
         self.huds.start(classic, plx_plex::plex::identity::version());
         self.huds_refresh();
@@ -2935,7 +2940,7 @@ impl Bridge<'_> {
                 hubs: self.retained.hubs.view(), listing: self.retained.listing.view(), directory: self.retained.directory.view(),
                 section_hubs: self.retained.section_hubs.view(), search: self.retained.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.retained.playback,
                 transport_paused: self.retained.transport_paused,
-                today: self.retained.today, wall: self.retained.wall, beneath: None,
+                today: self.retained.today, wall: self.retained.wall, update: self.retained.updater.view(), beneath: None,
             }, &self.retained.measure);
             let handled = self.session.step(event, &cx, fx);
             // #132: the owner logs nothing, and the Profiles screen cannot see a read-out that
@@ -3325,7 +3330,7 @@ impl Rig<AppHost> for Bridge<'_> {
                 directory: self.retained.directory.view(),
                 section_hubs: self.retained.section_hubs.view(), search: self.retained.search.view(), metadata: self.stores.metadata_view(), person: self.stores.person_view(), collection: self.stores.collection_view(), subtitle_search: self.stores.subtitle_search_view(), session: &self.retained.playback,
                 transport_paused: self.retained.transport_paused,
-                today: self.retained.today, wall: self.retained.wall, beneath: None,
+                today: self.retained.today, wall: self.retained.wall, update: self.retained.updater.view(), beneath: None,
             },
             measure: &self.retained.measure,
         }
@@ -3478,10 +3483,8 @@ impl Bridge<'_> {
                 let status = self.playback_trace_command(from, command);
                 out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::PlaybackTrace(status)))));
             }
-            InlineAppFx::Update(command) => {
-                let status = self.retained.updater.command(command);
-                out.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::Update(status)))));
-            }
+            // The state reaches the pages with the next frame's views (`AppViews::update`).
+            InlineAppFx::Update(command) => self.retained.updater.command(command),
             InlineAppFx::Huds(command) => out.push(Fx::Deliver(MachineId::Huds, Delivery::Machine(AppMsg::Huds(command)))),
             InlineAppFx::Store(StoreId::Person, StoreCmd::Person(command)) => out.push(Fx::Deliver(
                 MachineId::Store(StoreId::Person.ord()), Delivery::Machine(AppMsg::PersonCommand { from, command }))),

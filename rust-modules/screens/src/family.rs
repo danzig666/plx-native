@@ -308,10 +308,13 @@ pub struct InnerViews<'a> {
     pub directory: plx_data::stores::browse::DirectoryView<'a>,
     pub marker_prefs: plx_appkit::skip_policy::MarkerPrefsView,
     pub inputs: &'a crate::registry::ScreenInputs,
+    /// The fork's self-updater, as the frame published it (the root's Software update value and
+    /// the Software update page read it).
+    pub update: &'a crate::registry::UpdateStatus,
 }
 impl<'a> InnerViews<'a> {
     pub fn new(directory: plx_data::stores::browse::DirectoryView<'a>, inputs: &'a crate::registry::ScreenInputs) -> Self {
-        Self { directory, inputs, marker_prefs: Default::default() }
+        Self { directory, inputs, marker_prefs: Default::default(), update: &crate::registry::UPDATE_UNKNOWN }
     }
 }
 
@@ -345,6 +348,7 @@ impl DirectoryLike for InnerHost {
         cx.views.directory
     }
     fn marker_prefs(cx: &Cx<'_, Self>) -> plx_appkit::skip_policy::MarkerPrefsView { cx.views.marker_prefs }
+    fn update_status<'a>(cx: &Cx<'a, Self>) -> &'a crate::registry::UpdateStatus { cx.views.update }
 }
 
 /// The outer context as the inner pages see it, carrying the same retained Browse directory the
@@ -354,7 +358,8 @@ impl DirectoryLike for InnerHost {
 /// borrow to hand it to a `DrawFrame`.
 pub fn inner_cx<'o, 'a: 'o, H: DirectoryLike>(cx: &Cx<'a, H>) -> Cx<'o, InnerHost> {
     Cx {
-        views: InnerViews { directory: H::directory(cx), marker_prefs: H::marker_prefs(cx), inputs: H::screen_inputs(cx) },
+        views: InnerViews { directory: H::directory(cx), marker_prefs: H::marker_prefs(cx), inputs: H::screen_inputs(cx),
+            update: H::update_status(cx) },
         tick: cx.tick,
         measure: cx.measure,
         press: cx.press,

@@ -1152,13 +1152,16 @@ pub mod ls2 {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            let mut owned = true;
+            // The queue is freed only once a cancel has removed the callback; a refused cancel, or
+            // a call that came back with no token to cancel, leaks it rather than free memory a
+            // later dispatch could still write.
+            let mut owned = false;
             if token != 0 {
                 reset(&mut error);
-                if !unsafe { LSCallCancel(self.handle, token, &mut error) } {
+                owned = unsafe { LSCallCancel(self.handle, token, &mut error) };
+                if !owned {
                     plx_base::eventlog::log(&format!(
                         "ls2: stream cancel refused — leaking its reply queue ({})", error_text(&error)));
-                    owned = false;
                 }
             }
             unsafe { LSErrorFree(&mut error) };

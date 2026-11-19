@@ -426,5 +426,6 @@
   "settings.update.needs_hbc": "Патрэбны Homebrew Channel",
   "settings.update.install_failed": "Не ўдалося ўсталяваць",
   "settings.update.unavailable": "Няма ў гэтай зборцы",
-  "settings.update.toast": "Даступна PlxNative {version}. Усталюйце яе ў Наладах › Абнаўленне праграмы."
+  "settings.update.toast": "Даступна PlxNative {version}. Усталюйце яе ў Наладах › Абнаўленне праграмы.",
+  "settings.update.unconfirmed": "Магчыма, усё яшчэ ідзе"
 }
