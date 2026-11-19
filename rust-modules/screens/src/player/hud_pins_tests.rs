@@ -62,7 +62,7 @@
 
 use super::{test_store, TestHost, ENTRY};
 use crate::player::PlayerScreen;
-use crate::registry::{AppFx, AppMsg, PageMemory, PlayerReq};
+use crate::registry::{AppMsg, PageMemory, PlayerReq};
 use plx_appkit::player_hud::command::{HudCommand, Section};
 use plx_appkit::player_hud::{overscan_rects, slot_for, Busy, ControlSlot, Controls};
 use plx_machine::machine::{
@@ -198,13 +198,24 @@ impl Rig<TestHost> for PinRig {
         Handled::No
     }
     fn timer(&mut self, _: MachineId, _: TimerId, _: &CxParts<u32>, _: &mut Effects<'_, TestHost>) {}
-    fn app_fx(&mut self, from: MachineId, effect: AppFx, _: &CxParts<u32>, fx: &mut Effects<'_, TestHost>) {
-        if let AppFx::Player(req) = effect {
+    fn app_fx(&mut self, _: MachineId, _: crate::registry::InlineAppFx, _: &CxParts<u32>, _: &mut Effects<'_, TestHost>) {}
+    fn run_yielded_app_command(&mut self, d: &mut Dispatcher<TestHost>,
+        report: &mut plx_ui::dispatch::FrameReport, tap: &mut dyn plx_ui::dispatch::Tap<TestHost>) -> Option<u32> {
+        let command = d.take_app_command()?;
+        let outcome = match &command.effect {
+            Ok(_) => plx_machine::machine::AppCommandOutcome::Completed,
+            Err(outcome) => *outcome,
+        };
+        let mut out = vec![];
+        if let Ok(crate::registry::ExternalAppFx::Player(req)) = command.effect {
             if let (true, PlayerReq::Command(HudCommand::ToggleSection(section))) = (self.perform, &req) {
-                fx.push(Fx::Deliver(from, Delivery::Screen(ScreenEvent::App(AppMsg::HudSection(*section)))));
+                out.push(plx_machine::machine::Stamped { from: command.from,
+                    fx: Fx::Deliver(command.from, Delivery::Screen(ScreenEvent::App(AppMsg::HudSection(*section)))) });
             }
             self.reqs.push(req);
         }
+        Some(d.resume_app_command(self, command.id, outcome,
+            out, report, tap).unwrap())
     }
     fn log(&mut self, _: &str) {}
     fn prepare(&mut self, _: &mut Budget, _: &mut Present) {}
@@ -288,6 +299,7 @@ impl Run {
         let mut d: Dispatcher<TestHost> = Dispatcher::new();
         let mut rig = PinRig { mounter: PinMounter { package }, measure: FixtureMeasure,
             session: super::playback_session(0, 0), reqs: Vec::new(), perform };
+        super::publish_presentation_fixture(Default::default());
         d.request(MachineId::Nav, NavOp::Root(FixtureArg::VideoPlane));
         d.frame_with(&mut rig, tick(0), vec![], vec![], &mut NoTap, false);
         let id = d.nav.top_page().expect("the player page mounted").id;
@@ -310,6 +322,9 @@ impl Run {
     }
 
     fn frame(&mut self, ms: u32, inputs: Vec<InputEvent<u32>>) {
+        let mut presentation = self.screen().presentation.clone();
+        presentation.busy = self.screen().busy;
+        super::publish_presentation_fixture(presentation);
         self.d.frame_with(&mut self.rig, tick(ms), inputs, vec![], &mut NoTap, false);
     }
 
@@ -467,6 +482,7 @@ impl Chaptered {
                 width: 0,
                 height: 0,
                 bitrate: 0,
+                video_kbps: 0,
                 dovi: Default::default(),
                 markers: Vec::new(),
                 chapters: (1..=count).map(chapter).collect(),
@@ -563,6 +579,8 @@ struct Census {
 fn census_screen(occupant: Occupant, failed: bool) -> PlayerScreen {
     let mut screen = PlayerScreen::new(ENTRY, plx_appkit::player_hud::loaded::classic_for_test());
     screen.slot = slot_of(occupant);
+    // The census probes inactive failure geometry too; supply its complete explicit model.
+    screen.presentation.failure = Some(std::sync::Arc::new(super::failure_fixture(plx_media::route::idle_session_for_test())));
     if failed {
         screen.busy = Busy::Readout(
             plx_ui::widgets::StatusKind::Failed,
@@ -577,6 +595,9 @@ fn check_census(case: &Census) {
     let _chapters = case.chapters.then(Chaptered::install);
     let screen = census_screen(case.occupant, case.failed);
     let cx: Cx<'static, TestHost> = super::cx();
+    // whatever the occupant (discs, a Skip pill, Up Next's pair), the open strip or the read-out, every
+    // element the groups below declare has a unique id that finds it again
+    plx_ui::a11y::conformance::<TestHost, _>(&screen, &cx);
     let mut groups: Vec<GroupSpec> = Vec::new();
     Focusable::<TestHost>::groups(&screen, &cx, &mut groups);
     let ids: Vec<u32> = groups.iter().map(|g| g.id.0).collect();

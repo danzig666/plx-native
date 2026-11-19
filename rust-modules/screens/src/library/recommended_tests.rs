@@ -24,7 +24,7 @@ impl Host for HostFixture {
 }
 impl crate::registry::ScreenInputsLike for HostFixture {
     fn screen_inputs<'a>(_cx: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs {
-        crate::registry::empty_fixture()
+        crate::registry::caption_fixture()
     }
 }
 
@@ -100,7 +100,8 @@ impl Fixture {
     pub(super) fn cx(&self, focus: Option<FocusKey<u32>>) -> Cx<'_, HostFixture> {
         Cx { views: Views { listing: self.listing.view(), directory: self.directory.view(), hubs: self.hubs.view() },
             tick: Tick::default(), measure: &self.measure, focus: FocusRead { current: focus, ..Default::default() },
-            press: PressRead::default(), owner: OWNER }
+            press: PressRead::default(), owner: OWNER,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default() }
     }
     pub(super) fn screen(&self) -> RecommendedScreen {
         let mut page = RecommendedScreen::new(ENTRY, InstanceId(19), SecKind::Movie);
@@ -290,7 +291,7 @@ fn a_landscape_deck_card_draws_the_continue_footer() {
     let tile = Tile { rect: Rect::new(0.0, 0.0, 420.0, 236.0), scale: 1.0, radius: 12.0, focused: true, pop: 1.0 };
     let m = plx_ui::fixture::FixtureMeasure;
     for (row, deck) in [(0, true), (1, false)] {
-        let src = HubSrc { elems: &[1, 2, 3, 4], shelf: hubs.shelves().get(row), paging: false, deck: None };
+        let src = HubSrc { policy: crate::registry::captions::policy(), elems: &[1, 2, 3, 4], shelf: hubs.shelves().get(row), paging: false, deck: None, deck_press: plx_plex::plex::session::DeckPress::Details };
         let words = |draw: &dyn Fn(plx_ui::Painter)| -> Vec<String> {
             plx_ui::draw_census::capture_runs(|| draw(plx_ui::Painter::recording())).into_iter().map(|run| run.text).collect()
         };
@@ -431,4 +432,27 @@ fn the_crumb_row_is_built_once_per_key_not_once_per_question() {
     assert_eq!(page.probe_header_builds(), built + 1, "the library's new name builds the row once");
     for _ in 0..10 { ask(&fixture); }
     assert_eq!(page.probe_header_builds(), built + 1, "and the questions after it build none");
+}
+
+/// **Recommended, covered, notices that Settings changed what its shelves draw under the posters**
+/// (`step`'s head): a page returning from under a cover raises no damage of its own, and typed page
+/// damage is what retakes a frozen host's snapshot.
+#[test]
+fn recommended_damages_the_page_when_the_under_posters_setting_moved_under_a_cover() {
+    use crate::registry::captions::{PolicyPin, FIXTURE_TITLE_ON};
+    use plx_plex::plex::session::UnderPosters;
+    let _guard = plx_base::testlock::serial();
+    let fixture = Fixture::shelves(&["Trending"], 6);
+    let mut page = fixture.screen();
+    let mut uncover_under = |setting: UnderPosters| {
+        let _pin = PolicyPin::set(setting);
+        let mut out = Vec::new();
+        let mut present = plx_machine::present::Present::new();
+        page.step(&ScreenEvent::Uncover, &fixture.cx(None),
+            &mut Effects::new(&mut out, MachineId::Instance(InstanceId(19)), &mut present));
+        present.page_damaged()
+    };
+    assert!(!uncover_under(UnderPosters::DEFAULT), "control: an unchanged setting damages nothing");
+    assert!(uncover_under(FIXTURE_TITLE_ON), "the Title switch moved the caption policy");
+    assert!(!uncover_under(FIXTURE_TITLE_ON), "...once");
 }

@@ -13,7 +13,7 @@ import re
 from readonly_dependencies import _local_sha, _sha, _json, _manifest_paths, _configs, _workspace_hashes, WORKSPACE_HASHING
 
 CERTIFICATE_PATH = Path(__file__).with_name('proofs') / 'platform-generated-enums.json'
-CERTIFICATE_SHA256 = 'b61be9b470960a80bbb097dfa466fa5fd4229f89ef8f1234bb302edabf9f8396'
+CERTIFICATE_SHA256 = '1b3b34fa9b71d1850b8b9d569025e992440e29e2ce77d39f34d4e0b8d52c6503'
 SOURCES = ['platform/Cargo.toml', 'platform/src/lib.rs', 'platform/src/i18n/mod.rs',
            'platform/build.rs', 'platform/build_support/catalog.rs', 'build_support/install_identities.rs',
            'machine/src/lib.rs', 'machine/src/machine.rs']
@@ -24,7 +24,11 @@ GRAMMAR = {'Preference': {'prefix': ['System'], 'catalogue_unit_variants': True}
 MACHINE_SOURCES = ['571415d64a9885248f852b402153feedd4660acbe03606e4796c59659726049f',
                    '03a6e18f576dcbaff66c3d7405923b155302bfb2996bb373dac115ece055a5bf',
                    'd08b44dbff241962286eb7e1f85897073ba9f2f712a2ba935837f901635369a8',
-                   '9b1ffb66c7ba2eb9fdffcb4bcbf0a29cda87a003cce69b16c73567c8bc0a65b0']
+                   '9b1ffb66c7ba2eb9fdffcb4bcbf0a29cda87a003cce69b16c73567c8bc0a65b0',
+                   'b2794fd0febbbd98febfb45e12fedadcbb58900b02674af7f665bd15adea458d',
+                   'ff378a339f0b4934a4934ab25aa4965a51a27f38d053fe19c1abb382b690ee45',
+                   '1fafb56dcc9f423d7c00fd989a3f11bd21022d64d62d8f71f70e3eb97f6b4975',
+                   '8f46da48c81057c28aa19524d80a585e5aa136bcdd841a1a5359a9f576bbf7b5']
 MACHINE_LIB_SOURCES = ['105afdbb05fb762e6752cef260b6d928b1d828993350aaa71651f96cee0c3188',
                        'c35d39ae620b5607e7035222ab1023799adaf091d6a4f737a847dd70b26c1b36']
 
@@ -34,9 +38,11 @@ I18N_SOURCES = ['40a13d07a43c772b10587e510a69502684abfa1f582ce355b22fd935a8c46f4
 
 def source_hashes(root):
     sources = {p: _local_sha((root / p).read_bytes()) for p in SOURCES}
-    # Reviewed variants add NavOp::SelectTabWithChild or PressRead identity/live/active, or rewrite
-    # the Canon byte-feed loops; the complete doc-only newtype producer and its u32 invocations
-    # are unchanged.
+    # Reviewed variants add navigation/press facts, Canon loops, owned commands and
+    # effect/presentation contracts outside the generated declarations; the accessibility-id
+    # input (By::Script, InputKind::ById and its tag-9 write_with arm, OkTap) is one more, and the newest
+    # variant is a doc-only correction of FirstInGroupAnimated's arrival note. The doc-only
+    # newtype producer, ten u32 invocations and canonical include namespaces are unchanged.
     if sources['machine/src/machine.rs'] not in MACHINE_SOURCES: raise ValueError('unreviewed machine source')
     sources['machine/src/machine.rs'] = MACHINE_SOURCES
     # Owned-present migration changes sibling/test modules, never the canonical machine child.
@@ -65,7 +71,9 @@ def produce_certificate(root):
                        'string slots use Rust Debug escaping; numeric slots are integers',
                        'install_identities writes only install_identities.rs, never languages.rs',
                        'PR1366: PressRead identity/live/active and owned-present sibling/test modules; canonical machine child and doc-only u32 newtype producer unchanged',
-                       'PR1385: Canon byte-feed loops inlined (impl Canon and canon_tests only, FNV-1a byte stream unchanged); newtype macro and its ten u32 invocations unchanged'],
+                       'PR1385: Canon byte-feed loops inlined (impl Canon and canon_tests only, FNV-1a byte stream unchanged); newtype macro and its ten u32 invocations unchanged',
+                       'UI FIFO on PR1385: AppCommandId(u64), AppCommandOutcome and generic AppCommand<F,R> appended after unchanged doc-only newtype producer and its ten u32 invocations; none certified as generated declarations',
+                       'Owned runtime: HoldHintRead/Event, ModalRead, PageImageRead, Cx/Fx projections, AppEffect partition and PresentationAuthority/Receipt added outside the unchanged doc-only newtype macro and ten u32 invocations; Arc-bearing receipts and effect contracts are not certified; canonical include namespace unchanged'],
             'assumptions': __doc__.splitlines()}
 
 

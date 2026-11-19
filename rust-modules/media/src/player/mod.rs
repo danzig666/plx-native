@@ -1149,8 +1149,13 @@ pub fn failure_actions(kind: FailureKind, cx: FailureContext) -> Vec<FailureActi
 
 /// The live [`FailureContext`] (main thread).
 pub fn failure_context(ps: &crate::route::PlaybackSession) -> FailureContext {
+    failure_context_captured(ps, failtest_forced())
+}
+
+/// App-boundary resolver using the diagnostic policy already sampled for this frame.
+pub fn failure_context_captured(ps: &crate::route::PlaybackSession, diagnostic_forced: bool) -> FailureContext {
     FailureContext {
-        forced: crate::route::forced_direct_play(ps) || failtest_forced(),
+        forced: crate::route::forced_direct_play(ps) || diagnostic_forced,
         can_retry: crate::route::can_retry_current_play(ps),
         repair_idle: ps.repair_status == plx_platform::tv::sandbox::State::Idle,
     }
@@ -1423,7 +1428,12 @@ fn preview_not_direct_shape() -> ErrorShape {
 /// The live [`ErrorShape`] for `PlaybackState::Error` (main thread — `route::is_transcoding` and
 /// `route::play_verdict` read main-thread state).
 pub fn error_now(ps: &crate::route::PlaybackSession) -> ErrorShape {
-    if let Some(arm) = failtest_arm(ps) {
+    error_captured(ps, plx_base::devtrig::read("failtest").as_deref())
+}
+
+/// App-boundary resolver: no second diagnostic read can disagree with this frame's force bit.
+pub fn error_captured(ps: &crate::route::PlaybackSession, diagnostic: Option<&str>) -> ErrorShape {
+    if let Some(arm) = failtest_arm(ps, diagnostic) {
         return arm;
     }
     // Ahead of every other cause: on an affected, unfixed set every Load this boot has been (and
@@ -1569,8 +1579,8 @@ const FAILTEST_VERDICT: &str =
 /// the capsule reachable and it applies to EVERY server, so the pairing `docs/agent-reference.md`
 /// documents is unaffected — but note the arm still has to be looked at from the player route,
 /// i.e. after a play, which is when `route::cur_sid` names a server at all.
-fn failtest_arm(ps: &crate::route::PlaybackSession) -> Option<ErrorShape> {
-    let arm = plx_base::devtrig::read("failtest")?;
+fn failtest_arm(ps: &crate::route::PlaybackSession, diagnostic: Option<&str>) -> Option<ErrorShape> {
+    let arm = diagnostic?;
     let sub = playing_subscription(&ps);
     Some(match arm.trim() {
         "audio" => error_shape(true, true, sub, None, RuntimeFailure::Unknown),
@@ -1694,8 +1704,9 @@ pub struct Diag {
     pub feed_composed: bool,
     pub vp_mode: c_int,
     pub window_id: String,
-    /// This boot created an ACB handle (either backend's): a URI-only build has the URI engine's with
-    /// Feed's absent, and its diagnostics must not read that as a missing video plane.
+    /// An ACB handle has been created (either backend's; Feed's at the boot, the URI engine's at the
+    /// first Experimental offer or, while a release is in flight, at the Start's gate). A URI-only ACB
+    /// build therefore reads false until then.
     pub acb_ok: bool,
     pub place_rv: i32,
     pub placed_w: i32,
@@ -2281,8 +2292,10 @@ pub fn desired_sub_idx() -> i32 {
 pub fn request_subtitle(idx: i32) {
     SHARED.desired_sub_idx.store(idx, Relaxed);
     if idx < 0 {
-        // subs Off: free the image-cue store now (the demuxer also stops decoding new
-        // bitmap cues while off — see ff.rs's desired_sub_idx gate)
+        // subs Off: free the image-cue store now. The demuxer also stops decoding new bitmap cues
+        // while off and HOLDS the image packets it reads instead (`SubTracks::on_packet` in
+        // play-feed's `ff_subs.rs`), so a track chosen later decodes the read-ahead window it
+        // would otherwise have lost.
         SHARED.sub_bitmaps.lock().unwrap().clear();
     }
 }
@@ -2458,8 +2471,8 @@ pub fn sidecar_clock_ns(ps: &crate::route::PlaybackSession, playhead_ns: i64) ->
 /// reads ahead of the playhead, which this floor never prunes. What bounds memory is each store's
 /// budget and eviction order ([`SUB_BITMAP_BUDGET`]), not this floor.
 fn subtitle_floor_ns(retention: plx_playback_contract::subtitle::CaptionRetention) -> i64 {
-    let Some(playhead_ns) = retention.playhead_ns else { return i64::MIN; };
-    subtitle_floor_for(playhead_ns, retention.seek_target_ns.is_some(), retention.seek_target_ns.unwrap_or(-1))
+    let Some(anchor_ns) = retention.anchor_ns() else { return i64::MIN; };
+    subtitle_floor_for(anchor_ns, false, -1)
 }
 
 fn subtitle_floor_for(position_ns: i64, seeking: bool, target_ns: i64) -> i64 {

@@ -1003,3 +1003,115 @@ fn a_success_receipt_waits_for_the_next_captured_authority() {
     assert!(page.pending_auto.is_none());
     assert!(page.state.auto_sign_in);
 }
+
+#[test]
+fn adjacent_root_rows_use_independent_retained_profile_and_install_facts() {
+    use plx_plex::plex::session::{ProfilePrefs, UnderPosters};
+    use plx_platform::i18n::Preference;
+    let _serial = plx_base::testlock::serial();
+    let before = plx_platform::i18n::saved_preference_for_test(Preference::En);
+    let off = UnderPosters { title: false, ..UnderPosters::DEFAULT };
+    let a = crate::registry::ScreenInputs { install_language: Preference::Be,
+        preferences: Some(ProfilePrefs { under_posters: Some(off), ..Default::default() }), ..Default::default() };
+    let b = crate::registry::ScreenInputs { install_language: Preference::Es,
+        preferences: Some(ProfilePrefs { under_posters: Some(UnderPosters::DEFAULT), ..Default::default() }), ..a.clone() };
+    let directory = plx_data::stores::browse::DirectoryView::empty_for_test();
+    let (first, second) = {
+        let _step = plx_base::step::StepScope::enter();
+        (RootPage::new(EntryId(1), directory, &a), RootPage::new(EntryId(2), directory, &b))
+    };
+    plx_platform::i18n::saved_preference_for_test(before);
+    assert_eq!(first.state.language, Preference::Be);
+    assert_eq!(second.state.language, Preference::Es);
+    assert_eq!(first.state.under_posters, off);
+    assert_eq!(second.state.under_posters, UnderPosters::DEFAULT);
+}
+
+#[test]
+fn adjacent_root_pending_install_pick_refreshes_with_unchanged_cache_and_profile() {
+    use plx_platform::i18n::Preference;
+    let _serial = plx_base::testlock::serial();
+    let mut inputs = crate::registry::ScreenInputs::default();
+    inputs.install_language = plx_platform::i18n::saved_preference();
+    let mut context = cx(None);
+    context.views.inputs = &inputs;
+    let mut page = RootPage::new(EntryId(0), context.views.directory, &inputs);
+    let mut initial_out = Vec::new();
+    let mut initial_present = Present::new();
+    {
+        let _step = plx_base::step::StepScope::enter();
+        page.step(&ScreenEvent::Tick(Default::default()), &context,
+            &mut Effects::new(&mut initial_out, MachineId::Instance(InstanceId(0)), &mut initial_present));
+    }
+    let mut pending = inputs.clone();
+    pending.install_language = if inputs.install_language == Preference::Be { Preference::Es } else { Preference::Be };
+    assert!(std::sync::Arc::ptr_eq(&pending.session, &inputs.session));
+    assert_eq!(pending.session_key(), inputs.session_key());
+    context.views.inputs = &pending;
+    let mut out = Vec::new();
+    let mut present = Present::new();
+    {
+        let _step = plx_base::step::StepScope::enter();
+        page.step(&ScreenEvent::Tick(Default::default()), &context,
+            &mut Effects::new(&mut out, MachineId::Instance(InstanceId(0)), &mut present));
+    }
+    assert_eq!(page.state.language, pending.install_language, "a retained next-launch pick must not wait for the stored Session Arc");
+}
+
+// ---- accessibility ids -----------------------------------------------------------------------
+
+/// **Every page of the family the surface mounts answers ids that conform** (`a11y::conformance`: every
+/// element projects, ids are unique, `a11y_find` inverts `a11y`, `a11y_elems` lists no more keys than each
+/// group declares, and some when it declares any), and **no two pages answer one namespace**: the surface
+/// answers its top page's, so an id says which page it was read on, though a Legal document, the Legal
+/// index and About share one heartbeat word.
+#[test]
+fn every_page_the_surface_mounts_conforms_and_answers_a_namespace_of_its_own() {
+    // `settings_page_conforms` takes the serial lock and the scratch session for each mount itself
+    let pages = [
+        SettingsPage::Root,
+        SettingsPage::Language,
+        SettingsPage::UnderPosters,
+        SettingsPage::UnderPostersDetails(PosterKind::Movie),
+        SettingsPage::UnderPostersDetails(PosterKind::Show),
+        SettingsPage::Contribute,
+        SettingsPage::Playback,
+        SettingsPage::AudioSubtitles,
+        SettingsPage::Picker(PickerKind::Quality),
+        SettingsPage::Privacy,
+        SettingsPage::Preview(0),
+        SettingsPage::Legal,
+        SettingsPage::About,
+        SettingsPage::Document(0),
+        SettingsPage::Diagnostics,
+        SettingsPage::PlayerHud,
+        SettingsPage::HudGallery,
+    ];
+    let mut seen: Vec<&'static str> = Vec::new();
+    for page in pages {
+        let [ns] = settings_page_conforms(page)[..] else { panic!("{page:?}: one mounting, one namespace") };
+        assert!(!seen.contains(&ns), "{page:?}: the namespace {ns:?} is another page's already");
+        seen.push(ns);
+    }
+}
+
+/// The first-run consent question mounted as `AppArg::FirstRunConsent` mounts it: the same
+/// `RouteSurface` in the first-run family, over the stage-0 page (the coverage table calls this).
+pub(crate) fn first_run_consent_conforms() -> plx_ui::a11y::Namespaces {
+    let _g = plx_base::testlock::serial();
+    let _sess = scratch_session("a11y-first-run-consent");
+    let mut s = RouteSurface::new(EntryId(0), InstanceId(0), Family::FirstRunConsent, SettingsPage::ConsentStage(0));
+    step(&mut s, ScreenEvent::Mount, None);
+    vec![plx_ui::a11y::conform::<InnerHost, _>(&s, &cx(None))]
+}
+
+/// One page of the Settings family mounted as its surface mounts it (`RouteSurface` rooted at `page`,
+/// the Mount event delivered) and run through the id conformance; the namespace is the page's own.
+/// The coverage table calls this for every `SettingsPage` arm.
+pub(crate) fn settings_page_conforms(page: SettingsPage) -> plx_ui::a11y::Namespaces {
+    let _g = plx_base::testlock::serial();
+    let _sess = scratch_session("a11y-pages");
+    let mut s = RouteSurface::new(EntryId(0), InstanceId(0), Family::Settings, page);
+    step(&mut s, ScreenEvent::Mount, None);
+    vec![plx_ui::a11y::conform::<InnerHost, _>(&s, &cx(None))]
+}

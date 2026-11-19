@@ -7,6 +7,12 @@
 //! ACB / exported-window display binding (the engine itself is Rust: plx_media::player).
 #![allow(non_upper_case_globals)]
 pub(crate) mod hud_source;
+#[cfg(feature = "devtriggers")]
+mod a11y_state;
+#[cfg(feature = "devtriggers")]
+mod anim_diagnostics;
+mod card_motion_policy;
+mod player_presentation;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -131,6 +137,7 @@ pub(crate) mod playback;
 mod preferences;
 pub(crate) mod input;
 pub(crate) mod bridge;
+mod runtime_owners;
 pub(crate) mod chrome;
 mod collections_probe;
 pub(crate) mod content;
@@ -380,9 +387,15 @@ pub(crate) struct App {
     pub(crate) pages: plx_ui::dispatch::Dispatcher<bridge::AppHost>,
     /// Inputs collected for the dispatcher this iteration (`bridge` module doc).
     pub(crate) inputs: Vec<plx_machine::machine::InputEvent<u32>>,
-    /// What that dispatcher borrows: the mounter, the real `TtfMeasure`, the store deliveries,
-    /// the consent machine and the queue of requests an owned screen makes of this loop.
-    pub(crate) bridge: bridge::Bridge,
+    /// The latest `state:<nonce>` accessibility request not yet answered: `run::ingress_token` parks
+    /// it here and the frame tail (`run::report`) serves it, on the presented and the skipped path
+    /// alike (`a11y_state`). The app keeps it, not a thread-local, so one owner holds the slot.
+    #[cfg(feature = "devtriggers")]
+    a11y_pending: a11y_state::Pending,
+    /// Physical logical children. Native playback resources remain in `adapters` above.
+    pub(crate) runtime: runtime_owners::RuntimeOwners,
+    /// Retained publications and IO bookkeeping; each turn borrows these alongside `runtime`.
+    pub(crate) bridge: bridge::BridgeRetained,
 }
 
 impl App {
@@ -402,7 +415,7 @@ impl App {
 impl App {
     pub(crate) fn snapshot_init(&self) -> Option<bootstrap::Initial> {
         let mut initial = self.boot_initial.clone()?;
-        initial.session = self.bridge.snapshot_session_init();
+        initial.session = self.runtime.session.machine.snapshot_init();
         Some(initial)
     }
     /// `instr`'s own narrow read — see [`plx_base::diag::heartbeat::Instruments::last_frame_ms`]. A
@@ -551,8 +564,9 @@ unsafe fn run_and_shutdown(app: &mut App) -> ! {
     plx_base::task::watchdog::set_crash_phase(plx_base::task::watchdog::CrashPhase::Shutdown);
     // Quit: the last screen's visit has not been reported, and no route change will.
     run::end_route_visit(app, false);
-    let failed = finish_recording(&mut app.rec, app.bridge.landgate())
-        || app.bridge.controlled_failure().is_some();
+    let bridge = app.runtime.bridge(&mut app.bridge);
+    let failed = finish_recording(&mut app.rec, bridge.landgate())
+        || bridge.controlled_failure().is_some();
     app.glass.sources.borrow_mut().clear();
     let code = i32::from(failed);
     run::shutdown(&mut app.player.session, &mut app.adapters.player);
@@ -567,7 +581,7 @@ fn finish_recording(rec: &mut recorder::Recplay, gate: &plx_machine::landgate::G
 }
 
 /// Simulator tooling emits the entire typed contract, never a patched household auth file.
-#[cfg(feature = "hostsim")]
+#[cfg(any(test, feature = "hostsim"))]
 pub fn synthetic_home_initial(seed: u32, port: u16, settings: Option<String>)
     -> Result<String, &'static str> {
     let content = settings.as_deref() == Some("flow12");

@@ -139,8 +139,9 @@ pub fn declare_chrome_glass_for_test(p: Painter, rects: &[Rect]) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ground {
     /// A MENU (Sort & Filter, the account menu, the item hold menu): glass on the frozen ground
-    /// (`popover_glass`: the latched field and the host snapshot), the latched-field ground only
-    /// when there is nothing frozen to stand on.
+    /// (`popover_glass`: a frost of the host snapshot, the latched field as its fallback body, and
+    /// the snapshot itself for the rim), the latched-field ground only when there is nothing frozen
+    /// to stand on.
     Menu,
     /// Everything else that stands on a panel (alerts, About, Tracks, the person bio, the decision
     /// alert): the pre-DS6 ground, the latched underlay field under the frost. Never glass.
@@ -173,8 +174,8 @@ pub enum Ground {
 /// **DS6 put glass back on MENUS, and only menus** (owner decision, wave 2 review): the caller
 /// states which ground it wants with a [`Ground`], per call, and there is no global switch.
 /// [`Ground::Menu`] runs `popover_glass::draw` first and wins whenever the field is latched; that
-/// glass stands on the same frozen pictures (this field, and the host snapshot for its rim) and
-/// reads no framebuffer either. Everything described above is the ground of [`Ground::Sheet`]
+/// glass stands on frozen pictures (the host's frost of the page for its body, this field as the
+/// body's fallback, and the host snapshot for its rim) and reads no framebuffer either. Everything described above is the ground of [`Ground::Sheet`]
 /// (alerts, About, Tracks, the person bio, the decision alert) and the FALLBACK ground of a menu
 /// with nothing frozen to stand on. The chrome (the top bar's track, the profile chip's capsule,
 /// the hold hint) is the only live-blur user.
@@ -185,23 +186,27 @@ pub fn panel_ground(
     field: Option<&crate::underlay::UnderlayField>,
     ground: Ground,
 ) {
-    panel_ground_shadowed(p, r, radius, field, ground, 1.0);
+    panel_ground_shadowed(p, r, r, radius, field, ground, 1.0, plx_gfx::gfx::GlassMorph::NONE);
 }
 
 /// [`panel_ground`] with a menu glass's drop shadow at `shadow` of the painter's opacity
-/// ([`crate::popover_glass::draw_shadowed`]); the field ground casts none, so it is unchanged.
+/// ([`crate::popover_glass::draw_shadowed`]) and a morph's join (`morph`, which only the glass wears:
+/// the field ground casts no shadow and has no join, so it is unchanged).
+#[allow(clippy::too_many_arguments)]
 pub fn panel_ground_shadowed(
     p: Painter,
     r: Rect,
+    settled: Rect,
     radius: f32,
     field: Option<&crate::underlay::UnderlayField>,
     ground: Ground,
     shadow: f32,
+    morph: plx_gfx::gfx::GlassMorph,
 ) {
     // DS6: a menu is glass on the frozen ground (`popover_glass`); the field ground below is the
     // fallback when there is nothing frozen to stand on. A sheet never takes this branch.
     if ground == Ground::Menu
-        && crate::profile::phase("panel.glass", || crate::popover_glass::draw_shadowed(p, r, radius, field, shadow))
+        && crate::profile::phase("panel.glass", || crate::popover_glass::draw_shadowed(p, r, settled, radius, field, shadow, morph))
     {
         return;
     }
@@ -1801,7 +1806,8 @@ pub fn keyline_chip(p: Painter, x: f32, cy: f32, text: &str, col: [f32; 4], meas
 }
 
 /// The identity band shared by both full-bleed heroes. The text run yields room to the
-/// outlined resolution/accessibility chips, and overlong metadata elides within its column.
+/// outlined resolution, dynamic-range and accessibility chips, and overlong metadata elides within
+/// its column.
 /// Returns the width drawn, from `r.x` to the last chip's edge.
 pub fn hero_identity(p: Painter, r: Rect, parts: &[&str], resolution: Option<&str>, chips: &[&str], measure: &dyn plx_machine::machine::Measure) -> f32 {
     identity_row(Some(p), r, parts, resolution, chips, theme::TEXT_SECONDARY, measure)
@@ -1814,10 +1820,10 @@ pub fn hero_identity_w(r: Rect, parts: &[&str], resolution: Option<&str>, chips:
 }
 
 /// Home's metadata band uses brighter reading ink over the hero art and reserves room for the rating.
-pub fn hero_metadata(p: Painter, r: Rect, parts: &[&str], quality: Option<&str>, rating: &str, measure: &dyn plx_machine::machine::Measure) {
+pub fn hero_metadata(p: Painter, r: Rect, parts: &[&str], quality: Option<&str>, range: Option<&str>, rating: &str, measure: &dyn plx_machine::machine::Measure) {
     let rating = (!rating.is_empty() && keyline_chip_w(rating, measure) <= r.w * 0.5).then_some(rating);
-    let chips = rating.as_ref().map_or(&[][..], std::slice::from_ref);
-    identity_row(Some(p), r, parts, quality, chips, theme::TEXT_READING, measure);
+    let chips: Vec<&str> = range.into_iter().chain(rating).collect();
+    identity_row(Some(p), r, parts, quality, &chips, theme::TEXT_READING, measure);
 }
 
 /// The one layout of the identity band, painted with `paint` or only measured without it.
@@ -2907,26 +2913,39 @@ pub(crate) fn chip_face(face: plx_gfx::gfx::GlassFace, e: f32) -> plx_gfx::gfx::
 /// reach they still sample the page, never each other, so they keep one source
 /// (`backdrop::surface_with`).
 ///
-/// **`frozen` is the opener lift's ground** (`lift_profile_chip`, the account menu up): the
-/// capsule then stands on the stack's latched underlay field through `Painter::glass_frozen`, with
-/// the host snapshot behind its rim and no dim (it is drawn above the dim), and requests no
-/// backdrop entry and no blur source pass. It is the LATCHED field's texture, so an unlatched ground
-/// is not representable here: [`lift_profile_chip`] draws no lift at all until the field has latched,
-/// because a flat capsule over the bar's own would darken the chip twice. The chip on the tab strip
-/// passes `None` and keeps the live glass.
+/// **`stand` is the opener lift's ground** ([`lift_profile_chip`], the account menu up): the capsule
+/// then stands on FROZEN pictures through `Painter::glass_frozen` ([`LiftGround`]) and requests no
+/// backdrop entry and no blur source pass. The chip on the tab strip passes `None` and keeps the
+/// live glass.
 fn glass_capsule(
     p: Painter,
     cap: Rect,
     e: f32,
     bar_material: Option<plx_gfx::gfx::GlassFace>,
-    frozen: Option<u32>,
+    stand: Option<LiftGround>,
 ) -> bool {
     let face = match bar_material {
         None => return false,
         Some(f) => chip_face(f, e),
     };
-    if let Some(ground) = frozen {
-        let sharp = crate::popover::host::page_tex().unwrap_or(0);
+    if let Some(stand) = stand {
+        // A GlassFace does not ride the painter's alpha (`popover_glass::face_at`): the lift of a
+        // morphing menu's opener fades, and its rim must fade with it.
+        let face = chip_face(face, p.opacity().clamp(0.0, 1.0));
+        let (ground, sharp, morph) = match stand {
+            // the frosted material: the field behind the body, the snapshot behind the rim
+            LiftGround::Field(field) =>
+                (field, crate::popover::host::page_tex().unwrap_or(0), plx_gfx::gfx::GlassMorph::NONE),
+            // CLEAR glass (`GlassMorph::clear`, which only this lift draws now: a morphing menu's own
+            // glass is frosted on every frame): the body shows the sharp
+            // snapshot through `sharp`, whose window is the one flipped the way the snapshot is held;
+            // the texture in the `ground` slot is only the program's required non-zero binding, and
+            // `u_clear` 1 mixes every texel of it away
+            LiftGround::Snapshot(page) =>
+                (page, page, plx_gfx::gfx::GlassMorph { clear: 1.0, ..plx_gfx::gfx::GlassMorph::NONE }),
+            // the flat capsule below is this ground
+            LiftGround::Flat => return false,
+        };
         return p.glass_frozen(
             cap,
             cap.h * 0.5,
@@ -2936,6 +2955,7 @@ fn glass_capsule(
             [1.0, 1.0, 1.0, e],
             plx_gfx::gfx::GlassRim::Standing,
             face,
+            morph,
         );
     }
     Glass::DYNAMIC_BACKDROP.backdrop(
@@ -3051,15 +3071,14 @@ pub fn profile_chip_with(p: Painter, data: ProfileChipRead<'_>, chip_expand: f32
     profile_chip_on(p, data, chip_expand, bar_material, None);
 }
 
-/// [`profile_chip_with`] on a chosen ground for its capsule: `frozen` is the latched underlay field
-/// of the modal stack the chip is lifted over ([`lift_profile_chip`]) as its texture, `None` the live
-/// tab-strip glass.
+/// [`profile_chip_with`] on a chosen ground for its capsule: `stand` is what the chip is lifted over
+/// ([`lift_profile_chip`]), `None` the live tab-strip glass.
 fn profile_chip_on(
     p: Painter,
     data: ProfileChipRead<'_>,
     chip_expand: f32,
     bar_material: Option<plx_gfx::gfx::GlassFace>,
-    frozen: Option<u32>,
+    stand: Option<LiftGround>,
 ) {
     let r = CHIP_FRAME;
     let expand = chip_expand;
@@ -3083,7 +3102,7 @@ fn profile_chip_on(
         let cap = chip_cap(e, name_w);
         // the tab track's own material — literally the same material: glass when the track
         // resolved glass this frame, the flat capsule when it did not.
-        if !glass_capsule(p, cap, 1.0, bar_material, frozen) {
+        if !glass_capsule(p, cap, 1.0, bar_material, stand) {
             p.rect_sheened(
                 cap,
                 cap.h * 0.5,
@@ -3158,6 +3177,36 @@ fn profile_chip_on(
     }
 }
 
+/// What the opener lift's capsule stands on ([`lift_ground`]). **Never nothing**: the chrome pass
+/// leaves the chip out from the frame its menu mounts, so the lift is the chip's only copy on every
+/// frame of the open and the close and has to paint on each one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LiftGround {
+    /// The stack's latched underlay field: the frosted material, no live glass and no dim (it is
+    /// drawn above the dim), the host snapshot behind its rim.
+    Field(u32),
+    /// The host snapshot, before the field has latched: the same capsule drawn CLEAR over the
+    /// undimmed page it was taken of (the opener's own cap, which is whole on these frames; the menu's
+    /// glass beside it is frosted, never clear). The field is read
+    /// back from the GPU a frame or two after the menu mounts; the snapshot is taken in the mount
+    /// frame's own page pass, before the lift.
+    Snapshot(u32),
+    /// Neither exists: the flat tab-track capsule, `profile_chip_on`'s own fallback.
+    Flat,
+}
+
+/// **What the lift stands on this frame, decided where it paints**: the latched `field` once the
+/// stack has one, else the host `snapshot` (`popover::host::page_tex`), else [`LiftGround::Flat`].
+/// A state, not a frame count: the read takes "a frame or two" and may be refused, and the chip is
+/// painted on whichever frames those are.
+pub fn lift_ground(field: &crate::underlay::UnderlayField, snapshot: Option<u32>) -> LiftGround {
+    match (field.ground_tex(), snapshot) {
+        (Some(field), _) => LiftGround::Field(field),
+        (None, Some(page)) => LiftGround::Snapshot(page),
+        (None, None) => LiftGround::Flat,
+    }
+}
+
 /// [`profile_chip_with`], re-drawn above the account menu's scrim AND panel: the lit copy of the
 /// opener the dispatcher's lift pass (`Z::OPENER`, `Dispatcher::lifted_opener`, `Screen::bar_opener`)
 /// asks the rig for (`Rig::lift_bar_member`), the one place any opener is lifted. The control is
@@ -3166,13 +3215,12 @@ fn profile_chip_on(
 /// copy lies exactly on the chip the bar drew.
 ///
 /// **The lift's capsule stands on FROZEN ground** (owner rule, 2026-10-17: no live-refracting glass
-/// over a page): while the menu is up the capsule is `Painter::glass_frozen` over the stack's
-/// latched underlay field, its rim bending the host snapshot, and it requests no backdrop entry or
-/// blur source pass. **Before the field has latched it draws nothing** (CONFIRM2 CB1): the field
-/// latches a frame after the OK that opens the menu, the dim is still 0 on that frame, and the bar's
-/// own chip is already on screen at the same rect — the flat capsule this used to fall back to landed
-/// on top of that one and the chip blinked near-black for a frame on every open. The chip on the tab
-/// strip, with no menu up, stays live glass.
+/// over a page): while the menu is up the capsule is `Painter::glass_frozen`, its rim bending the host
+/// snapshot, and it requests no backdrop entry or blur source pass. What it stands on is chosen HERE,
+/// at paint time ([`lift_ground`]): the stack's latched field, or until that latches the snapshot
+/// drawn clear. **It always paints**: the lift owns the chip from the frame its menu mounts (the chrome
+/// pass leaves it out so the snapshot never holds it), and a frame it drew nothing on was a frame the
+/// chip blinked out. The chip on the tab strip, with no menu up, stays live glass.
 pub fn lift_profile_chip(
     p: Painter,
     data: ProfileChipRead<'_>,
@@ -3180,8 +3228,18 @@ pub fn lift_profile_chip(
     bar_material: Option<plx_gfx::gfx::GlassFace>,
     ground: &crate::underlay::UnderlayField,
 ) {
-    let Some(ground) = ground.ground_tex() else { return };
-    crate::guard(|| profile_chip_on(p, data, chip_expand, bar_material, Some(ground)));
+    lift_profile_chip_on(p, data, chip_expand, bar_material, lift_ground(ground, crate::popover::host::page_tex()));
+}
+
+/// [`lift_profile_chip`] on a chosen ground, for a test to state the frame's.
+pub(crate) fn lift_profile_chip_on(
+    p: Painter,
+    data: ProfileChipRead<'_>,
+    chip_expand: f32,
+    bar_material: Option<plx_gfx::gfx::GlassFace>,
+    stand: LiftGround,
+) {
+    crate::guard(|| profile_chip_on(p, data, chip_expand, bar_material, Some(stand)));
 }
 
 // ---- CircleButton: circular disc + centered glyph, same keyed/unkeyed ControlStyle family as
@@ -3946,6 +4004,17 @@ impl AmbientWash {
     pub fn drawn_corners(&self) -> [[f32; 3]; 4] {
         self.corners.map(|c| [code(c[0].pos), code(c[1].pos), code(c[2].pos)])
     }
+    /// **Everything [`draw`](Self::draw) and [`draw_ground`](Self::draw_ground) read of the wash**, as
+    /// the exact bits of its twelve positions in corner order, for a caller that has to NAME the
+    /// picture it paints ([`Painter::cached_ground`]).
+    ///
+    /// Not [`drawn_corners`](Self::drawn_corners): those are the corner codes, but `draw_ground` also
+    /// samples the wash's INTERIOR at the corners of each band it cuts (`sample`, then `code`), and
+    /// two washes with the same corner codes can code an interior point one apart. The positions
+    /// decide every pixel, so they are the name.
+    pub fn paint_bits(&self) -> [u32; 12] {
+        std::array::from_fn(|i| self.corners[i / 3][i % 3].pos.to_bits())
+    }
     /// Paint it over `r`. Opaque — this REPLACES what is under it (see the type docs), so it belongs
     /// at the bottom of a screen's draw, standing in for the flat clear.
     ///
@@ -4154,6 +4223,18 @@ impl WashScrim {
     /// The scrim's alpha at the authored point `(x, y)`.
     pub fn alpha(&self, x: f32, y: f32) -> f32 {
         self.field.at(x, y)
+    }
+
+    /// **The scrim by value, as a draw reads it**: the ink, the shader's mode/count and every
+    /// uniform it is uploaded, by bits ([`AmbientWash::paint_bits`] for the wash it rides). Two
+    /// scrims with the same bits draw the same field, cell for cell, so a screen that caches the
+    /// picture a scrim is drawn into (`Painter::cached_ground`) names the scrim by it.
+    pub fn paint_bits(&self) -> ([u32; 4], u32, [[u32; 4]; plx_gfx::gfx::scrim::VEC4S]) {
+        (
+            self.ink.map(f32::to_bits),
+            self.field.shader_count().to_bits(),
+            self.field.uniforms().map(|v| v.map(f32::to_bits)),
+        )
     }
 }
 

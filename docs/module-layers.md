@@ -108,6 +108,7 @@ play_feed      net  playback_contract  media_codecs                       + plat
 play_uri       playback_contract                                          + platform base
 media_codecs   playback_contract                                          + base
 playback_contract                                                         + base
+owp
 platform                                                                             machine base
 machine                                                                                      base
 base
@@ -180,6 +181,14 @@ Production offers it a source only for a viewer who turned on Settings > Video &
 Experimental: `media::route::uri_preflight::ProductQualifier` answers `Unknown` for everyone else, for an original
 Standard would not direct-play (the plan's own `StandardDirectPlay` verdicts for the video, Dolby Vision, audio and
 container, not the server's decision, which the offer precedes), and for a converted PMS output. `ci/check-deps.sh` reads the whole crate for the same IO and clock gates as every other layer.
+
+`owp` is a nineteenth layer, declared the same way. Its crate is `plx_owp` (`rust-modules/owp/`); it
+names no other layer and no `plx_*` crate, so it can be used on its own: the Open Watch Party client protocol, sans-IO. It holds the JSON reader that keeps
+unpaired surrogate escapes visible to the checks, the message codec, the checks on names, room codes, the
+relay list, descriptors and room snapshots, the clock sync and the room timeline, each run against the
+vendored conformance vectors in `rust-modules/owp/fixtures/`. The WebSocket under it is `plx_net::ws`; the
+application does not name the crate yet. `ci/check-deps.sh` reads the whole crate for the same IO and clock
+gates as every other layer, and as machine code.
 
 The Watchlist adds two data modules and no new edge. `watchlist` (rows, match table, `TileState`,
 intent ledger, comparator; with `stores::watchlist`) and `catalog` (the Discover-only item page; with
@@ -1941,8 +1950,8 @@ The last no-LTO figure is over the 12,426,000 limit, which made Splits 9 and 10 
 because whole-program optimisation with a single codegen unit sees the same code the single crate
 did. They also restore the cross-crate inlining the single crate had, which the per-frame UI code
 leans on. Only release-profile builds pay for it (the ARM staticlib and the storage helper when built as `release`, the
-Linux simulator of `make sim-linux` and `make macapp`); the dev profile that `make check`, the host
-tests and the macOS simulator use is untouched. The price is build time: CI's ARM library build
+Linux simulator of `make sim-linux` and `make macapp`); the `dev` and `test` profiles that the macOS
+simulator, `make check` and the host tests use are untouched. The price is build time: CI's ARM library build
 went from 2m40 to 4m15, and a local `ARM_PROFILE=release` one from 44 s to 94 s. A plain local `make` / `make deploy` no
 longer pays it: the Makefile builds the ARM staticlib with `[profile.tvdev]` (no LTO, 16 codegen
 units), which is faster and larger, and keeps `release` for CI, `RELEASE=1`, `SYMBOLS=1` and

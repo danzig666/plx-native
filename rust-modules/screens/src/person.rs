@@ -325,6 +325,7 @@ fn cstr_elide(s: &str, w: f32, sz: std::os::raw::c_int, bold: std::os::raw::c_in
 /// move an item between shelves without moving the engine cursor off that item: each shelf's
 /// `index_of` simply stops (or starts) answering for it.
 struct ShelfCards<'a> {
+    policy: plx_ui::caption_policy::CaptionPolicy,
     person: &'a Person,
     kind: usize,
     cards: &'a CardKeys,
@@ -360,13 +361,18 @@ impl<H: ContentLike> CardSource<H> for ShelfCards<'_> {
         match self.person.shelf(self.kind).get(i) {
             Some(m) => {
                 let role = Some(self.person.role(self.kind, i)).filter(|role| !role.is_empty()).map(str::to_owned);
-                crate::registry::captions::label(&crate::registry::captions::policy(), &tile_facts::caption_facts(m), role)
+                crate::registry::captions::label(&self.policy, &tile_facts::caption_facts(m), role)
             }
             None => TileLabel::default(),
         }
     }
     fn progress(&self, i: usize) -> Option<f32> {
         self.person.shelf(self.kind).get(i).and_then(|m| m.resume_frac())
+    }
+    /// The credit's ratingKey: what a by-id press names to stay on the title it read (the id's
+    /// position, `shelf.<kind>.card.<i>`, moves when the credits do).
+    fn subject(&self, i: usize) -> Option<std::borrow::Cow<'_, str>> {
+        self.person.shelf(self.kind).get(i).map(|m| std::borrow::Cow::Borrowed(m.rk.as_str()))
     }
 }
 
@@ -428,6 +434,9 @@ struct Page {
     entry_count_c: CString,
     header: HeaderFlow,
     header_dirty: bool,
+    /// The Under posters policy the filmography shelves were last drawn with (`step` compares it:
+    /// Settings changes the setting while it covers the page).
+    caption_policy: plx_ui::caption_policy::CaptionPolicy,
     /// What the page's links are made of; the screen turns it into group ids ([`PersonScreen::links`]).
     reach: Reach,
     /// The store revision ([`PersonView::revision`](plx_data::person::PersonView::revision)) the
@@ -548,6 +557,7 @@ impl Page {
             entry_count_c: CString::default(),
             header: HeaderFlow::default(),
             header_dirty: true,
+            caption_policy: crate::registry::caption_policy_of(plx_plex::plex::session::UnderPosters::DEFAULT),
             reach: Reach::default(),
             synced: None,
             covered_ready_c: false,
@@ -1097,14 +1107,17 @@ impl<H: ContentLike + PersonLike> StackPage<H> for Page {
     fn sections(&self, cx: &Cx<'_, H>, out: &mut Vec<SectionSpec<Sec>>) {
         let person = self.person(cx);
         let (kinds, n) = person.map_or(([0; NSHELF], 0), present);
-        out.push(SectionSpec::new(Sec::Head, Kind::Custom { height: HEADER_TOP + self.header.exp_h, focusable: person.is_some() }, HEADER_GROUP));
-        out.push(SectionSpec::new(Sec::Entry, Kind::Custom { height: 0.0, focusable: person.is_some_and(entry_reachable) }, ENTRY_GROUP));
-        out.push(SectionSpec::new(Sec::State, Kind::Custom { height: 0.0, focusable: false }, STATE_GROUP));
+        // The sections are named for what they ARE, not by position (the accessibility ids): which
+        // shelves are present moves a shelf's position, so a shelf is `shelf.<kind>` (0 = Movies,
+        // 1 = Shows) whatever stands before it.
+        out.push(SectionSpec::new(Sec::Head, Kind::Custom { height: HEADER_TOP + self.header.exp_h, focusable: person.is_some() }, HEADER_GROUP).named("head"));
+        out.push(SectionSpec::new(Sec::Entry, Kind::Custom { height: 0.0, focusable: person.is_some_and(entry_reachable) }, ENTRY_GROUP).named("filmography"));
+        out.push(SectionSpec::new(Sec::State, Kind::Custom { height: 0.0, focusable: false }, STATE_GROUP).named("state"));
         if n > 0 {
-            out.push(SectionSpec::new(Sec::Gap, Kind::Custom { height: BAND_GAP_TO_SHELF, focusable: false }, GAP_GROUP));
+            out.push(SectionSpec::new(Sec::Gap, Kind::Custom { height: BAND_GAP_TO_SHELF, focusable: false }, GAP_GROUP).named("gap"));
         }
         for &kind in &kinds[..n] {
-            out.push(SectionSpec::new(Sec::Shelf(kind), Kind::Shelf { style: &SHELF_STYLE, heading: SHELF_LABEL_H }, SHELF_GROUP[kind]));
+            out.push(SectionSpec::new(Sec::Shelf(kind), Kind::Shelf { style: &SHELF_STYLE, heading: SHELF_LABEL_H }, SHELF_GROUP[kind]).named_at("shelf", kind));
         }
     }
 
@@ -1126,13 +1139,14 @@ impl<H: ContentLike + PersonLike> StackPage<H> for Page {
     }
 
     /// Every filmography shelf is a row of posters: they follow the Under posters setting.
-    fn caption_policy(&self, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
-        matches!(k, Sec::Shelf(_)).then(crate::registry::captions::policy)
+    fn caption_policy(&self, cx: &Cx<'_, H>, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
+        matches!(k, Sec::Shelf(_)).then(|| crate::registry::captions::policy_for(H::screen_inputs(cx)))
     }
 
     fn cards<'a>(&'a self, cx: &'a Cx<'_, H>, k: Sec) -> Option<ShelfCards<'a>> {
         match k {
-            Sec::Shelf(kind) => self.person(cx).map(|person| ShelfCards { person, kind, cards: &self.cards }),
+            Sec::Shelf(kind) => self.person(cx).map(|person| ShelfCards { person, kind, cards: &self.cards,
+                policy: crate::registry::captions::policy_for(H::screen_inputs(cx)) }),
             _ => None,
         }
     }
@@ -1221,6 +1235,12 @@ impl PersonScreen {
 impl<H: ContentLike + PersonLike> Machine<H> for PersonScreen {
     type Ev = ScreenEvent<H>;
     fn step(&mut self, ev: &Self::Ev, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
+        // The shelves draw the Under posters policy, which Settings changes while it covers the page:
+        // noticed on whichever event comes first, and answered with page damage (a returning page
+        // raises none of its own).
+        if crate::registry::moved(&mut self.page.caption_policy, crate::registry::captions::policy_for(H::screen_inputs(cx))) {
+            fx.invalidate(Provenance::Nav);
+        }
         // The content the stack reads is current before it reads it for this event.
         let mut live = false;
         match ev {
@@ -1267,13 +1287,13 @@ impl<H: ContentLike + PersonLike> Machine<H> for PersonScreen {
             }
             ScreenEvent::FocusMoved { to, by, .. } => {
                 let page = &mut self.page;
-                if matches!(by, By::Dir | By::Pointer)
+                if matches!(by, By::Dir | By::Pointer | By::Script)
                     || page.person(cx).is_some_and(|person| page.locate(person, to.elem).is_some())
                 {
                     page.return_pending = false;
                 }
                 if matches!(page.person(cx).and_then(|p| page.locate(p, to.elem)), Some(Located::Header))
-                    && matches!(by, By::Dir | By::Pointer)
+                    && matches!(by, By::Dir | By::Pointer | By::Script)
                 {
                     page.header_marked = true;
                 }
@@ -1459,6 +1479,9 @@ mod tests {
         type Memory = PageMemory;
     }
 
+    impl crate::registry::ScreenInputsLike for PersonHost {
+        fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+    }
     impl PersonLike for PersonHost {
         fn person<'a>(cx: &Cx<'a, Self>) -> plx_data::person::PersonView<'a> { cx.views }
     }
@@ -1481,6 +1504,7 @@ mod tests {
             tick: Tick::default(),
             measure: m,
             press: PressRead::default(),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             focus: FocusRead::default(),
             owner: InputOwner::Entry(EntryId(0)),
         }
@@ -1524,6 +1548,32 @@ mod tests {
         s.page.refresh_store_cache(&cx(&FixtureMeasure, store.view()));
         lay(&mut s, &store, &FixtureMeasure);
         (store, s)
+    }
+
+    /// **A person page, covered, notices that Settings changed what its filmography draws under the
+    /// posters** (`step`'s head): a page returning from under a cover raises no damage of its own,
+    /// and typed page damage is what retakes a frozen host's snapshot.
+    #[test]
+    fn the_person_damages_the_page_when_the_under_posters_setting_moved_under_a_cover() {
+        use crate::registry::captions::{PolicyPin, FIXTURE_TITLE_ON};
+        use plx_plex::plex::session::UnderPosters;
+        let _guard = plx_base::testlock::serial();
+        let (store, mut s) = seed(4, 3);
+        let mut uncover_under = |setting: UnderPosters| {
+            let _pin = PolicyPin::set(setting);
+            let mut present = plx_machine::present::Present::new();
+            let mut buf: Vec<plx_machine::machine::Stamped<PersonHost>> = Vec::new();
+            let mut fx = Effects::new(&mut buf,
+                plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(0)), &mut present);
+            Machine::<PersonHost>::step(&mut s, &ScreenEvent::Cover, &cx(&FixtureMeasure, store.view()), &mut fx);
+            present.page_damaged()
+        };
+        // Probed with `Cover`: this page still damages unconditionally on `Uncover`/`Enter` (a
+        // leftover), and the head compare is the same on whichever event comes first.
+        uncover_under(UnderPosters::DEFAULT);
+        assert!(!uncover_under(UnderPosters::DEFAULT), "control: an unchanged setting damages nothing");
+        assert!(uncover_under(FIXTURE_TITLE_ON), "the Title switch moved the caption policy");
+        assert!(!uncover_under(FIXTURE_TITLE_ON), "...once");
     }
 
     fn focus_of(s: &PersonScreen, store: &plx_data::stores::person::PersonStore, kind: usize, col: usize) -> plx_machine::machine::FocusKey<u32> {
@@ -1584,24 +1634,35 @@ mod tests {
     #[test]
     fn the_hold_hint_stands_on_a_resting_shelf_card_once_per_install() {
         let _g = plx_base::testlock::serial();
-        plx_ui::hold_hint::reset_learned_for_test();
-        plx_ui::hold_hint::reset_shown_for_test();
+        let hint = std::cell::Cell::new(plx_machine::machine::HoldHintRead::default());
         let (store, mut s) = seed(6, 0);
         let card = focus_of(&s, &store, 0, 1);
         let mut ms = 100;
         let mut rest = |s: &mut PersonScreen, focus: plx_machine::machine::FocusKey<u32>, secs: f32| {
             for _ in 0..(secs * 60.0) as u32 {
                 ms += 17;
-                feed(s, &store, &FixtureMeasure, Some(focus), ScreenEvent::Tick(Tick { ms, dt_us: 16_667 }));
+                let context = Cx { focus: FocusRead { current: Some(focus), ..Default::default() },
+                    hold_hint: hint.get(), ..cx(&FixtureMeasure, store.view()) };
+                let mut present = plx_machine::present::Present::new();
+                let mut out = Vec::new();
+                let mut fx = Effects::new(&mut out,
+                    plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(0)), &mut present);
+                Machine::<PersonHost>::step(s, &ScreenEvent::Tick(Tick { ms, dt_us: 16_667 }), &context, &mut fx);
+                drop(fx);
+                let mut read = hint.get();
+                for effect in out {
+                    if let plx_machine::machine::Fx::HoldHint(event) = effect.fx { read.apply(event); }
+                }
+                hint.set(read);
             }
         };
         rest(&mut s, card, 1.2);
         assert!(!s.stack.hint_visible(), "not before the dwell");
         // negatives first: a stand spends the run's latch and would make them vacuous
         rest(&mut s, plx_machine::machine::FocusKey { entry: EntryId(900), elem: 0 }, 4.0);
-        assert!(!s.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(), "never while a menu owns focus");
+        assert!(!s.stack.hint_visible() && !hint.get().card, "never while a menu owns focus");
         rest(&mut s, plx_machine::machine::FocusKey { entry: EntryId(0), elem: ENTRY_ELEM }, 4.0);
-        assert!(!s.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(), "never on the Filmography pill");
+        assert!(!s.stack.hint_visible() && !hint.get().card, "never on the Filmography pill");
         rest(&mut s, card, 3.6);
         assert!(s.stack.hint_visible(), "after the dwell, on a settled card");
         rest(&mut s, plx_machine::machine::FocusKey { entry: EntryId(900), elem: 0 }, 1.0);
@@ -2204,6 +2265,7 @@ mod tests {
             tick: Tick::default(),
             measure: &m,
             press: PressRead::default(),
+            modal: cxv.modal, page_image: cxv.page_image, hold_hint: cxv.hold_hint,
             focus: FocusRead {
                 current: Some(focus_of(&s, &store, 0, 0)),
             ..Default::default() },
@@ -2907,6 +2969,7 @@ mod tests {
                 tick: Tick::default(),
                 measure: &measure,
                 press: PressRead::default(),
+                modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
                 focus: FocusRead { current: focus , ..Default::default() },
                 owner: InputOwner::Entry(screen.page.entry),
             };

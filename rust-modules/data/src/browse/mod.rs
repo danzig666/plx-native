@@ -1048,6 +1048,21 @@ pub struct BrowseState {
     recorded: Option<plx_plex::plex::session::HomePins>,
     preference_writes: preferences_job::Preferences,
     pending_pins: Option<(String, std::sync::Arc<std::sync::Mutex<PinWrite>>)>,
+    /// The outcome of the last editor commit ([`apply_pins_from`](Self::apply_pins_from)),
+    /// published on the directory ([`super::view::DirectoryView::pin_commit`]) so the screen that
+    /// sent it can wait for its answer instead of assuming one.
+    pin_commit: PinCommit,
+}
+
+/// **What the last `ApplyPins` came to**: `seq` counts the commits this store has run (a screen
+/// remembers the value it sent its own commit after, and waits for it to move), `recorded` says
+/// whether that commit produced a record (`false`: the session it was handed had no `client_id`, or
+/// the write queue refused it, so the selection stands for this run only). Not a durability claim:
+/// the write itself lands later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinCommit {
+    pub seq: u32,
+    pub recorded: bool,
 }
 
 /// Shared by a cloned Browse snapshot, so consuming a receipt never makes another clone
@@ -1147,6 +1162,7 @@ impl Default for BrowseState {
             view_memory: Default::default(),
             recorded: None,
             pending_pins: None,
+            pin_commit: PinCommit::default(),
             preference_writes: Default::default(),
             session_generation: 0,
             current_sid: ServerId::UNSET,
@@ -2233,6 +2249,9 @@ impl BrowseState {
         };
         state.shown_bands(kind).is_some_and(|rail| rail.listed(state.sort_desc).populated() >= 2)
     }
+    pub(crate) fn pin_commit(&self) -> PinCommit {
+        self.pin_commit
+    }
     fn discovery_state(&self) -> SecFetch {
         if !self.sections.is_empty() || self.sources.iter().all(|source| source.sections_done) {
             SecFetch::Ready
@@ -2549,6 +2568,7 @@ impl BrowseState {
             self.bump_sections_gen();
 
         }
+        self.pin_commit = PinCommit { seq: self.pin_commit.seq.wrapping_add(1), recorded: produced.is_some() };
         // Reconcile the pending selection immediately. Until its receipt lands, a captured
         // older session must not undo the viewer's edits. This is not a durability claim.
         match produced {
@@ -2842,6 +2862,37 @@ impl BrowseState {
         }
 
     }
+    /// Keep admission separate from visible damage. Want/Genres only ask for work; Letters can
+    /// also select a different cached calendar rail when the host's date appears or disappears.
+    pub fn run_owned_outcome(
+        &mut self,
+        adapter: &Arc<BrowseAdapter>,
+        cmd: crate::stores::browse::BrowseCmd,
+        keys: &ClientKeys,
+        session: &plx_plex::plex::session::Session,
+        jobs: &mut Vec<crate::stores::StoreJob>,
+    ) -> crate::stores::browse::CommandOutcome {
+        use crate::stores::browse::{BrowseCmd, CommandOutcome, LibraryWork};
+        let request_only = matches!(&cmd, BrowseCmd::Addressed {
+            work: LibraryWork::Want { .. } | LibraryWork::Genres, ..
+        });
+        let letters = matches!(&cmd, BrowseCmd::Addressed { work: LibraryWork::Letters { .. }, .. });
+        let shown = |owner: &Self| owner.cur_state().zip(owner.section_kind(owner.cur()))
+            .and_then(|(state, kind)| state.shown_bands(kind)).cloned();
+        let before = if letters { shown(self) } else { None };
+        let accepted = self.run_owned(adapter, cmd, keys, session, jobs);
+        let changed = if letters {
+            match (before, shown(self)) {
+                (Some(before), Some(after)) => !Arc::ptr_eq(&before, &after),
+                (None, None) => false,
+                _ => true,
+            }
+        } else {
+            accepted && !request_only
+        };
+        CommandOutcome { accepted, changed }
+    }
+
     pub fn run_owned(
         &mut self,
         adapter: &Arc<BrowseAdapter>,
@@ -3194,7 +3245,12 @@ impl BrowseState {
                             self.retry_cd = 120;
                             if result.gen == self.query_gen() {
                                 if let Some(state) = self.state_mut(result.sec) {
-                                    if !state.relist && state.fetch != SecFetch::Failed {
+                                    // A re-list that fails leaves the rows it was replacing on screen,
+                                    // so its failure is not the section's. A FIRST read holds none: with
+                                    // a re-list owed (`listings_changed` during the read) the failure is
+                                    // still the screen's to show, or the grid spins through every retry.
+                                    let relisting_held_rows = state.relist && state.total >= 0;
+                                    if !relisting_held_rows && state.fetch != SecFetch::Failed {
                                         state.fetch = SecFetch::Failed;
                                         changed = true;
                                     }
@@ -4271,6 +4327,26 @@ pub fn seed_letter_counts_for_owner_test(
                 .collect(),
         );
     }
+}
+
+/// Seed a cached calendar rail, optionally hidden while the host has no date.
+#[cfg(any(test, feature = "test-support"))]
+pub fn seed_calendar_bands_for_owner_test(state: &mut BrowseState, counted: bands::Day, today: Option<bands::Day>) {
+    plx_base::testlock::assert_held("an owned calendar rail");
+    let current = state.cur();
+    let section = state.state_mut(current).expect("a current section");
+    section.sorts = Arc::new(vec![SortEntry {
+        key: "addedAt".into(), desc_key: String::new(), title: "Date added".into(), default_desc: true,
+    }]);
+    section.sort_idx = 0;
+    section.sort_desc = true;
+    section.today = Some(counted);
+    let key = section.bands_key(bands::BandFamily::DateAdded);
+    let ladder = bands::plan(bands::BandFamily::DateAdded, counted, counted[0]);
+    let counts: Vec<u32> = (1..=ladder.len() as u32).collect();
+    let rail = bands::BandRail::new(&ladder, &counts, 400).expect("trusted calendar bands");
+    section.land_bands(key, Some(rail));
+    section.today = today;
 }
 
 /// The current section's A-Z counts are owed again (the registered fixture table lands them done).

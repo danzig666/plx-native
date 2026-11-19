@@ -14,7 +14,7 @@ pub trait Host: 'static {
     /// The app's screen argument enum (what an entry is mounted from).
     type Arg: ScreenArg;
     /// App effects: Store / Net / Disk / Sys / Player / Poster / Emit — executed by `app/effects.rs`.
-    type Fx: 'static;
+    type Fx: AppEffect;
     /// App payloads: async results, store notices, deliveries — parsed by the REQUESTER.
     type Msg: 'static;
     /// `ElemKey`: interned, never a String.
@@ -57,6 +57,27 @@ pub trait Host: 'static {
     /// `Vec` as the one being stepped. The default drops it: a host with no page that names its
     /// parent pays nothing.
     fn views_over<'a>(views: Self::Views<'a>, _beneath: Option<ScreenId>) -> Self::Views<'a> { views }
+}
+
+/// An owned, exhaustive execution partition. Routing consumes the effect exactly once;
+/// the yielded envelope can never contain an inline-only operation.
+pub enum EffectDisposition<I, E> { Inline(I), External(E) }
+
+/// Application-neutral effect contract associated with `Host::Fx`.
+/// No application vocabulary or runner capability crosses into the library.
+pub trait AppEffect: 'static {
+    type Inline: 'static;
+    type ExternalFx: 'static;
+    fn route(self) -> EffectDisposition<Self::Inline, Self::ExternalFx>;
+}
+
+pub type InlineFx<H> = <<H as Host>::Fx as AppEffect>::Inline;
+pub type ExternalFx<H> = <<H as Host>::Fx as AppEffect>::ExternalFx;
+
+impl AppEffect for () {
+    type Inline = ();
+    type ExternalFx = std::convert::Infallible;
+    fn route(self) -> EffectDisposition<(), Self::ExternalFx> { EffectDisposition::Inline(self) }
 }
 
 macro_rules! newtype {
@@ -106,6 +127,31 @@ newtype!(
     /// A part of a `Composed` screen (§7.1).
     PartId
 );
+
+/// One external app-command obligation, monotonically minted by its dispatcher.
+/// Tokens are local to that dispatcher, not portable between independent runtimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppCommandId(pub u64);
+
+/// Terminal execution/admission result, distinct from a later asynchronous job result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppCommandOutcome {
+    Completed,
+    Failed,
+    Refused,
+    Cancelled,
+    RetiredSender,
+}
+
+/// Owned handoff at the head of a dispatcher's FIFO. No screen/store borrow crosses IO.
+/// `from` includes the mounted lifetime; effect-specific request identities remain in `F`.
+/// A retired sender yields an error instead of an executable effect.
+pub struct AppCommand<F, R> {
+    pub id: AppCommandId,
+    pub from: MachineId,
+    pub return_state: R,
+    pub effect: Result<F, AppCommandOutcome>,
+}
 
 /// Why an entry is left (§3.4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -363,6 +409,66 @@ pub struct FocusKey<K> {
     pub elem: K,
 }
 
+/// Lessons captured from one input/runtime owner. Install facts are seeded explicitly;
+/// opening a menu retires physical feedback only for this owner's current profile tenure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldHintRead {
+    pub learned: bool,
+    pub card: bool,
+    pub pill: bool,
+    /// Profile-tenure identity; equal lesson bits must not retain an old page's claim.
+    pub context: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldHintEvent { Learned, ReadCard, ReadPill }
+
+impl HoldHintRead {
+    pub fn apply(&mut self, event: HoldHintEvent) {
+        match event {
+            HoldHintEvent::Learned => { self.learned = true; self.card = true; self.pill = true; }
+            HoldHintEvent::ReadCard => self.card = true,
+            HoldHintEvent::ReadPill => self.pill = true,
+        }
+    }
+}
+
+/// Visible modal veil threshold shared by the container and its captured readout.
+pub const MODAL_CLOSING_GONE: f32 = 0.02;
+
+/// Immutable modal facts captured from the owning container before a step or render walk.
+/// This is a projection, not another phase machine or a process-wide publication.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModalRead {
+    pub input_covered: bool,
+    pub host_cached: bool,
+    pub closing_only: bool,
+    pub veil: f32,
+}
+impl ModalRead {
+    pub fn page_veiled(self) -> bool { self.veil >= MODAL_CLOSING_GONE }
+}
+
+/// Immutable projection of an owner's captured page image, sampled anew for each context.
+/// Empty is live. Both identities are checked against the current navigation tree before use;
+/// this value is never published by input, a GL cache, or a speculative render walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageImageRead {
+    owner: Option<(EntryId, InstanceId)>,
+}
+impl PageImageRead {
+    pub const fn held(entry: EntryId, instance: InstanceId) -> Self {
+        Self { owner: Some((entry, instance)) }
+    }
+    pub fn is_held(self) -> bool { self.owner.is_some() }
+    pub fn for_entry(self, entry: EntryId) -> Self {
+        if self.owner.is_some_and(|owner| owner.0 == entry) { self } else { Self::default() }
+    }
+    pub fn for_owner(self, entry: EntryId, instance: InstanceId) -> Self {
+        if self.owner == Some((entry, instance)) { self } else { Self::default() }
+    }
+}
+
 /// The read-only context a step receives (§3.1).
 pub struct Cx<'a, H: Host> {
     pub views: H::Views<'a>,
@@ -371,6 +477,9 @@ pub struct Cx<'a, H: Host> {
     pub press: PressRead<H::Elem>,
     pub focus: FocusRead<H::Elem>,
     pub owner: InputOwner,
+    pub modal: ModalRead,
+    pub page_image: PageImageRead,
+    pub hold_hint: HoldHintRead,
 }
 
 /// The dispatcher's reborrow of `App.present` for one step (§3.1, §4.4): `note` is its one method.
@@ -492,10 +601,41 @@ pub enum Fx<H: Host> {
     },
     CancelTimer(TimerId),
     Press(PressArm<H::Elem>),
+    /// An owned input lesson; never an ambient publisher or a storage operation.
+    HoldHint(HoldHintEvent),
     Remember { group: GroupId, elem: H::Elem },
     Log(LogLine),
     /// Handed to the application's adapters.
     App(H::Fx),
+}
+
+/// Runtime identity for admitting environmental paint observations. Numeric frame/entry/
+/// instance counters alone do not distinguish two dispatchers in the same process.
+#[derive(Default)]
+pub struct PresentationAuthority(std::sync::Arc<()>);
+impl PresentationAuthority {
+    pub fn receipt<M>(&self, frame: u64, entry: EntryId, instance: InstanceId, message: M) -> PresentationReceipt<M> {
+        PresentationReceipt { authority:self.0.clone(), frame, entry, instance, message }
+    }
+    pub fn owns<M>(&self, receipt: &PresentationReceipt<M>) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &receipt.authority)
+    }
+}
+
+/// Opaque owner seal plus exact captured facts. Creating another authority cannot forge
+/// this runtime's seal; only its dispatcher holds the authority used at admission.
+pub struct PresentationReceipt<M> {
+    authority: std::sync::Arc<()>,
+    frame: u64,
+    entry: EntryId,
+    instance: InstanceId,
+    message: M,
+}
+impl<M> PresentationReceipt<M> {
+    pub fn frame(&self) -> u64 { self.frame }
+    pub fn entry(&self) -> EntryId { self.entry }
+    pub fn instance(&self) -> InstanceId { self.instance }
+    pub fn message(&self) -> &M { &self.message }
 }
 
 /// Everything a mounted screen can be told (§6.1).
@@ -534,6 +674,7 @@ pub enum ScreenEvent<H: Host> {
         by: By,
     },
     App(H::Msg),
+    Presented(PresentationReceipt<H::Msg>),
 }
 
 impl<H: Host> ScreenEvent<H> {
@@ -560,6 +701,7 @@ impl<H: Host> ScreenEvent<H> {
             ScreenEvent::StoreChanged(..) => "store_changed",
             ScreenEvent::FocusMoved { .. } => "focus_moved",
             ScreenEvent::App(_) => "app",
+            ScreenEvent::Presented(_) => "presented",
         }
     }
 }
@@ -602,16 +744,17 @@ pub enum FocusTarget<K> {
     /// so the arrival is exactly as deliberate as a directional move into the same group would
     /// be; reporting `By::Restore` for it read as "the page is being restored to where it was",
     /// which is false the first time a tab is ever visited, and it silently disabled every
-    /// screen's own "deliberate move" arrival animation (`library::LibraryScreen`'s
+    /// screen's own "deliberate move" arrival animation (at the time `library::LibraryScreen`'s
     /// `pop_from_rest`, gated on `By::Dir | By::Pointer`) for that one path only — the reason a
-    /// fresh Home/Search → TV Shows mint SNAPPED to the first tile while a Movies → TV Shows
-    /// peer switch (which never leaves the strip's already-focused pill, and never re-enters
-    /// through here at all) animated normally. `stack.rs`'s `SelectTab` "cover-and-mint" arm is
-    /// the one constructor of a MINT. The second sanctioned producer is a page seating its OWN
-    /// arrival through a self-delivered `Enter::Fresh`: the Watchlist's `follow_seat` moves its
-    /// first seat from the Sort & Filter pill to the first tile as the grid lands, and that seat
-    /// must read as a deliberate move for the opening animation to play
-    /// (`watchlist/opening_tests.rs`). Nothing else may produce this variant.
+    /// fresh Home/Search → TV Shows mint SNAPPED to the first tile while a Movies → TV Shows peer
+    /// switch (which never leaves the strip's already-focused pill, and never re-enters through
+    /// here at all) animated normally. Today the shared card grid reads a `By::Dir | By::Pointer |
+    /// By::Script` move as deliberate (`ui/src/cards/mod.rs`'s `Seen::of`). `stack.rs`'s
+    /// `SelectTab` "cover-and-mint" arm is the one constructor of a MINT. The second sanctioned
+    /// producer is a page seating its OWN arrival through a self-delivered `Enter::Fresh`: the
+    /// Watchlist's `follow_seat` moves its first seat from the Sort & Filter pill to the first tile
+    /// as the grid lands, and that seat must read as a deliberate move for the opening animation to
+    /// play (`watchlist/opening_tests.rs`). Nothing else may produce this variant.
     FirstInGroupAnimated(GroupId),
 }
 
@@ -621,6 +764,11 @@ pub enum By {
     Pointer,
     Restore,
     Reconcile,
+    /// **A deliberate arrival named by an accessibility id** (`focus:<id>` / `press:<id>`): the
+    /// dispatcher's by-id delivery sets focus with it. It reads like `Dir` everywhere a screen
+    /// asks "was this a deliberate move" (reveal-scroll, arrival animations, edge paging) and is
+    /// never a pointer hover. Recorded in its own resolution row, never as a `Focus` row.
+    Script,
 }
 
 /// What a `Deliver` carries: a screen event, app message, or identity-bound input operation.
@@ -687,6 +835,11 @@ impl<K> InputEvent<K> {
             InputKind::PointerHidden => { c.u32(6); }
             InputKind::SystemKeyboard(up) => { c.u32(7).bool(*up); }
             InputKind::Pan { dx, x, y } => { c.u32(8).f32(*dx).f32(*x).f32(*y); }
+            InputKind::ById { id, press, expect } => {
+                c.u32(9).str(id);
+                c.option(press.as_ref(), |c, tap| { c.u32(tap.sym).u32(tap.wcode); });
+                c.option(expect.as_ref(), |c, subject| { c.str(subject); });
+            }
         }
     }
 }
@@ -761,6 +914,27 @@ pub enum InputKind<K> {
     Text(TextEdit),
     PointerHidden,
     SystemKeyboard(bool),
+    /// **An accessibility-id focus or press** (`focus:<id>`, `press:<id>[@<subject>]`), ingress
+    /// only. The dispatcher acts on it at its ORDERED delivery position (never in the ingest
+    /// pre-pass): it resolves `id` against the input owner's view, moves focus with
+    /// `By::Script` and, for a press (`press` is `Some`), delivers the OK key's Down and Up to
+    /// the owner exactly as a remote OK would. `expect` is the subject the element must carry
+    /// (`@<subject>`), compared in the same delivery step. A refusal moves nothing and emits no
+    /// key. The id is text from the FIFO, so it is canonical content (`write_with` hashes the
+    /// bytes, never the `Arc` address).
+    ById {
+        id: std::sync::Arc<str>,
+        press: Option<OkTap>,
+        expect: Option<std::sync::Arc<str>>,
+    },
+}
+
+/// The OK key's codes a by-id press delivers (`InputKind::ById::press`), filled by the
+/// application from its `ok` token table so the core never names a platform key code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OkTap {
+    pub sym: u32,
+    pub wcode: u32,
 }
 
 /// A whole keyboard commit preserves LG's prediction boundary (`docs/search.md`). Cloning an

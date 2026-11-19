@@ -164,7 +164,13 @@ const APP_SHAPES: &[&str] = &[
 /// Product wire compatibility joins the existing TextInputWire/content codec census. The
 /// generic frame envelope is schema 3; product recordings without ordered resolutions and
 /// canonical final focus must be refused before parsing/boot, including Targets mode.
-const RESOLUTION_SHAPE: &str = "ProductResolutionV1{fo:Option<(entry:u32,elem:u32,group:Option<u32>)>,rs:ordered<Focus{phase:u8,entry:u32,focus:Option<(u32,u32)>,group:Option<u32>,outcome:u8,from:Option<(u32,u32)>,to:Option<(u32,u32)>,by:u8}|Hit{phase:u8,entry:Option<u32>,hit:Option<(u32,u32)>,focus:Option<(u32,u32)>,activate:Option<((u32,u32),u8)>,miss:bool}>,input:post-hit,metrics:Width(bytes,i32,bool)|Cap(i32)|Line(i32)->f32bits}";
+const RESOLUTION_SHAPE: &str = "ProductResolutionV2{fo:Option<(entry:u32,elem:u32,group:Option<u32>)>,rs:ordered<Focus{phase:u8,entry:u32,focus:Option<(u32,u32)>,group:Option<u32>,outcome:u8,from:Option<(u32,u32)>,to:Option<(u32,u32)>,by:u8}|Hit{phase:u8,entry:Option<u32>,hit:Option<(u32,u32)>,focus:Option<(u32,u32)>,activate:Option<((u32,u32),u8)>,miss:bool}|Id{entry:u32,focus:Option<(u32,u32)>,group:Option<u32>,refusal:u8}>,input:post-hit,metrics:Width(bytes,i32,bool)|Cap(i32)|Line(i32)->f32bits}";
+
+/// The census before the by-id `Id` row. The frozen session-codec vectors and the historical
+/// profile identities were graded under these bytes, so they keep them (`state_fp_v7`,
+/// `session_app_prior_vector`): a changed current shape must not move what history was computed from.
+#[cfg(test)]
+const RESOLUTION_SHAPE_V1: &str = "ProductResolutionV1{fo:Option<(entry:u32,elem:u32,group:Option<u32>)>,rs:ordered<Focus{phase:u8,entry:u32,focus:Option<(u32,u32)>,group:Option<u32>,outcome:u8,from:Option<(u32,u32)>,to:Option<(u32,u32)>,by:u8}|Hit{phase:u8,entry:Option<u32>,hit:Option<(u32,u32)>,focus:Option<(u32,u32)>,activate:Option<((u32,u32),u8)>,miss:bool}>,input:post-hit,metrics:Width(bytes,i32,bool)|Cap(i32)|Line(i32)->f32bits}";
 
 /// The state SHAPE of the product hash: bump by changing a `SHAPE` string, never silently.
 ///
@@ -209,16 +215,69 @@ const RESOLUTION_SHAPE: &str = "ProductResolutionV1{fo:Option<(entry:u32,elem:u3
 /// well as the term around it: the init shape names that type rather than spelling its fields, so
 /// a census that only said `ControlledHomeInitV3` would be claiming the change was in the
 /// envelope when it is in the session.
+#[cfg(test)]
 pub(crate) const FP_PRIOR: u64 = 4239819007634745513;
+#[cfg(test)]
 pub(crate) const FP_V6: u64 = 741022075462080307;
 
 pub(crate) fn state_fp() -> u64 {
+    let mut shapes = APP_SHAPES.to_vec();
+    shapes.extend_from_slice(plx_screens::registry::SCREEN_SHAPES);
+    shapes.extend_from_slice(&[super::bootstrap::CONTENT_SHAPE, RESOLUTION_SHAPE,
+        super::bootstrap::RUNTIME_POLICY_SHAPE, super::bootstrap::UI_PREFERENCES_SHAPE,
+        super::bootstrap::INSTALL_HOLD_HINT_SHAPE,
+        "ControlledHomeInitV13", "HoldHintEffectsV1{Learned|ReadCard|ReadPill}",
+        super::bootstrap::presentation::SHAPE,
+        "CaptureReadinessV2{before_dispatch:pending:bool,text:bool}",
+        "MeasurementV1{query:Width(text:bytes,sz:i32,bold:bool)|Cap(sz:i32)|Line(sz:i32),answer:f32bits:u32}",
+        "ControlledInstallLanguageV1{install_language:Preference};ControlledRunningLanguageV1{running_language:Preference};PlayerPresentation:unsupported_domain_neutral_no_ambient;NativePreview:controlled_port_unavailable"]);
+    plx_ui::rec::state_fp(&shapes)
+}
+
+/// Frozen pre-owned-hint identity: only diagnostic/refusal tests use this profile.
+#[cfg(test)]
+pub(crate) fn state_fp_v11() -> u64 {
+    plx_ui::rec::state_fp(&["ControlledHomeInitV11", "ControlledInstallLanguageV1{install_language:Preference};ControlledRunningLanguageV1{running_language:Preference};PlayerPresentation:unsupported_domain_neutral_no_ambient;NativePreview:controlled_port_unavailable", &state_fp_v10().to_string()])
+}
+
+/// The reviewed historical census owns these bytes, not today's changing InputMachine.
+#[cfg(test)]
+fn historical_input_shape() -> &'static str {
+    static CENSUS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    CENSUS.get_or_init(|| serde_json::from_str(include_str!("fixtures/session-codec-v5/current-base-fingerprints.json")).expect("frozen census"))
+        ["prior_vector"][1].as_str().expect("historical Input shape")
+}
+
+#[cfg(test)]
+pub(crate) fn state_fp_v10() -> u64 {
+    plx_ui::rec::state_fp(&["ControlledHomeInitV10", super::bootstrap::UI_PREFERENCES_SHAPE, &state_fp_v9().to_string()])
+}
+
+/// Frozen unpublished six-field identity, used only to refuse underspecified V9 captures.
+#[cfg(test)]
+pub(crate) fn state_fp_v9() -> u64 {
+    plx_ui::rec::state_fp(&["ControlledHomeInitV9",
+        "ControlledUiPreferencesV1{deck_press:DeckPress,under_posters:UnderPosters,instant_dpad_seeking:InstantDpadSeeking,playback_quality:PlaybackQuality,subtitle_size:SubtitleSize,subtitle_position:SubtitlePosition}",
+        &state_fp_v8().to_string()])
+}
+
+/// Frozen pre-preference-capture census; retained as an identity input, not an admission exception.
+#[cfg(test)]
+fn state_fp_v8() -> u64 {
+    plx_ui::rec::state_fp(&["ControlledHomeInitV8", "ScreenCommandsV1{fifo:before_single_navigation_commit}",
+        super::bootstrap::RUNTIME_POLICY_SHAPE, &state_fp_v7().to_string()])
+}
+
+/// Frozen V7 census: do not change historical profile identities.
+#[cfg(test)]
+pub(crate) fn state_fp_v7() -> u64 {
     let mut shapes: Vec<&str> = APP_SHAPES.to_vec();
+    shapes[1] = historical_input_shape();
     let shape = shapes.iter_mut().find(|shape| **shape == super::bootstrap::SHAPE)
         .expect("controlled initial shape");
     *shape = super::bootstrap::SHAPE_V7;
     shapes.push(super::bootstrap::CONTENT_SHAPE);
-    shapes.push(RESOLUTION_SHAPE);
+    shapes.push(RESOLUTION_SHAPE_V1);
     shapes.push("CaptureReadinessV2{before_dispatch:pending:bool,text:bool}");
     shapes.push("MeasurementV1{query:Width(text:bytes,sz:i32,bold:bool)|Cap(sz:i32)|Line(sz:i32),answer:f32bits:u32}");
     shapes.extend_from_slice(plx_screens::registry::SCREEN_SHAPES);
@@ -229,10 +288,11 @@ pub(crate) fn state_fp() -> u64 {
 #[cfg(test)]
 fn session_app_prior_vector() -> Vec<&'static str> {
     let mut shapes = APP_SHAPES.to_vec();
+    shapes[1] = historical_input_shape();
     // This test's session-codec census is frozen history, not today's product shape.
     shapes[3] = "AppFrameV4{route:str,overlay:str,focus:str,tree:u64,session:u64,consent:u64,initial:u64}";
     shapes.push(super::bootstrap::CONTENT_SHAPE);
-    shapes.push(RESOLUTION_SHAPE);
+    shapes.push(RESOLUTION_SHAPE_V1);
     shapes.push("CaptureReadinessV2{before_dispatch:pending:bool,text:bool}");
     shapes.push("MeasurementV1{query:Width(text:bytes,sz:i32,bold:bool)|Cap(sz:i32)|Line(sz:i32),answer:f32bits:u32}");
     shapes.extend_from_slice(plx_screens::registry::SCREEN_SHAPES);
@@ -281,7 +341,6 @@ fn session_app_fingerprint_probe_only() {
         Some(RecError::StateShape { theirs: prospective_fp_v6, ours: state_fp() }));
     assert_eq!(frozen["prospective_fp_v6"].as_u64(), Some(FP_V6));
     for manifest in [
-        include_str!("../../../tests/fixtures/replay/1-boot-home-chip-grid/manifest.json"),
         include_str!("../../../tests/fixtures/replay/6-settings-family/manifest.json"),
         include_str!("../../../tests/fixtures/replay/12-filmography-detail-return/manifest.json"),
     ] {
@@ -301,36 +360,20 @@ fn session_app_fingerprint_probe_only() {
 /// the common run tail. Only those u64 values are serialized; this neither adds raw secrets nor
 /// claims all-domain state coverage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FrameHashProfile { OwnedV5, KeyOnlyV4 }
+pub(crate) enum FrameHashProfile { OwnedV5 }
 
 /// Only owned key input can prove the retired app press stayed at its boot-time rest.
 /// Pointer/direct-token profiles are incompatible and are rejected before startup.
 fn recording_hash_profile(recording: &Recording) -> Result<FrameHashProfile, &'static str> {
     if recording.header.state_fp == state_fp() { return Ok(FrameHashProfile::OwnedV5); }
-    if recording.header.state_fp != FP_PRIOR { return Err("incompatible controlled state shape"); }
-    for input in recording.frames.iter().flat_map(|frame| &frame.inputs) {
-        if !matches!(decode_input(input).map_err(|_| "unsupported legacy press input")?.kind,
-            plx_machine::machine::InputKind::Key { .. }) {
-            return Err("unsupported legacy press input");
-        }
-    }
-    Ok(FrameHashProfile::KeyOnlyV4)
-}
-
-/// Frozen AppFrameV4 bytes, not a second press machine or mutable compatibility state.
-fn write_v4_idle_press(c: &mut Canon) {
-    c.f32(1.0).f32(0.0).discriminant(0)
-        .u32(0).u32(0).bool(false).u32(0).u32(0)
-        .bool(false).bool(false).bool(false).bool(false).bool(true);
+    Err("incompatible owner-input/presentation state; requires V13 capture")
 }
 
 pub(crate) fn state_hash_profile(profile: FrameHashProfile, route: &str, overlay: &str, focus: &str,
     tree: u64, session: u64, consent: u64, initial: u64) -> u64 {
-    if profile == FrameHashProfile::OwnedV5 { return state_hash(route, overlay, focus, tree, session, consent, initial); }
-    let mut c = Canon::new();
-    if profile == FrameHashProfile::KeyOnlyV4 { write_v4_idle_press(&mut c); }
-    c.str(route).str(overlay).str(focus).u64(tree).u64(session).u64(consent).u64(initial);
-    c.finish()
+    match profile {
+        FrameHashProfile::OwnedV5 => state_hash(route, overlay, focus, tree, session, consent, initial),
+    }
 }
 pub(crate) fn state_hash(route: &str, overlay: &str, focus: &str, tree: u64, session: u64, consent: u64, initial: u64) -> u64 {
     let mut current = Canon::new();
@@ -404,6 +447,9 @@ enum ResolutionWire {
         outcome: u8, from: Option<WireKey>, to: Option<WireKey>, by: u8 },
     Hit { phase: u8, entry: Option<u32>, hit: Option<WireKey>, focus: Option<WireKey>,
         activate: Option<(WireKey, u8)>, miss: bool },
+    /// One `InputKind::ById`, asked at its ordered delivery position: the element it named (and
+    /// the group it is in) or `refusal`, an `IdRefusal::code` (0 is "resolved").
+    Id { entry: u32, focus: Option<WireKey>, group: Option<u32>, refusal: u8 },
 }
 
 fn wire_key(k: plx_machine::machine::FocusKey<u32>) -> WireKey { (k.entry.0, k.elem) }
@@ -422,7 +468,9 @@ impl ResolutionWire {
         let (outcome, from, to, by) = match answer.outcome {
             Outcome::Nothing => (0,None,None,0),
             Outcome::Moved { from, to, by } => (1, from.map(wire_key), Some(wire_key(to)),
-                match by { By::Dir=>0, By::Pointer=>1, By::Restore=>2, By::Reconcile=>3 }),
+                // 4 is `By::Script`: a by-id move is resolved by an `Id` row, never a `Focus` row,
+                // so `focus_answer` refuses 4 as a Focus row's cause.
+                match by { By::Dir=>0, By::Pointer=>1, By::Restore=>2, By::Reconcile=>3, By::Script=>4 }),
             Outcome::Edge(rule) => (match rule { EdgeRule::Geometric=>2, EdgeRule::Stop=>3,
                 EdgeRule::Screen=>4, EdgeRule::Nav(NavOpKind::Back)=>5, EdgeRule::Nav(NavOpKind::Dismiss)=>6 },None,None,0),
         };
@@ -467,15 +515,45 @@ impl ResolutionWire {
         Ok(plx_ui::hit::Resolution { hit:hit.map(focus_key), focus:focus.map(focus_key), miss,
             activate:activate.map(|(k,a)|(focus_key(k), match a { 0=>Activate::Press,1=>Activate::Immediate,_=>Activate::Direct })) })
     }
+    fn id(entry: plx_machine::machine::EntryId, answer: plx_ui::dispatch::IdAnswer<u32>) -> Self {
+        Self::Id { entry:entry.0, focus:answer.focus.map(wire_key), group:answer.group.map(|g|g.0),
+            refusal:answer.refusal.map_or(0, |why|why.code()) }
+    }
+    fn id_answer(&self) -> Result<plx_ui::dispatch::IdAnswer<u32>, &'static str> {
+        use plx_ui::dispatch::{IdAnswer, IdRefusal};
+        let Self::Id { entry, focus, group, refusal } = *self else { return Err("wrong resolution family"); };
+        let refusal = match refusal {
+            0 => None,
+            code => Some(IdRefusal::from_code(code).ok_or("invalid id refusal")?),
+        };
+        let valid = match refusal {
+            // an element of the row's own entry, in a group or not
+            None => entry != 0 && focus.is_some_and(|k| k.0 == entry),
+            // a refusal names no element and no group; entry 0 is a by-id input no page was
+            // addressed (the one reason that has no entry to name)
+            Some(why) => focus.is_none() && group.is_none() && (entry != 0 || why == IdRefusal::NoOwner),
+        };
+        if !valid { return Err("invalid id resolution"); }
+        Ok(IdAnswer { focus:focus.map(focus_key), group:group.map(plx_machine::machine::GroupId), refusal })
+    }
     fn decode(value: Value) -> Result<Self, &'static str> {
         let v: Self = serde_json::from_value(value.clone()).map_err(|_|"invalid resolution encoding")?;
         // Option fields must be explicit null, not omitted.
         if serde_json::to_value(&v).ok().as_ref()!=Some(&value) { return Err("noncanonical resolution"); }
-        match &v { Self::Focus { .. } => { v.focus_answer()?; }, Self::Hit { .. } => { v.hit_answer()?; } }
+        match &v {
+            Self::Focus { .. } => { v.focus_answer()?; },
+            Self::Hit { .. } => { v.hit_answer()?; },
+            Self::Id { .. } => { v.id_answer()?; },
+        }
         Ok(v)
     }
-    fn identity(&self) -> (bool,u8,Option<u32>) {
-        match self { Self::Focus {phase,entry,..}=>(true,*phase,Some(*entry)), Self::Hit {phase,entry,..}=>(false,*phase,*entry) }
+    /// `(family, phase, entry)`: the family is 0 Focus, 1 Hit, 2 Id (the order the rows are asked in).
+    fn identity(&self) -> (u8,u8,Option<u32>) {
+        match self {
+            Self::Focus {phase,entry,..}=>(0,*phase,Some(*entry)),
+            Self::Hit {phase,entry,..}=>(1,*phase,*entry),
+            Self::Id {entry,..}=>(2,0,Some(*entry)),
+        }
     }
 }
 
@@ -491,6 +569,13 @@ struct ResultEnvelope {
 
 /// Validate every frame before SDL/resource construction. No unsupported family can select
 /// a live supplier as a fallback; content resources require the typed content initial domain.
+fn valid_hold_hint_sender(value: &Value) -> bool {
+    matches!(value.as_str(), Some("Session" | "Consent" | "Huds" | "Input" | "Present" | "Nav" | "Player" | "Cache")) || value.as_str().is_some_and(|sender| {
+        sender.strip_prefix("inst:").and_then(|id| id.parse::<u32>().ok())
+            .is_some_and(|id| id != 0 && sender == format!("inst:{id}"))
+    })
+}
+
 pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootstrap::Initial)
     -> Result<(), &'static str> {
     recording_hash_profile(recording)?;
@@ -502,6 +587,7 @@ pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootst
         return Err("unsupported controlled recording configuration");
     }
     let mut detail = plx_data::metadata::record::Validator::default();
+    let mut last_presentation: Option<(u64, u64)> = None;
     for (index, frame) in recording.frames.iter().enumerate() {
         if (index == 0 || !frame.inputs.is_empty() || !frame.effects.is_empty() || !frame.results.is_empty())
             && frame.st.is_none() {
@@ -516,8 +602,19 @@ pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootst
             || !frame.inputs.is_empty() || !frame.results.is_empty()) {
             return Err("invalid bootstrap frame");
         }
+        let mut presentation_seen = false;
         for input in &frame.inputs {
-            if direct_token(input).is_none() && controlled_foreground(input)?.is_none() {
+            if input["kind"] == "player_presentation_v1" {
+                let (paint_frame, _, _, _) = super::bootstrap::presentation::decode(input)?;
+                // Dispatcher observations are next-turn ingress, before the first ordinary input.
+                if presentation_seen || input != &frame.inputs[0] || index == 0
+                    || paint_frame == 0 || last_presentation.is_some_and(|(previous_frame, previous_paint)|
+                        paint_frame.checked_sub(previous_paint) != Some(frame.f - previous_frame)) {
+                    return Err("invalid player presentation schedule");
+                }
+                last_presentation = Some((frame.f, paint_frame));
+                presentation_seen = true;
+            } else if direct_token(input).is_none() && controlled_foreground(input)?.is_none() {
                 decode_input(input)?;
             }
         }
@@ -525,6 +622,7 @@ pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootst
         // their own order, so establish every synchronous answer before validating that frame's
         // asynchronous completion batch.
         for effect in &frame.effects {
+            // All older machine-state profiles are refused before this frame walk.
             if effect["payload"]["content_resource"] == true {
                 detail.admission(&effect["payload"])?;
             }
@@ -568,6 +666,19 @@ pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootst
                 }
                 plx_data::stores::tape::validate_admission(&effect["payload"], initial.primary_client)?;
             }
+            if effect["payload"].get("preferences").is_some()
+                || (effect["payload"].get("hold_hint").is_some() && effect["e"] != "HoldHint") {
+                return Err("unsupported controlled preferences or misnamed hold-hint effect");
+            }
+            if effect["e"] == "HoldHint" {
+                super::bootstrap::effects::validate_hold_hint(&effect["payload"])?;
+                // Writer::effect_payload emits exactly these five envelope fields.
+                if effect.as_object().is_none_or(|object| object.len() != 5
+                    || !["f", "t", "from", "e", "payload"].iter().all(|key| object.contains_key(*key)))
+                    || !valid_hold_hint_sender(&effect["from"]) {
+                    return Err("invalid controlled hold-hint origin");
+                }
+            }
             if effect["e"] == "Request" {
                 if effect["from"] != "Cache" { return Err("invalid admission origin"); }
                 super::bootstrap::validate_admission(&effect["payload"], initial.primary_client)?;
@@ -575,7 +686,7 @@ pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootst
             if effect["f"] != frame.f || effect["t"] != "eff"
                 || effect.get("payload").is_none() || effect["payload"].get("unsupported").is_some()
                 || !matches!(effect["e"].as_str(), Some("Nav" | "Mount" | "Unmount" | "Deliver" |
-                    "Timer" | "CancelTimer" | "Press" | "Remember" | "Log" | "App" | "Request")) {
+                    "Timer" | "CancelTimer" | "Press" | "HoldHint" | "Remember" | "Log" | "App" | "Request")) {
                 return Err("unsupported controlled effect");
             }
         }
@@ -583,6 +694,8 @@ pub(crate) fn validate_controlled(recording: &Recording, initial: &super::bootst
     Ok(())
 }
 pub(crate) fn validate_resolution_recording(recording:&Recording) -> Result<(), &'static str> {
+    // By-id inputs tapped so far and not yet resolved: see the pairing note below.
+    let mut id_owed = 0usize;
     for frame in &recording.frames {
         if frame.focus.is_none() { return Err("missing controlled focus truth"); }
         if frame.focus.flatten().is_some_and(|(entry,_,_)|entry==0) { return Err("invalid focus entry"); }
@@ -598,19 +711,34 @@ pub(crate) fn validate_resolution_recording(recording:&Recording) -> Result<(), 
         // Legacy pointers have no rs rows; current product pages are all Engine pages. Runtime
         // observation accounting still protects generic legacy test doubles.
         if hits!=pointer_inputs { return Err("incoherent pointer truth"); }
+        // Every by-id input is resolved exactly once, at its ORDERED DELIVERY position, and that
+        // position is not the pre-pass a pointer resolves in: a delivery the drain's budget carried
+        // runs in a later frame than the one that tapped it. A pointer's Hit rows therefore pair
+        // with its frame's inputs exactly, while Id rows pair as a running balance: a frame's rows
+        // are those of inputs tapped in this frame or an earlier one (a row ahead of its input is an
+        // extra row), and the balance is zero at the end (an input left over has no row). With
+        // nothing carried this is the exact per-frame pairing.
+        id_owed += frame.inputs.iter().filter(|row|matches!(decode_input(row),
+            Ok(plx_machine::machine::InputEvent{kind:plx_machine::machine::InputKind::ById{..},..}))).count();
+        let id_rows = frame.resolutions.iter().filter(|row|row["payload"]["kind"]=="Id").count();
+        id_owed = id_owed.checked_sub(id_rows).ok_or("id resolution without a by-id input")?;
     }
+    if id_owed != 0 { return Err("by-id input without an id resolution"); }
     Ok(())
 }
 impl Replay {
-    fn resolution_diff(&mut self, focus: bool, reason: &'static str, index: usize, hashes:Option<(u64,u64)>) {
-        if focus { self.resolution.focus_diffs += 1; } else { self.resolution.hit_diffs += 1; }
+    /// `family` is [`ResolutionWire::identity`]'s first term. By-id and pointer truth share the
+    /// `hit_diffs` counter (the `done` line's fields are read by tools and stay as they are); the
+    /// log line's `resolution=` word tells them apart.
+    fn resolution_diff(&mut self, family: u8, reason: &'static str, index: usize, hashes:Option<(u64,u64)>) {
+        if family == 0 { self.resolution.focus_diffs += 1; } else { self.resolution.hit_diffs += 1; }
         // Focus/hit truth is a subset of INPUT-resolution grading. Keep it in input_diffs too:
         // the existing adoption gate refuses input differences, including state-only rebaseline
         // with an unrelated state mismatch. Dedicated counters identify the exact subcategory.
         self.input_diffs += 1;
         let hashes=hashes.map(|(expected,got)|format!(" expected={expected:#018x} got={got:#018x}")).unwrap_or_default();
         plx_base::eventlog::log(&format!("replay: input diverge f={} resolution_index={index} reason={reason} resolution={}{hashes}",
-            self.rec.frames.get(self.at).map_or(self.at as u64,|f|f.f), if focus { "focus" } else { "hit" }));
+            self.rec.frames.get(self.at).map_or(self.at as u64,|f|f.f), ["focus","hit","id"][usize::from(family)]));
     }
     fn same(&self) -> bool {
         self.failure.is_none() && self.diverged == 0 && self.present_diffs == 0
@@ -626,7 +754,7 @@ pub(crate) enum Recplay {
 }
 
 /// Observe the real drain with complete supported effect and result payloads.
-impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
+impl plx_ui::dispatch::ReplayAuthority<super::bridge::AppHost> for Recplay {
     fn resolution_mode(&self) -> Option<bool> {
         if let Self::Replaying(r)=self { Some(r.resolution.mode==ReplayMode::Resolve) } else { None }
     }
@@ -635,7 +763,7 @@ impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
     fn resolve_focus(&mut self, _f:u64, phase:u8, entry:plx_machine::machine::EntryId,
         actual:Option<plx_ui::dispatch::FocusAnswer<u32>>) -> Option<plx_ui::dispatch::FocusAnswer<u32>> {
         if matches!(self,Self::Off) { return actual; }
-        self.resolve_observation((true,phase,Some(entry.0)), actual.map(|a|ResolutionWire::focus(phase,entry,a)))
+        self.resolve_observation((0,phase,Some(entry.0)), actual.map(|a|ResolutionWire::focus(phase,entry,a)))
             .and_then(|v|v.focus_answer().ok())
     }
     fn resolve_hit(&mut self, _f:u64, kind:plx_ui::hit::PointerKind, entry:Option<plx_machine::machine::EntryId>,
@@ -643,8 +771,14 @@ impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
         if matches!(self,Self::Off) { return actual; }
         use plx_ui::hit::PointerKind;
         let phase = match kind { PointerKind::Move=>0, PointerKind::Click=>1, PointerKind::Drag=>2 };
-        self.resolve_observation((false,phase,entry.map(|e|e.0)),actual.map(|a|ResolutionWire::hit(phase,entry,a)))
+        self.resolve_observation((1,phase,entry.map(|e|e.0)),actual.map(|a|ResolutionWire::hit(phase,entry,a)))
             .and_then(|v|v.hit_answer().ok())
+    }
+    fn resolve_id(&mut self, _f:u64, entry:plx_machine::machine::EntryId,
+        actual:Option<plx_ui::dispatch::IdAnswer<u32>>) -> Option<plx_ui::dispatch::IdAnswer<u32>> {
+        if matches!(self,Self::Off) { return actual; }
+        self.resolve_observation((2,0,Some(entry.0)),actual.map(|a|ResolutionWire::id(entry,a)))
+            .and_then(|v|v.id_answer().ok())
     }
     fn focus_continuation(&mut self, _f:u64, engine:bool, actual:Option<(u32,u32,Option<u32>)>)
         -> Option<Option<(u32,u32,Option<u32>)>> {
@@ -653,6 +787,9 @@ impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
         let _ = (engine, actual); // final product-frame truth is checked after the last drain.
         expected
     }
+}
+
+impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
     fn focus(&mut self, _f:u64, focus:Option<(u32,u32,Option<u32>)>) {
         match self {
             Self::Recording(r)=>{
@@ -670,6 +807,14 @@ impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
     fn input(&mut self, _frame: u64, input: &plx_machine::machine::InputEvent<u32>) {
         if matches!(self,Self::Off) { return; }
         match super::bootstrap::effects::input(input) {
+            Ok(encoded) => self.input(encoded),
+            Err(reason) => self.refuse(reason),
+        }
+    }
+    fn presentation(&mut self, _frame: u64, paint_frame: u64, entry: plx_machine::machine::EntryId,
+        instance: plx_machine::machine::InstanceId, message: &plx_screens::registry::AppMsg) {
+        if matches!(self, Self::Off) { return; }
+        match super::bootstrap::presentation::encode(paint_frame, entry, instance, message) {
             Ok(encoded) => self.input(encoded),
             Err(reason) => self.refuse(reason),
         }
@@ -720,7 +865,7 @@ impl plx_ui::dispatch::Tap<super::bridge::AppHost> for Recplay {
         let name = match &stamped.fx {
             Fx::Nav(_) => "Nav", Fx::Mount(_) => "Mount", Fx::Unmount(_) => "Unmount",
             Fx::Deliver(_, _) => "Deliver", Fx::Timer { .. } => "Timer",
-            Fx::CancelTimer(_) => "CancelTimer", Fx::Press(_) => "Press",
+            Fx::CancelTimer(_) => "CancelTimer", Fx::Press(_) => "Press", Fx::HoldHint(_) => "HoldHint",
             Fx::Remember { .. } => "Remember", Fx::Log(_) => "Log", Fx::App(_) => "App",
         };
         let payload = match super::bootstrap::effects::encode_from(stamped.from, &stamped.fx) {
@@ -770,13 +915,10 @@ pub(crate) fn machine_name(id: plx_machine::machine::MachineId) -> String {
 
 impl Recplay {
     pub(crate) fn frame_hash_profile(&self) -> FrameHashProfile {
-        match self {
-            Self::Replaying(replay) if replay.rec.header.state_fp == FP_PRIOR => FrameHashProfile::KeyOnlyV4,
-            _ => FrameHashProfile::OwnedV5,
-        }
+        FrameHashProfile::OwnedV5
     }
 
-    fn resolve_observation(&mut self, identity:(bool,u8,Option<u32>), actual:Option<ResolutionWire>) -> Option<ResolutionWire> {
+    fn resolve_observation(&mut self, identity:(u8,u8,Option<u32>), actual:Option<ResolutionWire>) -> Option<ResolutionWire> {
         match self {
             Self::Off => actual,
             Self::Recording(r) => {
@@ -942,6 +1084,10 @@ impl Recplay {
     pub(crate) fn recording_with_sink(initial: &super::bootstrap::Initial, sink: Box<dyn plx_ui::rec::Sink>)
         -> Result<Self, &'static str> {
         initial.validate()?;
+        if initial.install_hold_hint.is_none() { return Err("current recording requires explicit install hold-hint fact"); }
+        if initial.runtime_policy.is_none() { return Err("current recording requires explicit runtime policy"); }
+        if initial.ui_preferences.is_none() { return Err("current recording requires explicit UI preferences"); }
+        if initial.install_language.is_none() || initial.running_language.is_none() { return Err("current recording requires explicit install and running languages"); }
         let mut header = Header::new(state_fp(), initial);
         header.init_data = initial.to_v6_value()?;
         header.clock_start_ms = initial.clock_start;
@@ -1184,14 +1330,15 @@ impl Recplay {
                 r.started = true;
                 let remaining = r.rec.frames.get(r.at).map_or(0,|f|f.resolutions.len()).saturating_sub(r.resolution.at);
                 for index in r.resolution.at..r.resolution.at+remaining {
-                    let focus = r.rec.frames[r.at].resolutions[index]["payload"]["kind"]=="Focus";
-                    r.resolution_diff(focus,"missing",index,None);
+                    let family = match r.rec.frames[r.at].resolutions[index]["payload"]["kind"].as_str() {
+                        Some("Focus") => 0, Some("Id") => 2, _ => 1 };
+                    r.resolution_diff(family,"missing",index,None);
                 }
                 if let Some(expected) = r.rec.frames.get(r.at).and_then(|f|f.focus) {
                     if !r.resolution.final_seen {
-                        r.resolution_diff(true,"missing-final",r.resolution.at,None);
+                        r.resolution_diff(0,"missing-final",r.resolution.at,None);
                     } else if r.resolution.final_focus != expected {
-                        r.resolution_diff(true,"changed-final",r.resolution.at,Some((
+                        r.resolution_diff(0,"changed-final",r.resolution.at,Some((
                             resolution_hash(&expected),resolution_hash(&r.resolution.final_focus))));
                         r.failure=Some("final focus continuation was not applied");
                     }
@@ -1437,8 +1584,10 @@ mod tests {
         plx_machine::landgate::disarm();
         let initial = super::super::bootstrap::Initial::synthetic_home(
             1, 32517, Some("root".into())).unwrap();
-        let first_bridge = super::super::bridge::Bridge::for_test(|| 0);
-        let second_bridge = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let first_bridge = harness.bridge();
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let second_bridge = harness.bridge();
         let mut first = Recplay::recording_with_sink(
             &initial, Box::new(plx_ui::rec::MemSink::default())).unwrap();
         let mut second = Recplay::recording_with_sink(
@@ -1480,17 +1629,17 @@ mod tests {
         let mut recording = Recording { header, frames: vec![plx_ui::rec::Frame {
             f: 0, tick: Some(Tick::default()), st: Some(0), ..Default::default()
         }], metrics: Default::default(), stopped_at: None };
-        assert_eq!(recording_hash_profile(&recording), Ok(FrameHashProfile::KeyOnlyV4));
+        assert_eq!(recording_hash_profile(&recording), Err("incompatible owner-input/presentation state; requires V13 capture"));
         let key = super::super::bridge::script_edge(plx_machine::machine::Key::Down,
             plx_machine::machine::Edge::Down, Tick::default());
         recording.frames[0].inputs.push(super::super::bootstrap::effects::input(&key).unwrap());
-        assert_eq!(recording_hash_profile(&recording), Ok(FrameHashProfile::KeyOnlyV4));
+        assert_eq!(recording_hash_profile(&recording), Err("incompatible owner-input/presentation state; requires V13 capture"));
         let pointer = super::super::bridge::click_input(0.0, 0.0, Tick::default());
         recording.frames[0].inputs[0] = super::super::bootstrap::effects::input(&pointer).unwrap();
-        assert_eq!(recording_hash_profile(&recording), Err("unsupported legacy press input"));
+        assert_eq!(recording_hash_profile(&recording), Err("incompatible owner-input/presentation state; requires V13 capture"));
         recording.frames[0].inputs.clear();
         recording.header.state_fp = FP_V6;
-        assert_eq!(validate_controlled(&recording, &initial), Err("incompatible controlled state shape"));
+        assert_eq!(validate_controlled(&recording, &initial), Err("incompatible owner-input/presentation state; requires V13 capture"));
         recording.header.state_fp = state_fp();
         assert_eq!(recording_hash_profile(&recording), Ok(FrameHashProfile::OwnedV5));
         assert_eq!(validate_controlled(&recording, &initial), Ok(()));
@@ -1502,7 +1651,8 @@ mod tests {
         plx_ui::dispatch::press::Press::new().write(&mut old);
         old.str("home").str("").str("focus").u64(17).u64(21).u64(34).u64(55);
         let historical = old.finish();
-        assert_eq!(state_hash_profile(FrameHashProfile::KeyOnlyV4, "home", "", "focus", 17, 21, 34, 55), historical);
+        assert_eq!(state_hash_profile(FrameHashProfile::OwnedV5, "home", "", "focus", 17, 21, 34, 55),
+            state_hash("home", "", "focus", 17, 21, 34, 55));
         assert_ne!(state_hash("home", "", "focus", 17, 21, 34, 55), historical);
     }
 
@@ -1740,7 +1890,7 @@ mod tests {
 
     #[test]
     fn product_none_focus_and_missing_extra_truth_never_false_same() {
-        use plx_ui::dispatch::Tap;
+        use plx_ui::dispatch::{Tap, ReplayAuthority};
         // end_frame consumes the process-wide landing diffs even in this geometry-only case.
         let _serial = plx_base::testlock::serial();
         let initial=super::super::bootstrap::Initial::synthetic_home(1,32517,None).unwrap();
@@ -1748,7 +1898,7 @@ mod tests {
             f:0,focus:Some(None),st:Some(7),..Default::default()}],metrics:Default::default(),stopped_at:None};
         for mode in [ReplayMode::Targets,ReplayMode::Resolve] {
             let mut replay=replay_for_test(record(),mode);
-            assert_eq!(Tap::<Product>::focus_continuation(&mut replay,1,true,None),Some(None));
+            assert_eq!(ReplayAuthority::<Product>::focus_continuation(&mut replay,1,true,None),Some(None));
             Tap::<Product>::focus(&mut replay,1,None);
             replay.end_frame(&||7);
             let Recplay::Replaying(r)=replay else {unreachable!()};
@@ -1756,7 +1906,7 @@ mod tests {
         }
         for calls in [0] {
             let mut replay=replay_for_test(record(),ReplayMode::Resolve);
-            for _ in 0..calls { Tap::<Product>::focus_continuation(&mut replay,1,true,None); }
+            for _ in 0..calls { ReplayAuthority::<Product>::focus_continuation(&mut replay,1,true,None); }
             replay.end_frame(&||7);
             let Recplay::Replaying(r)=replay else {unreachable!()};
             assert!(!r.same());
@@ -1764,7 +1914,7 @@ mod tests {
         }
         let mut replay=replay_for_test(record(),ReplayMode::Resolve);
         for _ in 0..2 {
-            assert_eq!(Tap::<Product>::focus_continuation(&mut replay,1,true,None),Some(None));
+            assert_eq!(ReplayAuthority::<Product>::focus_continuation(&mut replay,1,true,None),Some(None));
             Tap::<Product>::focus(&mut replay,1,None);
         }
         replay.end_frame(&||7);
@@ -1775,7 +1925,7 @@ mod tests {
         let mut impossible=record();impossible.frames[0].focus=Some(Some((0,0,None)));
         assert!(validate_resolution_recording(&impossible).is_err());
         let mut replay=replay_for_test(record(),ReplayMode::Resolve);
-        assert_eq!(Tap::<Product>::focus_continuation(&mut replay,1,true,Some((1,2,Some(3)))),Some(None));
+        assert_eq!(ReplayAuthority::<Product>::focus_continuation(&mut replay,1,true,Some((1,2,Some(3)))),Some(None));
         Tap::<Product>::focus(&mut replay,1,Some((1,2,Some(3))));
         replay.end_frame(&||7);
         let Recplay::Replaying(r)=replay else {unreachable!()};
@@ -1787,29 +1937,44 @@ mod tests {
     /// The real product tap with a deliberately changed algorithm answer. Mutation happens at
     /// the resolution boundary, before Dispatcher publishes any effects, not after a frame.
     struct ChangedAnswer<'a> { rec:&'a mut Recplay, focus:bool, hit:bool }
-    impl plx_ui::dispatch::Tap<Product> for ChangedAnswer<'_> {
-        fn resolution_mode(&self)->Option<bool>{ plx_ui::dispatch::Tap::<Product>::resolution_mode(self.rec) }
-        fn resolution_active(&self)->bool{plx_ui::dispatch::Tap::<Product>::resolution_active(self.rec)}
+    impl plx_ui::dispatch::ReplayAuthority<Product> for ChangedAnswer<'_> {
+        fn resolution_mode(&self)->Option<bool>{ plx_ui::dispatch::ReplayAuthority::<Product>::resolution_mode(self.rec) }
+        fn resolution_active(&self)->bool{plx_ui::dispatch::ReplayAuthority::<Product>::resolution_active(self.rec)}
         fn resolution_error(&mut self,e:&'static str){ self.rec.refuse(e); }
         fn resolve_focus(&mut self,f:u64,p:u8,e:plx_machine::machine::EntryId,mut a:Option<plx_ui::dispatch::FocusAnswer<u32>>)
             ->Option<plx_ui::dispatch::FocusAnswer<u32>> {
             if self.focus && p==1 {
                 if let Some(a)=&mut a { a.focus=None; a.group=None; a.outcome=plx_ui::focus::Outcome::Nothing; }
             }
-            plx_ui::dispatch::Tap::<Product>::resolve_focus(self.rec,f,p,e,a)
+            plx_ui::dispatch::ReplayAuthority::<Product>::resolve_focus(self.rec,f,p,e,a)
         }
         fn resolve_hit(&mut self,f:u64,p:plx_ui::hit::PointerKind,e:Option<plx_machine::machine::EntryId>,mut a:Option<plx_ui::hit::Resolution<u32>>)
             ->Option<plx_ui::hit::Resolution<u32>> {
             if self.hit { if let Some(a)=&mut a { a.hit=None; a.focus=None; a.activate=None; } }
-            plx_ui::dispatch::Tap::<Product>::resolve_hit(self.rec,f,p,e,a)
+            plx_ui::dispatch::ReplayAuthority::<Product>::resolve_hit(self.rec,f,p,e,a)
         }
         fn focus_continuation(&mut self,f:u64,e:bool,a:Option<(u32,u32,Option<u32>)>) ->Option<Option<(u32,u32,Option<u32>)>> {
-            plx_ui::dispatch::Tap::<Product>::focus_continuation(self.rec,f,e,a)
+            plx_ui::dispatch::ReplayAuthority::<Product>::focus_continuation(self.rec,f,e,a)
         }
+    }
+    impl plx_ui::dispatch::Tap<Product> for ChangedAnswer<'_> {
         fn focus(&mut self,f:u64,a:Option<(u32,u32,Option<u32>)>){plx_ui::dispatch::Tap::<Product>::focus(self.rec,f,a);}
         fn input(&mut self,f:u64,e:&plx_machine::machine::InputEvent<u32>){plx_ui::dispatch::Tap::<Product>::input(self.rec,f,e);}
         fn effect(&mut self,f:u64,e:&plx_machine::machine::Stamped<Product>){plx_ui::dispatch::Tap::<Product>::effect(self.rec,f,e);}
         fn result(&mut self,f:u64,a:&plx_machine::machine::Addr,m:&plx_screens::registry::AppMsg){plx_ui::dispatch::Tap::<Product>::result(self.rec,f,a,m);}
+    }
+
+    #[derive(Default)]
+    struct SettingsObserver { ticks: usize, inputs: usize, results: usize, focus: usize, done: usize }
+    impl plx_ui::dispatch::Tap<Product> for SettingsObserver {
+        fn tick(&mut self, _: u64, _: Tick) { self.ticks += 1; }
+        fn input(&mut self, _: u64, _: &plx_machine::machine::InputEvent<u32>) { self.inputs += 1; }
+        fn result(&mut self, _: u64, _: &plx_machine::machine::Addr, _: &plx_screens::registry::AppMsg) { self.results += 1; }
+        fn focus(&mut self, _: u64, _: Option<(u32,u32,Option<u32>)>) { self.focus += 1; }
+        fn frame_done(&mut self, _: u64) { self.done += 1; }
+    }
+    impl plx_ui::dispatch::ReplayAuthority<Product> for SettingsObserver {
+        fn resolution_mode(&self) -> Option<bool> { panic!("passive observer cannot override owned replay mode") }
     }
 
     fn product_settings_run(rec:&mut Recplay, changed_focus:bool, changed_hit:bool) -> Vec<u64> {
@@ -1821,7 +1986,8 @@ mod tests {
         use plx_machine::{machine::{Tick,Key,InputKind}};
         use super::super::bridge;
         let mut d=Dispatcher::<Product>::new();
-        let mut rig=bridge::Bridge::for_test(||0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         rec.prepare_resources(&mut rig);
         bridge::show_page(&mut d,plx_screens::registry::AppArg::Settings(plx_screens::family::SettingsPage::Root));
         let mut hashes=Vec::new();
@@ -1837,6 +2003,19 @@ mod tests {
                 bridge::script_key(if f==1 {Key::Down} else {Key::Right},tick)
             } else { Vec::new() };
             let pointer=input.iter().any(|e|matches!(e.kind,InputKind::Pointer{..}));
+            let input_count = input.len();
+            let results = if let Some(results) = rec.replay_results(|_| None).unwrap() { results }
+                else if f == 0 {
+                    let mut state = plx_data::pms::PmsState::default();
+                    let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
+                    plx_data::pms::seed_for_test(&mut state, &adapter, 1, plx_data::pms::HubState::Ready);
+                    plx_data::pms::queue_test_landing(&state, &adapter, Some(2));
+                    plx_data::pms::take_landings(&adapter).into_iter().map(|result| {
+                        (plx_machine::machine::Addr { to: plx_machine::machine::MachineId::Store(plx_data::stores::StoreId::Hubs.ord()),
+                            req: plx_machine::machine::RequestId(result.request_id()) }, plx_screens::registry::AppMsg::HubsResult(result))
+                    }).collect()
+                } else { Vec::new() };
+            let result_count = results.len();
             rec.tick(tick.ms,0.016);
             // The host has no rasterizer; exercise its three layout capabilities through
             // the same Bridge split that the real dispatcher and renderer receive.
@@ -1849,7 +2028,10 @@ mod tests {
             }
             {
                 let mut tap=ChangedAnswer {rec,focus:changed_focus,hit:changed_hit};
-                d.frame_with(&mut rig,tick,input,Vec::new(),&mut tap,false);
+                let mut passive = SettingsObserver::default();
+                d.frame_with(&mut plx_ui::dispatch::ReplayFrame::new(&mut rig, &mut tap),tick,input,results,&mut passive,false);
+                assert_eq!((passive.ticks, passive.inputs, passive.results, passive.focus, passive.done),
+                    (1, input_count, result_count, 1, 1), "actual AppHost callbacks must not disappear behind the recorder");
             }
             if rec.failure().is_some(){ break; }
             // Rendering needs GL. Substitute only that resource: a presented stop for the
@@ -1935,10 +2117,14 @@ mod tests {
         let _serial=plx_base::testlock::serial();
         let initial=super::super::bootstrap::Initial::synthetic_home(1,32517,None).unwrap();
         let mt=unsafe {plx_base::task::MainThread::assume()};
-        let mut bridge=super::super::bridge::Bridge::controlled_home(||0,&initial,&mt,true);
+        let (runtime, retained) = super::super::bridge::BridgeRetained::controlled_home(||0,&initial,&mt,true);
+        let mut harness = crate::app::runtime_owners::Harness::from_parts(runtime, retained);
+        let mut bridge = harness.bridge();
         bridge.split().measure.width(c"no fonts loaded",28,false);
         assert!(bridge.take_measurements().is_err(),"construction-order violations must latch");
-        let mut bridge=super::super::bridge::Bridge::controlled_home(||0,&initial,&mt,true);
+        let (runtime, retained) = super::super::bridge::BridgeRetained::controlled_home(||0,&initial,&mt,true);
+        let mut harness = crate::app::runtime_owners::Harness::from_parts(runtime, retained);
+        let mut bridge = harness.bridge();
         let table=[
             (plx_ui::rec::MetricKey::Width {text:b"no fonts loaded".to_vec(),sz:28,bold:false},0x80000000),
             (plx_ui::rec::MetricKey::Cap {sz:28},0x00000001),
@@ -1960,7 +2146,8 @@ mod tests {
         let _serial=plx_base::testlock::serial();
         let run=|rec:&mut Recplay,changed:bool| {
             let mut d=Dispatcher::<Product>::new();
-            let mut rig=bridge::Bridge::for_test(||0);
+            let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+            let mut rig = harness.bridge();
             rec.prepare_resources(&mut rig);
             bridge::show_page(&mut d,plx_screens::registry::AppArg::Settings(
                 plx_screens::family::SettingsPage::ConsentStage(0)));
@@ -1974,7 +2161,7 @@ mod tests {
                 } else {key.map_or_else(Vec::new,|key|bridge::script_key(key,tick))};
                 rec.tick(tick.ms,0.016);
                 let mut tap=ChangedAnswer {rec,focus:changed,hit:false};
-                d.frame_with(&mut rig,tick,input,Vec::new(),&mut tap,false);
+                d.frame_with(&mut plx_ui::dispatch::ReplayFrame::new(&mut rig, &mut tap),tick,input,Vec::new(),&mut plx_ui::dispatch::NoTap,false);
                 assert_eq!(rec.failure(),None);
                 focuses.push(d.focus_record());
                 let hash=d.state_hash();
@@ -2010,6 +2197,46 @@ mod tests {
             }
         }
         plx_machine::landgate::disarm();
+    }
+
+    /// **An Id row pairs with its by-id input**: exactly in a frame with nothing carried, and as a
+    /// running balance when the drain's budget carried the delivery into a later frame. A missing row,
+    /// an extra row, and a row that runs AHEAD of its input are all refused.
+    #[test]
+    fn a_by_id_input_pairs_with_one_id_row_and_a_missing_or_extra_row_is_refused() {
+        use plx_machine::machine::{InputEvent, InputKind, Source, Tick};
+        let initial=super::super::bootstrap::Initial::synthetic_home(1,32517,None).unwrap();
+        let frame=|f:u64,inputs:usize,rows:usize|{
+            let by_id=InputEvent {at:Tick{ms:(f*16) as u32,dt_us:16_000},source:Source::RemoteFifo,
+                kind:InputKind::ById{id:"home.row.2".into(),press:None,expect:None}};
+            let mut input=super::super::bootstrap::effects::input(&by_id).unwrap();
+            input["f"]=json!(f);input["t"]=json!("in");
+            // an unaddressed by-id input: no page owned input, so a `NoOwner` row names entry 0
+            let payload=serde_json::to_value(ResolutionWire::Id{entry:0,focus:None,group:None,
+                refusal:plx_ui::dispatch::IdRefusal::NoOwner.code()}).unwrap();
+            plx_ui::rec::Frame {f,focus:Some(None),st:Some(7),inputs:vec![input;inputs],
+                resolutions:vec![json!({"f":f,"t":"rs","payload":payload});rows],..Default::default()}
+        };
+        let recording=|frames:Vec<plx_ui::rec::Frame>|Recording {header:Header::new(state_fp(),&initial),
+            frames,metrics:Default::default(),stopped_at:None};
+        // one input, one row, the same frame; two of each; none of either
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,1,1)])),Ok(()));
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,2,2),frame(2,0,0)])),Ok(()));
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,0,0)])),Ok(()));
+        // a carried delivery: tapped in frame 1, resolved in frame 3
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,1,0),frame(2,0,0),frame(3,0,1)])),Ok(()));
+        // a MISSING row: the input has none, in its frame or after
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,1,0)])),
+            Err("by-id input without an id resolution"));
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,2,1),frame(2,0,0)])),
+            Err("by-id input without an id resolution"));
+        // an EXTRA row: none in the recording, a second beside one input, one a frame AHEAD of its input
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,0,1)])),
+            Err("id resolution without a by-id input"));
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,1,2)])),
+            Err("id resolution without a by-id input"));
+        assert_eq!(validate_resolution_recording(&recording(vec![frame(0,0,0),frame(1,0,1),frame(2,1,0)])),
+            Err("id resolution without a by-id input"));
     }
 
     #[test]
@@ -2118,7 +2345,8 @@ mod tests {
         let writer = Writer::open(Box::new(sink), &Header::new(state_fp(), &initial), 0).unwrap();
         let mut rec = Recplay::Recording(Rec { w:writer, f:0, focus:None, events:false, spent_ns:0, failure:None });
         rec.tick(0, 0.0);
-        let mut bridge = super::super::bridge::Bridge::for_test(||0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut bridge = harness.bridge();
         let mut pages = plx_ui::dispatch::Dispatcher::<super::super::bridge::AppHost>::new();
         super::super::run::request_local_erasure(&mut rec, &mut bridge, &mut pages);
         assert!(matches!(rec, Recplay::Off), "confirmed erasure must revoke the writer before queued owner work");
@@ -2158,7 +2386,8 @@ mod tests {
             assert!(matches!(rec, Recplay::Off), "failed writer is still retired");
             let mut rec = Recplay::recording_with_sink(&initial, Box::new(Disk(midwrite))).unwrap();
             rec.tick(0, 0.0);
-            let mut bridge = super::super::bridge::Bridge::for_test(||0);
+            let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+            let mut bridge = harness.bridge();
             let mut pages = plx_ui::dispatch::Dispatcher::<super::super::bridge::AppHost>::new();
             assert!(super::super::run::request_local_erasure(&mut rec,&mut bridge,&mut pages));
             pages.frame_with(&mut bridge, Tick::default(), Vec::new(), Vec::new(), &mut rec, false);
@@ -2406,7 +2635,8 @@ mod tests {
             "recorder-shared", "127.0.0.1", 10, "synthetic", "fixture");
         plx_plex::plex::set_current(own);
         let _cleanup = Cleanup;
-        let mut rig = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         rig.seed_registered_browse_for_test([own, shared]);
         assert!(!rig.browse_directory().sections().is_empty(),
             "a Bridge Hubs landing fixture requires its retained Browse bootstrap");
@@ -2586,7 +2816,21 @@ mod tests {
         // the hub's `totalSize` (the linked heading's "· N"), in both the hubs record and the
         // hubs initial state.
         // AppFrameV5 drops the duplicate legacy press prefix; the tree hashes the real input.
-        assert_eq!(plx_ui::rec::state_fp(APP_SHAPES), 0xb7b3_fd3a_cc0b_e6b5);
+        // V12: Input owns HoldHintRead and the gesture/key/page-instance LiftReceipt.
+        // Reviewed against write_with: the receipt option precedes the four hint facts.
+        // Accessibility ids (plan a11y-ids D3): the queued-input census gained the by-id input
+        // `ById{id,press,expect}` and the `Pan` it had left out, so this moves from
+        // 0x6b18_a6a7_e8d6_f465. `ProductResolutionV2` adds the `Id` row, which moves the full census
+        // below and not this APP-side half.
+        assert_eq!(plx_ui::rec::state_fp(APP_SHAPES), 0x19b7_5414_e5d4_c071);
+        // V13 adds the exact captured presentation ingress, canonical latest-source
+        // generation and sealed queued event. The V12 fixture/census remains history.
+        // `ProductResolutionV2` (the by-id `Id` resolution row, a11y-ids D6) moves the full census
+        // from 0xea74_3865_5115_46c5, which `the_pre_content_navigation_recording_shape_is_refused`
+        // keeps refused at the shape boundary like every older value.
+        assert_eq!(state_fp(), 0x7f1d_280c_909c_8603, "current V13 producer census");
+        assert_ne!(state_fp(), 0xea74_3865_5115_46c5, "the census without the `Id` resolution row");
+        assert_ne!(state_fp(), 0x3ed9_2e0f_25bd_7f8e, "V12 cannot describe captured positive-swap presentation inputs");
     }
 
     /// The gate at the REAL hubs landing site, through the recording the driver loads: a result
@@ -2597,7 +2841,8 @@ mod tests {
     #[test]
     fn a_hubs_landing_is_delivered_on_its_recorded_frame_during_replay() {
         let _guard = plx_base::testlock::serial();
-        let mut rig = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         rig.seed_hubs_for_test(1, plx_data::pms::HubState::Ready);
         let _ = rig.take_hubs_results_for_test();
         // a recording in which Hubs landed on FRAME 2 and nowhere else
@@ -2625,7 +2870,8 @@ mod tests {
     #[test]
     fn a_hubs_landing_the_recording_never_saw_is_delivered_at_once_and_counted() {
         let _guard = plx_base::testlock::serial();
-        let mut rig = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut rig = harness.bridge();
         rig.seed_hubs_for_test(1, plx_data::pms::HubState::Ready);
         let _ = rig.take_hubs_results_for_test();
         rig.landgate().arm_replay(vec![]);
@@ -2657,7 +2903,8 @@ mod tests {
         for old in [0x8446_64d2_3399_0e72, 0x002c_b89e_e6a9_3668, 0x51ac_a85c_c16b_4b59,
             0x8af1_d09e_bbb1_1d47, 0x76d4_1ddb_e172_6b88, 0x702b_f9f7_e7c8_fe57,
             0x7252_4cf7_ed8d_97a3, 0x5ba4_34ad_d5db_5bdf, 0xe61b_6d55_f442_8637,
-            0x1006_0b14_b43f_5f57, 0x19e7_c63b_e018_e61f, 0x489b_bd48_8180_e355] {
+            0x1006_0b14_b43f_5f57, 0x19e7_c63b_e018_e61f, 0x489b_bd48_8180_e355,
+            0xea74_3865_5115_46c5] {
             let manifest = format!(r#"{{"schema": {}, "state_fp": {old}}}"#, plx_ui::rec::SCHEMA);
             assert_eq!(plx_ui::rec::Recording::parse(&manifest, &[], state_fp()).err(),
                 Some(plx_ui::rec::RecError::StateShape { theirs: old, ours: state_fp() }));
@@ -2671,7 +2918,7 @@ mod tests {
         let initial = shapes.iter_mut().find(|s| **s == super::super::bootstrap::SHAPE).unwrap();
         *initial = super::super::bootstrap::SHAPE_V7;
         shapes.push(super::super::bootstrap::CONTENT_SHAPE);
-        shapes.push(RESOLUTION_SHAPE);
+        shapes.push(RESOLUTION_SHAPE_V1);
         shapes.push("CaptureReadinessV2{before_dispatch:pending:bool,text:bool}");
         shapes.push("MeasurementV1{query:Width(text:bytes,sz:i32,bold:bool)|Cap(sz:i32)|Line(sz:i32),answer:f32bits:u32}");
         shapes.extend_from_slice(plx_screens::registry::SCREEN_SHAPES);
@@ -2756,8 +3003,10 @@ mod tests {
     #[test]
     fn session_discriminates_product_hash_with_all_other_terms_equal() {
         let _guard = plx_base::testlock::serial();
-        let base = super::super::bridge::Bridge::for_test(|| 0);
-        let mut other = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let base = harness.bridge();
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut other = harness.bridge();
         let initial = base.session_subhash();
         let hash = record_session_frame(&base).frames[0].st.unwrap();
         assert_eq!(initial, other.session_subhash());
@@ -2774,8 +3023,10 @@ mod tests {
     #[test]
     fn session_recorded_hash_is_graded_through_the_same_run_tail() {
         let _guard = plx_base::testlock::serial();
-        let base = super::super::bridge::Bridge::for_test(|| 0);
-        let mut other = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let base = harness.bridge();
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut other = harness.bridge();
         for changed in [false, true] {
             if changed { session_command(&mut other, plx_session::auth::SessionCmd::NoteDeleteLeftovers(1)); }
             let mut replay = Recplay::Replaying(Replay {
@@ -2785,7 +3036,7 @@ mod tests {
                 input_at: 0, input_diffs: 0, effect_diffs: 0, started: false, failure: None,
             });
 
-            assert_eq!(plx_ui::dispatch::Tap::<Product>::focus_continuation(
+            assert_eq!(plx_ui::dispatch::ReplayAuthority::<Product>::focus_continuation(
                 &mut replay, 0, true, None), Some(None));
             plx_ui::dispatch::Tap::<Product>::focus(&mut replay, 0, None);
             assert!(super::super::run::recorder_end_frame(
@@ -2814,6 +3065,7 @@ mod tests {
         // `child_count`; they are history, so they keep the record they were computed with.
         const PRE_CHILD_COUNT_RECORD_SHAPE: &str = "HubsResultV1{gen:u32,seq:u32,sid:u16,client:Option<u32>,token_gen:u32,build:Option<{cw:[{last_viewed_at:i64,m:PmsMovie}],shelves:[{title:str,hub_id:str,key:str,items:[PmsMovie]}]}>};PmsMovie{sid:u16,sec:i64,title:str,year:i32,rating:str,dur_ns:i64,part:str,thumb:str,still:str,art:str,summary:str,rk:str,vcodec:str,acodec:str,blur:[[f32bits;3];4],has_blur:bool,kind:i32,resume_ms:i64,show_rk:str,season_index:i32,show_title:str,ep_index:i32,unwatched:bool,watched:bool,aired:str}";
         let mut pre_settings = APP_SHAPES.to_vec();
+        pre_settings[1] = historical_input_shape();
         pre_settings[3] = "AppFrameV4{route:str,overlay:str,focus:str,tree:u64,session:u64,consent:u64,initial:u64}";
         let record = pre_settings.iter().position(|shape| *shape == plx_data::pms::record::SHAPE).unwrap();
         pre_settings[record] = PRE_CHILD_COUNT_RECORD_SHAPE;
@@ -2851,7 +3103,8 @@ mod tests {
     #[test]
     fn identical_unsupported_effect_markers_cannot_be_same() {
         let _guard = plx_base::testlock::serial();
-        let bridge = super::super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let bridge = harness.bridge();
         let mut recording = record_session_frame(&bridge);
         let payload = json!({"unsupported":"unsupported Home screen delivery"});
         recording.frames[0].effects.push(json!({"f":0,"t":"eff","from":"Nav",
@@ -2895,23 +3148,64 @@ mod fixture_preflight_tests {
     #[test]
     fn committed_recordings_keep_valid_page_requests_and_initial_hashes() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/replay");
-        for name in ["1-boot-home-chip-grid", "6-settings-family", "12-filmography-detail-return"] {
+        for (name, fp, frames) in [
+            ("1-boot-home-chip-grid", 13512213413816145485, 266),
+            ("6-settings-family", FP_PRIOR, 621),
+            ("12-filmography-detail-return", FP_PRIOR, 457),
+            ("12-filmography-detail-return-current", 13512213413816145485, 2287),
+        ] {
             let dir = root.join(name);
             let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
             let segment = std::fs::read(dir.join("rec-0000.jsonl")).unwrap();
-            let mut recording = Recording::parse(&manifest, &[segment.as_slice()], FP_PRIOR).unwrap();
-            let initial = super::super::bootstrap::Initial::decode(recording.header.init_data.clone(), recording.header.init_hash)
-                .expect("recorded initial state must retain its canonical hash");
-            // Host unit tests omit the simulator feature; this check covers the wire preflight.
-            recording.header.features = features();
-            assert_eq!(validate_controlled(&recording, &initial), Ok(()), "{name}");
+            let recording = Recording::parse(&manifest, &[segment.as_slice()], fp).unwrap();
+            assert_eq!(recording.frames.len(), frames, "{name}");
+            validate_resolution_recording(&recording).expect("complete recorded Focus/Hit resolutions");
+            assert_eq!(super::super::bootstrap::Initial::decode_profile(recording.header.init_data.clone(), recording.header.init_hash, fp).err(),
+                Some("incompatible owner-input/presentation state; requires V13 capture"), "{name}");
+            assert!(matches!(Recording::parse(&manifest, &[segment.as_slice()], state_fp()),
+                Err(RecError::StateShape { .. })), "{name} must fail before boot/IO");
         }
+    }
+
+    #[test]
+    fn historical_scheduler_boundary_uses_parsed_commands_not_names_or_text() {
+        let initial = super::super::bootstrap::Initial::synthetic_home(1, 32517, None).unwrap();
+        let mut header = Header::new(state_fp(), &initial);
+        header.features = features();
+        header.triggers = initial.triggers.clone();
+        let mut recording = Recording { header, frames: vec![plx_ui::rec::Frame {
+            f: 0, tick: Some(Tick::default()), st: Some(0), ..Default::default()
+        }], metrics: Default::default(), stopped_at: None };
+        let command = json!({"f":0,"t":"eff","from":"inst:2","e":"App",
+            "payload":{"content":{"push":{"person":[0,"19","guid","name","thumb"]}}}});
+        recording.frames[0].effects.push(command.clone());
+        assert_eq!(validate_controlled(&recording, &initial), Ok(()), "current FIFO envelope");
+        for fp in [FP_PRIOR, state_fp_v7()] {
+            recording.header.state_fp = fp;
+            for content in [json!({"push":{"person":[0,"19","guid","name","thumb"]}}),
+                json!({"present":{"filmography":0}}), json!("back"), json!({"unknown":true})] {
+                recording.frames[0].effects[0]["payload"]["content"] = content;
+                assert_eq!(validate_controlled(&recording, &initial),
+                    Err("incompatible owner-input/presentation state; requires V13 capture"));
+            }
+            recording.frames[0].effects[0] = json!({"f":0,"t":"eff","from":"Nav","e":"Log",
+                "payload":{"message":command.to_string()}});
+            assert_eq!(validate_controlled(&recording, &initial),
+                Err("incompatible owner-input/presentation state; requires V13 capture"), "old state is refused even without commands");
+            recording.frames[0].effects[0] = command.clone();
+        }
+        recording.header.state_fp = FP_V6;
+        assert_eq!(validate_controlled(&recording, &initial), Err("incompatible owner-input/presentation state; requires V13 capture"));
     }
 }
 
 /// `payload` as the recording's reader sees it. The segments are parsed without `float_roundtrip`,
 /// so a recorded f32 widened to f64 (9.600000381469727) reads back one ulp off; a live value
 /// compared against the file must make the same trip or a fresh recording would diverge from itself.
+#[cfg(test)]
+#[path = "recorder_hold_hint_tests.rs"]
+mod owned_hold_hint_codec_tests;
+
 fn reparsed(payload: &Value) -> Value {
     serde_json::from_str(&payload.to_string()).unwrap_or_else(|_| payload.clone())
 }
