@@ -98,12 +98,12 @@ impl RuntimeOwners {
         self.session.machine.read()
     }
 
-    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    #[cfg(all(feature = "sim", feature = "devtriggers"))]
     pub(crate) fn landgate(&self) -> &plx_machine::landgate::Gate {
         &self.stores.machines.landgate
     }
 
-    #[cfg(all(feature = "hostsim", feature = "devtriggers"))]
+    #[cfg(all(feature = "sim", feature = "devtriggers"))]
     pub(crate) fn open_claims(&self) -> Vec<&'static str> {
         use plx_data::stores::StoreId;
         let mut open = Vec::new();
@@ -145,6 +145,12 @@ impl Harness {
 
     pub(crate) fn from_parts(runtime: RuntimeOwners, retained: BridgeRetained) -> Self {
         Self { runtime, retained }
+    }
+
+    #[cfg(all(feature = "sim", feature = "play-feed"))]
+    pub(crate) fn swap_parts(&mut self, runtime: &mut RuntimeOwners, retained: &mut BridgeRetained) {
+        std::mem::swap(&mut self.runtime, runtime);
+        std::mem::swap(&mut self.retained, retained);
     }
 
     pub(crate) fn bridge(&mut self) -> Bridge<'_> {
@@ -230,7 +236,7 @@ mod tests {
         let (mut second, mut second_retained) = BridgeRetained::for_test(|| 0);
         let root = std::env::temp_dir().join(format!("plx-runtime-hud-{}", std::process::id()));
         let classic = || plx_appkit::player_hud::loaded::load_classic(
-            "0.10.0", plx_platform::i18n::english(), &plx_ui::fixture::FixtureMeasure);
+            "0.10.0", plx_os::i18n::english(), &plx_ui::fixture::FixtureMeasure);
         first.hud.driver = adapters::huds::HudDriver::started_in(root.join("first"), classic(), "0.10.0");
         second.hud.driver = adapters::huds::HudDriver::started_in(root.join("second"), classic(), "0.10.0");
         first.hud.driver.refresh("first-choice".into());

@@ -102,7 +102,7 @@ fn one_movie_and_one_tv_library_get_the_natural_per_type_recently_added_titles()
 /// recognize keeps drawing PMS's own text verbatim (checked below).
 #[test]
 fn a_recently_added_library_hub_renders_the_be_catalog_string_under_a_be_ui() {
-    let _thread_locale = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::Be);
+    let _thread_locale = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::Be);
     let body = r#"{"MediaContainer":{"Hub":[
         {"type":"movie","hubIdentifier":"movie.recentlyadded.1",
          "title":"Recently Added in Movies","key":"/library/sections/1/all?sort=addedAt:desc",
@@ -127,7 +127,7 @@ fn a_recently_added_library_hub_renders_the_be_catalog_string_under_a_be_ui() {
 /// the per-library `{library}`-interpolated form, under a `be` UI.
 #[test]
 fn a_lone_movie_library_renders_the_be_per_type_catalog_string_under_a_be_ui() {
-    let _thread_locale = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::Be);
+    let _thread_locale = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::Be);
     let body = r#"{"MediaContainer":{"Hub":[
         {"type":"movie","hubIdentifier":"home.movies.recent",
          "title":"Recently Added Movies","key":"/hubs/home/recentlyAdded?type=1",
@@ -151,7 +151,7 @@ fn a_lone_movie_library_renders_the_be_per_type_catalog_string_under_a_be_ui() {
 /// drawing PMS's own `title` verbatim, in any language, exactly as it did before this change.
 #[test]
 fn an_unrecognized_hub_identifier_keeps_the_pms_title_verbatim() {
-    let _thread_locale = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::Be);
+    let _thread_locale = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::Be);
     let body = r#"{"MediaContainer":{"Hub":[
         {"type":"movie","hubIdentifier":"custom.collection.987",
          "title":"Прайдзiсветы i Незнаёмцы","key":"/library/collections/987/children",
@@ -982,6 +982,31 @@ fn paging_a_recent_row_does_not_remove_other_home_rows() {
     assert_eq!(hubs[0].len, 24);
 }
 
+#[test]
+fn livetv_borrowed_shelf_composes_after_continue_watching_and_does_not_change_heroes() {
+    let owned = built(0, &[(10, "cw1")], vec![shelf(0, "Recent", "home.movies.recent", &["r1"])]);
+    let (items, hubs, heroes) = merge(&[src(0, "", HubState::Ready, Some(owned))]);
+    let snapshot = HubsSnapshot { data: Arc::new(HomeCatalog { items, hubs, heroes }), generation: 7, state: HubState::Ready };
+    let tiles = vec![row(0, "external")];
+    let base = snapshot.view();
+    let view = base.with_shelf("extra", "Independent", &tiles, 3);
+    assert_eq!(view.hub_count(), base.hub_count() + 1);
+    assert_eq!(view.hub(0).unwrap().identity, Some(HubIdentity::ContinueWatching));
+    assert_eq!(view.hub(1).unwrap().title, "Independent");
+    assert!(view.hub(1).unwrap().items == tiles.as_slice());
+    assert_eq!(view.hub(2).unwrap().title, "Recent");
+    assert_eq!(view.hero_count(), base.hero_count());
+    assert!(view.find(sid(0), "external").is_some());
+    assert!(base.find(sid(0), "external").is_none());
+    assert_eq!(view.generation, 10);
+    assert_ne!(view.generation, base.with_shelf("extra", "Independent", &tiles, 4).generation);
+    let empty = HubsSnapshot::empty_for_test();
+    let view = empty.view().with_shelf("extra", "Independent", &tiles, 3);
+    assert_eq!(view.hub(0).unwrap().title, "Independent");
+    assert_eq!(view.hero_count(), 0);
+    assert_eq!(empty.view().with_shelf("extra", "Independent", &[], 4).hub_count(), 0);
+    assert_ne!(empty.view().with_shelf("extra", "Independent", &[], 4).generation, empty.view().generation);
+}
 
 // ---- one tile per show across servers (#892) -------------------------------------------------------
 

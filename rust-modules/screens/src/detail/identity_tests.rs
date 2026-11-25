@@ -82,7 +82,7 @@ fn body(entry: EntryId, rk: &str) -> DetailScreen {
         preview_started_for: None,
         preview_had_picture: false,
         trailer_ctl: super::trailer::Transport::IDLE,
-        restore_intent: None, teardown_cleared: false, withdrawn: false, scroll: Spring::at(0.0),
+        restore_intent: None, provisional: false, teardown_cleared: false, withdrawn: false, scroll: Spring::at(0.0),
         refresh: DetailRefreshPhase::None,
         refresh_gen: 0,
         scroll_target: 0.0, free: false, episode_free: false, episode_scroll: Spring::at(0.0), tab_scroll: Spring::at(0.0),
@@ -439,7 +439,7 @@ fn cold_entry_argument_and_return_memory_both_change_the_tree_hash() {
 /// drawn page itself.
 fn stray_runs(detail: Detail, server_values: &[&str]) -> Vec<String> {
     use plx_ui::screen::DrawFrame;
-    let _pseudo = plx_platform::i18n::pseudo_on_this_thread_for_test();
+    let _pseudo = plx_os::i18n::pseudo_on_this_thread_for_test();
     let (mut d, _rig) = boot_with(detail);
     let runs = plx_gfx::text::capture_text_runs_for_test(|| {
         let entry = d.nav.tabs.stack.top_mut().expect("detail page");

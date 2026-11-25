@@ -104,10 +104,9 @@ fn a_cached_hosts_snapshot_carries_the_surfaces_scrim() {
     );
 }
 
-/// The other half of the rule the container owns: the SURFACES pass never asks for a scrim, so a
-/// dim cannot be drawn twice, and a page is never asked at all.
+/// Page-backed scrims are drawn only once, in the page pass.
 #[test]
-fn the_page_pass_is_the_only_place_a_scrim_is_asked_for() {
+fn the_page_pass_is_the_only_place_a_page_backed_scrim_is_asked_for() {
     let (mut d, mut rig, _) = booted();
     let id = open_modal(&mut d, &mut rig, Style::Sheet, 16);
     d.frame(&mut rig, tick(32), vec![], vec![], &mut NoTap);
@@ -405,6 +404,24 @@ fn an_opaque_surface_is_never_asked_for_a_page_scrim() {
         "an opaque surface's dim is its own ground's, not the page pass's"
     );
     assert!(d.nav.modals.scrims(1.0).is_empty(), "…so it owes the page nothing");
+}
+
+#[test]
+fn a_menu_scrim_is_composited_between_an_opaque_host_and_the_menu() {
+    let (mut d, mut rig, _) = booted();
+    let host = open_modal(&mut d, &mut rig, Style::Opaque { snapshot: false }, 16);
+    let menu = open_modal(&mut d, &mut rig, Style::Compact, 32);
+    let surface = d.nav.modals.surface_mut(host).unwrap();
+    surface.phase = Phase::Open;
+    surface.ground_ready = true;
+    assert_eq!(d.host_policy().1, HostRender::Replaced);
+
+    d.draw(&mut rig, false);
+
+    let host_draw = modal_of(&d, host).draw_at;
+    let menu = modal_of(&d, menu);
+    assert!(host_draw > 0 && host_draw < menu.scrim_at.get());
+    assert!(menu.scrim_at.get() < menu.draw_at);
 }
 
 /// The alpha the container computes, without the paint: the surface's declared peak times its own
@@ -3186,4 +3203,25 @@ fn the_owner_after_dismissals_is_the_page_once_the_surfaces_dismiss_is_parked() 
     assert_eq!(d.nav.modals.surface(menu).map(|s| s.phase), Some(Phase::Closing), "committed");
     assert_eq!(d.nav.input_owner(), Some(InputOwner::Entry(home)));
     assert_eq!(d.input_owner_after_dismissals(), d.nav.input_owner(), "after the commit the two agree");
+}
+
+/// **A page op parked behind a menu's `Dismiss` keeps the host's return spot.** Go to Movie in the
+/// item hold menu parks the menu's `Dismiss`, then the app's `Push`, both captured on the menu's
+/// row. The row's key used to reach the host's `ret`, so its `Enter(Restored)` missed and the page
+/// ran to its top while the menu closed, and BACK came back to the top instead of the card.
+#[test]
+fn a_push_parked_behind_a_surfaces_dismiss_keeps_the_hosts_return_spot() {
+    let (mut d, mut rig, _) = booted();
+    let home = d.nav.top_page().unwrap().id;
+    let card = FocusKey { entry: home, elem: 3 };
+    d.set_focus(Some(card));
+    let menu = open_modal(&mut d, &mut rig, Style::Compact, 16);
+    let row = FocusKey { entry: menu, elem: 1 };
+    d.set_focus(Some(row));
+    assert_eq!(d.nav.entry(home).unwrap().ret.focus, Some(card), "captured at the Present");
+    d.request(MachineId::Nav, NavOp::Dismiss(menu));
+    d.request(MachineId::Nav, NavOp::Push(FixtureArg::Page(20)));
+    d.frame(&mut rig, tick(32), vec![], vec![], &mut NoTap);
+    assert_eq!(d.nav.entry(home).unwrap().ret.focus, Some(card),
+        "the closing menu's row did not replace the host's return spot");
 }

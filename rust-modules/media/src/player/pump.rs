@@ -1,20 +1,19 @@
 //! Common route and recovery pump. The physical feed tick in `feed_pump` binds the plane,
 //! feeds AUs, and returns the stage and EOS facts used here for common presentation policy.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::shared::FEED_SHARED;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::feed_state::Engine;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_playback_contract::feed::Stage;
 use super::SHARED;
 use plx_playback_contract::feed::SeekMode;
-#[cfg(all(test, feature = "hostsim"))]
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_base::task::MainThread;
 use std::sync::atomic::Ordering::Acquire;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use std::sync::atomic::Ordering::Release;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use std::time::Duration;
 
 /// Attach the physical Load gate's timeout to the current common trace: the feed ran the Load
@@ -236,8 +235,7 @@ fn finish_preview_open_failure(
     if crate::player::preview::abandoning() {
         return;
     }
-    let seam_absent = cfg!(feature = "hostsim") && !plx_base::devtrig::flag("clocksink");
-    if seam_absent {
+    if pa.display_sink().lacks_video_path() {
         crate::player::preview::note_admission_refused();
     } else {
         crate::player::preview::note_failed(601);
@@ -264,13 +262,14 @@ enum OpenRecoveryRun {
 /// What the ladder decides on, read at the moment of a failure ([`super::recovery::OpenFacts`]).
 /// `native_audio` is what the caller's failure names ([`native_audio_fact`]); the branches which
 /// are not a pipeline refusal pass `None`.
-fn open_facts(ps: &crate::route::PlaybackSession, native_audio: Option<plx_platform::devcaps::Facet>) -> super::recovery::OpenFacts {
+fn open_facts(ps: &crate::route::PlaybackSession, native_audio: Option<plx_os::devcaps::Facet>) -> super::recovery::OpenFacts {
     super::recovery::OpenFacts {
         pending_original: crate::route::original_recovery_pending(),
         auto_original: crate::route::auto_original_watch(ps).is_some(),
         no_frames: ps.readout().raw().frames == 0,
         native_audio,
         forced: crate::route::forced_direct_play(ps),
+        live: crate::route::is_live(ps),
         direct: !crate::route::is_transcoding(ps),
         audio: crate::route::stream_audio(ps),
         video: crate::route::stream_video(ps),
@@ -299,11 +298,23 @@ fn load_refusal(ps: &crate::route::PlaybackSession) -> super::recovery::LoadRefu
     }
 }
 
+/// The source's own account of a failed read (`demux_io_failed`, or `demux_failed` before a
+/// picture): a live playlist that stopped advancing, which the demuxer named before it raised the
+/// flag (`FeedRaw::live_stalled`, the flag's own sample), or any other failure of the demuxer or the
+/// transport. The ladder converts a channel for the second and only reads out for the first.
+fn source_refusal(ps: &crate::route::PlaybackSession) -> super::recovery::LoadRefusal {
+    if ps.readout().raw().live_stalled {
+        super::recovery::LoadRefusal::LiveStalled
+    } else {
+        super::recovery::LoadRefusal::SourceFailed
+    }
+}
+
 /// The native audio a refusal just named: the flag `sf_on_event` (`type=18 num=200` while audio was
 /// fed natively) or the stall watchdog raised, and the audio the demuxer is feeding. Peeks the flag,
 /// which [`confirm_refusal`] consumes when the ladder asks for the write (the facet itself travels
 /// on the effect); a flag raised with nothing fed natively is dropped here, as it always was.
-fn native_audio_fact(ps: &mut crate::route::PlaybackSession) -> Option<plx_platform::devcaps::Facet> {
+fn native_audio_fact(ps: &mut crate::route::PlaybackSession) -> Option<plx_os::devcaps::Facet> {
     if !ps.readout().native_audio_refused() {
         return None;
     }
@@ -346,7 +357,7 @@ fn drive_open_recovery(ps: &mut crate::route::PlaybackSession, first: super::rec
         for effect in fx {
             let dispatched = match effect {
                 RecoveryEffect::ConfirmRefusal { facet, evidence } => {
-                    let record: fn(&plx_platform::devcaps::Facet) -> bool = match evidence {
+                    let record: fn(&plx_os::devcaps::Facet) -> bool = match evidence {
                         Evidence::Named => plx_plex::plex::session::record_named_refusal,
                         Evidence::Proof => plx_plex::plex::session::record_refusal_proof,
                     };
@@ -381,8 +392,8 @@ fn drive_open_recovery(ps: &mut crate::route::PlaybackSession, first: super::rec
                     // refused audio keeps the route as planned (an Original remux still copies the
                     // video).
                     let lane = match facet {
-                        plx_platform::devcaps::Facet::Audio { .. } => crate::route::VideoLane::AsPlanned,
-                        plx_platform::devcaps::Facet::Video { .. } => crate::route::VideoLane::Encode,
+                        plx_os::devcaps::Facet::Audio { .. } => crate::route::VideoLane::AsPlanned,
+                        plx_os::devcaps::Facet::Video { .. } => crate::route::VideoLane::Encode,
                     };
                     crate::route::dispatch_refusal_conversion(ps, secs, lane)
                 }
@@ -406,8 +417,15 @@ fn drive_open_recovery(ps: &mut crate::route::PlaybackSession, first: super::rec
                     let secs = (ps.readout().raw().playpos_ns / 1_000_000_000).max(0);
                     crate::route::dispatch_unopened_auto_hls(ps, secs)
                 }
+                RecoveryEffect::LiveTranscode { flight } => {
+                    // A channel's own playlist could not be decoded as emitted (a tune's cut begins
+                    // wherever the tuner was, so it may carry no parameter sets at all). The server is
+                    // already recording that session: read it through the live universal transcoder.
+                    super::log(&format!("open recovery: converting the live channel (flight {flight}/1)"));
+                    crate::route::dispatch_live_refusal_conversion(ps)
+                }
                 RecoveryEffect::DecodeInApp { audio, refusal } => {
-                    if let plx_platform::devcaps::Facet::Audio { codec, .. } = &audio {
+                    if let plx_os::devcaps::Facet::Audio { codec, .. } = &audio {
                         super::log(&format!("open recovery: decoding {codec} in the app (stereo) after {refusal}"));
                     }
                     run = OpenRecoveryRun::DecodeInApp { offset_ns: ps.readout().raw().playpos_ns };
@@ -462,7 +480,7 @@ fn recover_failed_open(
     ps: &mut crate::route::PlaybackSession,
     loading: bool,
     refusal: super::recovery::LoadRefusal,
-    native_audio: Option<plx_platform::devcaps::Facet>,
+    native_audio: Option<plx_os::devcaps::Facet>,
     why: &str,
 ) -> OpenRecoveryRun {
     let facts = open_facts(ps, native_audio);
@@ -496,9 +514,9 @@ fn decode_in_app(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter
 
 /// The native audio the demuxer is feeding, as the capability facet the pipeline's refusal of it
 /// removes from an attempt (`Caps::without`). `None` when nothing is fed natively.
-fn refused_native_audio(ps: &crate::route::PlaybackSession) -> Option<plx_platform::devcaps::Facet> {
+fn refused_native_audio(ps: &crate::route::PlaybackSession) -> Option<plx_os::devcaps::Facet> {
     let fed = ps.readout().raw().native_audio?;
-    Some(plx_platform::devcaps::Facet::Audio { codec: fed.codec.into(), channels: fed.channels })
+    Some(plx_os::devcaps::Facet::Audio { codec: fed.codec.into(), channels: fed.channels })
 }
 
 /// The machine asked for `facet` to be recorded as refused on this firmware (`record`, which is
@@ -511,10 +529,10 @@ fn refused_native_audio(ps: &crate::route::PlaybackSession) -> Option<plx_platfo
 /// absent from the attempt, gets no second conversion; the answer only words nothing today.
 fn confirm_refusal(
     ps: &mut crate::route::PlaybackSession,
-    facet: &plx_platform::devcaps::Facet,
+    facet: &plx_os::devcaps::Facet,
     evidence: super::recovery::Evidence,
     why: &str,
-    record: impl FnOnce(&plx_platform::devcaps::Facet) -> bool,
+    record: impl FnOnce(&plx_os::devcaps::Facet) -> bool,
 ) -> bool {
     match evidence {
         super::recovery::Evidence::Named => {
@@ -551,21 +569,27 @@ fn withdraw_dolby_vision(
         pa.feed_command(plx_playback_contract::feed::FeedCommand::DvStandDown);
         return None;
     }
-    let target = if let Some(tap) = super::take_pending_seek(ps, pa) {
-        crate::route::commit_user_seek();
-        tap.target_ns
-    } else {
-        // The feed's in-place target rides the sample (`FeedRaw::seek_target_ns`).
-        let in_place = ps.readout().raw().seek_target_ns.unwrap_or(-1);
-        if w.in_place && in_place >= 0 { in_place } else { w.armed_target.unwrap_or(w.kf_pts) }
-    }
-    .max(0);
+    let target = take_tap_target(ps, pa)
+        .unwrap_or_else(|| {
+            // The feed's in-place target rides the sample (`FeedRaw::seek_target_ns`).
+            let in_place = ps.readout().raw().seek_target_ns.unwrap_or(-1);
+            if w.in_place && in_place >= 0 { in_place } else { w.armed_target.unwrap_or(w.kf_pts) }
+        })
+        .max(0);
     super::log(&format!(
         "dv: withdrawn for this play: {}; reload at {:.3}s without DolbyHdrInfo, the base layer plays",
         w.why,
         target as f64 / 1e9,
     ));
     Some(target)
+}
+
+/// The newest coalesced tap, taken and committed as the seek stuck-watchdog adopts it
+/// (`commit_user_seek` included): where a reload that replaces the Engine goes when one is pending.
+fn take_tap_target(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter) -> Option<i64> {
+    let tap = super::take_pending_seek(ps, pa)?;
+    crate::route::commit_user_seek();
+    Some(tap.target_ns)
 }
 
 /// The Engine fails for good: any flight ends, the viewer gets the read-out, and the Engine's
@@ -1142,6 +1166,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
         let snapshot = super::timeline::TimelineSnapshot::from_feed(
             ps.readout(),
             super::duration_ns(ps).unwrap_or(0),
+            crate::route::is_live(ps),
         );
         pa.publish_timeline(attempt, snapshot);
     }
@@ -1199,6 +1224,32 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
             decode_in_app(ps, pa, offset_ns);
         }
         return;
+    }
+    // ---------- Dolby Vision the server did not report: the demuxer found RPUs in a stream whose
+    // container has no configuration record, so the Load declared none and the panel shows the base
+    // layer. Once the Load has returned (a teardown never waits on one in flight), and outside an
+    // Original trial not yet confirmed (as the plain seek waits for it), the route may declare them
+    // (`route::declare_rpu_dovi`, at most once a play, so this cannot loop) and the play reloads once
+    // with the node, at the newest tap else where this Engine was aimed.
+    let raw = ps.readout().raw();
+    let rpu = if raw.load.load_thread_finished { raw.rpu_dovi } else { None };
+    if let Some(rpu) = rpu {
+        if crate::route::rpu_dovi_open(ps)
+            && !crate::route::flight_outstanding()
+            && !crate::route::original_recovery_pending()
+            && !crate::route::preview_request(ps)
+            && crate::route::declare_rpu_dovi(ps, rpu)
+        {
+            let target = take_tap_target(ps, pa)
+                .unwrap_or_else(|| {
+                    let raw = ps.readout().raw();
+                    raw.seek_target_ns.unwrap_or(raw.playpos_ns)
+                })
+                .max(0);
+            super::log(&format!("dv: reload at {:.3}s with DolbyHdrInfo", target as f64 / 1e9));
+            settle_reload(super::engine::reload_at(ps, pa, target), "Dolby Vision found in the RPUs", ps);
+            return;
+        }
     }
     // ---------- the Dolby Vision landing guard (#1166): a declared landing the firmware's splitter
     // would skip (the keyframe was held back at the landing) or that no position update follows turns
@@ -1299,7 +1350,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
             return;
         }
         let loading = ps.readout().raw().load.loading();
-        let run = recover_failed_open(ps, loading, super::recovery::LoadRefusal::SourceFailed, None, "");
+        let run = recover_failed_open(ps, loading, source_refusal(ps), None, "");
         if let OpenRecoveryRun::DecodeInApp { offset_ns } = run {
             decode_in_app(ps, pa, offset_ns);
         }
@@ -1352,7 +1403,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
             // mismatch to the ordinary failure read-out instead of a loop.
             let _ = settle_reload(super::engine::reload_at(ps, pa, retry_position), "probe retry reload", ps);
         } else {
-            let run = recover_failed_open(ps, loading, super::recovery::LoadRefusal::SourceFailed, None, "");
+            let run = recover_failed_open(ps, loading, source_refusal(ps), None, "");
             if let OpenRecoveryRun::DecodeInApp { offset_ns } = run {
                 decode_in_app(ps, pa, offset_ns);
             }
@@ -1745,7 +1796,8 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
     // Load and speed policy are settled. Borrow the physical feed for ACB, feeding and EOS.
     let physical = pa.tick_feed_presentation(
         plx_playback_contract::feed::HoldRoute::of(
-            crate::route::is_segmented_hls(ps),
+            // A Live TV direct stream also needs the HLS hold when its playlist stops advancing.
+            crate::route::is_segmented_hls(ps) || crate::route::is_live(ps),
             crate::route::is_preview(ps),
             crate::route::is_progressive_original(ps),
         ),
@@ -1873,15 +1925,15 @@ mod tests {
     #[test]
     fn confirm_refusal_writes_only_through_the_injected_recorder() {
         use super::super::recovery::Evidence;
-        use plx_platform::devcaps::Facet;
+        use plx_os::devcaps::Facet;
         let _guard = plx_base::testlock::serial();
-        let _set = plx_platform::devcaps::firmware_on_this_thread_for_test(
+        let _set = plx_os::devcaps::firmware_on_this_thread_for_test(
             "fw",
             "B",
-            plx_platform::devcaps::Caps { audio: "aac,ac3,eac3,opus".into(), ..plx_platform::devcaps::Caps::assumed() },
+            plx_os::devcaps::Caps { audio: "aac,ac3,eac3,opus".into(), ..plx_os::devcaps::Caps::assumed() },
         );
         let _session = plx_plex::plex::session::TempSession::new("confirm-refusal-recorder");
-        let before = plx_platform::devcaps::caps();
+        let before = plx_os::devcaps::caps();
         let recorded = std::cell::RefCell::new(Vec::new());
         let recorder = |facet: &Facet| {
             recorded.borrow_mut().push(facet.clone());
@@ -1929,14 +1981,14 @@ mod tests {
         FEED_SHARED.raise_native_audio_refused();
         ingest(&mut ps);
         assert!(super::confirm_refusal(&mut ps, &opus6, Evidence::Named, "test", plx_plex::plex::session::record_named_refusal));
-        assert!(std::sync::Arc::ptr_eq(&before, &plx_platform::devcaps::caps()), "queueing the write moved no global");
+        assert!(std::sync::Arc::ptr_eq(&before, &plx_os::devcaps::caps()), "queueing the write moved no global");
         plx_base::storage_worker::drain_for_test();
         assert_eq!(plx_plex::plex::session::peek().native_audio_refused().len(), 1, "the real recorder wrote the row");
         // Installing the record moves nothing either; the play-start edge is what reads it, and a named row applies at once.
         assert!(before.audio_supports("opus", 6), "sanity: announced before the record is read");
         plx_plex::plex::session::save(&plx_plex::plex::session::peek());
-        assert!(std::sync::Arc::ptr_eq(&before, &plx_platform::devcaps::caps()), "installing the record moves no global");
-        let start = plx_platform::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals());
+        assert!(std::sync::Arc::ptr_eq(&before, &plx_os::devcaps::caps()), "installing the record moves no global");
+        let start = plx_os::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals());
         assert!(!start.audio_supports("opus", 6), "the start value lacks the named row's Opus 5.1");
         assert!(start.audio_supports("opus", 2), "a surround refusal keeps the codec to stereo");
         crate::player::reset_session_for_test();
@@ -2210,7 +2262,7 @@ mod tests {
 /// the physical encoder through PMS. These tests run the REAL `pump` inside a `FrameScope` against
 /// the hostsim Engine and the loopback server of `route::flight_rig`, and grade what the frame
 /// thread did: a frame that makes a PMS round trip is a frame the viewer waits on.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod flight_tests {
     use std::sync::atomic::Ordering::Relaxed;
     use super::*;
@@ -3079,6 +3131,44 @@ mod flight_tests {
         assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "still, a frame later");
     }
 
+    /// **A channel whose playlist stopped advancing for good ends in the read-out, and its
+    /// conversion is never asked for** (PR #993 review). The maintainer's webOS 4.5 run: a direct
+    /// play's stall was taken for a decode failure, the same recording was converted, and the
+    /// conversion met the same input gap. The demuxer names the stall before the flag that ends the
+    /// read (`FeedRaw::live_stalled`); both travel here through the feed's real sample.
+    #[test]
+    fn a_live_channel_whose_playlist_stalled_reads_out_and_asks_for_no_conversion() {
+        let mut rig = Rig::direct(0);
+        crate::route::mark_live_for_test(&mut rig.ps);
+        let epoch = engine_epoch(&mut rig);
+        FEED_SHARED.frames.store(10, Relaxed);
+        FEED_SHARED.seen_frame.store(true, Release);
+        FEED_SHARED.hls_live_stalled.store(true, Release);
+        FEED_SHARED.demux_io_failed.store(true, Release);
+        rig.frame();
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "a playback error is shown");
+        assert!(!crate::route::flight_outstanding(), "the conversion is not dispatched");
+        for _ in 0..8 { rig.frame(); }
+        assert_eq!(rig.flight.decisions(), 0, "the server is asked for no conversion decision");
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error);
+        let now = engine_epoch(&mut rig);
+        assert!(now.is_none() || now == epoch, "nothing is reloaded");
+    }
+
+    /// The control of the test above: the same channel failing for any other reason (a cut the
+    /// demuxer could not read) still takes its conversion.
+    #[test]
+    fn a_live_channel_whose_read_failed_otherwise_still_takes_its_conversion() {
+        let mut rig = Rig::direct(0);
+        crate::route::mark_live_for_test(&mut rig.ps);
+        FEED_SHARED.frames.store(10, Relaxed);
+        FEED_SHARED.seen_frame.store(true, Release);
+        FEED_SHARED.demux_io_failed.store(true, Release);
+        rig.frame();
+        assert!(crate::route::flight_outstanding(), "a decode failure converts the channel as before");
+        assert_ne!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error);
+    }
+
     /// Back from the read-out after the release still ends the playback, once: the real stop runs
     /// with no Engine and the standing error is cleared with the session.
     #[test]
@@ -3627,13 +3717,13 @@ mod flight_tests {
 
     /// This thread plays a set whose pipeline announces Opus, on a firmware the learned refusals key
     /// on (the process-wide answer is write-once; see `devcaps::firmware_on_this_thread_for_test`).
-    fn firmware_announcing_opus() -> plx_platform::devcaps::CapsGuard {
-        plx_platform::devcaps::firmware_on_this_thread_for_test(
+    fn firmware_announcing_opus() -> plx_os::devcaps::CapsGuard {
+        plx_os::devcaps::firmware_on_this_thread_for_test(
             "kisscurl-koli",
             "6.5.3-47",
-            plx_platform::devcaps::Caps {
+            plx_os::devcaps::Caps {
                 audio: "aac,ac3,eac3,opus".into(),
-                ..plx_platform::devcaps::Caps::assumed()
+                ..plx_os::devcaps::Caps::assumed()
             },
         )
     }
@@ -3652,12 +3742,12 @@ mod flight_tests {
         rig.flight.begin_attempt(&rig.ps);
         // The route was planned before the refusal, from the capability value read then: Opus at
         // any channel count. The attempt holds that value, not the process-wide answer.
-        FlightRig::plan_on(&mut rig.ps, plx_platform::devcaps::caps());
+        FlightRig::plan_on(&mut rig.ps, plx_os::devcaps::caps());
         FlightRig::declare_audio(&mut rig.ps, "opus", 6);
         rig.frame();
         let answered = rig.flight.answered();
         let epoch = engine_epoch(&mut rig);
-        let opus_channels = || plx_platform::devcaps::caps().audio_channels.get("opus").copied();
+        let opus_channels = || plx_os::devcaps::caps().audio_channels.get("opus").copied();
         assert_eq!(opus_channels(), None, "the set announces Opus at any channel count until it is refused");
 
         plx_play_feed::native_audio::publish_fed(plx_play_feed::native_audio::Kind::Opus, 6);
@@ -3712,7 +3802,7 @@ mod flight_tests {
         plx_base::storage_worker::drain_for_test();
         plx_plex::plex::session::save(&plx_plex::plex::session::peek());
         assert_eq!(opus_channels(), None, "the landed record moved the process-wide answer");
-        let start = plx_platform::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals());
+        let start = plx_os::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals());
         assert_eq!(start.audio_channels.get("opus").copied(), Some(2), "the landed record gives the next start the ceiling");
         rig.flight.wait_for("the replaced encoder's stop", |f| f.stopped().iter().any(|s| s == "rig-1"));
     }
@@ -3729,7 +3819,7 @@ mod flight_tests {
         let mut rig = Rig::new(150);
         let _set = firmware_announcing_opus();
         // The play began on the value the set announced: Opus at any channel count.
-        FlightRig::plan_on(&mut rig.ps, plx_platform::devcaps::caps());
+        FlightRig::plan_on(&mut rig.ps, plx_os::devcaps::caps());
         FlightRig::declare_audio(&mut rig.ps, "opus", 6);
         land_original_trial(&mut rig);
         let decisions = rig.flight.decisions();
@@ -3766,7 +3856,7 @@ mod flight_tests {
         let _set = firmware_announcing_opus();
         // The play began on the value the set announced (Opus at any width), as in the tests above:
         // an attempt which never announced Opus has nothing to narrow, so it gets no conversion.
-        FlightRig::plan_on(&mut rig.ps, plx_platform::devcaps::caps());
+        FlightRig::plan_on(&mut rig.ps, plx_os::devcaps::caps());
         FlightRig::declare_audio(&mut rig.ps, "opus", 6);
         rig.flight.refuse_decisions(1);
         rig.frame();
@@ -3804,14 +3894,14 @@ mod flight_tests {
         // and the play start derives its value from the record, so the attempt already lacks it.
         let _session = plx_plex::plex::session::TempSession::new("known-stall");
         let known = plx_plex::plex::session::NativeAudioRefusal::of_facet(
-            &plx_platform::devcaps::Facet::Audio { codec: "opus".into(), channels: 6 },
+            &plx_os::devcaps::Facet::Audio { codec: "opus".into(), channels: 6 },
             "kisscurl-koli",
             "6.5.3-47",
             None,
         )
         .expect("a named row");
         plx_plex::plex::session::save(&plx_plex::plex::session::peek().with_native_audio_refusal(&known).expect("news"));
-        FlightRig::plan_on(&mut rig.ps, plx_platform::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals()));
+        FlightRig::plan_on(&mut rig.ps, plx_os::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals()));
         assert!(!crate::route::audio_track_direct_plays(&rig.ps, "opus", 6, 48_000), "sanity: the attempt lacks the stored refusal");
         plx_play_feed::native_audio::publish_fed(plx_play_feed::native_audio::Kind::Opus, 6);
         let epoch = engine_epoch(&mut rig).expect("the rig's Engine");
@@ -3861,11 +3951,11 @@ mod flight_tests {
     /// The set the attempt started on: its pipeline announces DTS at six channels (the shape of
     /// `plan_track_selection_tests`' DTS row), so taking `dts:6` out of the attempt is a real
     /// narrowing and the facet rung has something to convert.
-    fn dts_announcing_start() -> std::sync::Arc<plx_platform::devcaps::Caps> {
-        std::sync::Arc::new(plx_platform::devcaps::Caps {
+    fn dts_announcing_start() -> std::sync::Arc<plx_os::devcaps::Caps> {
+        std::sync::Arc::new(plx_os::devcaps::Caps {
             audio: "aac,ac3,eac3,dts".into(),
             audio_channels: [("dts".into(), 6)].into(),
-            ..plx_platform::devcaps::Caps::assumed()
+            ..plx_os::devcaps::Caps::assumed()
         })
     }
 
@@ -4253,8 +4343,8 @@ mod flight_tests {
     // ---- S2a: a refusal is learned only from a facet-clean proof ---------------------------------
 
     /// This thread plays the DTS set of [`dts_announcing_start`] on firmware `fw`, build `B`.
-    fn firmware_announcing_dts() -> plx_platform::devcaps::CapsGuard {
-        plx_platform::devcaps::firmware_on_this_thread_for_test("fw", "B", (*dts_announcing_start()).clone())
+    fn firmware_announcing_dts() -> plx_os::devcaps::CapsGuard {
+        plx_os::devcaps::firmware_on_this_thread_for_test("fw", "B", (*dts_announcing_start()).clone())
     }
 
     /// The rows the install's record holds, after the queued writes landed.
@@ -4264,7 +4354,7 @@ mod flight_tests {
     }
 
     fn dts_row(proofs: u32) -> plx_plex::plex::session::NativeAudioRefusal {
-        let dts6 = plx_platform::devcaps::Facet::Audio { codec: "dts".into(), channels: 6 };
+        let dts6 = plx_os::devcaps::Facet::Audio { codec: "dts".into(), channels: 6 };
         plx_plex::plex::session::NativeAudioRefusal::of_facet(&dts6, "fw", "B", Some(proofs)).expect("a counted row")
     }
 
@@ -4299,12 +4389,12 @@ mod flight_tests {
         plx_plex::plex::session::save(&plx_plex::plex::session::peek());
         assert!(
             std::sync::Arc::ptr_eq(
-                &plx_platform::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals()),
-                &plx_platform::devcaps::caps()
+                &plx_os::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals()),
+                &plx_os::devcaps::caps()
             ),
             "a once-proved row leaves the next start alone"
         );
-        assert!(plx_platform::devcaps::caps().audio_supports("dts", 6), "one proof changes no capability answer");
+        assert!(plx_os::devcaps::caps().audio_supports("dts", 6), "one proof changes no capability answer");
     }
 
     /// A second rescued play persists the refusal; the next play's start value no longer announces
@@ -4340,11 +4430,11 @@ mod flight_tests {
         assert!(rows[0].applies());
 
         plx_plex::plex::session::save(&plx_plex::plex::session::peek());
-        let dts6 = plx_platform::devcaps::Facet::Audio { codec: "dts".into(), channels: 6 };
-        let start = plx_platform::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals());
+        let dts6 = plx_os::devcaps::Facet::Audio { codec: "dts".into(), channels: 6 };
+        let start = plx_os::devcaps::start_caps(&plx_plex::plex::session::peek().applied_refusals());
         assert!(!start.audio_supports("dts", 6), "the next start bounds DTS: {:?}", start.audio_channels);
         assert_eq!(start.without(&dts6), *start, "nothing left to take out");
-        assert!(plx_platform::devcaps::caps().audio_supports("dts", 6), "the boot snapshot is untouched");
+        assert!(plx_os::devcaps::caps().audio_supports("dts", 6), "the boot snapshot is untouched");
     }
 
     /// An HLS rescue (the both-facets rung) records nothing, however clean the verdicts.
@@ -4418,7 +4508,7 @@ mod flight_tests {
         let _session = plx_plex::plex::session::TempSession::new("s2a-named");
         let _set = firmware_announcing_opus();
         rig.flight.begin_attempt(&rig.ps);
-        FlightRig::plan_on(&mut rig.ps, plx_platform::devcaps::caps());
+        FlightRig::plan_on(&mut rig.ps, plx_os::devcaps::caps());
         FlightRig::declare_audio(&mut rig.ps, "opus", 6);
         rig.frame();
         let epoch = engine_epoch(&mut rig).expect("the rig's Engine");
@@ -4475,7 +4565,7 @@ mod flight_tests {
         let mut rig = Rig::new(150);
         let _set = firmware_announcing_opus();
         rig.flight.begin_attempt(&rig.ps);
-        FlightRig::plan_on(&mut rig.ps, plx_platform::devcaps::caps());
+        FlightRig::plan_on(&mut rig.ps, plx_os::devcaps::caps());
         FlightRig::declare_audio(&mut rig.ps, "opus", 6);
         FEED_SHARED.frames.store(1, Relaxed);
         rig.frame();
@@ -4696,9 +4786,9 @@ mod flight_tests {
     // ---- S4 enable: the app decodes what the pipeline refused --------------------------------------
 
     /// [`dts_announcing_start`] on a table that was read: the lossy policy admits DTS (it is measured).
-    fn measured_dts_start() -> std::sync::Arc<plx_platform::devcaps::Caps> {
-        std::sync::Arc::new(plx_platform::devcaps::Caps {
-            app_lossy: plx_platform::devcaps::AppLossy::Measured,
+    fn measured_dts_start() -> std::sync::Arc<plx_os::devcaps::Caps> {
+        std::sync::Arc::new(plx_os::devcaps::Caps {
+            app_lossy: plx_os::devcaps::AppLossy::Measured,
             ..(*dts_announcing_start()).clone()
         })
     }
@@ -4826,7 +4916,7 @@ mod flight_tests {
     /// stack that has none).
     #[test]
     fn the_app_decode_rungs_pcm_load_is_planned_its_stacks_lead() {
-        use plx_platform::devcaps::{audio_stack_on_this_thread_for_test, AudioStack};
+        use plx_os::devcaps::{audio_stack_on_this_thread_for_test, AudioStack};
         for (stack, pending, lead_once_read) in
             [(AudioStack::Liblxa, true, 400_000_000), (AudioStack::Other, false, 0)]
         {
@@ -4998,7 +5088,7 @@ mod flight_tests {
 /// armed (which reports `VP_EXPORTED`). `reload_at` has no route to reload in a unit rig (an empty
 /// URL is ignored), so each call is read off `engine::RELOAD_AT_LOG`; the rig stands in for the
 /// reload's EFFECT (a new Engine) where the next seek needs one.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod native_seek_pump_tests {
     use std::sync::atomic::Ordering::Relaxed;
     use super::*;
@@ -5140,7 +5230,7 @@ mod native_seek_pump_tests {
         assert_eq!(rig.ps.readout().raw().playpos_ns, 9_000_000_000, "the stale position reached the pump");
         assert!(rig.ps.readout().seeking(), "the segment is still awaiting presentation");
         assert!(super::super::timeline::TimelineSnapshot::from_feed(
-            rig.ps.readout(), 7_200_000_000_000,
+            rig.ps.readout(), 7_200_000_000_000, false,
         ).is_none(), "Plex must not save the stale clock");
         assert!(reloads().is_empty(), "presentation gets time to land");
         rig.now += 10_000;
@@ -5148,6 +5238,69 @@ mod native_seek_pump_tests {
             rig.frame();
         }
         assert_eq!(reloads(), vec![target], "reopen succeeded, but the seek needs one fresh Load");
+    }
+
+    /// **A channel read as recorded says "Buffering" when its media runs out, and plays on when the
+    /// recording's input returns** (PR #993 review: Plex waited ~30 s for DVR input and resumed on
+    /// the same encoder). A channel's direct play carries no encode contract, so the feed was told
+    /// it was not segmented, never held its clock, and the picture froze with nothing said. The
+    /// hold is the feed's own (`hls: auto-rebuffer`): the same Engine and session throughout, no
+    /// reload, and the fresh segment that covers the measured runway gives play back.
+    #[test]
+    fn a_live_channel_read_as_recorded_buffers_when_its_media_runs_out_and_resumes() {
+        let _serial = plx_base::testlock::serial();
+        const TAIL_NS: i64 = 60_000_000_000;
+        let mut rig = Rig::new(None);
+        crate::route::mark_live_for_test(&mut rig.ps);
+        assert!(!crate::route::is_segmented_hls(&rig.ps), "premise: a direct play, no encode contract");
+        let epoch = rig.eng().native_epoch;
+        // Past its start, as the Load tick leaves a route it was told is not segmented: its
+        // immediate first Play (`play_initial_now`) cleared the prime and completed the clock's
+        // initial hold, so the clock runs. Pictures are on the panel.
+        rig.eng().prime_play = false;
+        FEED_SHARED.finish_hls_recovery();
+        FEED_SHARED.frames.store(10, Relaxed);
+        FEED_SHARED.seen_frame.store(true, Release);
+        rig.frame();
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Playing, "premise: it plays");
+        assert_eq!(crate::player::rebuffering(&rig.ps), Some(false), "premise: with nothing held");
+        // The playlist brings nothing new: the playhead reaches the last delivered access unit.
+        FEED_SHARED.hls_video_tail_ns.store(TAIL_NS, Release);
+        FEED_SHARED.hls_audio_tail_ns.store(TAIL_NS, Release);
+        rig.frame();
+        rig.frame();
+        assert_eq!(crate::player::rebuffering(&rig.ps), Some(true), "the feed holds its clock");
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Buffering);
+        // The gap, however long: nothing fails, nothing reloads, the hold stands.
+        for _ in 0..120 {
+            rig.frame();
+        }
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Buffering);
+        assert!(reloads().is_empty(), "no reload, no new session");
+        assert_eq!(rig.eng().native_epoch, epoch, "the same Engine");
+        // The recording's input is back: one fresh three-second segment on the same session.
+        FEED_SHARED.observe_hls_recovery(500_000, std::time::Duration::from_secs(3));
+        let au = [0u8; 64];
+        {
+            let mut eng = rig.eng();
+            let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+            for i in 0..72 {
+                plx_play_feed::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, TAIL_NS + i * V_STEP_NS, c_int::from(i == 0), 1);
+            }
+            let qa = &mut **eng.aq_audio.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+            for i in 0..140 {
+                plx_play_feed::aq::aq_push(qa, au.as_ptr(), au.len() as c_int, TAIL_NS + i * 21_333_333, 1, 2);
+            }
+        }
+        FEED_SHARED.hls_video_tail_ns.store(TAIL_NS + 3_000_000_000, Release);
+        FEED_SHARED.hls_audio_tail_ns.store(TAIL_NS + 3_000_000_000, Release);
+        for _ in 0..40 {
+            rig.frame();
+        }
+        assert_eq!(crate::player::rebuffering(&rig.ps), Some(false), "fresh media releases the hold");
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Playing);
+        assert!(reloads().is_empty());
+        assert_eq!(rig.eng().native_epoch, epoch, "still the same Engine");
     }
 
     /// A Segment seek driven to the Play it accepts: returns the native epoch the sink's callbacks
@@ -6072,7 +6225,7 @@ mod native_seek_pump_tests {
         assert!(at("play") < at("pause"), "{verbs:?}");
         // No getVolume is bound (it returns an int on 4.5, not the header's string), so the restore
         // is the pipeline default by construction, not a value read back.
-        let default = plx_platform::tv::sink::PIPELINE_DEFAULT_VOLUME;
+        let default = plx_os::tv::sink::PIPELINE_DEFAULT_VOLUME;
         assert_eq!(default, 100, "libpf CustomPipeline::getVolume's default");
         assert!(at("pause") < at(&format!("volume:{default}")), "restored after the re-pause: {verbs:?}");
         assert_eq!(ffi_host::host_volume_for_test(), default);
@@ -6174,7 +6327,7 @@ mod native_seek_pump_tests {
     impl AcbGuard {
         fn arm() -> AcbGuard {
             crate::player::plane().reset_for_test();
-            crate::player::plane().boot(plx_platform::tv::plane::PlaneFacts { handle: true, player_type: 10 });
+            crate::player::plane().boot(plx_os::tv::plane::PlaneFacts { handle: true, player_type: 10 });
             ffi_host::reset_acb_for_test(true);
             AcbGuard
         }
@@ -6293,14 +6446,14 @@ mod native_seek_pump_tests {
     }
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 #[path = "dv_start_pump_tests.rs"]
 mod dv_start_pump_tests;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 #[path = "held_prime_play_tests.rs"]
 mod held_prime_play_tests;
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 #[path = "progressive_rebuffer_pump_tests.rs"]
 mod progressive_rebuffer_pump_tests;
 
@@ -6310,7 +6463,7 @@ mod progressive_rebuffer_pump_tests;
 /// the film. These drive the REAL feed lanes and the REAL `pump` against the clock sink and grade
 /// `player::ended()`. Nothing here sets `Shared::pipeline_eos` or `ended`: what is graded is the
 /// whole chain, the sink, its callback, the flag and the pump.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod end_of_film_tests {
     use std::sync::atomic::Ordering::Relaxed;
     use super::*;
@@ -6582,7 +6735,7 @@ mod end_of_film_tests {
             for _ in 0..80 {
                 rig.step();
                 let epoch = rig.eng().native_epoch;
-                let ty = plx_play_feed::sf_event::displayed_counter_type(plx_platform::tv::device::info().major);
+                let ty = plx_play_feed::sf_event::displayed_counter_type(plx_os::tv::device::info().major);
                 plx_play_feed::sf_event::sf_on_event(epoch, ty, 5, std::ptr::null());
             }
         });

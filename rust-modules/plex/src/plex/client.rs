@@ -114,7 +114,6 @@ pub struct Client {
     pub(super) client_id: String, // X-Plex-Client-Identifier — stable device id (NEVER per-item)
     pub(super) product: String,   // "PlxNative"
     pub(super) version: String,   // "0.1.0"
-    pub(super) platform: String,  // "webOS"
     // Token generation, PER SERVER. Bumped by `set_token`; read by caches keyed on a path that
     // bakes the token in (`app::adapters::poster::built_key`'s memo). This used to be a process-global
     // `static TOKEN_GEN`, which cannot express "server B's token changed" — with a registry that
@@ -272,7 +271,6 @@ impl Client {
             client_id: client_id.to_owned(),
             product: super::identity::PRODUCT.into(),
             version: super::identity::version().into(),
-            platform: super::identity::PLATFORM.into(),
             token_gen: AtomicU32::new(generation),
             grant_epoch: AtomicU32::new(generation),
             instance_gen: generation,
@@ -304,7 +302,7 @@ impl Client {
             ("X-Plex-Client-Identifier", &self.client_id),
             ("X-Plex-Product", &self.product),
             ("X-Plex-Version", &self.version),
-            ("X-Plex-Platform", &self.platform),
+            ("X-Plex-Platform", super::identity::platform()),
             ("X-Plex-Platform-Version", super::identity::platform_version()),
             ("X-Plex-Device", DEVICE),
             ("X-Plex-Device-Name", device_name()),
@@ -852,6 +850,14 @@ impl Client {
             .map(|e| e.media_container)
     }
 
+    /// POST → status and a parsed 2xx JSON tree, for the nested Live TV tune answer. A rejected
+    /// status survives parsing so its caller can distinguish a busy tuner from other failures.
+    pub(super) fn post_value(&self, path_no_token: &str) -> Option<(i32, Option<serde_json::Value>)> {
+        let reply = self.send(path_no_token, Method::Post, &[ACCEPT_JSON])?;
+        let parsed = if reply.ok() { serde_json::from_slice(&reply.body).ok() } else { None };
+        Some((reply.status, parsed))
+    }
+
     /// THE token choke point. Appends `X-Plex-Token=…` with the right separator.
     pub(super) fn with_token(&self, path: &str) -> String {
         let sep = if path.contains('?') { '&' } else { '?' };
@@ -1190,9 +1196,9 @@ mod tests {
     /// rather than inventing a client-side substitute catalog for server-owned strings.
     #[test]
     fn pms_headers_carry_the_literal_selected_ui_language_be_included() {
-        use plx_platform::i18n::{language_on_this_thread_for_test};
+        use plx_os::i18n::{language_on_this_thread_for_test};
         let c = a_client("mach-A", "tok-a");
-        for pref in plx_platform::i18n::SHIPPED {
+        for pref in plx_os::i18n::SHIPPED {
             let tag = pref.tag();
             let _guard = language_on_this_thread_for_test(pref);
             let headers = c.pms_headers(&[ACCEPT_JSON]);

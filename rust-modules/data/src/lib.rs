@@ -4,7 +4,7 @@
 //! machine per data store), `pms` (the Home catalog), `browse` (the per-section library catalog),
 //! `metadata` (the item detail), `person`, `collection`, `search` and `viewstate` (the view-state
 //! writes). It is the `data` layer of `ci/module-layers.ini`: it uses `base`, `machine`,
-//! `platform`, `net`, `plex` and `telemetry` and nothing above them, so it names no screen, widget
+//! `os`, `net`, `plex` and `telemetry` and nothing above them, so it names no screen, widget
 //! or application type.
 //!
 //! `test-support` exposes the seams the layers above drive their tests through
@@ -15,6 +15,7 @@
 pub mod browse; // Library browse: per-section paged catalog (sparse store + off-thread page fetches)
 pub mod catalog; // the catalog page's discover record, Membership and Load (plan W6)
 pub mod collection; // collection page model: tag resolution, header metadata and paged members
+pub mod livetv; // DVR lineup and on-now guide, independent of Home
 pub mod hudpacks; // the player-HUD package store: installed packs, the selection and the install rules, a pure machine
 pub mod metadata; // item detail data layer (detail page): full metadata + seasons/episodes + cast + related
 pub mod person; // person/actor page data layer: the header handed in by the cast row + /library/people/{id}/media

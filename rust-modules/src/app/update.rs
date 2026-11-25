@@ -2,7 +2,7 @@
 //! check reads the fork's Homebrew Channel repository file — the same one Homebrew Channel lists the
 //! fork from ([`FEED`], written by `ci/fork-homebrew-repo.py` at every fork release) — and when it
 //! names a newer version than this build, Settings offers to install it. The install is
-//! Homebrew Channel's (`plx_platform::tv::update`): the app may not install a package itself, and
+//! Homebrew Channel's (`plx_os::tv::update`): the app may not install a package itself, and
 //! the system installer stops the app while it replaces it.
 //!
 //! **When it checks.** Once at start-up when the last check is older than [`AUTO_EVERY_SECS`]
@@ -45,7 +45,7 @@ enum Msg {
     Checked { found: Result<Release, String>, auto: bool },
     /// A start-up check found its stamp too recent and asked nothing.
     NotDue,
-    Install(plx_platform::tv::update::Progress),
+    Install(plx_os::tv::update::Progress),
 }
 
 pub(crate) struct Updater {
@@ -158,7 +158,7 @@ impl Updater {
         plx_base::eventlog::log(&format!("update: installing {} through Homebrew Channel", release.version));
         let tx = self.tx.clone();
         let started = plx_base::task::spawn_small("update-install", move || {
-            plx_platform::tv::update::install(&release.ipk_url, &release.sha256, plx_base::paths::STABLE_APP_ID,
+            plx_os::tv::update::install(&release.ipk_url, &release.sha256, plx_base::paths::STABLE_APP_ID,
                 &mut |step| {
                     let _ = tx.send(Msg::Install(step));
                     plx_machine::present::wake_from_worker();
@@ -180,9 +180,9 @@ impl Updater {
             self.publish();
         }
         if let Some(version) = self.tell.take() {
-            let message = plx_platform::i18n::msg::settings_update_toast(&version);
+            let message = plx_os::i18n::msg::settings_update_toast(&version);
             plx_base::task::spawn_small("update notice", move || {
-                let outcome = plx_platform::tv::toast::toast(&message);
+                let outcome = plx_os::tv::toast::toast(&message);
                 plx_base::eventlog::log(&format!("update: toast {outcome:?}"));
             });
         }
@@ -190,7 +190,7 @@ impl Updater {
     }
 
     fn land(&mut self, msg: Msg) {
-        use plx_platform::tv::update::{Failure, Progress};
+        use plx_os::tv::update::{Failure, Progress};
         match msg {
             Msg::NotDue => self.phase = UpdatePhase::Idle,
             Msg::Checked { found: Ok(release), auto } => {
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn install_steps_land_in_order_and_a_late_one_never_revives_an_ended_install() {
-        use plx_platform::tv::update::{Failure, Progress};
+        use plx_os::tv::update::{Failure, Progress};
         let mut u = rig();
         u.found = Some(release("0.10.25"));
         u.phase = UpdatePhase::Downloading(None);
@@ -389,7 +389,7 @@ mod tests {
     /// it is not offered again in this run. One that was never sent can be tried again.
     #[test]
     fn a_silent_install_is_never_started_twice_and_an_unsent_one_can_be_retried() {
-        use plx_platform::tv::update::{Failure, Progress};
+        use plx_os::tv::update::{Failure, Progress};
         let mut u = rig();
         u.found = Some(release("0.10.25"));
         landed(&mut u, Msg::Install(Progress::Downloading(Some(10))));

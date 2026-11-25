@@ -85,7 +85,7 @@ pub fn label(d: &Detail, i: usize) -> TileLabel {
 /// The shelf's heading, `lift` being the row's live label lift (`Shelf::heading_lift`).
 pub fn draw_heading(p: Painter, top: f32, lift: f32) {
     p.text(
-        plx_platform::i18n::msg::browse_detail_extras_c().as_ptr(),
+        plx_os::i18n::msg::browse_detail_extras_c().as_ptr(),
         plx_ui::consts::MARGIN_X,
         top - lift,
         theme::size::HEADLINE,
@@ -144,6 +144,7 @@ mod tests {
                 assert_eq!(context, plx_data::metadata::EXTRA_CONTEXT);
             }
             PlayIntent::Movie { .. } => panic!("an extra is not the parent movie"),
+            PlayIntent::Live { .. } => panic!("an extra is not a live channel"),
         }
         assert!(play(&d, elem(1).unwrap()).is_none());
     }

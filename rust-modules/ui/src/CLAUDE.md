@@ -321,7 +321,7 @@ can follow.
 
 | layer | may name |
 |---|---|
-| `ui/` — the LIBRARY | `plx_gfx::{gfx,text}` plus `plx_platform::i18n` and `plx_base::{paths,task,tile}` — **never an application type**. Except the `plx_machine` crate (`machine`, `present`, `idle`, `landgate`, `landing`, `motion`; `rust-modules/machine/`), which `ci/module-layers.ini` places BELOW the library (`docs/module-layers.md`): it names only `plx_base` and itself, never `gfx`/`text`/`i18n` or anything in `ui/` |
+| `ui/` — the LIBRARY | `plx_gfx::{gfx,text}` plus `plx_os::i18n` and `plx_base::{paths,task,tile}` — **never an application type**. Except the `plx_machine` crate (`machine`, `present`, `idle`, `landgate`, `landing`, `motion`; `rust-modules/machine/`), which `ci/module-layers.ini` places BELOW the library (`docs/module-layers.md`): it names only `plx_base` and itself, never `gfx`/`text`/`i18n` or anything in `ui/` |
 | `appkit/` — widgets several screens share (`player_hud`, `track_menu`, `more_menu`, `info_panel`, `up_next`, `chapters_panel`, `timing_capsule`, `skip_pill`, `source_list`) | `ui/`, `stores/`, `plex/` types, `player/`, `route/` — never `screens/` or `app/`. They are compositions of `ui/` components over application types; they cannot live under `screens/` because the `sibling` gate forbids one screen family naming another |
 | `screens/` — the application's screens | `ui/`, `appkit/`, `stores/`, `plex/` types, `player/` — never a sibling screen |
 | `stores/` | data crates and `plx_machine::machine` only — never `screens/` |
@@ -754,7 +754,9 @@ tried first. None of it is reconstructable from the code without repeating the m
   re-renders the page closure before any popover draws, so a scrim drawn with the panel reaches
   the visible frame but not the snapshot, and the panel's ground then comes out brighter than the
   screen around it. Since phase 10 the pairing is the container's (`Screen::scrim` +
-  `ModalStack::draw_scrims`), not each panel's. **The dim's ink is the page's own light, not
+  `ModalStack::draw_scrims`), not each panel's. If an opaque surface replaces the ground, the
+  dispatcher draws the shared flat scrim above it and below the owning panel.
+  **The page-backed dim's ink is the page's own light, not
   black**: a surface names a ROLE (`theme::underlay::DIM_COMPACT`/`DIM_PANEL`/…), never a literal,
   and a test greps for one. **Drawn, yet a glass whose LAST source paint is the dim applies it at
   composite** (`backdrop::Dim`, `Painter::dim`, `fs_glass.frag`'s `u_dim`): that glass's retained

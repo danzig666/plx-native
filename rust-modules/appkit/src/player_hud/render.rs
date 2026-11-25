@@ -122,7 +122,7 @@ pub struct Frame<'a> {
 /// The compiled state this frame draws, or `None` when the package has no state for it
 /// ([`frame_state`], the lookup every geometry consumer takes too).
 fn state_for<'c>(compiled: &'c Compiled, open: u8, f: &Frame<'_>) -> Option<&'c CompiledState> {
-    let chapters = crate::chapters_panel::has_chapters(f.meta);
+    let chapters = !f.model.is_live && crate::chapters_panel::has_chapters(f.meta);
     super::geometry::frame_state_content(compiled, open, f.slot, chapters, f.model.is_episode, f.model.paused).map(|(state, skip)| state.skip_variant(skip))
 }
 
@@ -633,6 +633,12 @@ fn walk<H: Host>(
                     }
                 }
                 DrawOp::Playbar { track, fill, track_ink, clock_size, knob, clocks, mark, clock_rects, .. } => {
+                    if f.model.is_live {
+                        let rect = Rect { w: track.w, ..clock_rects.elapsed };
+                        sections::text_view(plx_os::i18n::msg::browse_home_live_tv(), *clock_size, true,
+                            theme::TINT_WHITE, 1, 1.0).draw(q, sections::line_frame(rect, *clock_size, true));
+                        continue;
+                    }
                     let mut live = Playbar::live(f.model, f.busy, f.focus, row.since_play_ms(f.now), f.now);
                     live.clock_grow = row.preview.motion.clock_grow(f.now);
                     // a cancelled scrub's knob returns to the playhead rather than jumping to it
@@ -896,6 +902,7 @@ fn draw_control(
     state: &CompiledState,
     c: &crate::hud_format::compile::ControlRect,
 ) {
+    if f.model.is_live && c.act.is_some_and(|command| !command.shown_live()) { return; }
     let native_tab = !c.is_action && c.widget == Widget::Pill && c.command == "toggle_section" && c.face == Default::default()
         && c.rest == Rest::Film && c.focus == Focus::Accent;
     let row_index = state.row_ids.iter().position(|id| id.as_deref() == Some(c.id.as_str()));
@@ -950,7 +957,7 @@ fn draw_control(
         Widget::Pill => {
             let Some(section) = c.section.as_deref() else { return };
             let Some(i) = tab_of_section(section) else { return };
-            let labels = tab_labels(crate::chapters_panel::has_chapters(f.meta));
+            let labels = tab_labels(!f.model.is_live && crate::chapters_panel::has_chapters(f.meta));
             let Some(Ok(label)) = usize::try_from(i).ok().and_then(|i| labels[i]).map(CString::new) else { return };
             let (focused, selected) = hud_tab_state(f.transport, f.focus, f.tab, i);
             // the state the walk is in says which sections are open: their tabs read selected, whatever the
@@ -982,7 +989,7 @@ mod tests {
     use crate::player_hud::state::Controls;
     use crate::skip_pill::prompt_for;
     use plx_data::metadata::{Marker, MarkerKind};
-    use plx_platform::i18n::{language_on_this_thread_for_test, Preference, SHIPPED};
+    use plx_os::i18n::{language_on_this_thread_for_test, Preference, SHIPPED};
     use plx_ui::draw_census::{capture, capture_icons, capture_inks, capture_runs, Run};
     use plx_ui::fixture::FixtureMeasure;
     use plx_ui::icons::Icon;
@@ -1166,7 +1173,7 @@ mod tests {
         let mut compared = 0;
         for language in frozen_languages.iter().copied() {
             let _language = language_on_this_thread_for_test(language);
-            let cx = plx_platform::i18n::current();
+            let cx = plx_os::i18n::current();
             let hud = crate::player_hud::loaded::load_classic("0.0.0-test", cx, &FM);
             for (index, c) in cases().into_iter().enumerate() {
                 let (new, drew) = drawn(&hud.compiled, c);
@@ -1185,7 +1192,7 @@ mod tests {
     #[test]
     fn catalan_classic_renders_every_case() {
         let _language = language_on_this_thread_for_test(Preference::Ca);
-        let cx = plx_platform::i18n::current();
+        let cx = plx_os::i18n::current();
         let hud = crate::player_hud::loaded::load_classic("0.0.0-test", cx, &FM);
         for c in cases() {
             let (drawn_census, drew) = drawn(&hud.compiled, c);
@@ -1197,7 +1204,7 @@ mod tests {
     /// A failure owns the frame: nothing of the transport draws, and the title's marquee resets.
     #[test]
     fn a_failure_read_out_owns_the_frame_in_the_renderer_too() {
-        let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+        let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
         let ps = plx_media::route::PlaybackSession::IDLE;
         let store = plx_data::stores::metadata::MetadataStore::default();
         let model = HudModel::default();
@@ -1301,10 +1308,10 @@ mod tests {
 
         fn scene(items: Vec<Chapter>, sel: u32, appear: f32, closing: bool) -> Side {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
             let mut store = plx_data::stores::metadata::MetadataStore::default();
             plx_data::metadata::set_playing_chapters_for_test(store.state_mut(), items);
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_CHAPTERS, Slot::Discs, true, true, false).expect("classic has a chapters state");
             let geo = state.ops.iter().find_map(Geometry::of).expect("the chapters state has a strip");
             let ps = plx_media::route::PlaybackSession::IDLE;
@@ -1517,10 +1524,10 @@ mod tests {
 
         fn scene(detail: Detail, appear: f32, closing: bool) -> Census {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
             let mut store = plx_data::stores::metadata::MetadataStore::default();
             plx_data::metadata::set_current_for_test(store.state_mut(), Some(detail));
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             assert!(hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).is_some(), "classic has an info state");
             let ps = plx_media::route::PlaybackSession::IDLE;
             let model = HudModel::default();
@@ -1668,8 +1675,8 @@ mod tests {
         #[test]
         fn the_synopsis_column_ends_where_the_cards_text_column_ends() {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("classic has an info state");
             let text = |bind: &str| {
                 state
@@ -1757,7 +1764,7 @@ mod tests {
         /// what is compared; the full block fills the rect exactly.
         #[test]
         fn a_group_stays_inside_its_worst_case_rect() {
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("an info state");
             assert_eq!(state.groups.len(), 1, "classic's info text block is one group");
             let rect = state.groups[0].rect;
@@ -1785,7 +1792,7 @@ mod tests {
         #[test]
         fn a_package_vstack_with_the_title_pair_stays_static() {
             let text = include_str!("../hud_format/fixtures/reference/hud.json");
-            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &FM)
+            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &FM)
                 .expect("the reference loads")
                 .compiled;
             let state = compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("the reference has an info state");
@@ -1794,7 +1801,7 @@ mod tests {
 
         #[test]
         fn an_open_chapters_state_has_no_info_arms_and_the_gate_only_hides_the_compact_state() {
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             assert!(hud.compiled.lookup(OPEN_CHAPTERS, Slot::Discs, true, true, false).is_some());
         }
     }
@@ -1809,10 +1816,10 @@ mod tests {
 
         fn info_frame_census(transport: bool, tab: i32, focus: GroupId, btn: i32, row: &mut HudMotion) -> Census {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
             let mut store = plx_data::stores::metadata::MetadataStore::default();
             plx_data::metadata::set_current_for_test(store.state_mut(), Some(plx_data::metadata::Detail { title: "T".into(), ..Default::default() }));
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("an info state");
             let ps = plx_media::route::PlaybackSession::IDLE;
             let model = HudModel::default();
@@ -1840,7 +1847,7 @@ mod tests {
         #[test]
         fn a_toggle_section_control_reads_selected_while_its_section_is_open() {
             let text = include_str!("../hud_format/fixtures/reference/hud.json");
-            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &FM)
+            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &FM)
                 .expect("the reference loads")
                 .compiled;
             let open = |bits: u8| {
@@ -1894,7 +1901,7 @@ mod tests {
 
         fn reference() -> std::sync::Arc<Compiled> {
             let text = include_str!("../hud_format/fixtures/reference/hud.json");
-            crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &FM)
+            crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &FM)
                 .expect("the reference loads")
                 .compiled
         }

@@ -1,4 +1,4 @@
-//! The `hostsim` stand-in for `src/starfish.c` — the television's media seam, absent.
+//! The `sim` stand-in for `src/starfish.c` — the television's media seam, absent.
 //!
 //! This file has two behaviours and the default is still the honest failure.
 //!
@@ -54,17 +54,18 @@
 //! callback ([`Clock::tick`]), so a film whose audio outlasts its video ends here as on the
 //! television instead of hanging at the video tail. Cleared wherever the fed timeline restarts.
 //!
-//! It reports [`VP_EXPORTED`](plx_platform::tv::sink::VP_EXPORTED), the webOS 5+ path, because that
+//! It reports [`VP_EXPORTED`](plx_os::tv::sink::VP_EXPORTED), the webOS 5+ path, because that
 //! one binds video through an exported window id and never touches ACB — so the whole ACB stage
 //! sequence stays skipped rather than faked.
 //!
 //! # How it is reached
 //!
 //! The verbs below are private; [`HostSink`] is the simulator's own `tv::sink::VideoSink`, one
-//! method per verb, installed by `port.rs` for the `hostsim` build (the application builds it in
+//! method per verb, held by the desktop platform crate's `SERVICES` (`platform-desktop/src/lib.rs`) for the `sim` build (the application builds it in
 //! `app::adapters::hostsim`, with the simulator's picture) and returned directly by the media
 //! tests' composition (`player::test_physical`) and the application's (`app::adapters::backends`)
-//! in the hostsim tests. The `*_for_test` hooks stay here, next to the statics
+//! in the hostsim tests. It is compiled for the simulator (`sim`) and for every test build (`cfg(test)`, or a
+//! dependent that enables `test-support`), so the tests that need it run in the default pass. The `*_for_test` hooks stay here, next to the statics
 //! they touch, and the tests reach them as `plx_play_feed::ffi_host::<hook>` (media does not re-export
 //! this module).
 //!
@@ -80,8 +81,8 @@
 //! sets, so no event can precede them.
 
 use plx_base::task::MainThread;
-use plx_platform::tv::plane::{CompletionQueue, PlaneCompletion};
-use plx_platform::tv::sink::{DisplaySink, PlaneFinish, PlaneUnload, VideoSink};
+use plx_os::tv::plane::{CompletionQueue, PlaneCompletion};
+use plx_os::tv::sink::{DisplaySink, PlaneFinish, PlaneUnload, VideoSink};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_long, c_uint};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::Relaxed};
@@ -205,7 +206,7 @@ static TICKER_HUSHED: AtomicBool = AtomicBool::new(false);
 static FEED_REFUSED_LANE: AtomicI32 = AtomicI32::new(i32::MIN);
 /// The host pipeline's volume (`setVolume`); a fresh pipeline starts at `PIPELINE_DEFAULT_VOLUME`.
 #[cfg(any(test, feature = "test-support"))]
-static HOST_VOLUME: AtomicI32 = AtomicI32::new(plx_platform::tv::sink::PIPELINE_DEFAULT_VOLUME);
+static HOST_VOLUME: AtomicI32 = AtomicI32::new(plx_os::tv::sink::PIPELINE_DEFAULT_VOLUME);
 /// Every Play / Pause / `set_volume(n)` the sink saw, in order, as `"play"`, `"pause"`,
 /// `"volume:n"`: what a test reads to prove the paused preroll mutes BEFORE its Play and restores
 /// AFTER its re-pause. Cleared by [`reset_volume_probe_for_test`].
@@ -1274,9 +1275,9 @@ unsafe fn sf_quarantine() {
 /// rather than faked. Faking ACB would mean modelling a bind order this file cannot verify.
 unsafe fn vp_mode() -> c_int {
     if enabled() {
-        plx_platform::tv::sink::VP_EXPORTED
+        plx_os::tv::sink::VP_EXPORTED
     } else {
-        plx_platform::tv::sink::VP_NONE
+        plx_os::tv::sink::VP_NONE
     }
 }
 unsafe fn vp_create_window() -> *const c_char {
@@ -1408,6 +1409,10 @@ impl HostSink {
 }
 
 impl VideoSink for HostSink {
+    /// The host decodes nothing unless the clock sink is armed (`plxnative-clocksink`), so a refused
+    /// `Load` is the seam being absent. Read fresh, like the trigger itself: the test arming
+    /// (`force_clocksink_for_test`) is a separate, in-process switch that does not change it.
+    fn lacks_video_path(&self) -> bool { !plx_base::devtrig::flag("clocksink") }
     fn no_object_proof(&self, _: &MainThread) -> bool {
         // NativeStop joins the Load worker before asking. A refused host Load never wrote an
         // object, callback epoch or loaded state. A prior quarantine clears OBJECT_READY too,
@@ -1467,7 +1472,7 @@ impl VideoSink for HostSink {
     ) -> c_char {
         sf_feed(p, size, pts, es_data)
     }
-    unsafe fn unload(&self, _: &plx_platform::tv::sink::UnloadTicket) {
+    unsafe fn unload(&self, _: &plx_os::tv::sink::UnloadTicket) {
         sf_unload()
     }
     unsafe fn callback_gate_retire(&self, _: &MainThread) -> c_int {
@@ -1591,7 +1596,7 @@ pub(crate) mod test_sink {
 mod tests {
     use super::*;
 
-    /// The seam state is process-global and the engine's hostsim tests drive the same atomics.
+    /// The seam state is process-global and the engine's tests drive the same atomics.
     /// Use the crate-wide lock rather than a module-local mutex: two different locks made both
     /// suites individually serial while still allowing them to overwrite `FED_MAX_NS` together.
     fn lock() -> plx_base::testlock::Serial {

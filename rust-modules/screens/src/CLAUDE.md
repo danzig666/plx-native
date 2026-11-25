@@ -99,7 +99,22 @@ that mixes async content with a live cursor:
   block that lands late). A restore is only what the reader chose: the engine remembers
   the page's own seats too, so the page keeps their provenance (`LibraryScreen::placed`). Home already has this shape (the hero seats when its action row
   arrives, while focus is still on the strip); Search seats its field, which never arrives async,
-  and Person and Detail keep no self-seat for a landing to strand.
+  and Person keeps no self-seat for a landing to strand. Detail keeps none while a playback driver
+  is composed (Play is its first seat and the landing does not move it); with none composed its
+  first seat, before the item lands, is the watched toggle, which writes to the account once the
+  item is there. The page owns that seat the way the Library owns its grid's
+  (`DetailScreen::provisional`, set by a fresh open's `Enter`): every frame's `reconcile` answers
+  `DetailScreen::default_elem` until the viewer acts at it: a key that moves focus, the pointer
+  moving it, an activation (`activate`: OK or a click) on a landed page, a hold that opens the item
+  menu, or, once the item has landed and the page has placed its seat (focus is on `default_elem`),
+  any key-down, pointer, click, drag or wheel (the Library's rule, since a wheel or a hover on the
+  focused control moves no focus for a `FocusMoved` to report). The item's
+  landing, a later Also available landing and a restore that waits on a season or retires all move the
+  seat by that one rule, so account safety never depends on a restore firing in the landing frame.
+  Before the item lands, and in the landing frame before `reconcile` has moved focus off the toggle,
+  only a focus move ends it: an OK there would let its press commit on the watched toggle, so an OK,
+  a key that moves nothing, a wheel, a drag and a hover on the control already focused leave it the
+  page's.
 - **The grid absorbs an index landing, the page shifts its scroll.** The Library's grid is a
   `cards::Grid` in `ScrollMode::External`: when the focused element's index changes with no
   `FocusMoved` (an insert or reorder before it) the grid moves its pop with the element and
@@ -281,7 +296,11 @@ episode view's cards are 4 columns wide, wider than a poster, so no value gains 
 input, not a read:** a screen reads no clock and fetches no date; the application's loop publishes the
 calendar date once per frame (`Bridge::publish_today`, read from the platform at most once a minute through
 `app::clock::today`, the loop its one caller) and `LibraryLike::today` hands it in from the frame's views,
-and `CaptionCache` keys its labels on it so "Today" rebuilds at midnight. The Under posters page's picture
+and `CaptionCache` keys its labels on it so "Today" rebuilds at midnight. **The time of day is the same kind of
+input:** the loop publishes the wall-clock second and the zone's UTC offset once per frame
+(`Bridge::publish_wall`, from `app::clock::wall`), a page receives them as `LiveTvLike::wall`, the player's banner as
+`PlayerLike::wall`, and every clock face, "22m left" and progress fraction is derived from them by the pure
+`plx_ui::fmt::airing_line` / `left` / `frac` (`None` under a replay: no clock face, never a guessed one). The Under posters page's picture
 illustrates the mode as a library sorted by Year while the Sort value row has focus: each sample's own year
 (through `registry::sort_info::year_value`, the Year sort's own wording) replaces its caption lines (`RootPicture::sorted`; the details pickers never preview it). The picture never adds sort choices.
 

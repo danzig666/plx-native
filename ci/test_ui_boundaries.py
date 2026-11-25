@@ -59,7 +59,7 @@ class BoundaryTests(unittest.TestCase):
                 self.assertTrue(boundary.screen_violations(source))
 
     def test_shipping_disabled_developer_io_still_fails(self):
-        for cfg in ('feature = "devtriggers"', 'all(feature = "hostsim", not(test))',
+        for cfg in ('feature = "devtriggers"', 'all(feature = "sim", not(test))',
                     'any(test, feature = "devtriggers")'):
             self.assertTrue(boundary.screen_violations(f'#[cfg({cfg})] fn helper() {{ std::fs::read("x"); }}'))
 
@@ -67,7 +67,7 @@ class BoundaryTests(unittest.TestCase):
         source = '''
         // std::fs::read("comment")
         fn pure() { let s = r#"std::fs::read("data")"#; }
-        #[cfg(all(test, feature = "hostsim"))]
+        #[cfg(all(test, feature = "sim"))]
         #[allow(dead_code)] mod fixtures { fn seed() { std::fs::read("x"); } }
         #[cfg(any(test, feature = "test-support"))]
         fn fixture() { plx_base::devtrig::read("x"); }
@@ -87,6 +87,57 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(boundary.check_screens(root), [])
             (root / 'lib.rs').write_text('mod fixture;')
             self.assertTrue(boundary.check_screens(root))
+
+    def _extension_tree(self, directory, planted=None):
+        """The four roots the closed-ladder gate reads, empty, with one file planted in one of them."""
+        root = Path(directory)
+        for rel in ('rust-modules/src', 'rust-modules/platform-webos/src', 'rust-modules/platform-desktop/src',
+                    'rust-modules/platform-tizen/src'):
+            (root / rel).mkdir(parents=True)
+            (root / rel / 'lib.rs').write_text('')
+        if planted:
+            rel, source = planted
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source)
+        return root
+
+    def test_the_platform_crates_are_read_for_a_closed_arg_ladder(self):
+        """W7b: `port.rs`, `system.rs`, `platform_desktop.rs` and `bin/sim.rs` left `rust-modules/src` for the two
+        platform crates, and this gate read only `rust-modules/src`: a closed `AppArg` match in any of them passed.
+        RED against the one-root gate: each platform crate's files fail, and are named."""
+        ladder = 'fn word(arg: &AppArg) { match arg { AppArg::Home => "home", AppArg::Search => "search" } }'
+        for rel in ('rust-modules/platform-webos/src/system.rs', 'rust-modules/platform-webos/src/webos/toast.rs',
+                    'rust-modules/platform-desktop/src/bin/sim.rs', 'rust-modules/platform-desktop/src/lib.rs',
+                    'rust-modules/platform-tizen/src/lib.rs'):
+            with self.subTest(file=rel), TemporaryDirectory() as directory:
+                root = self._extension_tree(directory, (rel, ladder))
+                errors = boundary.check_extension_registration(root)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(rel, errors[0])
+
+    def test_the_application_crate_is_still_read_beside_the_platform_crates(self):
+        ladder = 'fn word(arg: &AppArg) { match arg { AppArg::Home => "home", AppArg::Search => "search" } }'
+        with TemporaryDirectory() as directory:
+            root = self._extension_tree(directory, ('rust-modules/src/app/words2.rs', ladder))
+            errors = boundary.check_extension_registration(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn('rust-modules/src/app/words2.rs', errors[0])
+
+    def test_a_platform_crate_with_no_ladder_passes(self):
+        with TemporaryDirectory() as directory:
+            root = self._extension_tree(directory, ('rust-modules/platform-webos/src/system.rs',
+                                                    'fn word(arg: &AppArg) { arg.route_word() }'))
+            self.assertEqual(boundary.check_extension_registration(root), [])
+
+    def test_a_missing_platform_root_is_reported_not_read_as_no_ladder(self):
+        with TemporaryDirectory() as directory:
+            root = self._extension_tree(directory)
+            (root / 'rust-modules/platform-webos/src/lib.rs').unlink()
+            (root / 'rust-modules/platform-webos/src').rmdir()
+            errors = boundary.check_extension_registration(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn('rust-modules/platform-webos/src: a directory this gate reads is missing', errors[0])
 
     def test_orphan_named_tests_is_not_exempt(self):
         with TemporaryDirectory() as directory:
@@ -185,11 +236,11 @@ class BoundaryTests(unittest.TestCase):
 
     def test_adjacent_root_install_and_profile_aliases_fail(self):
         for source in (
-            'impl RootPage { fn rebuild() { plx_platform::i18n::saved_preference(); } }',
+            'impl RootPage { fn rebuild() { plx_os::i18n::saved_preference(); } }',
             'impl RootPage { fn rebuild() { plx_media::route::under_posters(); } }',
             'use plx_media::route as playback; impl RootPage { fn rebuild() { playback::under_posters(); } }',
             'use plx_media::route::{under_posters as read}; impl RootPage { fn rebuild() { read(); } }',
-            'use plx_platform::i18n::saved_preference as pick; impl LanguagePage { fn new() { pick(); } }',
+            'use plx_os::i18n::saved_preference as pick; impl LanguagePage { fn new() { pick(); } }',
             'impl LanguagePage { fn pending() { i18n::current().preference(); } }',
         ):
             with self.subTest(source=source):

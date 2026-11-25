@@ -61,7 +61,7 @@ fn route_layout(measure: &dyn Measure) -> RouteLayout {
     RouteLayout::screen_for_title(
         COPY_W,
         RouteLayout::screen().content.w,
-        plx_platform::i18n::msg::browse_person_filmography(),
+        plx_os::i18n::msg::browse_person_filmography(),
         measure,
     )
 }
@@ -306,6 +306,15 @@ impl FilmographyScreen {
             .map(|(sid, rk)| (*sid, rk.as_str()))
     }
 
+    /// The Discover identity of the focused credit, independent of library availability.
+    pub fn watchlist_hex(
+        &self,
+        focus: Option<plx_machine::machine::FocusKey<u32>>,
+    ) -> Option<[u8; 12]> {
+        let credit = self.rows().get(self.current_row(focus)?)?;
+        plx_data::watchlist::decode_hex(&credit.catalog_id)
+    }
+
     fn credit_by_identity(&self, department: &str, catalog_id: &str) -> Option<&Credit> {
         self.model
             .iter()
@@ -516,7 +525,7 @@ impl FilmographyScreen {
         self.tab_c = self
             .model
             .iter()
-            .map(|d| CString::new(format!("{} · {}", d.title, plx_platform::i18n::current().number(d.total as i64))).unwrap_or_default())
+            .map(|d| CString::new(format!("{} · {}", d.title, plx_os::i18n::current().number(d.total as i64))).unwrap_or_default())
             .collect();
         let sel = self
             .current_row(focus)
@@ -686,8 +695,8 @@ impl FilmographyScreen {
         self.ground_ready = opaque_ground_ready(f.page_alpha);
         let layout = route_layout(f.measure);
         let total: usize = self.model.iter().map(|d| d.total).sum();
-        let title = plx_platform::i18n::msg::browse_person_filmography();
-        let copy = plx_platform::i18n::msg::browse_person_credits(total as i64);
+        let title = plx_os::i18n::msg::browse_person_filmography();
+        let copy = plx_os::i18n::msg::browse_person_credits(total as i64);
         layout.draw_narrative(
             p,
             Some(&self.name),
@@ -1038,10 +1047,13 @@ impl<H: ContentLike + PersonLike> Machine<H> for FilmographyScreen {
                 self.activate_focus(cx.focus.current, fx);
                 Handled::Yes
             }
-            // Credits never fabricate a `PmsMovie`, including locally joined ones. The rows are
-            // Cards retain the ordinary hold gesture, but decline its action; a held row must
-            // neither fabricate a catalog item/menu nor activate when its key is released.
-            ScreenEvent::PressHold(_) => Handled::No,
+            ScreenEvent::PressHold(_) => {
+                if self.watchlist_hex(cx.focus.current).is_none() {
+                    return Handled::No;
+                }
+                fx.push(plx_machine::machine::Fx::App(AppFx::Content(ContentReq::ItemMenu)));
+                Handled::Yes
+            }
             ScreenEvent::Input(InputEvent {
                 kind: InputKind::Key { key: Key::Back, .. },
                 ..
@@ -1519,19 +1531,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn only_a_joined_credit_exposes_a_real_target_and_no_catalog_item() {
+    fn credits_offer_watchlist_without_requiring_a_library_copy() {
         let _serial = plx_base::testlock::serial();
         let mut s = screen(9, &_serial);
         select(&mut s, "Writer");
+        s.model[1].rows[0].catalog_id = "abababababababababababab".into();
+        s.sync_keys();
         let held = focus(&s, Located::Row(0));
         assert_eq!(s.focused_target(Some(held)), Some((ServerId::UNSET, "77")));
         let (handled, out, _) =
             step_screen(&mut s, &ScreenEvent::PressHold(PressId(1)), Some(held));
-        assert_eq!(handled, Handled::No);
-        assert!(!has_content(&out, |r| matches!(r, ContentReq::ItemMenu)));
+        assert_eq!(handled, Handled::Yes);
+        assert!(has_content(&out, |r| matches!(r, ContentReq::ItemMenu)));
+        assert_eq!(s.watchlist_hex(Some(held)), Some([0xab; 12]));
 
         select(&mut s, "Actor");
-        assert!(s.focused_target(Some(focus(&s, Located::Row(0)))).is_none());
+        s.model[0].rows[0].catalog_id = "cdcdcdcdcdcdcdcdcdcdcdcd".into();
+        s.sync_keys();
+        let held = focus(&s, Located::Row(0));
+        assert!(s.focused_target(Some(held)).is_none());
+        assert_eq!(s.watchlist_hex(Some(held)), Some([0xcd; 12]));
+        let (handled, out, _) = step_screen(&mut s, &ScreenEvent::PressHold(PressId(2)), Some(held));
+        assert_eq!(handled, Handled::Yes);
+        assert!(has_content(&out, |r| matches!(r, ContentReq::ItemMenu)));
+
+        for focus in [None, Some(focus(&s, Located::Tab(0))),
+            Some(plx_machine::machine::FocusKey { entry: EntryId(99), elem: held.elem }),
+            Some(focus(&s, Located::Row(1)))] {
+            assert_eq!(s.watchlist_hex(focus), None);
+            let (handled, out, _) = step_screen(&mut s, &ScreenEvent::PressHold(PressId(3)), focus);
+            assert_eq!(handled, Handled::No);
+            assert!(!has_content(&out, |_| true));
+        }
     }
 
     #[test]
@@ -1541,6 +1572,8 @@ pub(crate) mod tests {
         let _serial = plx_base::testlock::serial();
         let mut s = screen(9, &_serial);
         select(&mut s, "Writer");
+        s.model[1].rows[0].catalog_id = "abababababababababababab".into();
+        s.sync_keys();
         let key = focus(&s, Located::Row(0));
         let mut groups = Vec::new();
         Focusable::<FilmographyHost>::groups(&s, &cx(&FixtureMeasure, Some(key)), &mut groups);
@@ -1557,16 +1590,16 @@ pub(crate) mod tests {
                     PressEvent::Hold(id, _, _) => {
                         holds += 1;
                         let (handled, out, _) = step_screen(&mut s, &ScreenEvent::PressHold(id), Some(key));
-                        assert_eq!(handled, Handled::No);
-                        assert!(!has_content(&out, |_| true));
+                        assert_eq!(handled, Handled::Yes);
+                        assert!(has_content(&out, |r| matches!(r, ContentReq::ItemMenu)));
                     }
                     PressEvent::Commit(_, _, _) => commits += 1,
                     PressEvent::PageDamage => {}
                 }
             }
         }
-        assert_eq!(holds, 1, "credits retain the card hold gesture but decline its action");
-        assert_eq!(commits, 0, "a declined hold must not turn into navigation on release");
+        assert_eq!(holds, 1, "a hold opens exactly one menu");
+        assert_eq!(commits, 0, "opening the menu must not navigate on release");
     }
 
     #[test]
@@ -1833,7 +1866,7 @@ pub(crate) mod tests {
     #[test]
     fn every_credit_row_fits_the_table_in_every_language() {
         use plx_base::fontcov::advances::ShippedMeasure;
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let credits = [
             credit("A Film With A Rather Long Title Indeed", "An Unusually Long Role Name", 2020, None),
             credit("Undated", "", 0, None),

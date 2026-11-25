@@ -152,11 +152,11 @@ impl Kind {
     /// The shelf heading.
     pub fn title(self) -> &'static str {
         match self {
-            Kind::Movie => plx_platform::i18n::msg::browse_kind_movies(),
-            Kind::Show => plx_platform::i18n::msg::browse_kind_tv_shows(),
-            Kind::Episode => plx_platform::i18n::msg::browse_kind_episodes(),
-            Kind::Person => plx_platform::i18n::msg::browse_detail_cast(),
-            Kind::Collection => plx_platform::i18n::msg::browse_kind_collections(),
+            Kind::Movie => plx_os::i18n::msg::browse_kind_movies(),
+            Kind::Show => plx_os::i18n::msg::browse_kind_tv_shows(),
+            Kind::Episode => plx_os::i18n::msg::browse_kind_episodes(),
+            Kind::Person => plx_os::i18n::msg::browse_detail_cast(),
+            Kind::Collection => plx_os::i18n::msg::browse_kind_collections(),
         }
     }
     /// The count read-out beside it — how many RESULTS are on this shelf, as one complete
@@ -167,8 +167,8 @@ impl Kind {
     /// answered by two different formatters.
     pub fn count_label(self, n: usize) -> String {
         match self {
-            Kind::Person => plx_platform::i18n::msg::browse_search_people(n as i64),
-            _ => plx_platform::i18n::msg::browse_search_count(n as i64),
+            Kind::Person => plx_os::i18n::msg::browse_search_people(n as i64),
+            _ => plx_os::i18n::msg::browse_search_count(n as i64),
         }
     }
     /// Which hub identifiers feed this shelf.
@@ -439,7 +439,7 @@ pub fn terms(q: &str) -> Option<&str> {
 /// and `CString::new` refuses it at the far end, so the field's run and the empty statement both
 /// blank over a query the app still believes it is holding. Borrowed when there is nothing to
 /// remove, which is every keystroke: the television's panel cannot commit one
-/// (`textinput::decode_text_at` ends its string AT the NUL) and a remembered term is refused by
+/// (`plx_shell_sdl::text`'s `decode_text_at` ends its string AT the NUL) and a remembered term is refused by
 /// `recents::usable`, so the seed path is the only way one gets in — and that path now enters
 /// through the STORE rather than through a screen's mount.
 pub fn sanitize_query(q: &str) -> std::borrow::Cow<'_, str> {

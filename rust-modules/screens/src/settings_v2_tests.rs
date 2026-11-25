@@ -5,8 +5,8 @@ use super::*;
 #[allow(unused_imports)]
 use super::test_support::*;
 use plx_base::fontcov::advances::ShippedMeasure;
-use plx_platform::i18n::{language_on_this_thread_for_test, msg, SHIPPED};
-use plx_platform::playback_trace::{Command, Status};
+use plx_os::i18n::{language_on_this_thread_for_test, msg, SHIPPED};
+use plx_os::playback_trace::{Command, Status};
 
 fn inputs(signed_in: bool) -> RootInputs {
     RootInputs {
@@ -14,7 +14,7 @@ fn inputs(signed_in: bool) -> RootInputs {
         update_value: String::new(),
         signed_in, multi_user: false, library_count: 3, auto_sign_in: false, trailer_autoplay: true,
         resolution: UiResolution::Auto, resolution_offered: false,
-        language: plx_platform::i18n::Preference::System,
+        language: plx_os::i18n::Preference::System,
         under_posters: plx_plex::plex::session::UnderPosters::DEFAULT, plaintext: Vec::new(),
     }
 }

@@ -27,7 +27,7 @@ set, not production source, control or release coverage. Boot now installs a pro
 and source qualification port. The port's production qualifier returns Unknown (but for a viewer's own
 Playback engine opt-in, `OriginalRequest::uri_opt_in`, below) and the evidence it reports has no certified
 capabilities, so ordinary routes still choose Feed. The driver itself is configured with what an opted-in
-viewer certifies (`ProductEvidence::opted_in`), and only a qualification ever offers it a source. Host fixtures inject qualified source
+viewer certifies (`ProductEvidence::opt_in_certifies`, which `ProductEvidence::opted_in` applies to the evidence's own pair), and only a qualification ever offers it a source. Host fixtures inject qualified source
 and firmware evidence to exercise source, control and release logic.
 
 The product driver also carries the ACB plane binding the probe proved (`Binding::Acb` in
@@ -44,11 +44,16 @@ accepted pause/resume to the plane once the bind has completed. Release is `UNLO
 plane owner's fence on that call's completion callback, pumped from the backend's `poll`
 (`docs/measurements/acb-release-fence-2026-11-04.md`); a quarantine until process exit is only the
 outcome of a failed fence, not the normal one. `plx_play_uri::backend::product_binding` selects it at
-composition (an ACB display; the URI engine's own handle, player type 0, is created ON DEMAND when the first source is OFFERED (`UriDriver::ready_to_start`, asked by `offer_qualified_uri`, runs `PlaneOwner::ensure_handle`; the driver's gate `Op::Check` makes it if nothing did), while the boot creates only Feed's player type 10 handle, each created once and never destroyed, and the plane owner binds one at a time across both; a create or initialize that fails DECLINES the offer, `uri: original declined (the ACB handle for the URI engine could not be created)`, and Feed plays the title; the failure is recorded, so a later offer declines without a new attempt, and the Start's own gate stays the backstop); media's `uri_preflight` only receives the result as
-`ProductEvidence::unqualified_on(.., binding)`. `ProductEvidence::permits` and
-`ResolvePort::could_qualify_pms` accept `Binding::Acb` as an offerable display path beside an exported
-canvas, but only through `certified` capabilities: the production evidence certifies nothing and
-`ProductQualifier` answers `Unknown`, which is what keeps the ACB binding from being offered a source.
+composition (an ACB display; the URI engine's own handle, player type 0, is created ON DEMAND when the first source is OFFERED (`UriDriver::ready_to_start`, asked by `offer_qualified_uri`, runs `PlaneOwner::ensure_handle`; the driver's gate `Op::Check` makes it if nothing did), while the boot creates only Feed's player type 10 handle, each created once and never destroyed, and the plane owner binds one at a time across both; a create or initialize that fails DECLINES the offer, `uri: original declined (the ACB handle for the URI engine could not be created)` (the driver's own reason, `UriNotReady::Driver`), and Feed plays the title; the failure is recorded, so a later offer declines without a new attempt, and the Start's own gate stays the backstop); media's `uri_preflight` never sees the binding.
+The driver reports the display path it can show a source on as `DisplayEvidence` (`UriDriver::display`: whether
+the display is ready, whether it can place a preview rectangle, and an opaque tag the boot log prints; the
+exported window, the ACB plane and the window mode that exports it are the LG driver's own detail, compared
+only inside `plx_play_uri`), and the composition joins it to the product's callable and certified
+capabilities as `ProductEvidence { display, callable, certified }`. `ProductEvidence::permits` and
+`ResolvePort::could_qualify_pms` read only whether that display is ready, and offer a source only through
+`certified` capabilities: the production evidence certifies nothing and the product's `ProductQualifier`
+(`app/adapters/backends.rs`, which also holds LG's one display rule, a Part with several audio tracks stays
+on Standard on the exported window) answers `Unknown`, which is what keeps the ACB binding from being offered a source.
 The one exception is a viewer who turned on Settings > Video & playback > Playback engine > Experimental
 (`UriEngine::On`, per profile, off by default): the route snapshots it into `ResolveEnv::uri_engine`,
 `OriginalRequest::uri_opt_in` carries it to the worker, `ProductQualifier` then answers the original
@@ -60,7 +65,10 @@ that original: the plan carries its own verdicts in `OriginalRequest::standard` 
 certifies a DV record only where the frozen decision admitted it. So a codec or raster the caps refuse, a
 Profile 5 file on a set without Dolby Vision, an audio track only the app decodes or the set cannot decode,
 and a container Standard hands the server to remux (anything but .mkv/.mp4/.m4v) play exactly as in Standard.
-The gate is Standard's own verdicts for the video, Dolby Vision, audio and container, and nothing more: it is
+The gate is Standard's own verdicts for the video, Dolby Vision, audio and container, plus one check of the
+TV's pipeline: an original Standard plays as Dolby Vision is declined where the TV's own demuxer would show
+only its base layer (`pipeline_carries_dolby_vision`: a Profile 7 Feed converts, or an MKV before webOS 10.3).
+It is
 NOT the server's decision, which the URI offer is made before (no Media Decision Engine round trip), so a
 file that clears these checks but that the server would still convert is offered all the same. A converted PMS output
 (`qualify_pms`) and any file whose Part carries a subtitle stream, whether or not a subtitle is on (the
@@ -192,11 +200,11 @@ and seeks by time via `av_seek_frame` (libavformat's own Cues index).
   the session reset the readout does not: the teardown records it as the terminal
   `AttemptFacts::load_abandoned`.
 
-**The main-thread rule is compiler-enforced.** The seam is the `VideoSink` trait in `plx_platform::tv::sink` (`rust-modules/platform/src/tv/sink.rs`)
-(Starfish-shaped: one method per verb, reached through `PlayerAdapter::display_sink`). `platform/src/webos/video_sink.rs`'s `extern "C"`
+**The main-thread rule is compiler-enforced.** The seam is the `VideoSink` trait in `plx_os::tv::sink` (`rust-modules/os/src/tv/sink.rs`)
+(Starfish-shaped: one method per verb, reached through `PlayerAdapter::display_sink`). `platform-webos/src/webos/video_sink.rs`'s `extern "C"`
 declarations are private to that module and only `StarfishSink` there implements the trait on the
 television; `HostSink` (`play-feed/src/ffi_host.rs`, `plx_play_feed::ffi_host`) is the simulator's. Every verb but `load` and `unload`
-takes a `task::MainThread` (the constant queries `feed_abi_is_cow`, `window_mode` and `window_id`
+takes a `task::MainThread` (the constant queries `feed_abi_is_cow`, `lacks_video_path`, `window_mode` and `window_id`
 take nothing); `unload` takes an `UnloadTicket`, which only a `&MainThread` can issue and which is
 `Send`, so the main thread decides when an Unload happens and a worker may carry it out.
 `MainThread` is a `!Send` ZST the application mints once. Since phase 9 it mints exactly one
@@ -229,12 +237,19 @@ something.
   probe's own capability (for read-outs) + that gated presentation decision, and every
   Load/reload/recovery consumes the
   stored presentation rather than re-reading the later cache; `dvnonode` is the logged diagnostic
-  exception, and the Feed's `dv_start` guard (`play-feed/src/dv_start.rs`, reached only through `FeedLoad::dv_landing_due`) is the one mid-play change (#1166): at a landing the firmware's
+  exception, and the Feed's `dv_start` guard (`play-feed/src/dv_start.rs`, reached only through `FeedLoad::dv_landing_due`) is one of the two mid-play changes (#1166): at a landing the firmware's
   Dolby Vision splitter would skip, or after 4 s with no position update, it takes the declaration
   out of the route for the rest of that play request (`route::withdraw_dv_presentation`: what DV Off
   would have planned, the probed capability kept, on the installed route, the file's own declaration
   and the stored Auto Original candidate, so a trip to HLS and back to Original stays base-layer)
-  and reloads once. Atmos routing and ACB forwarding are independent and unchanged. The payload evidence,
+  and reloads once. The other goes the opposite way: a stream whose container has no Dolby Vision
+  configuration record but whose RPUs say Profile 5 or Profile 8 over PQ/HLG (a remux that dropped
+  the record; the server then reports no Dolby Vision) is reported by the demuxer
+  (`ff::RpuOnlyScan`, `FeedRaw::rpu_dovi`), and once the Load has returned the pump has the route
+  declare it (`route::declare_rpu_dovi`: direct play only, outside an unconfirmed Original trial,
+  with the Dolby Vision setting frozen at the resolve, so DV Off and a set without confirmed support
+  change nothing) and reloads once with the node.
+  Atmos routing and ACB forwarding are independent and unchanged. The payload evidence,
   Profile 5 one-tick fix and instrument traps live in that document.
 - **The Load's `adaptiveStreaming` ceiling is derived per session (`plx_play_feed::sink_envelope`), and
   it was a 4K60 constant for EVERY codec until 2026-09-03 — which on webOS 10 refused every H.264

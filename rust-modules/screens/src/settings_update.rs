@@ -41,7 +41,7 @@ pub(super) enum UpdateAction {
 
 /// The value beside *Check for updates*: what the last check found.
 fn check_value(status: &UpdateStatus) -> String {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     match status.phase {
         UpdatePhase::Unavailable => msg::settings_update_unavailable().to_owned(),
         UpdatePhase::Checking => msg::settings_update_checking().to_owned(),
@@ -54,7 +54,7 @@ fn check_value(status: &UpdateStatus) -> String {
 
 /// The value beside *Install {version}*: how the install is going, once it has started.
 fn install_value(phase: UpdatePhase) -> String {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     match phase {
         UpdatePhase::Downloading(None) => msg::settings_update_downloading().to_owned(),
         UpdatePhase::Downloading(Some(p)) => msg::settings_update_downloading_percent(&p.to_string()),
@@ -71,7 +71,7 @@ fn install_value(phase: UpdatePhase) -> String {
 
 /// The page's rows from the updater's state alone.
 pub(super) fn update_form(status: &UpdateStatus) -> Form<UpdateId, UpdateAction, SettingsPage> {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     let installing = matches!(status.phase, UpdatePhase::Downloading(_) | UpdatePhase::Verifying
         | UpdatePhase::Installing | UpdatePhase::Installed | UpdatePhase::NoHomebrewChannel | UpdatePhase::InstallFailed
         | UpdatePhase::Unconfirmed);
@@ -89,7 +89,7 @@ pub(super) fn update_form(status: &UpdateStatus) -> Form<UpdateId, UpdateAction,
 pub(super) fn root_value(status: &UpdateStatus) -> String {
     match (status.phase, status.latest.as_deref()) {
         (UpdatePhase::Unavailable, _) | (_, None) => String::new(),
-        (_, Some(version)) => plx_platform::i18n::msg::settings_update_available(version),
+        (_, Some(version)) => plx_os::i18n::msg::settings_update_available(version),
     }
 }
 
@@ -143,11 +143,11 @@ impl UpdatePage {
         let keep = self.form.selected_id().cloned().unwrap_or(UpdateId::Check);
         self.form.set(update_form(&self.state.status), Some(&keep));
         self.form.table.list_focused = true;
-        self.copy = plx_platform::i18n::msg::settings_update_detail(&self.state.status.current);
+        self.copy = plx_os::i18n::msg::settings_update_detail(&self.state.status.current);
     }
 
     fn view(&self) -> TableScreen<'_> {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         TableScreen::new(
             Header::new(RouteLayout::screen(), Some(msg::settings_title()), msg::settings_update_title(), &self.copy),
             &self.form.table, GroupId(0), self.entry,
@@ -225,7 +225,7 @@ plx_ui::focusable_via_view!(UpdatePage, InnerHost, view);
 impl Screen<InnerHost> for UpdatePage {
     fn name(&self) -> &'static str { super::super::registry::word::SOFTWARE_UPDATE }
     fn state(&self) -> &dyn LogicalState { &self.state }
-    fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_platform::i18n::msg::settings_title())) }
+    fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_os::i18n::msg::settings_title())) }
     fn prepare(&mut self, _b: &mut Budget, _cx: &Cx<'_, InnerHost>) {}
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, InnerHost>) {
         plx_ui::screen::Part::<InnerHost>::draw(&mut self.view(), f, Rect::FULL);
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn the_values_say_what_was_found_and_how_the_install_goes() {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         assert_eq!(check_value(&status(UpdatePhase::UpToDate, None)), msg::settings_update_up_to_date());
         assert_eq!(check_value(&status(UpdatePhase::Available, Some("0.10.25"))), msg::settings_update_available("0.10.25"));
         assert_eq!(check_value(&status(UpdatePhase::Unavailable, None)), msg::settings_update_unavailable());

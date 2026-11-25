@@ -89,6 +89,7 @@ use std::ptr::{addr_of, addr_of_mut};
 use std::rc::Rc;
 
 use plx_base::surface::{LOGICAL_H as SCR_H, LOGICAL_W as SCR_W};
+use crate::gfx::{degrade_on_link_failure, GfxFault};
 use crate::overdraw::{gate, Class};
 
 /// Last resort only. Reaching this is a DEFECT, not a graceful degradation — see `font_at`.
@@ -378,7 +379,7 @@ pub fn draw_mask_inked(tex: c_uint, x: f32, y: f32, w: f32, h: f32, tint: *const
 
 /// One opened face per pixel size, per array. 80 covers the whole `theme::size` ladder; the
 /// simulator's supersampled rendering (`surface::render_scale`, up to 4x) rasterises at up to 4x it.
-const FONT_SLOTS: usize = if cfg!(feature = "hostsim") { 320 } else { 80 };
+const FONT_SLOTS: usize = if cfg!(feature = "sim") { 320 } else { 80 };
 static FONTS: [AtomicPtr<TtfFont>; FONT_SLOTS] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; FONT_SLOTS];
 static FONTS_B: [AtomicPtr<TtfFont>; FONT_SLOTS] =
@@ -453,7 +454,7 @@ fn key_hash(s: &[u8], sz: c_int, bold: c_int) -> u64 {
 // headroom past the ~80 simultaneous worst case, stable text is a pure cache hit after first paint.
 // The simulator's supersampled rendering keeps a second, `n`x texture per visible string beside
 // the logical one layout measures, so it gets the room for both.
-const TCACHE: usize = if cfg!(feature = "hostsim") { 480 } else { 160 };
+const TCACHE: usize = if cfg!(feature = "sim") { 480 } else { 160 };
 static mut TCACHE_A: [TCacheEntry; TCACHE] = [TCacheEntry::ZERO; TCACHE];
 static mut TCLOCK: c_uint = 0;
 
@@ -1646,20 +1647,21 @@ unsafe fn publish_text_ok() -> bool {
     true
 }
 
-pub fn init_text() {
+pub fn init_text() -> Result<(), GfxFault> {
     FITTED_LINES.with(|cache| cache.borrow_mut().entries.clear());
     MEASURED_BOUNDS.with(|cache| cache.borrow_mut().entries.clear());
     unsafe {
         if !ttf_init() {
             log("TTF_Init failed");
-            return;
+            return Ok(());
         }
         TPROG = match crate::gfx::link_program(VS_TEXT.as_ptr(), FS_TEXT.as_ptr()) {
-            Some(p) => p,
-            None => {
+            Ok(p) => p,
+            Err(GfxFault::Link) => {
                 log("text prog link failed");
-                return;
+                return Ok(());
             }
+            Err(fault) => return Err(fault),
         };
         TL_RECT = glGetUniformLocation(TPROG, c"u_trect".as_ptr());
         TL_SCREEN = glGetUniformLocation(TPROG, c"u_tscreen".as_ptr());
@@ -1667,12 +1669,10 @@ pub fn init_text() {
         TL_TEX = glGetUniformLocation(TPROG, c"u_tex".as_ptr());
         // the fade program shares VS_TEXT; a link failure leaves TPROGF=0 and draw_text_fade
         // falls back to the plain path (the fade is a nicety, not load-bearing)
-        TPROGF = crate::gfx::link_program(VS_TEXT.as_ptr(), FS_TEXT_FADE.as_ptr()).unwrap_or_else(
-            || {
-                log("text fade prog link failed");
-                0
-            },
-        );
+        TPROGF = degrade_on_link_failure(
+            crate::gfx::link_program(VS_TEXT.as_ptr(), FS_TEXT_FADE.as_ptr()),
+            "text fade prog link failed",
+        )?;
         if TPROGF != 0 {
             TLF_RECT = glGetUniformLocation(TPROGF, c"u_trect".as_ptr());
             TLF_SCREEN = glGetUniformLocation(TPROGF, c"u_tscreen".as_ptr());
@@ -1685,12 +1685,10 @@ pub fn init_text() {
         }
         // the ink program shares VS_TEXT too; without it a label crossed by a capsule's rounded end
         // is painted plain (a nicety again: the stretches' ink is still chosen, only the edge is square)
-        TPROGI = crate::gfx::link_program(VS_TEXT.as_ptr(), FS_TEXT_INK.as_ptr()).unwrap_or_else(
-            || {
-                log("text ink prog link failed");
-                0
-            },
-        );
+        TPROGI = degrade_on_link_failure(
+            crate::gfx::link_program(VS_TEXT.as_ptr(), FS_TEXT_INK.as_ptr()),
+            "text ink prog link failed",
+        )?;
         if TPROGI != 0 {
             TLI_RECT = glGetUniformLocation(TPROGI, c"u_trect".as_ptr());
             TLI_SCREEN = glGetUniformLocation(TPROGI, c"u_tscreen".as_ptr());
@@ -1723,6 +1721,7 @@ pub fn init_text() {
         // which is a shared reference to a `static mut` (`static_mut_refs`, a future hard error)
         log(&format!("init_text ok={}", *addr_of!(TEXT_OK)));
     }
+    Ok(())
 }
 
 /// **The fonts without the renderer.** [`init_text`] opens the fonts AND links the text shaders, so it
@@ -2789,7 +2788,7 @@ unsafe fn drawn_tex(
     bold: c_int,
     logical: (c_uint, c_int, c_int, c_int),
 ) -> (c_uint, f32, f32, f32) {
-    #[cfg(feature = "hostsim")]
+    #[cfg(feature = "sim")]
     {
         let n = plx_base::surface::render_scale();
         if n > 1 {
@@ -2800,7 +2799,7 @@ unsafe fn drawn_tex(
             }
         }
     }
-    #[cfg(not(feature = "hostsim"))]
+    #[cfg(not(feature = "sim"))]
     let _ = (s_bytes, s, sz, bold);
     (logical.0, logical.1 as f32, logical.2 as f32, logical.3 as f32)
 }

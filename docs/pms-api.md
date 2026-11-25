@@ -999,6 +999,20 @@ GET /library/metadata/{rk}?includeMarkers=1&includeChapters=1
   playhead routinely stops short of — treat it as open-ended rather than exclusive, or an
   end-of-item prompt blinks out over the last frames.
 
+### Reads by key — `skipRefresh` (the spec, and timed on one PMS)
+
+`plex-openapi.json` describes `skipRefresh=1` on `GET /library/metadata/{ids}` as skipping the synchronous
+local media agent and analysis refresh, which the default (false) runs. This client's background reads by
+key (`plex::Client::metadata_many`, which a Home row re-read, a hub or listing page's batch, the
+view-state read-back after Mark Watched or a stopped play and a person's filmography go through,
+`Client::metadata_background`, and the `includePreferences=1` show-preferences read of every episode play)
+send `skipRefresh=1`; the preferences read still returns the same `Preferences` with it (3 shows on one
+PMS). The detail read (`Client::metadata`), which a viewer opened, sends none. Plex Web 4.162.1 sends `skipRefresh=1` on its
+re-reads by key and never takes the refresh. On one household PMS the first batch read without it took 138
+to 948 ms in four of five sets, and no read with it was slow; a field log over a remote link read 4 to 9 s
+per Home row, with a timeline "item processed" notification about once a second while Home scrolled
+(issue #1458).
+
 ### Up Next — the `continuous=1` PlayQueue already carries it (verified live 2026-07-29)
 
 There is no "what plays next" endpoint to call: the `POST /playQueues?continuous=1` the app makes
@@ -1732,13 +1746,21 @@ What a hint does for the Watchlist: a session on a matched title that the page h
 any held card. A `timeline` create or delete does not read the item: it owes the Watchlist store ONE re-match
 of that server and kind (a delete of the item a tile is matched to asks again about that guid, a create asks
 again about the kind's titles the server was not seen to hold, `/library/all?type=T&guid=…` at 40 guids to a
-request), deduplicated per pump, at most once per quiet-refetch spacing (5 s) per server and kind, only once
-the Watchlist has loaded and only when `reread_allowed`; it stays queued otherwise. A feed that came back
+request), deduplicated per server and kind, only once the Watchlist has loaded and only when `reread_allowed`
+(it stays queued otherwise). A feed that came back
 after a gap re-asks the server's titles whole. The tile flips when the answer lands (`docs/watchlist.md`,
 *Live-update gaps*). The same create or delete also moves that server's lists: one quiet Home refetch
-and one section-shelf invalidate (spaced like a `stopped`'s), and one `BrowseCmd::ListingsChanged` for its
-library listings, at most once per quiet-refetch spacing per server (a change inside it stays owed and is
-spent when due). PMS sends the same `finished` frame for a refreshed item as for a new one, so the open grid
+and one section-shelf invalidate (coalesced like a `stopped`'s), and one `BrowseCmd::ListingsChanged` for its
+library listings. **None of these four (the re-match, the refetch, the invalidate and the re-list) is made
+when the entry arrives.** A scan delivers about one finished entry a second for minutes, and over a remote
+link one row read takes seconds, so re-reading on each entry kept every read the viewer scrolled to stuck in
+a queue (#1458). A server's entries wait for ITS feed to go quiet: the four are made once, when no library
+entry for that server has arrived for 10 s (`LIBRARY_QUIET_FRAMES`) or when 60 s
+(`LIBRARY_LONGEST_WAIT_FRAMES`) have passed since the oldest entry not yet spent, so a feed that never goes
+quiet still refreshes about once a minute; the next entry starts a new wait. The wait is counted in pumped frames and holds only library entries: a `stopped` session's
+refetch and invalidate, a feed gap's sweep and the read-backs above are not waited on, and the spacings
+downstream (5 s per quiet refetch, per section shelf and per re-match) still apply.
+PMS sends the same `finished` frame for a refreshed item as for a new one, so the open grid
 is never listed again while it is visible: it is marked stale, as a read-back that moves a row's membership
 marks it, and re-queried keeping the reader's place when a page covers it (at once when no Library page is
 on the navigation stack). The server's other sections forget their pages and fetch afresh on their next
@@ -1802,6 +1824,134 @@ was captured).
 
 ---
 
+## 10. Live TV — DVRs, guide lineup, airings (measured live 2026-10-20, PMS 1.43.3, one ErsatzTV tuner)
+
+Read-only GETs against a server with one DVR backed by an HDHomeRun-protocol tuner (ErsatzTV) and an
+XMLTV guide. The app's reads live in `rust-modules/plex/src/plex/livetv.rs`.
+
+- **`GET /livetv/dvrs`** → `Dvr[]`: `key`, `uuid`, `language`, `country`, `lineup`
+  (`lineup://tv.plex.providers.epg.xmltv/<url-encoded XMLTV URL>#<title>`), **`epgIdentifier`**
+  (`tv.plex.providers.epg.xmltv:{key}`, the path prefix of every guide read below) and `Device[]`:
+  `key`, `uuid` (`device://tv.plex.grabbers.hdhomerun/<id>`), `uri` (the tuner's own host), `status`
+  (`alive` | `dead`), `state` (`enabled`), `lastSeenAt`, `tuners`, `ChannelMapping[]`
+  (`channelKey`, `deviceIdentifier`, `enabled` as the string `"1"`, `lineupIdentifier`).
+- **`status` is a discovery result, not a health check.** PMS sets it when it discovers devices,
+  which it does at start-up and on `POST /media/grabbers/devices/discover`; `lastSeenAt` is that
+  moment. A tuner that was not answering at start-up stays `dead` until a later discovery, however
+  healthy it is in between. `POST /media/grabbers/devices?uri=…` probes the tuner and updates its URI
+  but leaves `status` as it was. Both are admin writes; the app sends neither.
+- **`GET /media/providers`** → `MediaProvider[]`: `identifier`, `protocols` (`library`, `livetv`, …)
+  and `title`. This is the read a NON-ADMIN token can make: a Home user who has been granted Live TV
+  gets `403` from `/livetv/dvrs` and sees only the `tv.plex.providers.epg.xmltv:{dvr}` provider here
+  (reported by the maintainer on webOS 4.5, 2026-11-15), so the app finds Live TV through this and
+  falls back to the DVR list only when the read is absent. The provider identifier is the same string
+  `/livetv/dvrs` reports as `epgIdentifier` and its suffix is the same DVR key, so the tune path is
+  unchanged.
+- **`GET /{epgIdentifier}/lineups/dvr/channels`** → `Channel[]`, only the channels the DVR mapped:
+  `id` = `gridKey` (`C101.242.ersatztv.org`), `vcn` (`"101"`), `title` and `callSign` with the number
+  in front (`"101 Some Channel"`), `thumb` — a URL on the TUNER's host. Fetched through
+  `/photo/:/transcode?url=…` it comes back as an image, so a client that cannot reach the tuner still
+  gets the logo.
+- **`GET /{epgIdentifier}/grid?beginsAt%3C={now}&endsAt%3E={now}`** → `Metadata[]`, one per channel
+  airing at `now`: `type` (`episode` | `movie`), `title` (the XMLTV title; for an episode it is
+  `"Show - S03E23 - Name"`), `grandparentTitle` (the show), `ratingKey`/`key` under the provider
+  (`/tv.plex.providers.epg.xmltv:7/metadata/…`), `onAir`, `Media[]` with `channelVcn`,
+  `channelIdentifier`, `channelTitle`, `channelThumb`, `protocol` `livetv`, `beginsAt` and `endsAt`
+  (Unix seconds), and a `Channel[]` tag. The comparison operator is part of the KEY (`beginsAt%3C=`).
+  Adding `type=1,4` returned the same four rows.
+
+### Watching a channel (the official LG client's sequence, read from the server log 2026-10-21)
+
+Plex for LG 5.94.3 on webOS 10.3 tuned one channel, watched it for six minutes and backed out. The
+order below is that client's; nothing here was sent by hand (a hand-sent tune has been seen to leave
+a server looping on its grabber).
+
+1. **`POST /livetv/dvrs/{dvr}/channels/{gridKey}/tune`** — the channel is the guide's `gridKey`
+   (`C101.242.ersatztv.org`), not the `vcn`. The server reserves a tuner, starts a "rolling"
+   subscription (`Live TV - Session {client id}`) and a `copy` transcode of the tuner's stream, and
+   answers only once that streams: **200 after 4.8 s**, 2764 bytes. The body was not captured; what
+   it carries is the session `/livetv/sessions/{uuid}` (the client's next request names it) and the
+   airing's `ratingKey`, under a `MediaSubscription` → `MediaGrabOperation` → item nesting that the
+   app does not rely on (`livetv::session_of` takes the first object whose `key` is a session key).
+2. **`GET /video/:/transcode/universal/decision?path=%2Flivetv%2Fsessions%2F{uuid}`** with
+   `directPlay=1&directStream=1&directStreamAudio=1&protocol=hls&mediaIndex=0&partIndex=0&session=…`
+   → 200. The session is then **direct play**: `/status/sessions` shows `Part.decision=directplay`,
+   `Part.key` = **`/livetv/sessions/{uuid}/{X-Plex-Client-Identifier}/index.m3u8?offset=-1.000000`**,
+   H.264 High 1080p25 + AAC LC stereo 48 kHz in MPEG-TS, `TranscodeSession.videoDecision=copy`.
+3. **The playlist is a MEDIA playlist with no master in front of it**, re-read about once a second
+   (`Content-Type: application/vnd.apple.mpegurl`, `Cache-Control: no-cache`):
+   `#EXT-X-VERSION:4`, `#EXT-X-TARGETDURATION:3`, `#EXT-X-MEDIA-SEQUENCE:0`, one
+   `#EXT-X-PROGRAM-DATE-TIME`, then one-second `#EXTINF:1.000000, nodesc` segments named `00000.ts`,
+   `00001.ts`, … relative to the playlist. No `PLAYLIST-TYPE`, no `ENDLIST`, no discontinuity; the
+   list only grows (segment 0 was still listed after six minutes: `buildLiveM3U8: min 0 max 385`).
+   Segment requests carry no token in the URI.
+4. **`/:/timeline?key=%2Flivetv%2Fsessions%2F{uuid}&ratingKey={airing}&state=…&time=0&duration=0&playbackTime={ms}`**
+   — `buffering`, then `playing` about every 10 s. The server records it with `scrobble: 0`.
+5. **The stop is the timeline's `state=stopped&continuing=0`.** On it the server terminates the
+   streaming session ("Client stopped playback"), the recorder sees no consumer left, kills the
+   transcode, deletes its directory, **frees the tuner** and destroys the rolling subscription — all
+   inside the same 3 ms. The client's `DELETE /media/subscriptions/{id}` afterwards answered 404.
+
+### App routing beyond the measured direct-play sequence (implemented, tuner acceptance unmeasured)
+
+The app retains the tune's HTTP status and distinguishes `Tuned`, `Busy` and `Failed` outcomes.
+**409 and 503 are classified as Busy by inference, not by a measured exhausted-tuner response.**
+Every other HTTP rejection, a transport failure, malformed JSON or a successful answer without a
+session remains a generic failure; the UI must not claim a cause that the response does not prove.
+
+The live decision's selected playlist also carries its own `Media.width`, `Media.height` and
+`Media.audioChannels`, parsed with the same lenient numeric handling as library decisions; missing
+values stay 0 (unknown). These output facts allow routing to check the actual stream against the
+attempt's device capabilities and the feed HLS reader's H.264/AAC codec contract instead of
+assuming the measured channel represents every tuner. Direct play requires both; other codecs
+take the conversion route below, refusing video copy when the reader cannot accept the source
+video codec. A playlist whose codecs no decision named converts too. Only when that conversion is
+refused as well is the session's own playlist read as H.264/AAC, the shape of every measured
+session: PMS 1.43.3 refused both decisions on the owner's TV while that playlist played.
+
+The Direct Play setting is a permission on top of those codec facts. **Disabled** never reads the
+session's own playlist: a channel the set decodes is converted, and a refused conversion reads out (the
+server's reason, else "Direct Play is Disabled" when the original is what would have played)
+instead of falling back to the playlist as recorded. **Forced** never asks for a conversion: a lane
+the decision named and the reader cannot take is refused with the Forced read-out, and a playlist
+with nothing named wrong is read as recorded. The
+as-recorded read is the original route (no encoder id, no fixed-HLS contract), so the channel's
+conversion is still there to try if that playlist then fails to decode. When a decision lists
+several `Media`, the one PMS marks `selected` is the playlist read; with none marked, the first.
+
+**A live playlist that brings nothing new is waited out, not converted.** A recording whose DVR
+input pauses keeps answering with the same playlist and no end marker. Measured by the maintainer on
+webOS 4.5 (PR #993, two Pluto channels): Plex waited 29.8 s and 30.3 s for input and then produced
+segments again on the same encoder. So the reader keeps polling the playlist it opened (no reopen,
+no second tune, no new session), and once the delivered media has played out the player holds its
+clock and shows **Buffering**, a channel read as recorded included; the first new segment that
+covers the measured runway gives play back. The no-progress allowance is three target durations
+and never under 45 s, a **provisional** floor taken from those two gaps, not a protocol bound. While
+the start cushion still holds, a tuner's own playlist gets the same allowance and a conversion's
+gets four times three target durations and never under 60 s (its clock runs from before the
+encoder has listed anything). Past the allowance the read fails as a stall, which is a different
+outcome from a decode failure: it ends in the playback error and does **not** take the channel's
+conversion (which reads that same recording and would meet the same gap), and the conversion stays
+unspent for a later decode failure. A cut that cannot be decoded (no SPS/IDR, a refused demux)
+still converts.
+
+`TranscodeSpec::source` now supports either a library rating key or the tuned
+`/livetv/sessions/{uuid}` key. Live re-encode requests reuse the **same** universal-transcoder
+query, capability profile, decision and fixed-segment HLS delivery (`start.m3u8`, the library's
+`FixedHls` contract) as library playback, with the source path replaced. The player reads that
+output as live because its `path=` source is a `/livetv/sessions/…` key: it starts at the edge on
+every open and publishes no duration. This is an implemented extension of the library contract,
+**not a measured live-tuner remux/transcode flow**. Real PMS/tuner acceptance, output codecs and
+resource cleanup for this route still require device or server evidence; the official client's
+sequence above proves only the direct-play route.
+
+The mock server models this whole sequence for tests without a tuner:
+`tests/mock_pms.py --livetv-fixture` (one DVR, two tuners, five channels including an MPEG-2/AC-3
+and an AC-4 one; `--livetv-busy` for no free tuner), pinned by `tests/test_mock_pms_livetv.py`.
+Its busy (503) and live-transcode answers follow the inferences above; they are not captures.
+
+---
+
 ## Paging, observed
 
 Observed on PMS 1.43.4 with a small library, by read-only GETs. Only the endpoints in the table were
@@ -1827,6 +1977,7 @@ only `size`.
 | Key of `movie.topunwatched` and `movie.by.actor.or.director` (random hubs) | yes | not recorded | The listing came back in the same order on two calls; the windows (0,6) and (6,50) together equal the whole listing; every preview card is in it. The library held only 13 items, so large lists are not covered. |
 | `/playlists/all` (the key of the playlists hub in the Home hub list, `/hubs` and `/hubs/promoted`) | yes | yes | Measured on PMS 1.43: `X-Plex-Container-Start=2&X-Plex-Container-Size=2` answered `size` 2, `totalSize` 5, `offset` 2, items of type `playlist`. The app does not page it and no row shows it: a hub of type `playlist` is not listed (`pms::listable`), so it never reaches a shelf, and `is_pageable_hub_key` does not admit the key. |
 
+| `/livetv/dvrs`, `/{epg}/lineups/dvr/channels`, `/{epg}/grid?beginsAt%3C=…&endsAt%3E=…` (Live TV, §10) | no | no | Measured on PMS 1.43.3 with one DVR: the DVR list and the lineup come whole (one DVR, four mapped channels); the grid bounded to one instant returns one airing per channel. |
 
 ## App data-layer summary
 

@@ -20,7 +20,7 @@
 //! the locale's own month-and-day tables (`LocaleContext::month_day`, W3), medium width, in the one
 //! phrase every page uses for it ("Coming 12 Mar", `fmt::coming_on`).
 use plx_data::watchlist::model::{Kind, TileState, WatchRow};
-use plx_platform::i18n::{msg, MonthWidth};
+use plx_os::i18n::{msg, MonthWidth};
 use plx_plex::plex::ListingFacts;
 use plx_ui::caption_policy::{CaptionFacts, CaptionPolicy};
 use plx_ui::cards::TileLabel;
@@ -67,6 +67,7 @@ pub fn label(row: &WatchRow, state: TileState, policy: &CaptionPolicy, copy: &Li
         genre: copy.genre.clone(),
         video_resolution: copy.video_resolution.clone(),
         hdr: copy.hdr,
+        dolby_vision: copy.dolby_vision,
         content_rating: copy.content_rating.clone(),
         audience_rating: copy.audience_rating,
         leaf_count: copy.leaf_count,

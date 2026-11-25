@@ -186,7 +186,7 @@ Captions
   (`player_hud.rs:155-164`). Readers of the band: `player_hud.rs:15`, `:155-163`, `:304-322`, `:477`;
   `text_style.rs:68`, `:192-195`; `screens/src/player/ass_subtitles.rs:271` (test `:398`);
   `media/src/player/ass/tests/synth.rs:443-447`; `plex/src/plex/session.rs:1076` (doc). Media cannot name
-  appkit (`ci/module-layers.ini` `[media] uses = base machine platform gfx net plex telemetry data`).
+  appkit (`ci/module-layers.ini` `[media] uses = base machine os gfx net plex telemetry data`).
   Captions drew first and the HUD over them (`screens/src/player/mod.rs:1513-1525`, `:1539-1541`), so
   an open Info card (top 668) or strip (684) covered a caption lifted to 780 until PR17, which lifts the
   caption clear of it and draws it above the section (section "Captions").
@@ -195,7 +195,7 @@ Captions
   What must be inside is what the viewer has to read or press" (`:88-93`).
 
 Layers, Sans-IO, settings, replay
-- F30. `ci/module-layers.ini`: `[ui] uses = base machine platform gfx`; `[data]` members by name;
+- F30. `ci/module-layers.ini`: `[ui] uses = base machine os gfx`; `[data]` members by name;
   `[appkit] members = appkit`; a new top-level module "fails the gate until it is placed here"; `[data]
   uses` has no `ui` (`:120`). `ui/src/CLAUDE.md:279`: the ui library is "never an application type".
 - F31. `docs/sans-io.md:12-17`: a machine "starts no worker, makes no network, storage or LS2 call, and
@@ -249,7 +249,7 @@ Other subsystems the plan touches
   reader exists, private (`ui/src/rec/strict_json.rs`, `mod strict_json;` at `ui/src/rec.rs:40`); no JSON
   Schema crate (`grep -c 'name = "schemars"\|name = "jsonschema"' Cargo.lock` prints 0); `plx_ui` already
   depends on `serde_json` (`ui/Cargo.toml:50`). The lint host is the existing `plxnative-sim` bin
-  (`Cargo.toml:64-67`, `required-features = ["hostsim"]`); dev triggers are the default `devtriggers`
+  (`Cargo.toml:64-67`, `required-features = ["sim"]`); dev triggers are the default `devtriggers`
   feature, absent from the shipping `--no-default-features` set (`Cargo.toml:73`, `:88`).
 
 ## Decisions (with reasons)
@@ -1496,7 +1496,7 @@ the television's. `plxnative-sim --hud-lint` prints every state's cost beside it
 ## Storage per install mode
 
 New `paths::hud_candidates()` on F39's pattern, keyed by `app_id()`:
-0. a steerable (hostsim) build: `in_runtime_dir("huds")` FIRST, so simulators never share one store;
+0. a steerable (`sim`) build: `in_runtime_dir("huds")` FIRST, so simulators never share one store;
 1. `/media/developer/{id}-huds/` (Dev Mode: rw, survives reinstall);
 2. `/media/internal/.{id}-huds/` (the HBC/cryptofs jail's persistent rw location);
 3. `/media/developer/temp/{id}-huds/` if (1) is refused, created owner-only like the image cache;

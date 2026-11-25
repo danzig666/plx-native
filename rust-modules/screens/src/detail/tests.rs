@@ -33,7 +33,14 @@ impl ScreenArg for TestArg {
 pub(super) struct TestHost;
 
 impl crate::registry::ScreenInputsLike for TestHost {
-    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs {
+        if NO_DRIVER.with(|flag| flag.get()) { crate::registry::no_driver_fixture() } else { crate::registry::caption_fixture() }
+    }
+}
+
+thread_local! {
+    /// TEST ONLY: the host publishes a platform that composed no playback driver.
+    static NO_DRIVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl crate::registry::PlayerLike for TestHost {
@@ -173,6 +180,7 @@ pub(super) fn bare_held(sid: ServerId, rk: &str) -> DetailScreen {
         refresh: DetailRefreshPhase::None,
         refresh_gen: 0,
         restore_intent: None,
+        provisional: false,
         teardown_cleared: false,
         withdrawn: false,
         scroll: Spring::at(0.0),
@@ -2918,7 +2926,7 @@ fn a_show_trailer_disc_plays_the_extra_not_the_on_deck_episode() {
             assert_ne!(part.as_str(), "/library/parts/trailer");
             assert_ne!(context.as_str(), plx_data::metadata::TRAILER_CONTEXT);
         }
-        (PlayIntent::Movie { .. }, _) => {}
+        (PlayIntent::Movie { .. } | PlayIntent::Live { .. }, _) => {}
     }
     clear();
 }
@@ -3356,7 +3364,7 @@ fn extras_sit_after_cast_and_crew_and_do_not_move_the_compact_title() {
     spot.section = 6;
     spot.col = 1;
     screen.restore(&spot, test_store().view());
-    let key = screen.restore_focus(test_store().view()).expect("extras column restores");
+    let key = screen.restore_focus(&cx(&plx_ui::fixture::FixtureMeasure, None)).expect("extras column restores");
     assert!(matches!(screen.locate(key, test_store().view()), Some(Located::Extras(1))));
 
     let movie = Detail {
@@ -4741,10 +4749,10 @@ fn a_restore_onto_episode_700_waits_for_its_page_and_then_seats_it() {
         seek: Default::default(),
     });
     screen.sync_keys(test_store().view());
-    assert_eq!(screen.restore_focus(test_store().view()), None, "episode 700's page has not landed");
+    assert_eq!(screen.restore_focus(&cx(&plx_ui::fixture::FixtureMeasure, None)), None, "episode 700's page has not landed");
     land_page(1000, 11);
     screen.sync_keys(test_store().view());
-    assert_eq!(screen.restore_focus(test_store().view()), episode_key(&screen, 700, episodes::Row::Still));
+    assert_eq!(screen.restore_focus(&cx(&plx_ui::fixture::FixtureMeasure, None)), episode_key(&screen, 700, episodes::Row::Still));
     clear();
 }
 
@@ -5174,7 +5182,7 @@ fn a_non_plex_guid_has_no_bookmark_disc() {
     let set = screen.hero_set(test_store().view());
     assert!(!set.watchlist);
     assert!(!hero::hero_ctls(set).0[..hero::hero_ctls(set).1].contains(&hero::HeroCtl::Watchlist));
-    assert!(!hero::visible_ctls(set, false).0[..hero::visible_ctls(set, false).1].contains(&hero::HeroCtl::Watchlist));
+    assert!(!hero::visible_ctls(set, hero::Stops::trailer(false)).0[..hero::visible_ctls(set, hero::Stops::trailer(false)).1].contains(&hero::HeroCtl::Watchlist));
     assert_eq!(hero::index_of(set, hero::HeroCtl::Watchlist), None);
     let (_, fx) = step(&mut screen, &ScreenEvent::Activate(hero::ELEM_WATCHLIST), Some(hero::ELEM_WATCHLIST));
     assert!(item_menu_acts(&fx).is_empty());
@@ -5371,14 +5379,14 @@ fn the_identity_line_paints_sm_after_the_run_and_xs_between_chips() {
     let d = identity_detail(false);
     let m = &plx_base::fontcov::advances::ShippedMeasure;
     let runs = plx_ui::draw_census::capture_runs(|| screen.identity_row(plx_ui::Painter::recording(), &d, 300.0, m));
-    let kind = plx_platform::i18n::msg::browse_kind_movie();
+    let kind = plx_os::i18n::msg::browse_kind_movie();
     let kind_run = runs.iter().find(|r| r.text == kind).expect("the kind label is painted");
     // The recording painter has no loaded font. Geometry comes from the same injected measure
     // as the run, rather than the painter's uninitialized-font width estimate.
     let run_right = kind_run.at.x + plx_machine::machine::Measure::width_str(m, kind, theme::hero::IDENTITY_SIZE, false);
     let res = keyline_left(painted_x(&runs, "1080p").expect("resolution chip"), "1080p", m);
-    let cc_label = plx_platform::i18n::msg::widgets_badge_cc();
-    let sdh_label = plx_platform::i18n::msg::widgets_badge_sdh();
+    let cc_label = plx_os::i18n::msg::widgets_badge_cc();
+    let sdh_label = plx_os::i18n::msg::widgets_badge_sdh();
     let cc = keyline_left(painted_x(&runs, cc_label).expect("CC chip"), cc_label, m);
     let sdh = keyline_left(painted_x(&runs, sdh_label).expect("SDH chip"), sdh_label, m);
     assert!((res.0 - run_right - theme::space::SM).abs() < 0.5, "SM after the dotted run: {} vs {run_right}", res.0);
@@ -5399,7 +5407,7 @@ fn the_identity_line_names_the_dynamic_range_after_the_resolution() {
     d.hdr = true;
     let runs = row(&d);
     let x = |label: &str| painted_x(&runs, label).unwrap_or_else(|| panic!("the {label} chip"));
-    assert!(x("1080p") < x("HDR") && x("HDR") < x(plx_platform::i18n::msg::widgets_badge_cc()), "between the resolution and the accessibility chips");
+    assert!(x("1080p") < x("HDR") && x("HDR") < x(plx_os::i18n::msg::widgets_badge_cc()), "between the resolution and the accessibility chips");
     d.dovi.present = true;
     let runs = row(&d);
     assert!(painted_x(&runs, "HDR").is_some() && painted_x(&runs, "Dolby Vision").is_none(),
@@ -5719,6 +5727,7 @@ fn a_picked_version_plays_it_resuming_like_play() {
                 assert_eq!(*version, Some(pick), "{kind}");
             }
             PlayIntent::Movie { .. } => panic!("{kind}: the loaded item, not a hub row"),
+            PlayIntent::Live { .. } => panic!("{kind}: the loaded item, not a live channel"),
         }
         assert_eq!(resume_ns, plx_data::metadata::resume_ns(600_000, 6_000_000), "{kind} resumes");
         let (_, effects) = step(&mut screen, &ScreenEvent::Activate(hero::ELEM_PLAY), Some(hero::ELEM_PLAY));
@@ -5892,6 +5901,7 @@ fn a_hero_controls_subject_is_the_rating_key_its_activation_acts_on() {
     let played = match play_item(&effects) {
         Some((PlayIntent::Item { rk, .. }, _)) => rk.clone(),
         Some((PlayIntent::Movie { item, .. }, _)) => item.rk.clone(),
+        Some((PlayIntent::Live { .. }, _)) => panic!("Detail cannot tune a channel"),
         None => panic!("Play pushes a play request"),
     };
     assert_eq!(subject(&screen, "hero.play").as_deref(), Some(played.as_str()));
@@ -5915,6 +5925,7 @@ fn a_hero_controls_subject_is_the_rating_key_its_activation_acts_on() {
     let played = match play_item(&effects) {
         Some((PlayIntent::Movie { item, .. }, _)) => item.rk.clone(),
         Some((PlayIntent::Item { rk, .. }, _)) => rk.clone(),
+        Some((PlayIntent::Live { .. }, _)) => panic!("Detail cannot tune a channel"),
         None => panic!("Play pushes a play request"),
     };
     assert_eq!(played, "card");
@@ -6103,3 +6114,49 @@ pub(crate) fn detail_conforms() -> plx_ui::a11y::Namespaces {
 
 #[path = "hero_shade_tests.rs"]
 mod hero_shade;
+
+#[path = "no_driver_tests.rs"]
+mod no_driver;
+
+/// W6c: a platform that composes no playback driver leaves Detail's Play pill inert (it owns no focus
+/// stop either: `no_driver`'s tests). The same press with a driver composed starts the play, so the
+/// guard is the only difference.
+#[test]
+fn the_hero_play_is_inert_when_no_playback_driver_is_composed() {
+    let sid = ServerId::UNSET;
+    for (no_driver, plays) in [(false, true), (true, false)] {
+        let _guard = install(Detail {
+            sid, rk: "movie".into(), kind: "movie".into(), part: "/library/parts/1/file.mkv".into(),
+            ..Default::default()
+        });
+        NO_DRIVER.with(|flag| flag.set(no_driver));
+        let mut screen = bare(&_guard, sid, "movie");
+        let (_, effects) = step(&mut screen, &ScreenEvent::Activate(hero::ELEM_PLAY), Some(hero::ELEM_PLAY));
+        NO_DRIVER.with(|flag| flag.set(false));
+        assert_eq!(play_item(&effects).is_some(), plays, "no_driver={no_driver}");
+        clear();
+    }
+}
+
+/// W6c: the Play pill's label wears the shared button's disabled ink while no playback driver is
+/// composed, and its ordinary ink otherwise: `Button::enabled`, not a screen-local look.
+#[test]
+fn the_play_pill_reads_disabled_when_no_playback_driver_is_composed() {
+    let sid = ServerId::UNSET;
+    let play_label = plx_os::i18n::msg::browse_detail_play();
+    let mut inks = Vec::new();
+    for no_driver in [false, true] {
+        let _guard = install(Detail { sid, rk: "movie".into(), kind: "movie".into(), ..Default::default() });
+        NO_DRIVER.with(|flag| flag.set(no_driver));
+        let screen = bare(&_guard, sid, "movie");
+        let measure = plx_ui::fixture::FixtureMeasure;
+        let runs = plx_ui::draw_census::capture_runs(|| {
+            screen.draw_buttons(plx_ui::Painter::recording(), &cx(&measure, None), 600.0, 1.0)
+        });
+        NO_DRIVER.with(|flag| flag.set(false));
+        inks.push(runs.iter().find(|r| r.text == play_label).map(|r| r.ink));
+        clear();
+    }
+    assert_eq!(inks[1], Some(plx_ui::theme::INK_DISABLED), "no driver: the disabled ink");
+    assert!(inks[0].is_some() && inks[0] != inks[1], "a driver composed: the ordinary ink");
+}

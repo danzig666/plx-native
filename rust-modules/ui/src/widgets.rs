@@ -822,7 +822,7 @@ pub fn still_overlay(
                 ),
                 (None, _) => {
                     let tag = tag_of();
-                    let status = if tag.is_empty() { String::new() } else { plx_platform::i18n::msg::widgets_card_new_episode().to_owned() };
+                    let status = if tag.is_empty() { String::new() } else { plx_os::i18n::msg::widgets_card_new_episode().to_owned() };
                     (tag, status, crate::still_footer::Right::None)
                 }
             };
@@ -1289,8 +1289,8 @@ pub fn row_watch_state<T: crate::tile::Tile + ?Sized>(m: &T) -> PosterMark {
 ///
 /// Each names the OUTCOME its press produces, never the state the item is in — which is what lets
 /// a part-watched item show both at once without either being a lie.
-pub fn mark_watched_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_mark_watched() }
-pub fn mark_unwatched_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_mark_unwatched() }
+pub fn mark_watched_verb() -> &'static str { plx_os::i18n::msg::widgets_action_mark_watched() }
+pub fn mark_unwatched_verb() -> &'static str { plx_os::i18n::msg::widgets_action_mark_unwatched() }
 
 /// …and the third verb the same two surfaces share: **play this from 00:00, ignoring the resume
 /// point.** The detail hero's disc and the card menu's row are one action, so they carry one WORD —
@@ -1304,8 +1304,8 @@ pub fn mark_unwatched_verb() -> &'static str { plx_platform::i18n::msg::widgets_
 /// resembling a play mark. The two were reconciled onto one glyph for a day and it was wrong;
 /// `Icon::Restart`'s doc is the argument. One action, one word, and the mark chosen per surface for
 /// what that surface has to tell apart.
-pub fn play_from_start_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_play_start() }
-pub fn play_trailer_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_play_trailer() }
+pub fn play_from_start_verb() -> &'static str { plx_os::i18n::msg::widgets_action_play_start() }
+pub fn play_trailer_verb() -> &'static str { plx_os::i18n::msg::widgets_action_play_trailer() }
 
 /// The **watched tick** on a poster, as fractions of the tile's DRAWN width: the tick's box, its
 /// corner inset, then the veil's box. Anchored on the design system's `ArtTile` — a 26px tick inset
@@ -3283,6 +3283,9 @@ pub struct CircleButton {
     pub frame: Rect,
     pub glyph: *const c_char,
     pub icon: Option<crate::icons::Icon>, // vector glyph; overrides the text glyph when set
+    /// Whether the control can act: a disabled disc wears the disabled ink and never the focused
+    /// face, whatever order the builder ran in ([`CircleButton::enabled`]).
+    pub enabled: bool,
     pub focused: bool,
     /// Focus PROGRESS 0..1 when driven off a spring ([`CircleButton::focus_mix`]); `None` is the
     /// plain binary [`focused`](Self::focused).
@@ -3310,6 +3313,7 @@ impl CircleButton {
             glyph,
             icon: None,
             fill: None,
+            enabled: true,
             focused: false,
             focus: None,
             style: ControlStyle::Accent,
@@ -3358,6 +3362,15 @@ impl CircleButton {
         self.focused = f;
         self
     }
+    /// A disc that cannot act: the disabled ink ([`theme::INK_DISABLED`]), and never the focused
+    /// face whatever order the two are set in — [`Button::enabled`]'s and
+    /// [`TransportButton::enabled`]'s own rule, so a disabled disc reads the same on every row.
+    /// A disabled control owns no focus stop (`focus::next_enabled_index`), so the caller that
+    /// disables one also keeps focus off it. Defaults to enabled.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
     /// Draw the focus fill at progress `t` (0..1) — normally [`CtlPop::focus`], the lift spring —
     /// instead of the binary [`focused`](Self::focused); see [`ControlStyle::face_at`].
     pub fn focus_mix(mut self, t: f32) -> Self {
@@ -3367,7 +3380,15 @@ impl CircleButton {
     }
     /// The face this disc draws now.
     fn face_now(&self) -> ControlFace {
-        self.style.face_at(self.focus.unwrap_or(f32::from(self.focused)), self.ground, self.palette)
+        let mut face = self.style.face_at(
+            if self.enabled { self.focus.unwrap_or(f32::from(self.focused)) } else { 0.0 },
+            self.ground,
+            self.palette,
+        );
+        if !self.enabled {
+            face.ink = theme::INK_DISABLED;
+        }
+        face
     }
     /// The [FOCUS POP](CTRL_FOCUS_SCALE), about the control's centre — normally
     /// [`CtlPop::scale`], which already folds the press dip in. `1.0` is the resting control, which
@@ -3503,14 +3524,15 @@ impl View for CircleButton {
         // capsule, and `face_box`/`face_outline` pick that up from the shape rather than from a
         // flag — at rest both are no-ops on a circle.
         let plate = face_box(r);
-        if self.focused {
+        let focused = self.enabled && self.focused;
+        if focused {
             control_cast_at(p, plate, plate.h * 0.5, self.focus.unwrap_or(1.0));
         }
         let glass = self.ground == ControlGround::Keyed
             && glass_capsule(p, plate, 1.0, self.glass, None);
         if !glass {
-            control_rim(p, plate, plate.h * 0.5, face.top, face.body, self.focused, self.ground);
-        } else if self.focused {
+            control_rim(p, plate, plate.h * 0.5, face.top, face.body, focused, self.ground);
+        } else if focused {
             let focus = self.focus.unwrap_or(1.0);
             let bright = self.style.face_at(1.0, self.ground, self.palette);
             control_rim(p.alpha(focus), plate, plate.h * 0.5, bright.top, bright.body, true, self.ground);
@@ -6860,6 +6882,9 @@ pub const TAB_KEY_CHIP: u32 = crate::dispatch::STRIP_BASE + 4;
 /// BEFORE Search in the strip's visual order (`app::chrome::strip_keys`) — a key is a destination's
 /// identity, never its position.
 pub const TAB_KEY_WATCHLIST: u32 = crate::dispatch::STRIP_BASE + 5;
+/// The Live TV pill, `+6`: appended after the Watchlist's `+5`, so no existing key moves; drawn
+/// after the library type pills (`app::chrome::strip_keys`).
+pub const TAB_KEY_LIVETV: u32 = crate::dispatch::STRIP_BASE + 6;
 /// The top chrome band's y — the chip and the pills sit on it (Home and Library alike).
 ///
 /// **Derived from the overscan safe area, not chosen.** It was a bare `44.0` until 2026-08-23, which

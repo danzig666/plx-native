@@ -240,12 +240,23 @@ pub(crate) fn state_fp_v11() -> u64 {
     plx_ui::rec::state_fp(&["ControlledHomeInitV11", "ControlledInstallLanguageV1{install_language:Preference};ControlledRunningLanguageV1{running_language:Preference};PlayerPresentation:unsupported_domain_neutral_no_ambient;NativePreview:controlled_port_unavailable", &state_fp_v10().to_string()])
 }
 
-/// The reviewed historical census owns these bytes, not today's changing InputMachine.
 #[cfg(test)]
-fn historical_input_shape() -> &'static str {
+fn historical_census() -> &'static [Value] {
     static CENSUS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     CENSUS.get_or_init(|| serde_json::from_str(include_str!("fixtures/session-codec-v5/current-base-fingerprints.json")).expect("frozen census"))
-        ["prior_vector"][1].as_str().expect("historical Input shape")
+        ["prior_vector"].as_array().expect("historical census vector")
+}
+
+#[cfg(test)]
+fn historical_input_shape() -> &'static str {
+    historical_census()[1].as_str().expect("historical Input shape")
+}
+
+/// The screen census starts at AppArg and is the suffix of the reviewed historical vector.
+#[cfg(test)]
+fn historical_screen_shapes() -> impl Iterator<Item = &'static str> {
+    historical_census().iter().map(|value| value.as_str().expect("historical shape"))
+        .skip_while(|shape| !shape.starts_with("AppArg{"))
 }
 
 #[cfg(test)]
@@ -280,7 +291,7 @@ pub(crate) fn state_fp_v7() -> u64 {
     shapes.push(RESOLUTION_SHAPE_V1);
     shapes.push("CaptureReadinessV2{before_dispatch:pending:bool,text:bool}");
     shapes.push("MeasurementV1{query:Width(text:bytes,sz:i32,bold:bool)|Cap(sz:i32)|Line(sz:i32),answer:f32bits:u32}");
-    shapes.extend_from_slice(plx_screens::registry::SCREEN_SHAPES);
+    shapes.extend(historical_screen_shapes());
     plx_ui::rec::state_fp(&shapes)
 }
 
@@ -295,7 +306,7 @@ fn session_app_prior_vector() -> Vec<&'static str> {
     shapes.push(RESOLUTION_SHAPE_V1);
     shapes.push("CaptureReadinessV2{before_dispatch:pending:bool,text:bool}");
     shapes.push("MeasurementV1{query:Width(text:bytes,sz:i32,bold:bool)|Cap(sz:i32)|Line(sz:i32),answer:f32bits:u32}");
-    shapes.extend_from_slice(plx_screens::registry::SCREEN_SHAPES);
+    shapes.extend(historical_screen_shapes());
     shapes
 }
 
@@ -1476,7 +1487,7 @@ pub(crate) fn features() -> Vec<String> {
     if cfg!(feature = "devtriggers") {
         v.push("devtriggers".into());
     }
-    if cfg!(feature = "hostsim") {
+    if cfg!(feature = "sim") {
         v.push("hostsim".into());
     }
     if cfg!(feature = "lab-diagnostics") {
@@ -1876,6 +1887,33 @@ mod tests {
         }
     }
 
+    /// W5a: the loop reads a `HostEvent`, and the tape still records each lifecycle edge as the SDL
+    /// code it arrived as, so every recorded tape replays as it did. Each pair is spelled as the
+    /// literal record an earlier build wrote.
+    #[test]
+    fn a_lifecycle_edge_is_recorded_as_the_sdl_code_it_arrived_as() {
+        use super::super::events::{decode_host_event, HostEvent, Lifecycle};
+        for (code, edge, foreground) in [
+            (0x103u32, Lifecycle::WillBackground, false),
+            (0x104, Lifecycle::DidBackground, false),
+            (0x105, Lifecycle::WillForeground, true),
+            (0x106, Lifecycle::DidForeground, true),
+        ] {
+            let mut event = [0u8; 128];
+            event[..4].copy_from_slice(&code.to_ne_bytes());
+            for flavor in super::super::events::BOTH_FLAVORS {
+                assert_eq!(decode_host_event(flavor, &event), Some(HostEvent::Lifecycle(edge)), "{flavor:?} {code:#x}");
+            }
+            let recorded = enc_lifecycle(edge.sdl_code());
+            let legacy: Value = serde_json::from_str(&format!(r#"{{"kind":"lifecycle","code":{code}}}"#)).unwrap();
+            assert_eq!(recorded, legacy, "{code:#x}");
+            assert_eq!(recorded.to_string(), legacy.to_string(), "{code:#x}: byte-equal on the tape");
+            assert_eq!(controlled_foreground(&recorded),
+                if foreground { Ok(Some(code)) } else { Err("unsupported controlled lifecycle") },
+                "{code:#x}: only the foreground pair is in the controlled domain");
+        }
+    }
+
     #[test]
     fn product_mode_encoding_is_bounded_explicit_and_fail_closed() {
         assert_eq!(ReplayMode::parse("/tmp/synthetic"),Ok((ReplayMode::Targets,"/tmp/synthetic")));
@@ -2117,12 +2155,12 @@ mod tests {
         let _serial=plx_base::testlock::serial();
         let initial=super::super::bootstrap::Initial::synthetic_home(1,32517,None).unwrap();
         let mt=unsafe {plx_base::task::MainThread::assume()};
-        let (runtime, retained) = super::super::bridge::BridgeRetained::controlled_home(||0,&initial,&mt,true);
+        let (runtime, retained) = super::super::bridge::BridgeRetained::controlled_home(||0, crate::app::platform::Platform::HOST_TEST.shell, &initial,&mt,true);
         let mut harness = crate::app::runtime_owners::Harness::from_parts(runtime, retained);
         let mut bridge = harness.bridge();
         bridge.split().measure.width(c"no fonts loaded",28,false);
         assert!(bridge.take_measurements().is_err(),"construction-order violations must latch");
-        let (runtime, retained) = super::super::bridge::BridgeRetained::controlled_home(||0,&initial,&mt,true);
+        let (runtime, retained) = super::super::bridge::BridgeRetained::controlled_home(||0, crate::app::platform::Platform::HOST_TEST.shell, &initial,&mt,true);
         let mut harness = crate::app::runtime_owners::Harness::from_parts(runtime, retained);
         let mut bridge = harness.bridge();
         let table=[
@@ -2828,7 +2866,8 @@ mod tests {
         // `ProductResolutionV2` (the by-id `Id` resolution row, a11y-ids D6) moves the full census
         // from 0xea74_3865_5115_46c5, which `the_pre_content_navigation_recording_shape_is_refused`
         // keeps refused at the shape boundary like every older value.
-        assert_eq!(state_fp(), 0x7f1d_280c_909c_8603, "current V13 producer census");
+        assert_eq!(state_fp(), 0x7410_4747_8858_9e13, "current V13 producer census");
+        assert_ne!(state_fp(), 0x7f1d_280c_909c_8603, "the census before Filmography's Watchlist menu");
         assert_ne!(state_fp(), 0xea74_3865_5115_46c5, "the census without the `Id` resolution row");
         assert_ne!(state_fp(), 0x3ed9_2e0f_25bd_7f8e, "V12 cannot describe captured positive-swap presentation inputs");
     }

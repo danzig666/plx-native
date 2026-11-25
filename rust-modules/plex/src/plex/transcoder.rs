@@ -16,15 +16,15 @@
 //! HTTP, deadline and transport causes for route policy.
 use super::client::{Client, JsonDeadlineOutcome, QueryBuilder, StreamUrl};
 use super::models::MediaContainer;
-use super::params::{Ceiling, TranscodeDelivery, TranscodeSpec};
+use super::params::{Ceiling, TranscodeDelivery, TranscodeSource, TranscodeSpec};
 use super::probe::Location;
 
 // `DP_AUDIO_CODECS` — the AUDIO codec set the buffer-feed pipeline decodes — is defined in
-// `devcaps` (the platform layer intersects it with the device's own codec table) and re-exported
+// `devcaps` (the os layer intersects it with the device's own codec table) and re-exported
 // here, so the profile string below and `plex::DP_AUDIO_CODECS` keep naming it. The live set is
 // `devcaps::Caps::audio`; normal routing uses [`is_dp_audio_track_with`] for membership, channel
 // bounds and sample rate, shared with the device profile.
-pub use plx_platform::devcaps::DP_AUDIO_CODECS;
+pub use plx_os::devcaps::DP_AUDIO_CODECS;
 
 /// Codec, channel and rate check for an actual selected track, against the capability value `caps`
 /// of the attempt asking. Codec-only membership is insufficient on devices whose DTS decoder stops
@@ -35,8 +35,8 @@ pub use plx_platform::devcaps::DP_AUDIO_CODECS;
 ///
 /// The value is an argument, never a read of the process-wide `devcaps::caps()`: the profile the
 /// server is sent ([`TranscodeSpec::caps`]) and the plan that chose the track come from the same one.
-pub fn is_dp_audio_track_with(caps: &plx_platform::devcaps::Caps, codec: &str, channels: i64, sample_rate: i64) -> bool {
-    caps.audio_supports(codec, channels) && plx_platform::devcaps::audio_track_fits(codec, channels, sample_rate)
+pub fn is_dp_audio_track_with(caps: &plx_os::devcaps::Caps, codec: &str, channels: i64, sample_rate: i64) -> bool {
+    caps.audio_supports(codec, channels) && plx_os::devcaps::audio_track_fits(codec, channels, sample_rate)
 }
 
 /// Subtitle codecs Original client-renders (`ff.rs` / the track menu). This is the
@@ -142,7 +142,7 @@ pub fn link_policy(link: Option<Location>) -> LinkPolicy {
 /// string is built from it, and `route::plan::video_direct_plays` (the local gate that stands in for
 /// `/decision` when it is unreachable) is held to it by a test over every capability combination,
 /// so the two can no longer drift apart silently.
-pub fn direct_play_video_codecs(caps: &plx_platform::devcaps::Caps) -> Vec<&'static str> {
+pub fn direct_play_video_codecs(caps: &plx_os::devcaps::Caps) -> Vec<&'static str> {
     let mut v = vec!["h264"];
     if caps.hevc {
         v.push("hevc");
@@ -219,7 +219,7 @@ pub fn direct_play_video_codecs(caps: &plx_platform::devcaps::Caps) -> Vec<&'sta
 ///
 /// The Load payload cannot drift whatever PMS chooses: `route.rs` reads the OUTPUT codecs off
 /// the /decision response (`decision_codecs`) and describes those, not the profile's wish.
-fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeDelivery) -> String {
+fn profile_for_delivery(caps: &plx_os::devcaps::Caps, delivery: TranscodeDelivery) -> String {
     let dp_video = direct_play_video_codecs(caps).join(",");
     // The table-gated copy codecs, in list order. Each one is advertised only when the table
     // carries ITS row, and each brings the row's own bound (see `row_limits`).
@@ -308,13 +308,13 @@ fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeD
     // input's top rate (`devcaps::pcm_load_rate`), so only their channel limit above is sent, and a
     // PCM rate under the ceiling that is not in the PCM table is refused by the planner instead.
     let audio_limits = audio_limits
-        + &plx_platform::devcaps::PCM_AUDIO_CODECS
+        + &plx_os::devcaps::PCM_AUDIO_CODECS
             .split(',')
             .filter(|c| caps.audio_has(c))
-            .chain(plx_platform::devcaps::APP_DECODED.iter().filter(|c| c.lossy && caps.audio_has(c.id)).map(|c| c.id))
+            .chain(plx_os::devcaps::APP_DECODED.iter().filter(|c| c.lossy && caps.audio_has(c.id)).map(|c| c.id))
             .chain(target_audio_codecs.iter().copied())
-            .filter(|c| plx_platform::devcaps::audio_rate_bounded(c))
-            .map(|codec| audio_limit(codec, "audio.samplingRate", plx_platform::devcaps::AUDIO_RATE_CEILING))
+            .filter(|c| plx_os::devcaps::audio_rate_bounded(c))
+            .map(|codec| audio_limit(codec, "audio.samplingRate", plx_os::devcaps::AUDIO_RATE_CEILING))
             .collect::<String>();
     let target = match delivery {
         TranscodeDelivery::ProgressiveMkv => format!(
@@ -343,14 +343,14 @@ fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeD
     )
 }
 
-fn profile_for(caps: &plx_platform::devcaps::Caps) -> String {
+fn profile_for(caps: &plx_os::devcaps::Caps) -> String {
     profile_for_delivery(caps, TranscodeDelivery::ProgressiveMkv)
 }
 
 /// The forced-direct-play profile: the engine's own formats, no device limits, no transcode
 /// target. `vp9` and `av1` join the video list only when the device table lists their rows (issue
 /// #593); a forced start never widens the codec set past what the table says the panel decodes.
-fn forced_direct_profile_for(caps: &plx_platform::devcaps::Caps) -> String {
+fn forced_direct_profile_for(caps: &plx_os::devcaps::Caps) -> String {
     let mut video = "h264,hevc".to_string();
     if caps.vp9 {
         video.push_str(",vp9");
@@ -365,8 +365,8 @@ fn forced_direct_profile_for(caps: &plx_platform::devcaps::Caps) -> String {
     // one still gets a direct-play answer for it instead of a transcode (`Caps::app_may_decode_lossy`).
     let audio = DP_AUDIO_CODECS
         .split(',')
-        .chain(plx_platform::devcaps::PCM_AUDIO_CODECS.split(','))
-        .chain(plx_platform::devcaps::APP_DECODED.iter().filter(|c| c.lossy).map(|c| c.id))
+        .chain(plx_os::devcaps::PCM_AUDIO_CODECS.split(','))
+        .chain(plx_os::devcaps::APP_DECODED.iter().filter(|c| c.lossy).map(|c| c.id))
         .filter(|c| caps.forced_feeds_audio(c) || caps.app_may_decode_lossy(c))
         .fold(Vec::<&str>::new(), |mut seen, c| {
             if !seen.contains(&c) {
@@ -386,7 +386,7 @@ fn forced_direct_profile_for(caps: &plx_platform::devcaps::Caps) -> String {
 /// profiles shipped with PMS does), where the pipeline and the device table say `dts`. The one
 /// place profile text leaves our own vocabulary.
 fn profile_codec_name(codec: &str) -> &str {
-    match plx_platform::devcaps::audio_codec_id(codec).as_ref() {
+    match plx_os::devcaps::audio_codec_id(codec).as_ref() {
         "dts" => "dca",
         _ => codec,
     }
@@ -431,8 +431,12 @@ impl Client {
         );
         let copy_ok = !hls && !(s.contract.no_video_copy && !s.contract.remux);
         let protocol = if hls { "hls" } else { "http" };
+        let path = match s.source {
+            TranscodeSource::Library(rating_key) => format!("/library/metadata/{rating_key}"),
+            TranscodeSource::Live(key) => key.to_owned(),
+        };
         let mut q = QueryBuilder::new("")
-            .str("path", &format!("/library/metadata/{}", s.rating_key))
+            .str("path", &path)
             .int("mediaIndex", s.media_index as i64)
             .int("partIndex", 0)
             .str("protocol", protocol)
@@ -549,7 +553,7 @@ impl Client {
         session: &str,
         audio_stream_id: i64,
         subtitle_stream_id: i64,
-        caps: &plx_platform::devcaps::Caps,
+        caps: &plx_os::devcaps::Caps,
     ) -> Option<MediaContainer> {
         self.mde_decision_with_profile(rating_key, media_index, session, audio_stream_id, subtitle_stream_id, caps, false)
     }
@@ -564,7 +568,7 @@ impl Client {
         session: &str,
         audio_stream_id: i64,
         subtitle_stream_id: i64,
-        caps: &plx_platform::devcaps::Caps,
+        caps: &plx_os::devcaps::Caps,
     ) -> Option<MediaContainer> {
         self.mde_decision_with_profile(rating_key, media_index, session, audio_stream_id, subtitle_stream_id, caps, true)
     }
@@ -577,7 +581,7 @@ impl Client {
         session: &str,
         audio_stream_id: i64,
         subtitle_stream_id: i64,
-        caps: &plx_platform::devcaps::Caps,
+        caps: &plx_os::devcaps::Caps,
         forced: bool,
     ) -> Option<MediaContainer> {
         let q = QueryBuilder::new("/video/:/transcode/universal/decision")
@@ -658,21 +662,31 @@ impl Client {
 
     /// GET /video/:/transcode/universal/stop — free both the physical encoder and the Streaming
     /// Resource bandwidth allocation owned by `session`.
-    /// Returns whether the request reached the server and came back accepted.
+    /// Returns whether the server answered 2xx.
     ///
-    /// Reported rather than discarded, for the reason [`Client::get_ok`] exists: this is a
-    /// body-less WRITE whose caller is off the main thread (`route::scrobble_stop`'s worker), and
-    /// the bool is the only thing that can say it landed. What a silently lost stop leaves behind is
-    /// specific — the server keeps ENCODING into a session nothing will read again, the leaked
-    /// server-side encoder `docs/parity-gaps.md` names on the retranscode path. Like
-    /// [`super::library::Client::scrobble`], it does not tell a 200 from a 404: `get_ok` is
-    /// `http_get`'s own success, which is the honest limit of a GET whose body carries nothing.
+    /// Reported rather than discarded: this is a body-less WRITE whose caller is off the main
+    /// thread (`route::scrobble_stop`'s worker), and the bool is the only thing that can say it
+    /// landed. What a silently lost stop leaves behind is specific — the server keeps ENCODING into
+    /// a session nothing will read again, the leaked server-side encoder `docs/parity-gaps.md`
+    /// names on the retranscode path. A 404 means no transcoder ever ran under `session` (it only
+    /// reached `/decision`): the stop's own close never reaches the Streaming Resource that
+    /// decision reserved, so it is closed through [`Client::transcode_resource_reconciled`], and
+    /// the stop still returns `false`.
     #[track_caller]
     pub fn transcode_stop(&self, session: &str) -> bool {
         if session.is_empty() {
             return false;
         }
-        self.get_ok(&self.transcode_stop_query(session, true))
+        match self.get_status(&self.transcode_stop_query(session, true)) {
+            Some(200..=299) => true,
+            // Decision-only session: close its reserved stream slot, or the server holds it
+            // until its own timeout.
+            Some(404) => {
+                let _ = self.transcode_resource_reconciled(session);
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Stop the physical encoder while deliberately preserving its Streaming Resource. Runtime
@@ -744,9 +758,9 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::{
-        link_policy, Ceiling, Client, LinkPolicy, Location, TranscodeDelivery, TranscodeSpec,
+        link_policy, Ceiling, Client, LinkPolicy, Location, TranscodeDelivery, TranscodeSource, TranscodeSpec,
     };
-    use plx_platform::devcaps::Caps;
+    use plx_os::devcaps::Caps;
     use crate::plex::{AudioEnhancements, EncodeContract, Origin, ServerId};
 
     // ---- the universal-transcoder query: who is allowed to COPY ---------------------------
@@ -778,7 +792,7 @@ mod tests {
         audio: AudioEnhancements,
     ) -> TranscodeSpec<'a> {
         TranscodeSpec {
-            rating_key: "5",
+            source: TranscodeSource::Library("5"),
             media_index: 0,
             session: "s1",
             encoder_session: "s1",
@@ -797,29 +811,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_live_session_is_not_prefixed_with_library_metadata() {
+        let mut live = spec(false, false);
+        live.source = TranscodeSource::Live("/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2");
+        let query = a_client().transcode_query(&live);
+        assert!(query.contains("path=%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2&"), "{query}");
+        assert_eq!(query.replace("path=%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2&", "path=%2Flibrary%2Fmetadata%2F5&"),
+            a_client().transcode_query(&spec(false, false)), "the source changes no encode contract parameter");
+    }
+
     /// PMS acknowledges `/stop` before its cleanup worker erases the physical session. The
     /// matching ping exact-looks up that half of the lifecycle: 200 while the physical map entry
     /// exists, 404 after it is gone. Other statuses prove neither state and must fail closed; the
     /// logical Streaming Resource has its own close method and is deliberately not inferred here.
     //
-    // Dev-only, this test through `resource_close_is_posted_and_accepts_only_terminated_or_absent`
-    // below: each drives a plaintext loopback PMS with a real, token-bearing client, which a store
-    // build's `CredentialPolicy::HttpsOnly` refuses before the request reaches the wire (see
-    // `http::credential_transport_allowed`) — the refused call's return value fails the fixture's
-    // own assertion. The store-build case is covered instead by `auth.rs`'s `e2e_real_curl_*`
-    // HTTPS harness.
+    /// A plaintext loopback PMS that answers one connection per entry of `statuses`, in order,
+    /// with an empty body, publishing each request line; and a client pointed at it.
     #[cfg(feature = "devtriggers")]
-    #[test]
-    fn transcode_ping_distinguishes_present_absent_and_unknown_cleanup_state() {
-        use std::io::{BufRead, BufReader, Write};
+    fn loopback_pms(
+        statuses: &'static [&'static str],
+    ) -> (
+        Client,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
         use plx_base::testnet::{self, CLIENT_WAIT};
+        use std::io::{BufRead, BufReader, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port() as i32;
         let (tx, rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            for status in ["200 OK", "404 Not Found", "500 Internal Server Error"] {
-                let (mut socket, _) = testnet::accept_within(&listener, CLIENT_WAIT).expect("accept ping");
+            for status in statuses {
+                let (mut socket, _) =
+                    testnet::accept_within(&listener, CLIENT_WAIT).expect("accept");
                 let mut line = String::new();
                 BufReader::new(&socket)
                     .read_line(&mut line)
@@ -832,7 +858,6 @@ mod tests {
                 .expect("response");
             }
         });
-
         let client = Client::new(
             ServerId::from_raw(1),
             "mach",
@@ -840,6 +865,20 @@ mod tests {
             "tok",
             "cid",
         );
+        (client, rx, server)
+    }
+
+    // Dev-only, this test through `resource_close_is_posted_and_accepts_only_terminated_or_absent`
+    // below: each drives a plaintext loopback PMS with a real, token-bearing client, which a store
+    // build's `CredentialPolicy::HttpsOnly` refuses before the request reaches the wire (see
+    // `http::credential_transport_allowed`) — the refused call's return value fails the fixture's
+    // own assertion. The store-build case is covered instead by `auth.rs`'s `e2e_real_curl_*`
+    // HTTPS harness.
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn transcode_ping_distinguishes_present_absent_and_unknown_cleanup_state() {
+        let (client, rx, server) =
+            loopback_pms(&["200 OK", "404 Not Found", "500 Internal Server Error"]);
         assert_eq!(client.transcode_session_present("encoder-one"), Some(true));
         assert_eq!(client.transcode_session_present("encoder-two"), Some(false));
         assert_eq!(client.transcode_session_present("encoder-three"), None);
@@ -904,35 +943,8 @@ mod tests {
     #[cfg(feature = "devtriggers")]
     #[test]
     fn resource_close_is_posted_and_accepts_only_terminated_or_absent() {
-        use std::io::{BufRead, BufReader, Write};
-        use plx_base::testnet::{self, CLIENT_WAIT};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port() as i32;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            for status in ["200 OK", "404 Not Found", "500 Internal Server Error"] {
-                let (mut socket, _) = testnet::accept_within(&listener, CLIENT_WAIT).expect("accept close");
-                let mut line = String::new();
-                BufReader::new(&socket)
-                    .read_line(&mut line)
-                    .expect("request line");
-                tx.send(line).expect("publish request");
-                write!(
-                    socket,
-                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("response");
-            }
-        });
-
-        let client = Client::new(
-            ServerId::from_raw(1),
-            "mach",
-            Origin::http("127.0.0.1", port),
-            "tok",
-            "cid",
-        );
+        let (client, rx, server) =
+            loopback_pms(&["200 OK", "404 Not Found", "500 Internal Server Error"]);
         assert_eq!(
             client.transcode_resource_reconciled("resource-one"),
             Some(true)
@@ -951,6 +963,30 @@ mod tests {
                 "{line}",
             );
         }
+        server.join().unwrap();
+    }
+
+    /// A session that only ever ran `/decision` has no transcoder: PMS answers its `/stop` 404
+    /// and its Streaming Resource, which holds a stream slot, is left to the server's timeout. The
+    /// stop must then close the resource itself, or two quick start/stop cycles exhaust a
+    /// server's stream limit.
+    // Dev-only: see the comment on `transcode_ping_distinguishes_present_absent_and_unknown_cleanup_state`.
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn a_stop_that_finds_no_transcoder_still_closes_the_reserved_resource() {
+        let (client, rx, server) = loopback_pms(&["404 Not Found", "200 OK"]);
+        assert!(!client.transcode_stop("decided-only"));
+        let stop = rx.recv().expect("stop request");
+        assert!(
+            stop.starts_with("GET /video/:/transcode/universal/stop?"),
+            "{stop}"
+        );
+        let close = rx.recv().expect("the resource close after a 404 stop");
+        assert!(close.starts_with("POST /status/sessions/close?"), "{close}");
+        assert!(
+            close.contains("X-Plex-Session-Identifier=decided-only"),
+            "{close}"
+        );
         server.join().unwrap();
     }
 
@@ -1192,9 +1228,10 @@ mod tests {
             audio_channels: Default::default(),
             native_ceiling: Default::default(),
             video_ceiling: Default::default(),
-            app_lossy: plx_platform::devcaps::AppLossy::Off,
+            app_lossy: plx_os::devcaps::AppLossy::Off,
             app_lossy_in_force: Default::default(),
-            dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
+            dv_first_picture: plx_os::devcaps::DvFirstPicture::AnyIrap,
+            dv_matroska: false,
             },
             s.contract.delivery,
         );
@@ -1339,7 +1376,7 @@ mod tests {
             "no subscription-free video fallback in {video:?} — a free server drops the video track");
         assert_eq!(video.first().map(String::as_str), Some("hevc"),
             "hevc must stay FIRST: order is preference, and hevc is what keeps 4K+HDR10 through a re-encode");
-        for c in plx_platform::devcaps::Caps::assumed().audio.split(',') {
+        for c in plx_os::devcaps::Caps::assumed().audio.split(',') {
             assert!(list_of(target, "audioCodec=").contains(&c.to_string()),
                 "{c} is direct-playable but absent from the target — the server would re-encode a track we decode natively");
         }
@@ -1367,9 +1404,9 @@ mod tests {
     #[test]
     fn flac_is_offered_for_direct_play_up_to_stereo_and_never_as_a_target() {
         // what `devcaps` makes of a READ table (its own tests pin that half)
-        let mut caps = plx_platform::devcaps::Caps::assumed();
+        let mut caps = plx_os::devcaps::Caps::assumed();
         caps.audio.push_str(",flac");
-        caps.audio_channels.insert("flac".into(), plx_platform::devcaps::PCM_MAX_CHANNELS);
+        caps.audio_channels.insert("flac".into(), plx_os::devcaps::PCM_MAX_CHANNELS);
         let profile = super::profile_for(&caps);
         assert!(list_of(&profile, "audioCodec=").contains(&"flac".into()), "{profile}");
         assert!(profile.contains("scope=videoAudioCodec&scopeName=flac&type=upperBound&name=audio.channels&value=2&replace=true"), "{profile}");
@@ -1377,7 +1414,7 @@ mod tests {
         assert!(!profile.contains("scopeName=flac&type=upperBound&name=audio.samplingRate"), "{profile}");
         assert!(!list_of(target_of(&profile), "audioCodec=").contains(&"flac".into()));
         assert!(list_of(&super::forced_direct_profile_for(&caps), "audioCodec=").contains(&"flac".into()));
-        let assumed = plx_platform::devcaps::Caps::assumed();
+        let assumed = plx_os::devcaps::Caps::assumed();
         assert!(!super::profile_for(&assumed).contains("flac"));
         assert!(!super::forced_direct_profile_for(&assumed).contains("flac"));
     }
@@ -1386,10 +1423,10 @@ mod tests {
     /// and Force only, never a transcode target. LPCM is named `pcm` in the profile.
     #[test]
     fn alac_and_pcm_are_offered_like_flac_and_never_as_a_target() {
-        let mut caps = plx_platform::devcaps::Caps::assumed();
+        let mut caps = plx_os::devcaps::Caps::assumed();
         caps.audio.push_str(",flac,alac,pcm");
         for c in ["flac", "alac", "pcm"] {
-            caps.audio_channels.insert(c.into(), plx_platform::devcaps::PCM_MAX_CHANNELS);
+            caps.audio_channels.insert(c.into(), plx_os::devcaps::PCM_MAX_CHANNELS);
         }
         let profile = super::profile_for(&caps);
         let forced = super::forced_direct_profile_for(&caps);
@@ -1400,7 +1437,7 @@ mod tests {
             assert!(!list_of(target_of(&profile), "audioCodec=").contains(&c.into()), "{c} is not a transcode target");
             assert!(list_of(&forced, "audioCodec=").contains(&c.into()), "{c}: {forced}");
         }
-        let assumed = plx_platform::devcaps::Caps::assumed();
+        let assumed = plx_os::devcaps::Caps::assumed();
         for c in ["alac", "pcm"] {
             assert!(!list_of(&super::profile_for(&assumed), "audioCodec=").contains(&c.into()), "{c}");
         }
@@ -1414,7 +1451,7 @@ mod tests {
     /// `/decision` direct-plays what the profile has the server convert.
     #[test]
     fn every_transcode_target_audio_codec_is_asked_for_at_48_khz_at_most() {
-        use plx_platform::devcaps::{audio_track_fits, DP_AUDIO_CODECS, PCM_AUDIO_CODECS};
+        use plx_os::devcaps::{audio_track_fits, DP_AUDIO_CODECS, PCM_AUDIO_CODECS};
         let mut caps = Caps { audio: format!("{DP_AUDIO_CODECS},{PCM_AUDIO_CODECS}"), ..Caps::assumed() };
         caps.audio_channels.insert("dts".into(), 6);
         let rate_bound = |codec: &str| format!(
@@ -1445,11 +1482,11 @@ mod tests {
     /// is still converted: the `audio.channels` limitation of the three stays at two.
     #[test]
     fn hi_res_lossless_is_not_converted_by_the_server_but_surround_still_is() {
-        use plx_platform::devcaps::audio_track_fits;
+        use plx_os::devcaps::audio_track_fits;
         let mut caps = Caps::assumed().with_app_lossy();
         caps.audio.push_str(",opus,flac,alac,pcm");
         for c in ["flac", "alac", "pcm"] {
-            caps.audio_channels.insert(c.into(), plx_platform::devcaps::PCM_MAX_CHANNELS);
+            caps.audio_channels.insert(c.into(), plx_os::devcaps::PCM_MAX_CHANNELS);
         }
         let limit = |codec: &str, name: &str, value: u32| format!(
             "scope=videoAudioCodec&scopeName={codec}&type=upperBound&name={name}&value={value}&replace=true"
@@ -1555,7 +1592,7 @@ mod tests {
     /// well, and Auto's profile does not move with the policy at all.
     #[test]
     fn the_forced_profile_offers_an_enabled_lossy_codec_the_set_cannot_decode() {
-        use plx_platform::devcaps::AppLossy;
+        use plx_os::devcaps::AppLossy;
         let rowless = Caps { app_lossy: AppLossy::Measured, ..Caps::assumed() };
         let forced = super::forced_direct_profile_for(&rowless);
         assert_eq!(list_of(&forced, "audioCodec="), ["aac", "ac3", "eac3", "dca"], "{forced}");
@@ -1605,9 +1642,10 @@ mod tests {
             audio_channels: Default::default(),
             native_ceiling: Default::default(),
             video_ceiling: Default::default(),
-            app_lossy: plx_platform::devcaps::AppLossy::Off,
+            app_lossy: plx_os::devcaps::AppLossy::Off,
             app_lossy_in_force: Default::default(),
-            dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
+            dv_first_picture: plx_os::devcaps::DvFirstPicture::AnyIrap,
+            dv_matroska: false,
         };
         let p = super::profile_for(&caps);
         assert!(!p.contains("hevc"), "hevc must not appear anywhere in {p}");
@@ -1641,9 +1679,10 @@ mod tests {
                 audio_channels: Default::default(),
                 native_ceiling: Default::default(),
                 video_ceiling: Default::default(),
-                app_lossy: plx_platform::devcaps::AppLossy::Off,
+                app_lossy: plx_os::devcaps::AppLossy::Off,
                 app_lossy_in_force: Default::default(),
-                dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
+                dv_first_picture: plx_os::devcaps::DvFirstPicture::AnyIrap,
+                dv_matroska: false,
             },
         ] {
             let p = super::profile_for(&caps);
@@ -1674,9 +1713,10 @@ mod tests {
             audio_channels: Default::default(),
             native_ceiling: Default::default(),
             video_ceiling: Default::default(),
-            app_lossy: plx_platform::devcaps::AppLossy::Off,
+            app_lossy: plx_os::devcaps::AppLossy::Off,
             app_lossy_in_force: Default::default(),
-            dv_first_picture: plx_platform::devcaps::DvFirstPicture::AnyIrap,
+            dv_first_picture: plx_os::devcaps::DvFirstPicture::AnyIrap,
+            dv_matroska: false,
         };
         let p = super::profile_for(&caps);
         let dp = p.split("add-transcode-target").next().unwrap();
@@ -1726,13 +1766,13 @@ mod tests {
     }
 
     /// A recovery that took a refused 4K H.264 out of the attempt bounds THAT codec in the profile
-    /// ([`plx_platform::devcaps::Facet::Video`]): PMS cannot copy the raster the pipeline refused
+    /// ([`plx_os::devcaps::Facet::Video`]): PMS cannot copy the raster the pipeline refused
     /// and must encode, while the other codecs and the shared bound stay. Both deliveries carry it
     /// (the block is delivery-independent), and an attempt without a ceiling is byte-identical.
     #[test]
     fn a_video_ceiling_bounds_that_codec_in_the_profile() {
         let assumed = Caps::assumed();
-        let narrowed = assumed.without(&plx_platform::devcaps::Facet::Video {
+        let narrowed = assumed.without(&plx_os::devcaps::Facet::Video {
             codec: "h264".into(),
             width: 3840,
             height: 2160,
