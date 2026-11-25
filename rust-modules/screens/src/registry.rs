@@ -3580,7 +3580,7 @@ mod a11y_coverage_tests {
     /// How many leaf arms the table has: 22 flat `AppArg` arms, 5 `ContentArg`, 22 `SettingsPage` and
     /// `FirstRunConsent`. A new arm fails [`coverage`] to compile, and then this to pass until the census
     /// below holds it too.
-    const ARMS: usize = 50;
+    const ARMS: usize = 51;
 
     /// **A value of every leaf arm** the table names: the registry's own page and surface censuses, plus
     /// the arms those leave out (Filmography and every Settings page).
